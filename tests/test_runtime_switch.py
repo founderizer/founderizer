@@ -407,8 +407,15 @@ class Switch(OwnerAPI):
         before = self.opt_in({"start": "app-server"})
         self.report(runtime="claude", agent="studio", features=APP_SERVER)
         self.assertTrue(self.line("studio")["runtime_switch"]["ready"], self.line("studio")["runtime_switch"])
+        # A hold of its screen route (the Codex of its desktop): once Codex is its own runtime, its desktop tasks run
+        # on its own route (needs_route), so the hold becomes the hold of its own route, which holds all of its work.
+        # The bug: a screen hold that stays one after the switch, and holds nothing (owner API 1.330).
+        held = hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known,route) VALUES('studio',?,?,1,'screen')",
+                       (hub.now(), hub.now() + 3600))
+        self.assertIsNone(hub.active_limit("studio"))
         code, receipt = self.switch("codex", agent="studio")
         self.assertEqual((code, receipt.get("changed")), (200, [{"field": "runtime", "before": "claude", "after": "codex"}]))
+        self.assertEqual(hub.active_limit("studio")["id"], held)
         after = self.team()["agents"]["studio"]
         self.assertEqual((after["runtime"], after["start"], "allow" in after, after["runtime_policies"]),
                          ("codex", "app-server", False, {"claude": {"start": STUDIO, "allow": ["mcp__fleet__*"]}}))

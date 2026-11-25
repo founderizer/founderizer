@@ -892,18 +892,25 @@ class Checks(OwnerAPI):
         self.assertEqual(self.count("tasks"), 25)
 
     def test_a_run_held_by_a_usage_limit_goes_on_at_the_reset(self):
+        """A usage limit of the agent holds the run of its wake-up until the reset, not a retry clock. A hold of the
+        agent's screen route holds only its desktop tasks (the owner, 24 November 2026): the wake-up of a task that
+        needs no screen starts under it. The bug: a reader of the hold that does not look at its route, which kept
+        an agent's duties asleep while only another agent's account was spent."""
         anchor = self.clock
         self.create()
         hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('vps',?,?,1)", (anchor, anchor + 5400))
+        hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known,route) VALUES('vps',?,?,1,'screen')",
+                (anchor, anchor + 9000))
         self.tick(anchor + 3600)
         self.assertEqual(self.answer(self.sent(), value=11)[1]["decision"], "waiting")
         run = self.run_row()
         self.assertEqual((run["retry_at"], run["reason"]), (anchor + 5400, "vps is at its usage limit until 20:40 UTC."))
         self.tick(anchor + 5000)
         self.assertIsNone(self.sent())                                      # the reset, not a retry clock
-        hub.q("UPDATE agent_limits SET ended=?", (anchor + 5400,))
+        hub.q("UPDATE agent_limits SET ended=? WHERE route IS NULL", (anchor + 5400,))
         self.tick(anchor + 5400)
         self.assertEqual(self.answer(self.sent(), value=11)[1]["decision"], "started")
+        self.assertIsNone(hub.q1("SELECT ended FROM agent_limits WHERE route='screen'")["ended"])     # it still holds
 
     def test_a_run_its_helper_lost_is_sent_once_more_and_a_second_loss_ends_it(self):
         anchor = self.clock

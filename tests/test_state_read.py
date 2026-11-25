@@ -503,15 +503,21 @@ class SameBytes(StateCase):
         # The five tables have no twin of before: their rows, in their order and with the logins masked, are the
         # database's own. A task has values more that are no column: from_conversation (owner API 1.231), false
         # here, where no conversation opened a task, and on an open task since when it is in its state (since, owner
-        # API 1.237), the hub's own answer.
+        # API 1.237), the hub's own answer. And its `limit` (owner API 1.330): on an open task the hold that keeps it
+        # waiting, as the hub reads it for that task alone (task_limit), and none on a task that ended or has no state.
         with hub.LOCK:
             since = hub.task_since(hub.parked_until())
         self.assertTrue(since)
         for table, key in FIVE:
             rows = hub.scrub([dict(r) for r in hub.q(f"SELECT * FROM {table} ORDER BY id")])
             if key == "tasks":
-                rows = [dict(r, **({"since": since[r["id"]]} if r["id"] in since else {}), from_conversation=False)
-                        for r in rows]
+                rows = [dict(r, **({"since": since[r["id"]]} if r["id"] in since else {}), from_conversation=False,
+                             limit=None if r["state"] in hub.TERMINAL + (None,) else
+                             hub.limit_view(hub.task_limit(r))) for r in rows]
+                held = [r["id"] for r in rows if r["limit"]]
+                stateless = [r["id"] for r in rows if r["state"] is None and hub.task_limit(r)]
+                self.assertTrue(held and stateless, "the fixture has an open task that a hold keeps waiting, and a "
+                                                    "task with no state whose agent is held")
             self.assertEqual(state[key], rows, key)
 
     def test_the_five_tables_keep_their_place_in_the_answer(self):
@@ -646,8 +652,17 @@ class Reads(StateCase):
         self.assertEqual((by["ivy"]["alive"], by["ivy"]["last_seen"], by["oli"]["reports_to"]), (None, None, "leo"))
 
     def test_the_state_reads_the_agents_tables_once(self):
-        """A read of the state reads each table of the agents' views once, where each agent read its own rows."""
+        """A read of the state reads each table of the agents' views once, where each agent read its own rows. Also
+        the route of a desktop task of a Codex agent with a hold of its screen route, which needs the accounts of its
+        agent (needs_route, owner API 1.330): from the state's one read of agent_usage, never a read of its own, also
+        when the hold has ended (task_since)."""
         self.fill()
+        with hub.LOCK:
+            desk = self.x("INSERT INTO tasks(title,done_when,needs,owner,requester,state,created,started,attempt) "
+                          "VALUES('Desk','done','screen','leo','manager','working',?,?,1)", (T0 - 100, T0 - 90))
+            self.x("INSERT INTO agent_limits(agent,since,until,reset_known,task,route,ended) "
+                   "VALUES('leo',?,?,1,?,'screen',?)", (T0 - 80, T0 - 20, desk, T0 - 20))
+            hub.commit()
         _, seen = self.traced(self.state_bytes)
         _, before = self.traced(lambda: self.run_with(each_part_alone(), self.state_bytes))
         tables = ("agent_usage", "agent_limits", "machine_status", "server_jobs", "signin_jobs", "agent_keys",
@@ -661,8 +676,10 @@ class Reads(StateCase):
         # owner chat that are active, whose helper can name chat_stop (chat_stoppable), and an open limit again for
         # the 5 whose helper names it; the two kinds of sign-in of those 7; the key of the 4 whose helper starts its
         # chat; the chat of the 2 with a key whose chat window runs; the newest press of Stop of each, for its turn end
-        # (turn_ended_after), and again for the one with a read message that waits.
-        self.assertEqual(count(before), {"agent_usage": 8, "agent_limits": 8 + 2 + 1 + 5, "machine_status": 7 + 6 + 7,
+        # (turn_ended_after), and again for the one with a read message that waits. And (owner API 1.330) the open
+        # limits once more for each task's own `limit`, and the usage twice for the accounts of the desktop task.
+        self.assertEqual(count(before), {"agent_usage": 8 + 2, "agent_limits": 8 + 2 + 1 + 1 + 5,
+                                         "machine_status": 7 + 6 + 7,
                                          "server_jobs": 7, "signin_jobs": 7, "agent_keys": 4,
                                          "session_credentials": 2, "kv WHERE k%turn_ended": 8, "chat_stops": 8 + 1})
 

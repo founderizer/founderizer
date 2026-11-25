@@ -1039,7 +1039,7 @@ class Devices(test_ui_api.OwnerAPI):
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (first,))
         page = self.call(f"/ui/mobile/task/{lead}")[1]
         self.assertEqual([(t["id"], t["state"]) for t in page["subtasks"]], [(first, "completed"), (second, "working")])
-        self.assertEqual(set(page["subtasks"][0]), set(hub.MOBILE_HEAD))
+        self.assertEqual(set(page["subtasks"][0]), set(hub.MOBILE_HEAD) | {"limit"})      # 1.330: the task's wait
         self.assertIsNone(page["parent_task"])
         child = self.call(f"/ui/mobile/task/{second}")[1]
         self.assertEqual((child["parent_task"]["id"], child["parent_task"]["title"]), (lead, "Lead"))
@@ -1060,7 +1060,7 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual(status, 200, page)
         self.assertEqual([t["id"] for t in page["tasks"]], ended)
         self.assertNotIn(open_task, [t["id"] for t in page["tasks"]])
-        self.assertEqual(set(page["tasks"][0]), set(hub.MOBILE_HEAD) | {"trigger_id"})
+        self.assertEqual(set(page["tasks"][0]), set(hub.MOBILE_HEAD) | {"trigger_id", "limit"})      # 1.330: no wait
         self.assertEqual([t["trigger_id"] for t in page["tasks"][:3]], [None, 3, 3])
         self.assertEqual(page["mark"], mobile["ended_mark"])
         hub.q("UPDATE tasks SET accepted=1 WHERE id=?", (ended[0],))

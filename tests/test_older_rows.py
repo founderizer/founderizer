@@ -592,7 +592,7 @@ class Phone(RowsCase):
                          [tasks[(corrected, "completed")], tasks[(held, "failed")]])
         self.assertEqual(answer["asked"], {held: "The export"})
         self.assertEqual(answer["mark"], self.get("/ui/mobile")["ended_mark"], "the mark of the main read")
-        self.assertEqual(sorted(answer["tasks"][0]), sorted(hub.MOBILE_HEAD + ("trigger_id",)))
+        self.assertEqual(sorted(answer["tasks"][0]), sorted(hub.MOBILE_HEAD + ("trigger_id", "limit")))   # 1.330
         self.assertEqual([t["id"] for t in self.ended(f"&chat=manager&from={T0 - 1000}")["tasks"]],
                          [tasks[(old, "completed")], tasks[(corrected, "completed")], tasks[(held, "failed")]])
         self.assertEqual([t["id"] for t in self.ended(f"&chat=mia&from={T0 - 1000}")["tasks"]],

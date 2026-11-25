@@ -541,6 +541,129 @@ class Runtime(unittest.TestCase):
                       hub.q1("SELECT live_path FROM tasks WHERE id=?", (theirs,))["live_path"])
         self.assertIn("YOUR ALLOWANCE is used up: a session of studio", hub.start_text("vps", theirs))
 
+    def test_a_limit_that_spreads_to_a_screen_route_holds_only_the_desktop_tasks_of_that_agent(self):
+        """The owner, 24 November 2026: it is concerning that the fleet has wrong data about an agent. studio's own
+        account is at 6%, and the Codex of its desktop spends vps's account. vps reaches
+        its limit: the hold that spreads to studio is of its screen route, and holds its desktop task only. Its own
+        task goes on and gets its messages, no app reads a limit of studio's, and the reset resumes only the desktop
+        task. The bugs: a reader of the hold that does not look at its route (as active_limit was, by agent) holds
+        all of studio's work and shows "Usage limit" on its row; a spread or a resume that does not look at it tells
+        or starts studio's own task."""
+        later, shared = hub.now() + 3600, "openai:" + "a" * 32
+        self.reading("vps", shared, 100, later)
+        self.reading("studio", "anthropic:" + "b" * 32, 6, later + 86400, labels=("7 days",))
+        data = json.loads(hub.q1("SELECT data FROM agent_usage WHERE name='studio'")["data"])
+        data["screen"] = {"limits": dict(data["limits"], account_key=shared, windows=[
+            {"id": "w0", "label": "codex / 7 days", "used_percent": 40, "resets_at": later, "window_minutes": 10080}])}
+        hub.q("UPDATE agent_usage SET data=? WHERE name='studio'", (json.dumps(data),))
+        own, desk, theirs = self.task(), self.task(), self.task(owner="vps")
+        hub.q("UPDATE tasks SET needs='screen' WHERE id=?", (desk,))
+        self.alive("studio", f"T-{own}", f"T-{desk}")
+        self.alive("vps", f"T-{theirs}")
+        self.hit(theirs, later, agent="vps")
+        self.assertIsNone(hub.active_limit("studio"))
+        held = hub.active_limit("studio", "screen")
+        self.assertEqual((held["route"], hub.limit_source(held), round(held["until"])), ("screen", "vps", round(later)))
+        told = [t for t in self.said("manager") if "reached its usage limit" in t]
+        self.assertEqual(len(told), 1)
+        self.assertIn("studio's desktop tasks spend the same provider allowance, so the hub holds them", told[0])
+        self.assertEqual([r["task"] for r in hub.q("SELECT task FROM events WHERE agent='studio' AND kind='say' AND "
+                                                   "text LIKE '%A session of vps%'")], [desk])
+        # no app reads a limit of studio's, and the manager is told none when it gives studio work of its own route;
+        # each task's `limit` (owner API 1.330) is the hold that keeps it waiting, in the state and in the phone's and
+        # the PC's readings: the desktop task's is the screen route's, the own task's none, vps's task its agent's
+        state = self.call("GET", "/ui/state")[1]
+        limits = {a["name"]: a["limit"] for a in state["agents"]}
+        self.assertEqual((limits["studio"] is None, limits["vps"] is None), (True, False))
+        self.assertIsNone(hub.mobile_agent("studio", hub.agents()["studio"])["limit"])
+        phone = {t["id"]: t["limit"] for t in self.call("GET", "/ui/mobile")[1]["tasks"]}
+        for tasks in ({t["id"]: t["limit"] for t in state["tasks"]}, phone):
+            self.assertEqual([(tasks[t] or {}).get("until") for t in (desk, own, theirs)],
+                             [held["until"], None, hub.active_limit("vps")["until"]])
+        self.assertEqual(self.call("GET", f"/ui/mobile/task/{desk}")[1]["task"]["limit"]["until"], held["until"])
+        note = hub.t_create_task("manager", {"owner": "studio", "title": "x", "done_when": "y"})
+        self.assertNotIn("usage limit", note)
+        self.assertNotIn("held until", note)
+        hub.emit("studio", "say", "[hub] for its own task", task=own)
+        hub.emit("studio", "say", "[hub] for its desktop task", task=desk)
+        texts = [e["text"] for e in self.delivered("studio")]
+        self.assertIn("[hub] for its own task", texts)
+        self.assertNotIn("[hub] for its desktop task", texts)
+        hub.tick()
+        paths = {t: hub.q1("SELECT live_path FROM tasks WHERE id=?", (t,))["live_path"] for t in (own, desk)}
+        self.assertEqual(paths[own], "live session")
+        self.assertIn("the usage limit of the account studio shares with vps", paths[desk])
+        # the reset: the desktop task, whose session is gone, starts again; the own task, which was not held, is told
+        # nothing
+        self.alive("studio", f"T-{own}")
+        hub.q("UPDATE agent_limits SET until=?", (hub.now() - 1,))
+        hub.tick()
+        self.assertEqual([hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"] for t in (own, desk)], [1, 2])
+        self.assertFalse(any("usage limit has reset" in t for t in self.said("studio")))
+        resets = [t for t in self.said("manager") if "has reset" in t]
+        self.assertEqual(len(resets), 1)
+        self.assertIn(f"studio's desktop tasks: T-{desk} (new session)", resets[0])
+
+    def test_a_desktop_task_that_reaches_a_limit_holds_the_routes_that_spend_its_account(self):
+        """A desktop task's limit holds the work of each route that spends the account that it ran on. A Codex agent's
+        desktop task runs on its own runtime: its limit is the agent's own, also with no reading of its screen route
+        (a review of 24 November 2026 found it held as its desktop tasks only, its own account spent). The desktop
+        task of an agent whose screen route has an account of its own holds its desktop tasks only, and the manager
+        reads them as such. An agent whose own route and screen route spend one account is held on both: when its
+        own route leaves that account first, its own work resumes and its desktop task waits for the reset. The
+        bugs: a route by the task's needs alone, or a Codex agent's desktop always on its own route, also when its
+        two readings name two accounts; a spread that skips the reporting agent's own route (name != agent); a
+        resume of a task that another hold still holds; the agent's own words for its desktop tasks."""
+        later = hub.now() + 3600
+
+        def screen(agent, key):
+            data = json.loads(hub.q1("SELECT data FROM agent_usage WHERE name=?", (agent,))["data"])
+            data["screen"] = {"limits": dict(data["limits"], account_key=key)}
+            hub.q("UPDATE agent_usage SET data=? WHERE name=?", (json.dumps(data), agent))
+
+        def desktop(owner):
+            tid, own = self.task(owner=owner), self.task(owner=owner)
+            hub.q("UPDATE tasks SET needs='screen' WHERE id=?", (tid,))
+            self.alive(owner, f"T-{tid}", f"T-{own}")
+            return tid, own
+        hub.TEAM["agents"]["vps"]["can"].append("screen")          # a Codex agent, with no reading of its screen
+        desk, own = desktop("vps")
+        self.hit(desk, later, agent="vps")
+        self.assertEqual(hub.active_limit("vps")["task"], desk)
+        hub.emit("vps", "say", "[hub] for its own task", task=own)
+        self.assertNotIn("[hub] for its own task", [e["text"] for e in self.delivered("vps")])
+        self.reading("vps", "openai:" + "f" * 32, 40, later)        # its own account, and its desktop signed in by
+        screen("vps", "openai:" + "9" * 32)                         # hand to another: the desktop is a route of its own
+        self.assertEqual(hub.task_route(desk), "screen")
+        self.reading("studio", "anthropic:" + "b" * 32, 6, later, labels=("7 days",))
+        screen("studio", "openai:" + "c" * 32)                      # its desktop tasks: an account of their own
+        desk, own = desktop("studio")
+        self.hit(desk, later)
+        self.assertIsNone(hub.active_limit("studio"))
+        said = self.said("manager")[-1]
+        self.assertIn("studio's desktop tasks reached the usage limit of their provider account", said)
+        self.assertIn("its other work goes on", said)
+        hub.TEAM["agents"]["w3"] = {"role": "worker", "runtime": "claude", "machine": "w3", "can": ["shell", "screen"]}
+        self.reading("w3", "openai:" + "d" * 32, 40, later)
+        screen("w3", "openai:" + "d" * 32)                          # its own route and its desktop: one account
+        desk, own = desktop("w3")
+        self.hit(desk, later, agent="w3")
+        mine, desks = hub.active_limit("w3"), hub.active_limit("w3", "screen")
+        self.assertEqual((mine["cause"], hub.limit_source(mine)), (desks["id"], None))
+        self.assertIn("w3 reached its usage limit", self.said("manager")[-1])
+        data = json.loads(hub.q1("SELECT data FROM agent_usage WHERE name='w3'")["data"])
+        data["limits"]["account_key"] = "openai:" + "e" * 32        # its own route signs in to another account
+        hub.q("UPDATE agent_usage SET data=? WHERE name='w3'", (json.dumps(data),))
+        hub.limit_account("w3", hub.now())
+        self.assertEqual([hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"] for t in (own, desk)], [2, 1])
+        self.assertFalse(any(f"Continue T-{desk}" in t for t in self.said("w3")))
+        self.assertIn("w3's desktop tasks spend the account that reached the limit", self.said("manager")[-1])
+        hub.q("UPDATE agent_limits SET until=? WHERE ended IS NULL", (hub.now() - 1,))
+        hub.tick()
+        self.assertTrue(any(f"Continue T-{desk}" in t for t in self.said("w3")))
+        self.assertTrue(any("The usage limit of the account of w3's desktop tasks has reset" in t
+                            for t in self.said("manager")))
+
     def test_a_window_that_is_one_models_share_of_an_account_holds_nobody_else(self):
         """The trap. A usage window can be scoped to one model -- the live hub shows "7 days (Fable)" on one login
         -- and a reported limit carries nothing but a reset time, so the hub cannot say which window a session hit.
@@ -748,8 +871,8 @@ class Runtime(unittest.TestCase):
         reports(since + 30, 99, since + 500)                # and so can this one be, by a clock that is ahead
         hub.limit_reading("vps", reading(hub.now(), 100, since - 5), hub.now())         # a reset that has passed
         hub.limit_reading("studio", reading(hub.now(), 40, since + 500), hub.now())
-        for agent in ("vps", "studio"):
-            lim = hub.active_limit(agent)
+        for agent, route in (("vps", "primary"), ("studio", "screen")):
+            lim = hub.active_limit(agent, route)
             self.assertEqual((round(lim["until"] - lim["since"]), lim["reset_known"]), (3600, 0), agent)
         reports(hub.now(), 40, since + 500)                                             # read after it: open again
         self.assertLessEqual(hub.active_limit("vps")["until"], hub.now())

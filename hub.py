@@ -458,6 +458,8 @@ CREATE INDEX IF NOT EXISTS history_agent_at ON history(agent, at);
 CREATE INDEX IF NOT EXISTS history_of_task ON history(task, at) WHERE task IS NOT NULL;
 CREATE INDEX IF NOT EXISTS history_of_person ON history(person, at) WHERE person IS NOT NULL;
 CREATE INDEX IF NOT EXISTS history_of_ref ON history(ref, agent) WHERE kind<>'tool';
+-- the ids of the history's rows that the raw sweep took, whose words the index still holds (history_unindex)
+CREATE TABLE IF NOT EXISTS history_unindexed(id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tool_commands(agent TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL,
   digest TEXT NOT NULL, receipt TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(agent, request_id));
 CREATE TABLE IF NOT EXISTS chat_in(id INTEGER PRIMARY KEY, account TEXT NOT NULL, msg_id TEXT NOT NULL, chat TEXT NOT NULL,
@@ -2206,10 +2208,13 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # works on your message or your answer, Stop stands where Send stands. A press
                                     # interrupts that turn, as Pause does for a task."): agents[].chat_stop of GET
                                     # /ui/state and GET /ui/mobile, and POST /ui/chats/<agent>/stop (UI-API.md 1.301)
-               "message_skills"]    # the owner, 21 November 2026 ("Yes, as drawn" to the / list) and 22 November 2026
+               "message_skills",    # the owner, 21 November 2026 ("Yes, as drawn" to the / list) and 22 November 2026
                                     # ("Yes, as drawn" to the given skill): POST /ui/messages takes `skills`, a skill to
                                     # use and the ZIP of a skill that the owner gives, and messages[].skills of GET
                                     # /ui/state gives them (UI-API.md 1.304)
+               "task_limit"]        # owner API 1.330: each task's `limit` in GET /ui/state, GET /ui/mobile and GET
+                                    # /ui/mobile/task/<id> is its own wait (held_task_limit); an app reads a task's wait
+                                    # from it alone, and from its agent's `limit` on a hub without this name
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -4724,7 +4729,7 @@ def mobile_agent(name, config, stops=None, waiting=None):
             "alive_ts": row["alive_ts"] if row else None,
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
                              "('completed','failed','rejected','canceled')", (name,))["n"],
-            "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
+            "limit": limit_view(lim, task=False),
             "usage": windows, "turn_ended_after": turn, "waits_since": chat_waits_since(name, stops, asked),
             "chat_undelivered": bool(kv_get(f"chat_undelivered:{name}")),
             # owner feature chat_stop: the message whose turn a press of Stop stops now, only while there is one
@@ -4741,15 +4746,17 @@ def mobile_state(generation, at=None):
     tasks = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state NOT IN {ended} ORDER BY id")]
     turns = task_turns()                    # owner API 1.147, 1.148: whether each working task's session works on it
     parks = parked_until()                  # owner API 1.161: until when its agent parked it, as GET /ui/state says
+    held = limit_reads(q)[0]                # owner API 1.330: the hold that keeps each task waiting
     for task in tasks:                      # now, and what its running turn does
+        task["limit"] = held_task_limit(task, held, task=False)
         if task["id"] in turns:
             task["works"] = turns[task["id"]]["works"]
             if turns[task["id"]]["doing"]:
                 task["doing"] = turns[task["id"]]["doing"]
         if task["id"] in parks:
             task["parked_until"] = parks[task["id"]]
-    recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
-                                                        f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
+    recent = [dict({k: r[k] for k in MOBILE_HEAD}, limit=None) for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
+                                                                          f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     mark = ended_mark()                     # owner API 1.166: read GET /ui/mobile/ended again when it changes
     # Owner API 1.189: the name of each ask that a head names (owner feature asks), by its message's request_id. The
     # phone keeps a chat's messages from before the work got its name, so the name comes here and not with them.
@@ -4831,7 +4838,7 @@ def phone_ended(query):
                       "lower(replaces_request_id) FROM ui_requests WHERE recipient=? AND created>=? AND "
                       "replaces_request_id IS NOT NULL")
         with LOCK:
-            tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
+            tasks = [dict({k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}, limit=None)     # 1.330: no wait
                      for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} AND ask IS NOT NULL AND lower(ask) "
                                 f"IN ({asked_here}) ORDER BY id", (chat, start, chat, start))]
             mark = ended_mark()
@@ -4839,7 +4846,7 @@ def phone_ended(query):
         return 200, scrub({"db": generation, "mark": mark, "tasks": tasks, "asked": asked, "chat": chat,
                            "from": start}), {"Cache-Control": "no-store"}
     with LOCK:
-        tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
+        tasks = [dict({k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}, limit=None)         # owner API 1.330: no wait
                  for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} ORDER BY id")]
         mark = ended_mark()
         asked = ask_names(tasks)             # owner API 1.189: the names of the asks of these heads
@@ -5154,6 +5161,7 @@ def older_read(query):
     by_id = {t["id"]: t for t in tasks}
     for task in tasks:              # as GET /ui/state says it (owner API 1.231), by the same walk
         task["from_conversation"] = conversation_opened(task["id"], lambda i: by_id.get(i) or above.get(i))
+        task["limit"] = None        # owner API 1.330: a block holds no open task, so none waits for a usage limit
     attached = {}
     for r in files:
         attached.setdefault(r["message"], []).append(attachment_view(r))
@@ -5769,8 +5777,9 @@ def desktop_refusal(owner, needs, caller, keep=False, exact=False):
 # marks are not in place (OLDER) answers `window=1` with every head and no `older`, so that the reader holds every head.
 def ended_heads(rows):
     """The heads of these ended tasks in a window or a block, as GET /ui/mobile/ended gives a head: MOBILE_HEAD and the
-    schedule that the task ran for, masked. Its code is a part of the shape of a block (ended_shape)."""
-    return scrub([{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)} for r in rows])
+    schedule that the task ran for, masked, and its `limit`, null for a task that ended (owner API 1.330). Its code is
+    a part of the shape of a block (ended_shape)."""
+    return scrub([dict({k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}, limit=None) for r in rows])
 
 
 def ended_shape():
@@ -6099,7 +6108,7 @@ def browser_active(owner, alive=None):
     windowed = [r["id"] for r in rows if tref(r["id"]) in alive]
     if windowed:
         return windowed[0]
-    if read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL", (owner,)):
+    if read_row(f"SELECT 1 FROM agent_limits WHERE agent=? AND {AGENT_HOLD_SQL}", (owner,)):     # its own route's
         return rows[0]["id"]
     free = [r["id"] for r in rows if not (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-"))]
     return free[0] if free else rows[0]["id"]
@@ -6151,7 +6160,7 @@ def browser_pending(server, team=None):
                                              holders)}
     held = {int(r["k"][len(BROWSER_WAKE_HELD):]) for r in browser_kv_rows(BROWSER_WAKE_HELD)
             if r["k"][len(BROWSER_WAKE_HELD):].isdigit()}
-    limited = {r["agent"] for r in read_rows("SELECT agent FROM agent_limits WHERE ended IS NULL")}
+    limited = {r["agent"] for r in read_rows(f"SELECT agent FROM agent_limits WHERE {AGENT_HOLD_SQL}")}   # own route
     out = []
     for r in read_rows(f"SELECT id, owner, state, waiting_on FROM tasks WHERE needs='browser' AND {OPEN_TASK} AND owner "
                        f"IN ({','.join('?' * len(names))}) ORDER BY id", names):
@@ -10413,18 +10422,19 @@ def allowance_start_text(agent, task_id):
     It reads this agent's own work route and nothing more. capacity_view groups the routes of every agent by the
     provider's account identity; a worker that read that would be reasoning about another agent's spending."""
     t = read_row("SELECT needs FROM tasks WHERE id=?", (task_id,)) if task_id else None
-    want = "screen" if t and t["needs"] == "screen" else "primary"
+    want = needs_route(agent, t["needs"]) if t else "primary"      # a Codex agent's desktop runs on its own route
     route = next((r for r in usage_routes(agent) if r[0] == want), None)
     if route is None or (want == "primary" and local_model(agents().get(agent) or {}, team_read().get("accounts"))):
         return ""              # a local model has no account allowance to pace against
     _, runtime, reading = route
-    lim = read_row("SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (agent,))
-    state = account_state(reading, [lim] if lim and limit_route(lim) == want else [], now())
+    lim = read_row(f"SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL AND {LIMIT_ROUTE_SQL}=? "
+                   f"ORDER BY id DESC LIMIT 1", (agent, want))     # the hold of this task's own route
+    state = account_state(reading, [lim] if lim else [], now())
     if state["state"] == "limited":
         # Where it went, when it was not this agent that spent it (account_limits): an agent held for an allowance
         # it shares reads the same line as one that reached its own limit, and would otherwise pace against a
         # window of its own that is nowhere near full.
-        source = limit_source(lim) if lim and limit_route(lim) == want else None
+        source = limit_source(lim) if lim else None
         return ("\nYOUR ALLOWANCE is used up" +
                 (f": a session of {source}, which spends the same provider account, reached its usage limit" if source
                  else "") + ". The hub holds your work until " +
@@ -10965,13 +10975,92 @@ def browser_poll_sets(query):
     return split("browser_closed"), split("alive")
 
 
-def active_limit(agent):
-    return q1("SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (agent,))
+# The route of a usage-limit hold in SQL, as limit_route gives it: its own route, else the route of the task that
+# reported it (a row from before the route column has none). Only in a statement whose FROM is agent_limits itself.
+LIMIT_ROUTE_SQL = ("COALESCE(route, CASE WHEN (SELECT needs FROM tasks WHERE tasks.id=agent_limits.task)='screen' "
+                   "THEN 'screen' ELSE 'primary' END)")
+# An open hold of the agent's own route: the hold that holds all of the agent's work (active_limit).
+AGENT_HOLD_SQL = f"ended IS NULL AND {LIMIT_ROUTE_SQL}='primary'"
+
+
+# **A hold of a route holds only the work of that route** (the owner, 24 November 2026: it is concerning that the
+# fleet has wrong data about an agent). An agent with its own account for its primary route can run its desktop tasks
+# on the account of another agent (its screen route). When that other account reached its limit, spread_limit wrote a
+# hold on the screen route, and every reader of active_limit took it as the agent's own limit: all of its work, its
+# chats and the wake-ups of its duties stopped, and every app showed "Usage limit" on its row, while its own account
+# was at 6% (18 November 2026, agent_limits id 1). So active_limit gives the hold of one route, by default the
+# primary one: that hold is the agent's own, and it holds all of its work as before. A hold of the screen route holds
+# only the agent's screen tasks (needs_limit, task_limit), and no app reads it as the agent's.
+def active_limit(agent, route="primary"):
+    """The open usage-limit hold of one route of this agent, the newest, or None. The primary route's hold is the
+    agent's own: it holds all of its work, and the apps show it as the agent's limit. A screen route's hold holds only
+    the agent's screen tasks (needs_limit)."""
+    return q1(f"SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL AND {LIMIT_ROUTE_SQL}=? ORDER BY id DESC "
+              f"LIMIT 1", (agent, route))
+
+
+def needs_route(agent, needs, held=False, usage=NOT_READ):
+    """The route that work of this agent with this `needs` (a task's needs) runs on: screen for a screen task of an
+    agent whose screen tasks run on a runtime that is not its own (own_runtime_task: the Codex of its desktop), else
+    primary. A Codex agent's screen tasks run on its own runtime and its own account, so their limit is its own,
+    unless the readings of its two routes name two accounts (route_account: a desktop signed in by hand to another
+    account): then they run on the screen route, and its limit holds only them. `held`: a hold of its screen route
+    is open, and keeps them on that route unless both readings name one account (a reading that names none, as one
+    that failed, does not end that hold). `usage`: the agent's stored usage (agent_usage.data, AgentReads.usage),
+    which a read of the state gives from its one read of that table; by default it is read here."""
+    if needs != "screen":
+        return "primary"
+    if not own_runtime_task(agents().get(agent) or {}, needs):
+        return "screen"
+    if usage is NOT_READ:
+        screen, own = route_account(agent, "screen"), route_account(agent)
+    else:
+        data = json.loads(usage) if usage else {}
+        screen = reading_account((data.get("screen") or {}).get("limits"))
+        own = model_group(agent) or reading_account(data.get("limits"))
+    if held:
+        return "primary" if screen and own and screen == own else "screen"
+    return "screen" if screen and own and screen != own else "primary"
+
+
+def needs_limit(agent, needs):
+    """The usage-limit hold that keeps work of this agent with this `needs` (a task's needs) from starting now, or
+    None: the agent's own hold, which holds all of its work, else for work that runs on its screen route (needs_route)
+    the hold of that route. needs_route reads the routes' accounts only where a hold of the screen route is open."""
+    own = active_limit(agent)
+    if own or needs != "screen":
+        return own
+    lim = active_limit(agent, "screen")
+    return lim if lim and needs_route(agent, needs, held=True) == "screen" else None
+
+
+def task_limit(t):
+    """The usage-limit hold that keeps task row `t` waiting now, or None (needs_limit). A row read without its needs
+    reads them."""
+    needs = t["needs"] if "needs" in t.keys() else (read_row("SELECT needs FROM tasks WHERE id=?", (t["id"],)) or
+                                                    {"needs": None})["needs"]
+    return needs_limit(t["owner"], needs)
+
+
+def limit_words(lim):
+    """Who or what a usage-limit hold holds, in words: the agent for a hold of its own route, and "<agent>'s desktop
+    tasks" for a hold of its screen route, in the app's word for that route (ProviderAccountSection): such a hold is
+    no limit of the agent's own, so no sentence says that the agent is at its usage limit."""
+    return f"{lim['agent']}'s desktop tasks" if limit_route(lim) == "screen" else lim["agent"]
+
+
+def limit_until_words(lim):
+    """One sentence for the requester of held work: the agent is at its usage limit until the reset, or, for a hold
+    of its screen route, its desktop tasks wait until then (limit_words)."""
+    if limit_route(lim) == "screen":
+        return f"{limit_words(lim)} wait for the usage limit of their account until {clock(lim['until'])}."
+    return f"{lim['agent']} is at its usage limit until {clock(lim['until'])}."
 
 
 def limit_ended(agent):
-    """When the agent's last usage limit ended (0 if never). Silence is measured from after it."""
-    return q1("SELECT MAX(ended) m FROM agent_limits WHERE agent=?", (agent,))["m"] or 0
+    """When the agent's last usage limit of its own route ended (0 if never). Silence is measured from after it."""
+    return q1(f"SELECT MAX(ended) m FROM agent_limits WHERE agent=? AND {LIMIT_ROUTE_SQL}='primary'",
+              (agent,))["m"] or 0
 
 
 def parked(task_id):
@@ -11066,30 +11155,59 @@ WAIT_BEGAN = {"Q": ("questions", "asked"), "N": ("needs", "raised"), "CM": ("con
               "P": ("prompts", "created")}
 
 
-LIMIT_READ = ("SELECT * FROM agent_limits WHERE ended IS NULL OR id IN (SELECT MAX(id) FROM agent_limits WHERE "
-              "ended IS NOT NULL GROUP BY agent) ORDER BY id DESC")
+LIMIT_READ = (f"SELECT *, {LIMIT_ROUTE_SQL} AS held_route FROM agent_limits WHERE ended IS NULL OR id IN "
+              f"(SELECT MAX(id) FROM agent_limits WHERE ended IS NOT NULL GROUP BY agent, {LIMIT_ROUTE_SQL}) "
+              f"ORDER BY id DESC")
 
 
 def limit_reads(read):
-    """({agent: its newest open limit}, {agent: when its newest limit that ended ended}) in one read of agent_limits
-    (LIMIT_READ), with `read` (q, or read_rows outside the lock): the agents' views and task_since take both from the
-    one read of the state (AgentReads)."""
+    """({(agent, route): its newest open limit}, {(agent, route): when its newest limit that ended ended}) in one read
+    of agent_limits (LIMIT_READ), with `read` (q, or read_rows outside the lock): the agents' views and task_since take
+    both from the one read of the state (AgentReads). The route is the hold's (limit_route): only the primary route's
+    hold is the agent's own (active_limit)."""
     limits, ends = {}, {}
     for r in read(LIMIT_READ):
+        key = (r["agent"], r["held_route"])
         if r["ended"] is None:
-            limits.setdefault(r["agent"], r)
+            limits.setdefault(key, r)
         else:
-            ends[r["agent"]] = max(ends.get(r["agent"], r["ended"]), r["ended"])
+            ends[key] = max(ends.get(key, r["ended"]), r["ended"])
     return limits, ends
+
+
+def limit_view(lim, task=True):
+    """A usage-limit hold as the apps read it, an agent's `limit` and a task's (owner API 1.330): since, until,
+    reset_known and, where the agent's `limit` of that reading has it, the task whose session reported it."""
+    if not lim:
+        return None
+    return dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
+                **({"task": lim["task"]} if task else {}))
+
+
+def held_task_limit(t, held, task=True, usage=NOT_READ):
+    """Owner API 1.330: a task's `limit`, the hold that keeps task row `t` waiting now (task_limit), from the open holds
+    that limit_reads read (`held`), or None for a task that is not open: one that ended, or a row with no state, which
+    no open-task read takes either (OPEN_TASK) and a block of older tasks holds (OLDER_REST). The apps read a task's
+    wait from it alone: a hold of the agent's screen route is no `limit` of the agent's. `usage`: {agent: its stored
+    usage}, the state's one read (AgentReads.usage), for needs_route; by default needs_route reads it."""
+    if t["state"] is None or t["state"] in TERMINAL:
+        return None
+    lim = held.get((t["owner"], "primary"))
+    if not lim and t["needs"] == "screen":          # needs_route reads accounts: only where a screen hold is open
+        lim = held.get((t["owner"], "screen"))
+        own = usage if usage is NOT_READ else usage.get(t["owner"])
+        lim = lim if lim and needs_route(t["owner"], t["needs"], held=True, usage=own) == "screen" else None
+    return limit_view(lim, task)
 
 
 def task_since(parks, reads=None):
     """Owner API 1.237: by task, since when each open task is in the state that the owner's apps show for it, in the
     order of the mark that the Mac app draws on its row: a hold that is not released, since it was set; a usage limit
-    of its agent, since it began (or since the task was made, when that was later); a stall, since it began, or
-    since the hub nudged the task; a lost session, since it was lost; the start of what it waits on (waiting_on:
-    WAIT_BEGAN); for a task that its agent parked (parks, as parked_until gives them), the time that its reminder
-    was set; for one that no session took yet, its creation; else the time that it came back to work: the later of
+    of its agent that holds it (task_limit), since it began (or since the task was made, when that was later); a
+    stall, since it began, or since the hub nudged the task; a lost session, since it was lost; the start of what it
+    waits on (waiting_on: WAIT_BEGAN); for a task that its agent parked (parks, as parked_until gives them), the time
+    that its reminder was set; for one that no session took yet, its creation; else the time that it came back to
+    work: the later of
     the start of its attempt and the last end of a wait of it. A wait can end in the session that waited, with no new
     attempt, so each kind of end counts: a question answered (not one answered after the task went on with its
     default), a prompt decided, the owner's answer to a request that the task waited on, a person's answer that the
@@ -11098,8 +11216,8 @@ def task_since(parks, reads=None):
     "show its name too and the time it's been in that state"). reads: the state's AgentReads, whose one read of
     agent_limits gives the limits (limit_reads), else None for a read of its own. read_rows: it is read inside the
     state's own hold of the lock."""
-    rows = read_rows(f"SELECT id, owner, state, created, started, waiting_on, stalled_since, nudge_level, nudged_at, "
-                     f"missing_since FROM tasks WHERE {OPEN_TASK}")
+    rows = read_rows(f"SELECT id, owner, needs, state, created, started, waiting_on, stalled_since, nudge_level, "
+                     f"nudged_at, missing_since FROM tasks WHERE {OPEN_TASK}")
     if not rows:
         return {}
     waits = {}
@@ -11117,8 +11235,13 @@ def task_since(parks, reads=None):
     marks = ",".join("?" * len(ids))
     held = {h["task"]: h["t"] for h in read_rows(f"SELECT task, MAX(created) AS t FROM holds WHERE state<>'released' "
                                                  f"AND task IN ({marks}) GROUP BY task", ids)}
-    open_limits, unlimited = (reads.limits, reads.limit_ends) if reads is not None else limit_reads(read_rows)
-    limited = {agent: lim["since"] for agent, lim in open_limits.items()}
+    open_limits, unlimited = (reads.held, reads.held_ends) if reads is not None else limit_reads(read_rows)
+    # the routes whose hold holds a task (needs_limit): the agent's own, and for a screen task also its screen route's
+    def routes(r):
+        screen = (r["owner"], "screen")         # needs_route: only where a screen hold has a row, from the state's read
+        return ("primary", "screen") if r["needs"] == "screen" and (screen in open_limits or screen in unlimited) and \
+            needs_route(r["owner"], r["needs"], held=True, usage=NOT_READ if reads is None else
+                        reads.usage.get(r["owner"])) == "screen" else ("primary",)
     ended, parked_at = {}, {}
     for sql in (f"SELECT task, MAX(answered) AS t FROM questions WHERE assumed IS NULL AND task IN ({marks}) "
                 f"GROUP BY task",
@@ -11147,10 +11270,12 @@ def task_since(parks, reads=None):
     for r in rows:
         stall = r["stalled_since"] if r["stalled_since"] is not None else \
             r["nudged_at"] if (r["nudge_level"] or 0) > 0 else None
+        ways = routes(r)            # once for each task: without the state's reads, needs_route reads the accounts
+        lim = next((open_limits[(r["owner"], x)] for x in ways if (r["owner"], x) in open_limits), None)
         if held.get(r["id"]) is not None:
             out[r["id"]] = held[r["id"]]
-        elif limited.get(r["owner"]) is not None:
-            out[r["id"]] = max(limited[r["owner"]], r["created"] or limited[r["owner"]])
+        elif lim is not None:
+            out[r["id"]] = max(lim["since"], r["created"] or lim["since"])
         elif stall is not None:
             out[r["id"]] = stall
         elif r["missing_since"] is not None:
@@ -11162,7 +11287,8 @@ def task_since(parks, reads=None):
         elif r["state"] == "submitted" or r["started"] is None:
             out[r["id"]] = r["created"]
         else:
-            out[r["id"]] = max([r["started"]] + [t for t in (ended.get(r["id"]), unlimited.get(r["owner"]))
+            out[r["id"]] = max([r["started"]] + [t for t in (ended.get(r["id"]),
+                                                             *(unlimited.get((r["owner"], x)) for x in ways))
                                                  if t is not None])
     return out
 
@@ -11306,8 +11432,8 @@ def turn_ended_after(agent, ended=None, reads=None, stops=None):
     stop = (reads.stops if reads is not None else stops if stops is not None else chat_stops_newest(agent)).get(agent)
     stopped = stop["asked"] if stop and chat_stop_over(stop) else None
     if not ended and stopped is None or (
-            read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,))
-            if reads is None else agent in reads.limits):
+            read_row(f"SELECT 1 FROM agent_limits WHERE agent=? AND {AGENT_HOLD_SQL} LIMIT 1", (agent,))
+            if reads is None else agent in reads.limits):     # its own limit: its chat runs on its own route
         return None
     row = read_row("SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id "
                    f"WHERE u.recipient=? AND {chat_waited_kinds(agent, 'u.')} AND e.read_at<=?",
@@ -11377,8 +11503,9 @@ class AgentReads:
     gets a row for each session.
     rows: {agent: its AGENT_SEEN values}.
     usage: {agent: its stored usage}.
-    limits: {agent: its newest open limit}.
-    limit_ends: {agent: when its newest limit that ended ended}, in the same read (task_since).
+    limits: {agent: its newest open limit of its own route}, the agent's own limit (active_limit).
+    held and held_ends: {(agent, route): its newest open limit of that route} and {(agent, route): when its newest
+    limit of that route that ended ended}, in the same read (limit_reads, task_since).
     status: {agent: its machine_status row}. data(agent) is that row's data, read from JSON once.
     jobs and logins: {(agent, runtime): the time of its newest done sign-in}, as finished_sign_in reads them.
     keys: the agents with a key.
@@ -11396,7 +11523,8 @@ class AgentReads:
                      for r in q(f"SELECT name,{','.join(AGENT_SEEN)} FROM agents")}
         self.usage = {r["name"]: r["data"] for r in q("SELECT name, data FROM agent_usage")}
         self.chats, self.parsed = None, {}
-        self.limits, self.limit_ends = limit_reads(q)
+        self.held, self.held_ends = limit_reads(q)
+        self.limits = {agent: lim for (agent, route), lim in self.held.items() if route == "primary"}
         self.status = {r["agent"]: r for r in q("SELECT agent, data, reported FROM machine_status")}
         self.jobs = {(r["agent"], r["runtime"]): r["t"] for r in q(
             "SELECT agent, runtime, MAX(updated) t FROM server_jobs WHERE state='done' AND step='sign_in' AND "
@@ -11488,8 +11616,7 @@ def agent_view(name, config, reads=None):
                 # in place of "Thinking" (chat_late_sweep).
                 chat_undelivered=bool(reads.undelivered.get(name) if reads is not None else read_row(
                     "SELECT v FROM kv WHERE k=?", (f"chat_undelivered:{name}",))),
-                limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
-                           task=lim["task"]) if lim else None,
+                limit=limit_view(lim),
                 # owner API 1.275: its active KPIs, one number, so the app shows its KPIs tab (GET /ui/kpis)
                 kpis=reads.kpis.get(name, 0) if reads is not None else read_row(
                     "SELECT COUNT(*) n FROM standing WHERE kind='kpi' AND ended IS NULL AND agent=?", (name,))["n"],
@@ -11638,8 +11765,10 @@ def live_reason(t, state, but=None):
     hold = active_hold(tid)
     if hold:
         return "hold", held_word(hold)
-    if active_limit(owner):
-        return "limit", f"{owner}'s usage limit"
+    lim = task_limit(t)                 # its agent's own limit, or for a screen task its screen route's
+    if lim:
+        return "limit", f"{owner}'s usage limit" if limit_route(lim) == "primary" else \
+            f"the usage limit of {limit_words(lim)}"
     if os_user_held(owner):             # one OS user for each agent: the hub holds it, and it waits
         return "os_user", os_user_held_words(owner)
     if sign_in_waits(t):
@@ -12035,8 +12164,9 @@ def fresh_refusal(t, attempt):
         return f"{tref(t['id'])} is at attempt {t['attempt']}, not {attempt}"
     if active_hold(t["id"]):
         return f"{tref(t['id'])} is held"
-    if active_limit(t["owner"]):
-        return f"{t['owner']} is at a usage limit"
+    lim = task_limit(t)                 # its agent's own limit, or for a screen task its screen route's
+    if lim:
+        return f"{t['owner']} is at a usage limit" if limit_route(lim) == "primary" else limit_until_words(lim)
     if os_user_held(t["owner"]):
         return f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds it"
     if waits_for_sign_in(t):
@@ -12151,8 +12281,9 @@ def limit_menu_reset(t):
     """True when the usage limit behind the menu that the session of task row `t` shows is over (runtime gaps C1): no
     limit holds its agent, the last thing the attempt did is a usage limit, and the limit that its record started has
     ended, or the record's own reset is past. A menu whose record has not reached the hub yet waits for the hold that
-    the record starts, whose reset starts the task again (resume_held)."""
-    if active_limit(t["owner"]):
+    the record starts, whose reset starts the task again (resume_held). The holds and the ends that count are those
+    of the task's own route (task_route), and the agent's own hold, which holds all of its work."""
+    if task_limit(t):
         return False
     last = read_row("SELECT type, data, created FROM thread_events WHERE task=? AND attempt=? AND "
                     "type NOT IN ('session','model','result') ORDER BY id DESC LIMIT 1", (t["id"], t["attempt"]))
@@ -12161,8 +12292,8 @@ def limit_menu_reset(t):
         return False
     resets = data.get("resets_at")
     return bool(isinstance(resets, (int, float)) and resets <= now() or read_row(
-        "SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NOT NULL AND ended>=? LIMIT 1",
-        (t["owner"], last["created"])))
+        f"SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NOT NULL AND ended>=? AND {LIMIT_ROUTE_SQL}=? LIMIT 1",
+        (t["owner"], last["created"], task_route(t["id"]))))
 
 
 def carry_steers(t):
@@ -12546,10 +12677,11 @@ def t_restart_task(agent, a):
     g = q1("SELECT id, state FROM goals WHERE id=?", (t["goal_id"],)) if t["goal_id"] else None
     if g and g["state"] != "active":
         raise ToolError(f"{tref(tid)} belongs to G-{g['id']}, which is {g['state']}. It starts no new session now.")
-    lim = active_limit(t["owner"])
-    if lim and limit_route(lim) == "primary":
-        raise ToolError(f"{t['owner']} waits for its usage limit to reset at {clock(lim['until'])}. {tref(tid)} "
-                        f"continues by itself then, so it is not restarted now.")
+    lim = task_limit(t)         # its agent's own limit, or for a screen task its screen route's
+    if lim:
+        raise ToolError((f"{t['owner']} waits for its usage limit to reset at {clock(lim['until'])}."
+                         if limit_route(lim) == "primary" else limit_until_words(lim)) +
+                        f" {tref(tid)} continues by itself then, so it is not restarted now.")
     if os_user_held(t["owner"]):
         raise ToolError(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work. "
                         f"{tref(tid)} continues by itself once it runs in a user account of its own, so it is not "
@@ -12639,9 +12771,10 @@ def restart_continue(hold_id):
     allowed, why = restart_authority(r["by"], t)
     if not allowed:
         return held(why)
-    lim = active_limit(t["owner"])
-    if lim and limit_route(lim) == "primary":
-        return held(f"{t['owner']} reached its usage limit, which resets at {clock(lim['until'])}.")
+    lim = task_limit(t)         # its agent's own limit, or for a screen task its screen route's
+    if lim:
+        return held(f"{t['owner']} reached its usage limit, which resets at {clock(lim['until'])}."
+                    if limit_route(lim) == "primary" else limit_until_words(lim))
     if os_user_held(t["owner"]):
         return held(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work.")
     if door_lacks(t["owner"], asked_repos(tid, t["attempt"])):
@@ -13036,8 +13169,15 @@ NO_RESET = ", one hour from now, because no reset time was given"
 
 
 def spread_limit(agent, route, cause, until, known, t0):
-    """One account, one allowance: hold the other agents that spend it, with the same reset and this report as their
-    cause. Returns (the agents held, the words for why none was).
+    """One account, one allowance: hold the other routes that spend it, with the same reset and this report as their
+    cause. Returns (the rows that it wrote, the words for why it wrote none).
+
+    **A route is held, not an agent** (the owner, 24 November 2026): the hold of another agent's screen route on this
+    account holds only that agent's screen tasks (needs_limit), and a hold of its own route holds all of its work, as
+    before. So an agent whose screen tasks spend this account and whose own route does not goes on with its own work,
+    and no app shows it at its usage limit. The reporting agent's other route on the same account is held too: its
+    desktop tasks and its own work spend one allowance. Its own route's hold holds its screen tasks already, so no
+    screen row is written for an agent whose own route this episode holds.
 
     The manager is never held this way. A wrong spread onto a worker delays that worker until a reset; a wrong one
     onto the manager stops the fleet, and the hub would be deriving it from a report it cannot attribute to a window
@@ -13046,28 +13186,39 @@ def spread_limit(agent, route, cause, until, known, t0):
     g = account_group(agent, route)
     if not g:
         return [], "its runtime names no provider account, so the hub knows of no other agent on that allowance"
-    others = [(name, r) for name, r in g["routes"] if name != agent and name != manager_name()]
+    others = [(name, r) for name, r in g["routes"] if (name, r) != (agent, route) and name != manager_name()]
     if not others:
         return [], "no other agent spends this allowance"
     # an account with a kind is one allowance (spec 3.1); every other account says so by its reading alone
     shared, why = (True, None) if g["key"].startswith(ACCOUNT_GROUP) else one_allowance(g["reading"])
     if not shared:
         return [], why
-    held = []
-    for name, r in others:
-        if active_limit(name):
+    held, whole = [], {agent} if route == "primary" else set()     # whole: its own route is held in this episode
+    told = q1("SELECT task FROM agent_limits WHERE id=?", (cause,))
+    told = told["task"] if told else None       # the reporting session, which start_limit tells itself
+    for name, r in others:          # sorted: an agent's primary route comes before its screen route
+        if r == "screen" and (name in whole or needs_route(name, "screen") == "primary"):
+            continue            # the hold of its own route in this episode holds its screen tasks too, or its screen
+                                # tasks run on its own runtime, so a hold of that route would hold no work
+        if active_limit(name, r):
             continue            # already held, by its own report or by an earlier one of this account
         if (route_reading(name, r) or {}).get("error") == IDENTITY_CHANGED and route_account(name, r) is None:
             continue            # its own runtime named another account since: account_groups still files that
                                 # reading under the key of the account it left, which is not the agent's now
-        ins("INSERT INTO agent_limits(agent,since,until,reset_known,cause,route,account) VALUES(?,?,?,?,?,?,?)",
-            (name, t0, until, known, cause, r, g["key"]))
-        held.append(name)
-        for t in q("SELECT id FROM tasks WHERE owner=? AND state='working' ORDER BY id", (name,)):
-            if not session_alive(name, t["id"]):
+        lim = q1("SELECT * FROM agent_limits WHERE id=?", (ins(
+            "INSERT INTO agent_limits(agent,since,until,reset_known,cause,route,account) VALUES(?,?,?,?,?,?,?)",
+            (name, t0, until, known, cause, r, g["key"])),))
+        held.append(lim)
+        if r == "primary":
+            whole.add(name)
+        for t in q("SELECT id FROM tasks WHERE owner=? AND state='working' AND (?='primary' OR needs='screen') "
+                   "ORDER BY id", (name, r)):
+            if t["id"] == told or not session_alive(name, t["id"]):
                 continue        # no session to tell; its next one reads allowance_start_text
-            emit(name, "say", f"[hub] A session of {agent} on the provider account you share with it reached its "
-                 f"usage limit, so the allowance you were spending is gone too. The hub holds your work on "
+            emit(name, "say", (f"[hub] A session of {agent} on the provider account you share with it reached its "
+                               f"usage limit" if name != agent else
+                               "[hub] Another session of yours on the same provider account reached its usage limit") +
+                 f", so the allowance you were spending is gone too. The hub holds your work on "
                  f"{tref(t['id'])} until {clock(until)}" + ("" if known else NO_RESET) + f". The best thing you can "
                  f"do with this turn is one report_progress on {tref(t['id'])} saying where you got to and what is "
                  f"left: the session that resumes this task reads it. After the reset, check what was already done "
@@ -13075,15 +13226,29 @@ def spread_limit(agent, route, cause, until, known, t0):
     return held, None
 
 
+def held_sentence(rows):
+    """The words that name the other routes that one report held (spread_limit), for the manager: " vps spends the
+    same provider allowance, so the hub holds its work until then too." A screen route's row is its agent's desktop
+    tasks (limit_words)."""
+    if not rows:
+        return ""
+    many = len(rows) > 1 or limit_route(rows[0]) == "screen"
+    what = "them" if len(rows) == 1 and limit_route(rows[0]) == "screen" else "their work" if many else "its work"
+    return (f" {' and '.join(limit_words(r) for r in rows)} {'spend' if many else 'spends'} the same provider "
+            f"allowance, so the hub holds {what} until then too.")
+
+
 def start_limit(agent, resets_at, task_id=None):
-    """A session reported a usage limit. Hold the agent's work until the reset, or for one hour without one, and with
-    it the other agents that spend the same provider allowance (spread_limit).
+    """A session reported a usage limit. Hold the work of the route that it ran on until the reset, or for one hour
+    without one, and with it the other routes that spend the same provider allowance (spread_limit). The hold of the
+    agent's own route holds all of its work; the hold of its screen route only its screen tasks (needs_limit).
     The manager's own limit is shown to the owner by the manager flag, because the manager cannot act on it."""
     t0 = now()
     if resets_at is not None and resets_at <= t0:
         return
     until, known = (resets_at, 1) if resets_at else (t0 + 3600, 0)
-    lim = active_limit(agent)
+    route = task_route(task_id)
+    lim = active_limit(agent, route)
     if lim:
         if known and (not lim["reset_known"] or until > lim["until"]):
             # Every agent this episode holds waits for one reset, so a later and better reset time moves all of
@@ -13092,8 +13257,10 @@ def start_limit(agent, resets_at, task_id=None):
             q("UPDATE agent_limits SET until=?, reset_known=1 WHERE ended IS NULL AND (id=? OR cause=?)",
               (until, root, root))
         return
-    route = task_route(task_id)
-    q("UPDATE agent_limits SET resumed=? WHERE agent=? AND resumed IS NULL", (t0, agent))     # a new hold replaces the old resume
+    # A new hold replaces the old resume of a hold that ended: of this route, and for the agent's own route, which
+    # holds all of its work, of every route. A hold of the other route that is still open keeps its own resume.
+    q(f"UPDATE agent_limits SET resumed=? WHERE agent=? AND resumed IS NULL AND ended IS NOT NULL AND "
+      f"(?='primary' OR {LIMIT_ROUTE_SQL}=?)", (t0, agent, route, route))
     cause = ins("INSERT INTO agent_limits(agent,since,until,reset_known,task,route,account) VALUES(?,?,?,?,?,?,?)",
                 (agent, t0, until, known, task_id, route, route_account(agent, route)))
     if task_id:
@@ -13109,26 +13276,41 @@ def start_limit(agent, resets_at, task_id=None):
              f"allowance ran out. After the reset, check what was already done before you repeat anything (rule 9).",
              task=task_id, extra=LIMIT_SAY)
     also, why_not = spread_limit(agent, route, cause, until, known, t0)
+    # its desktop tasks spend the account of its own route: the spread held its own route, and so all of its work
+    screen = route == "screen" and not any(r["agent"] == agent for r in also)
+    also = [r for r in also if r["agent"] != agent]
+    names = [limit_words(r) for r in also]
+    who = f"{agent}'s desktop tasks" if screen else agent
     if agent == manager_name():
-        log("hub", f"the manager is limited until {clock(until)}" +
-            (f"; so are {', '.join(also)}, on the same account" if also else ""))
+        log("hub", f"the manager{'s desktop tasks are' if screen else ' is'} limited until {clock(until)}" +
+            (f"; so are {', '.join(names)}, on the same account" if also else ""))
         return
     held = [tref(r["id"]) for r in q("SELECT id FROM tasks WHERE owner=? AND state NOT IN "
-                                    "('completed','failed','rejected','canceled') ORDER BY id", (agent,))]
+                                    "('completed','failed','rejected','canceled') AND (? OR needs='screen') "
+                                    "ORDER BY id", (agent, int(not screen)))]
     source = f"the session of {tref(task_id)}" if task_id else "its helper"
     # One allowance, said where the manager chooses who works. Without this the manager read "vps is limited",
     # created the next task for worker4 on the same account, and learned the rest from a session that failed on
     # its first call. With it, the line names every agent the allowance holds -- or says why it holds only one.
-    shared = (f" {' and '.join(also)} {'spend' if len(also) > 1 else 'spends'} the same provider allowance, so the "
-              f"hub holds {'their' if len(also) > 1 else 'its'} work until then too." if also else
-              f" The hub holds no other agent for it: {why_not}." if why_not else "")
-    emit(manager_name(), "say", f"[hub] {agent} reached its usage limit (reported by {source}). "
-         f"The hub holds its work until {clock(until)}" + ("" if known else NO_RESET) +
-         f": {', '.join(held) or 'no open tasks'}.{shared} New tasks for {agent} wait too. There are no nudges or "
-         f"restarts until then, and the hub resumes the held work one time after the reset. To move an urgent task, "
-         f"cancel it and create it for another worker -- one that does not spend this allowance.", extra=LATER_SAY)
-    log("hub", f"{agent} is limited until {clock(until)}" +
-        (f"; so are {', '.join(also)}, on the same account" if also else ""))
+    shared = held_sentence(also) if also else f" The hub holds no other agent for it: {why_not}." if why_not else ""
+    if screen:
+        # A hold of the screen route is no limit of the agent's own (needs_limit): its other work goes on.
+        said = (f"[hub] {who} reached the usage limit of their provider account (reported by {source}). The hub "
+                f"holds them until {clock(until)}" + ("" if known else NO_RESET) +
+                f": {', '.join(held) or 'no open desktop tasks'}.{shared} New desktop tasks for {agent} wait too; its "
+                f"other work {'waits for its own usage limit' if active_limit(agent) else 'goes on'}. There are no "
+                f"nudges or restarts of them until then, and the hub resumes them "
+                f"one time after the reset. To move an urgent one, cancel it and create it for another worker -- one "
+                f"whose desktop tasks do not spend this allowance.")
+    else:
+        said = (f"[hub] {agent} reached its usage limit (reported by {source}). "
+                f"The hub holds its work until {clock(until)}" + ("" if known else NO_RESET) +
+                f": {', '.join(held) or 'no open tasks'}.{shared} New tasks for {agent} wait too. There are no nudges "
+                f"or restarts until then, and the hub resumes the held work one time after the reset. To move an "
+                f"urgent task, cancel it and create it for another worker -- one that does not spend this allowance.")
+    emit(manager_name(), "say", said, extra=LATER_SAY)
+    log("hub", f"{who} {'are' if screen else 'is'} limited until {clock(until)}" +
+        (f"; so are {', '.join(names)}, on the same account" if also else ""))
 
 
 def limit_reading(agent, reading, t0):
@@ -13179,20 +13361,21 @@ def limit_account(agent, t0):
     A row with no account is one from before this release, or one whose reading named none at its start: it takes
     the account that the reading names now, unless a sign-in of that route's runtime ended on its machine since the
     hold began, which made that account a new one. A new account whose allowance is spent too is not predicted: its
-    first turn reports it, and start_limit holds the agent again, on that account."""
-    lim = active_limit(agent)
-    if not lim:
-        return
-    route = limit_route(lim)
-    key = route_account(agent, route)
-    if key is None or key == lim["account"]:
-        return
-    if lim["account"] is None:
-        runtime = next((r[1] for r in usage_routes(agent) if r[0] == route), None)
-        if not any((finished_sign_in(n, runtime) or 0) > lim["since"] for n in sign_in_agents(agent)):
-            q("UPDATE agent_limits SET account=? WHERE id=?", (key, lim["id"]))
-            return
-    leave_limit(lim, t0)
+    first turn reports it, and start_limit holds the agent again, on that account. Each route's hold is read on its
+    own: the reading of each route names the account of that route (route_account)."""
+    for route in ("primary", "screen"):
+        lim = active_limit(agent, route)
+        if not lim:
+            continue
+        key = route_account(agent, route)
+        if key is None or key == lim["account"]:
+            continue
+        if lim["account"] is None:
+            runtime = next((r[1] for r in usage_routes(agent) if r[0] == route), None)
+            if not any((finished_sign_in(n, runtime) or 0) > lim["since"] for n in sign_in_agents(agent)):
+                q("UPDATE agent_limits SET account=? WHERE id=?", (key, lim["id"]))
+                continue
+        leave_limit(lim, t0)
 
 
 def limit_left_text(t):
@@ -13212,15 +13395,18 @@ def leave_limit(lim, t0):
     done = resume_held(lim, t0, text=limit_left_text, fresh=True) if agent != manager_name() else []
     q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, lim["id"]))
     root = lim["cause"] or lim["id"]
-    stay = [r["agent"] for r in q("SELECT agent FROM agent_limits WHERE ended IS NULL AND (id=? OR cause=?) ORDER BY id",
-                                  (root, root)) if r["agent"] != manager_name()]
+    rows = [r for r in q("SELECT * FROM agent_limits WHERE ended IS NULL AND (id=? OR cause=?) ORDER BY id",
+                         (root, root)) if r["agent"] != manager_name()]
+    stay, many = [limit_words(r) for r in rows], len(rows) > 1 or any(limit_route(r) == "screen" for r in rows)
     if agent != manager_name():
-        emit(manager_name(), "say", f"[hub] {agent} now uses another provider account, so the hold of its usage limit "
+        emit(manager_name(), "say", (f"[hub] {agent} now uses another provider account, so the hold of its usage limit "
+                                     if limit_route(lim) == "primary" else
+                                     f"[hub] {limit_words(lim)} now use another provider account, so their hold ") +
              f"ended before the reset. The hub resumed its held work one time: {', '.join(done) or 'nothing was waiting'}."
-             + (f" {' and '.join(stay)} {'spend' if len(stay) > 1 else 'spends'} the account that reached the limit, so "
-                f"the hub holds {'their' if len(stay) > 1 else 'its'} work until {clock(lim['until'])}, as long as "
-                f"{'they use' if len(stay) > 1 else 'it uses'} that account." if stay else ""), extra=QUIET_SAY)
-    log("hub", f"{agent}'s usage limit ended: its account changed; resumed {len(done)} task(s)")
+             + (f" {' and '.join(stay)} {'spend' if many else 'spends'} the account that reached the limit, so "
+                f"the hub holds {'their' if many else 'its'} work until {clock(lim['until'])}, as long as "
+                f"{'they use' if many else 'it uses'} that account." if stay else ""), extra=QUIET_SAY)
+    log("hub", f"{limit_words(lim)}: the usage limit ended, the account changed; resumed {len(done)} task(s)")
 
 
 def session_failed_note(needs):
@@ -13265,21 +13451,29 @@ def screen_failed(key, seq, error):
     log("hub", f"{tref(t['id'])} on {t['owner']} is paused: its {session} failed ({error.get('code') or 'no error record'})")
 
 
-def resume_held(lim, t0, text=None, fresh=False):
-    """One held agent's working tasks, each resumed one time: a message when its session still runs, a new attempt
-    when it does not, or when its window still shows its runtime's usage-limit menu, where no line can be typed
-    (runtime gaps C1). The new attempt is not counted, so a reset never spends one of the three session restarts.
-    `text(t)`: the words of each resume, the reset's by default. `fresh`: after a change of account (leave_limit), a
-    new attempt also where the session still runs, because a session that started on the old account keeps what its
-    runtime read at its start. Only for a task of the route that the hold was on, and only where fresh_refusal lets its
-    session go: one with a command in the background, a job or a permission prompt open keeps its session and gets
-    the message, as at a reset."""
-    done = []
+def resume_held(lim, t0, text=None, fresh=False, taken=None):
+    """One held agent's working tasks that this hold held, each resumed one time: a message when its session still
+    runs, a new attempt when it does not, or when its window still shows its runtime's usage-limit menu, where no line
+    can be typed (runtime gaps C1). The new attempt is not counted, so a reset never spends one of the three session
+    restarts. `text(t)`: the words of each resume, the reset's by default. `fresh`: after a change of account
+    (leave_limit), a new attempt also where the session still runs, because a session that started on the old account
+    keeps what its runtime read at its start. Only for a task of the route that the hold was on, and only where
+    fresh_refusal lets its session go: one with a command in the background, a job or a permission prompt open keeps
+    its session and gets the message, as at a reset.
+
+    A hold of the screen route held only the agent's screen tasks, and a task that another hold of its agent still
+    holds (task_limit) waits for the end of that one, which resumes it. `taken`: the tasks that the same pass resumed
+    already (end_limits), which this one adds to: two holds of one agent that end together resume a task once."""
+    done, screen = [], limit_route(lim) == "screen"
+    taken = set() if taken is None else taken
     for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
+        if (screen and t["needs"] != "screen") or t["id"] in taken or task_limit(t):
+            continue            # this hold did not hold it, it resumed already, or another hold holds it still
         if active_hold(t["id"]) or parked(t["id"]) or (turn_state(t["id"], t["attempt"]) or {}).get("running"):
             continue            # a parked task comes back at its own time (reminder_sweep); a running turn needs nothing
+        taken.add(t["id"])
         text_t = (text or limit_reset_text)(t)
-        again = fresh and ("screen" if t["needs"] == "screen" else "primary") == limit_route(lim) and \
+        again = fresh and needs_route(lim["agent"], t["needs"]) == limit_route(lim) and \
             fresh_refusal(t, t["attempt"]) is None
         if not again and session_alive(lim["agent"], t["id"]) and kv_get(f"screen_limit:{t['id']}") != str(t["attempt"]):
             emit(lim["agent"], "say", "[hub] " + text_t, task=t["id"])
@@ -13321,7 +13515,7 @@ def end_limits(t0):
     # the episode before the reset (leave_limit: that agent uses another account now). The derived rows of one cause
     # resume together, so the manager reads one message for the rest of that episode, in the pass that ends it or,
     # after a fault in that pass, in the next.
-    taken = set()
+    taken, resumed = set(), set()           # resumed: the tasks that this pass resumed (resume_held)
     for lim in q("SELECT l.* FROM agent_limits l LEFT JOIN agent_limits c ON c.id=l.cause "
                  "WHERE l.ended IS NOT NULL AND l.resumed IS NULL AND l.until<=? "
                  "AND (l.cause IS NULL OR c.id IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0,)):
@@ -13333,17 +13527,21 @@ def end_limits(t0):
         told = []
         for r in episode:
             if r["agent"] != manager_name():
-                told.append((r["agent"], resume_held(r, t0)))
+                told.append((limit_words(r), resume_held(r, t0, taken=resumed)))
             q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, r["id"]))
         if len(told) == 1 and not lim["cause"]:
             agent, done = told[0]
-            emit(manager_name(), "say", f"[hub] {agent}'s usage limit has reset. The hub resumed its held work one "
+            emit(manager_name(), "say", (f"[hub] {agent}'s usage limit has reset. The hub resumed its held work one "
+                                         if limit_route(lim) == "primary" else
+                                         f"[hub] The usage limit of the account of {agent} has reset. The hub resumed "
+                                         f"them one ") +
                  f"time: {', '.join(done) or 'nothing was waiting'}.", extra=QUIET_SAY)
         elif told:
             names = " and ".join(a for a, _ in told)
+            many = len(told) > 1 or any(limit_route(r) == "screen" for r in episode)
             emit(manager_name(), "say", f"[hub] The usage limit of the provider account that {names} "
-                 f"{'share' if len(told) > 1 else 'shares'} has reset. The hub resumed "
-                 f"{'their' if len(told) > 1 else 'its'} held work one time -- "
+                 f"{'share' if many else 'shares'} has reset. The hub resumed "
+                 f"{'their' if many else 'its'} held work one time -- "
                  + "; ".join(f"{a}: {', '.join(d) or 'nothing was waiting'}" for a, d in told) + ".", extra=QUIET_SAY)
         log("hub", f"{lim['agent']}'s usage limit ended; resumed "
                    f"{sum(len(d) for _, d in told)} task(s) of {len(told)} agent(s)")
@@ -15791,12 +15989,14 @@ def t_create_task(agent, a):
                  f"of it can work; the task waits until the owner signs it in.")
     late += shell_off_note(owner, tid, agent)   # a Shell-off agent: what this task's session holds
     late += same_work_note(agent, owner, tid, a, f)     # it names work that the same agent runs already
-    lim = active_limit(owner)
+    lim = needs_limit(owner, f["needs"])        # its own limit, or for a screen task its screen route's
     if lim:
         source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
-        late += (f" Note: {owner} is held until {clock(lim['until'])}, because a session of {source} on the account "
-                 f"they share reached its usage limit; the task waits until then." if source else
-                 f" Note: {owner} is at its usage limit until {clock(lim['until'])}; the task waits until then.")
+        late += (f" Note: {limit_words(lim)} {'are' if limit_route(lim) == 'screen' else 'is'} held until "
+                 f"{clock(lim['until'])}, because a session of {source} on the account they share reached its usage "
+                 f"limit; the task waits until then." if source else
+                 f" Note: {owner} is at its usage limit until {clock(lim['until'])}; the task waits until then."
+                 if limit_route(lim) == "primary" else f" Note: {limit_until_words(lim)} The task waits until then.")
         # The moment the split is worth considering, said where the manager is standing. It names no alternative
         # agent on purpose: suitability is the manager's judgement and see_capacity is where the facts are, and a
         # list of free agents here would be an invitation to give the work to one that does not suit it.
@@ -16445,15 +16645,21 @@ def usage_routes(name):
 
 
 def task_route(task_id):
-    """The route a task's session runs on: screen for a screen task, else primary."""
-    t = read_row("SELECT needs FROM tasks WHERE id=?", (task_id,)) if task_id else None
-    return "screen" if t and t["needs"] == "screen" else "primary"
+    """The route a task's session runs on (needs_route): screen for a screen task that runs on the Codex of its agent's
+    desktop, else primary. A Codex agent's screen task runs on its own runtime, so its limit is the agent's own: on 24
+    November 2026 a review found that such a limit held only its desktop tasks, while its own account was spent."""
+    t = read_row("SELECT owner, needs FROM tasks WHERE id=?", (task_id,)) if task_id else None
+    return needs_route(t["owner"], t["needs"]) if t else "primary"
 
 
 def limit_route(lim):
-    """The route of this agent that spends from the limited account: screen for a screen task, else primary. A hold
-    derived from another agent's report (account_limits) has no task of its own, so it carries its route."""
-    return lim["route"] or task_route(lim["task"])
+    """The route of this agent that spends from the limited account. A hold carries its route (start_limit,
+    spread_limit); a row from before the route column has none, and reads as screen for a screen task, else primary,
+    the twin of LIMIT_ROUTE_SQL."""
+    if lim["route"]:
+        return lim["route"]
+    t = read_row("SELECT needs FROM tasks WHERE id=?", (lim["task"],)) if lim["task"] else None
+    return "screen" if t and t["needs"] == "screen" else "primary"
 
 
 def availability(kind, reason=None, until=None, retry_at=None):
@@ -16568,9 +16774,10 @@ def account_groups(t0=None):
     needs. This is the grouping alone, for the places that say something about an allowance before it is spent."""
     t0, out = t0 or now(), {}
     for name in agents():
-        lim, local = active_limit(name), local_model(agents().get(name) or {}, team_read().get("accounts"))
+        local = local_model(agents().get(name) or {}, team_read().get("accounts"))
         own = model_group(name)         # the AI providers build: an account with a kind, whatever its reading says
         for route, runtime, reading in usage_routes(name):
+            lim = active_limit(name, route)         # the hold of this route, which a session on this account caused
             key = own if own and route == "primary" else (reading or {}).get("account_key")
             if not key or (route == "primary" and local and not own):
                 continue
@@ -16580,7 +16787,7 @@ def account_groups(t0=None):
             g["routes"].append((name, route))       # account_limits: which route of each agent spends from it
             if key != own and (reading.get("collected_at") or 0) > ((g["reading"] or {}).get("collected_at") or -1):
                 g["reading"] = reading
-            if lim and limit_route(lim) == route:
+            if lim:
                 g["holds"].append(lim)
     for g in out.values():
         g["agents"] = sorted(g["agents"])
@@ -16652,7 +16859,8 @@ def limit_source(lim):
     read_row and not q1: allowance_start_text reads this from start_text, which admit_task runs inside the
     transaction that writes the task. A q1 there would commit the half-written task (see read_rows)."""
     row = read_row("SELECT agent FROM agent_limits WHERE id=?", (lim["cause"],)) if lim and lim["cause"] else None
-    return row["agent"] if row else None
+    # A hold of its own route that a session of its own other route caused (spread_limit) is its own limit too.
+    return row["agent"] if row and row["agent"] != lim["agent"] else None
 
 
 def limit_reason(lim):
@@ -16761,13 +16969,15 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
     identity (usage account_key) over every agent, so an allowance that several agents or a screen runtime share counts
     once, and its newest reading decides for every route on it. A route without that identity is a group of its own,
     never merged by label, provider, model or reset time. Readings are never added up. A route's state is its
-    account's allowance; a usage-limit hold of the hub, which holds all of the agent's work, is the agent's "hold".
+    account's allowance; a usage-limit hold of the hub of the agent's own route, which holds all of the agent's work,
+    is the agent's "hold". A hold of its screen route holds only its screen tasks: that route's state says it.
     names: the agents to show (all by default)."""
     t0, team, rev = now(), agents(), kit_revision(fresh=True)
     routes_of, groups = {}, {}
     for name, a in team.items():
-        lim, own = active_limit(name), model_group(name)       # own: the AI providers build (account_groups)
+        own = model_group(name)         # own: the AI providers build (account_groups)
         for route, runtime, reading in usage_routes(name):
+            lim = active_limit(name, route)         # the hold of this route (account_groups)
             group = own if own and route == "primary" else None if route == "primary" and \
                 local_model(a, team_read().get("accounts")) else \
                 (reading or {}).get("account_key") or f"unknown:{name}:{route}"
@@ -16779,7 +16989,7 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                     g["labels"].add(a["account"])
                 if reading and group != own:
                     g["samples"].append((name, route, reading))
-                if lim and limit_route(lim) == route:
+                if lim:
                     g["holds"].append(lim)
     for key, g in groups.items():
         newest = max(g["samples"], key=lambda x: x[2].get("collected_at") or 0, default=None)
@@ -31150,12 +31360,16 @@ def conversation_records(agent, cid, generation, attempt, session, events):
         tasks = q("SELECT id, attempt, state, created FROM tasks WHERE source_conversation=? AND owner=? AND "
                   "source_message IS NOT NULL ORDER BY created, id", (cid, agent))
         last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE session=?", (session,))["m"]
-        groups = {}
+        groups, let_go = {}, {}
         for record in records:
             if record[0] <= last or not tasks:
                 continue
             at = (record[1] or t0) + CONVERSATION_RECORD_SKEW
             t = ([t for t in tasks if t["created"] <= at] or tasks[:1])[-1]
+            if t["id"] not in let_go:
+                let_go[t["id"]] = raw_gone(t["id"])
+            if let_go[t["id"]]:
+                continue        # F14-3: the records of a task that the sweep let go are not stored again
             groups.setdefault(t["id"], (t, []))[1].append(record)
         with area("activity"), committed():
             for tid, (t, batch) in groups.items():
@@ -43080,7 +43294,8 @@ def report_notices(t0):
         if not watch or case_pool_used(watch["id"]) >= CASE_POOL:
             continue
         route, _ = wakeups.wake_route(wake_org(), watch["agent"])
-        if route is None or route["kind"] != "task" or active_limit(watch["agent"]):
+        if route is None or route["kind"] != "task" or \
+            needs_limit(watch["agent"], json.loads(watch["task"]).get("needs")):
             continue
         try:
             admission = wake_admission(watch, route, json.loads(watch["task"]))
@@ -43169,7 +43384,8 @@ def case_notice_start(key, t0):
     if not watch or case_pool_used(watch["id"]) >= CASE_POOL:
         return
     route, _ = wakeups.wake_route(wake_org(), watch["agent"])
-    if route is None or route["kind"] != "task" or active_limit(watch["agent"]):
+    if route is None or route["kind"] != "task" or \
+            needs_limit(watch["agent"], json.loads(watch["task"]).get("needs")):
         return
     try:
         admission = wake_admission(watch, route, json.loads(watch["task"]))
@@ -43433,7 +43649,8 @@ def case_reminder_start(rem, t0):
     if not watch or case_pool_used(watch["id"]) >= CASE_POOL:
         return
     route, _ = wakeups.wake_route(wake_org(), watch["agent"])
-    if route is None or route["kind"] != "task" or active_limit(watch["agent"]):
+    if route is None or route["kind"] != "task" or \
+            needs_limit(watch["agent"], json.loads(watch["task"]).get("needs")):
         return
     try:
         admission = wake_admission(watch, route, json.loads(watch["task"]))
@@ -43690,7 +43907,8 @@ def report_question_start(rq, t0):
     if not watch or case_pool_used(watch["id"]) >= CASE_POOL:
         return
     route, _ = wakeups.wake_route(wake_org(), watch["agent"])
-    if route is None or route["kind"] != "task" or active_limit(watch["agent"]):
+    if route is None or route["kind"] != "task" or \
+            needs_limit(watch["agent"], json.loads(watch["task"]).get("needs")):
         return
     try:
         admission = wake_admission(watch, route, json.loads(watch["task"]))
@@ -45787,6 +46005,83 @@ def history_indexer():
         time.sleep(0.01 if done is False else 5)
 
 
+UNINDEX_IDS = 5000              # waiting ids that one read of the index's word list takes
+UNINDEX_IDLE = 600              # seconds from a pass that found none waiting to the thread's next look
+
+
+def history_unindex_rows(ids, words, at):
+    """history_unindex's one write: from position `at` of `ids` on, the words that the index holds at each id
+    (`words`: {id: {column: terms}}, from the index itself) leave the index, and the id leaves the waiting list, in one
+    quiet transaction of RAW_ROWS ids at most and no id after RAW_STEP seconds but the first. An id that has a row of
+    the history is not one whose words go (no writer gives an id again, unused_id), nor one that the index has no size
+    of. Returns the position after the last one."""
+    end, start = time.monotonic() + RAW_STEP, at
+    with area("quiet"), transaction():
+        while at < len(ids) and at - start < RAW_ROWS and not (at > start and time.monotonic() >= end):
+            hid = ids[at]
+            if not DB.execute("SELECT 1 FROM history WHERE id=?", (hid,)).fetchone() and \
+                    DB.execute("SELECT 1 FROM history_fts_docsize WHERE id=?", (hid,)).fetchone():
+                held = words.get(hid, {})
+                DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                           (hid, " ".join(held.get("text", ())), " ".join(held.get("agent", ()))))
+            DB.execute("DELETE FROM history_unindexed WHERE id=?", (hid,))
+            at += 1
+    return at
+
+
+def history_unindex():
+    """One pass: the words of up to UNINDEX_IDS ids that wait (history_unindexed) leave the index. The index is
+    contentless, so it removes a row's words only when it gets the same words again, and the words of a session record
+    cannot be built again from it: the index took them masked as the logins were then, and a later login changes the
+    mask (a delete with other words damages the index, 15 November 2026). The index itself says which words it holds
+    at an id (fts5vocab), so exactly those go, as history_mend does. That list is read whole, once for all of the ids,
+    from a connection of its own (mode=ro) with no lock held, and the words of an id that left the history cannot
+    change meanwhile: no writer adds words at an id below the floor (unused_id). Only in WAL mode, where a reader
+    holds no writer back. Then the words go in short writes (history_unindex_rows). True when more ids may wait."""
+    if not HISTORY_FTS[0]:
+        return False
+    with LOCK:
+        mode = str(DB.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        path = next((r["file"] for r in DB.execute("PRAGMA database_list") if r["name"] == "main"), "")
+    ids = [r["id"] for r in read_rows("SELECT id FROM history_unindexed ORDER BY id LIMIT ?", (UNINDEX_IDS,))]
+    if not ids or mode != "wal" or not path:
+        return False
+    words = {}
+    conn = sqlite3.connect(f"file://{urllib.parse.quote(os.path.abspath(path))}?mode=ro", uri=True)
+    try:
+        conn.execute("CREATE TEMP TABLE waiting(id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO temp.waiting VALUES(?)", [(i,) for i in ids])
+        conn.execute("CREATE VIRTUAL TABLE temp.held USING fts5vocab(main, 'history_fts', 'instance')")
+        for doc, column, term in conn.execute("SELECT h.doc, h.col, h.term FROM temp.held h WHERE h.doc IN "
+                                              "(SELECT id FROM temp.waiting)"):
+            words.setdefault(doc, {}).setdefault(column, []).append(term)
+    finally:
+        conn.close()
+    at = 0
+    while at < len(ids):
+        if at:
+            time.sleep(0.01)            # the lock back to the hub's other callers between two writes
+        at = history_unindex_rows(ids, words, at)
+    return len(ids) == UNINDEX_IDS
+
+
+def history_unindexer():
+    """The thread of history_unindex: a pass each UNINDEX_IDLE seconds, and while ids wait, the next pass after twice
+    the time of the last one: each pass reads the index's whole word list (1.38 s on the first fleet's server), so
+    passes one after the other would hold a CPU, slow the hub's answers and read as a busy hub (diagnostics' stall). A
+    pass that fails is a fault of the hub, as a damaged index is (print_fault: the journal's traceback, and one count in
+    memory that diagnostics sends and System status shows), and the ids that it did not take wait for the next pass.
+    Nothing of it goes into the records, not even the hub's log: on a full disk that write fails as the pass did, and
+    its error would end the thread until the hub's next start."""
+    while True:
+        more, began = False, time.monotonic()
+        try:
+            more = history_unindex()
+        except sqlite3.Error:
+            print_fault()
+        time.sleep(max(1.0, 2 * (time.monotonic() - began)) if more else UNINDEX_IDLE)
+
+
 def history_note(agent, kind, ref, text, at=None, task=None, person=None, owner_chat=False):
     """Inside the caller's transaction: one record that has no stream here, in the agent's history with its words
     kept. For a lane's own event that is not a row of its own, such as the end of a standing item or the removal of a
@@ -45863,8 +46158,9 @@ def history_rewrite(src, src_id, ref):
 def history_drop_row(h):
     """Inside the caller's write: one history row out of the history and out of the index. Only words that the row
     keeps can leave the contentless index exactly; a tool record keeps none, and its words stay behind with no row to
-    join them, so no search can reach them. No row joins them later either: the history's floor of ids goes up to
-    this one (unused_id), so its id is never given again."""
+    join them, so no search can reach them. (Those of a record that the raw sweep took leave later, history_unindex.)
+    No row joins them later either: the history's floor of ids goes up to this one (unused_id), so its id is never
+    given again."""
     in_transaction("history_drop_row")
     key = history_key(h["agent"])
     if HISTORY_FTS[0] and key and h["text"] is not None:
@@ -46524,6 +46820,9 @@ def t_read_history(agent, a):
     behind = not history_catch_up(HISTORY_SEARCH_STEP)
     recs = history_records(agent, ref, not contact_session(agent), session_scope(agent))
     history_outside_read(a, [r["kind"] for r in recs])
+    if not recs and ref.startswith("TR-") and raw_record_gone(int(ref[3:])):
+        return (f"{ref} was a step of a session of a task that ended more than 90 days ago. The hub does not keep "
+                f"those. The task's result and its notes are in your history: search_history finds them.")
     if not recs:
         return (f"{ref} is not in your history: you took no part in it, or it does not exist. search_history finds "
                 f"what you took part in." + (" The history is still taking in older records, so it may be one of "
@@ -54171,10 +54470,13 @@ def history_accounts(a, days, start, before):
     for name in who:
         new = q("SELECT * FROM agent_limits WHERE agent=? AND since>=?", (name, start))
         old = q("SELECT * FROM agent_limits WHERE agent=? AND since>=? AND since<?", (name, before, start))
-        held = sum((r["ended"] or now()) - r["since"] for r in new)
-        shared = [r for r in new if r["cause"]]
         if not new and not old:
             continue
+        # a hold of its own route that its own desktop task caused (spread_limit) is the same episode as that one's
+        ids = {r["id"] for r in new}
+        new = [r for r in new if r["cause"] not in ids]
+        held = sum((r["ended"] or now()) - r["since"] for r in new)
+        shared = [r for r in new if r["cause"]]
         out.append(f"  {name} ({(agents().get(name) or {}).get('account') or 'no owner label'}): "
                    f"limit episodes {moved(len(new) - len(shared), len([r for r in old if not r['cause']]))}"
                    + (f", {len(shared)} of them an allowance another agent on the account spent" if shared else "")
@@ -54793,7 +55095,7 @@ def lead_unread_sweep(t0):
         told = kv_get(f"stuck_notice:{t['id']}")
         key = f"stuck:{t['id']}:{told}"
         if not told or t["requester"] in (None, mgr) or kv_get(f"lead_unread:{key}") or \
-                active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]) or \
+                active_hold(t["id"]) or task_limit(t) or os_user_held(t["owner"]) or parked(t["id"]) or \
                 waits_for_sign_in(t) or not (not_acting(t["requester"], int(told)) or lead_left(t["requester"], t)):
             continue
         lines.append(f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}): {t['requester']} was told that "
@@ -54828,11 +55130,12 @@ def tasks_stuck(t0):
     leaves unread goes to the manager (lead_unread_sweep), and shows here only when the manager left it unread too.
     Since owner API 1.331 no screen of the owner's shows this list.
 
-    **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit or waits for its
-    sign-in and a parked task are left out whole."""
+    **Deliberate quiet is not stuckness**: a held task, a task that a usage limit holds (task_limit: its agent's own,
+    or for a screen task its screen route's), a task whose agent waits for its sign-in and a parked task are left out
+    whole."""
     out = []
     for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
-        if active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"]) or parked(t["id"]):
+        if active_hold(t["id"]) or task_limit(t) or os_user_held(t["owner"]) or parked(t["id"]):
             continue
         told = kv_get(f"stuck_notice:{t['id']}")
         if not told or waits_for_sign_in(t) or \
@@ -56333,15 +56636,15 @@ TOOLS = [
        ["request_id", "memory", "reason"])),
     # History search (AUTONOMY.md P6): everything an agent took part in, kept for ever and found by topic and date.
     ("all", "search_history", t_search_history,
-     "Search everything you took part in: your conversations with people, your chats with the owner, your messages "
-     "with other agents, your tasks with their results, progress notes and questions, your reports, your duties' "
-     "cases and steps, your lessons, and your own tool records. query is a few words of the topic, not a sentence, "
-     "with the other forms you want found together (refund refunds reembolso): a record with more of them, and with "
-     "the rarer ones, comes first, a word of four letters or more also finds the words it begins, and \"words in "
-     "quotes\" are found as they stand. Narrow it with from and to (2026-10-26, or 2026-10-26 14:00, in the fleet's "
-     "own time zone; today and yesterday work too; to with a date alone is the end of that day), person (a person's "
-     "name, another agent's name, or owner), task (T-7) and kind. With no words, the newest records of those come "
-     "first. Each record comes with its date, who else took part, and its ref; read_history opens one in full.",
+     "Search everything you took part in: conversations with people, chats with the owner, messages with other "
+     "agents, tasks with results, progress notes and questions, reports, your duties' cases and steps, lessons, and "
+     "your own tool records. query is a few words of the topic, not a sentence, with other forms you want found "
+     "together (refund refunds reembolso): a record with more of them, and rarer ones, comes first, a word of four "
+     "letters or more also finds words it begins, and \"words in quotes\" are found as they stand. Narrow it with "
+     "from and to (2026-10-26, or 2026-10-26 14:00, in the fleet's time zone; today and yesterday work too; to with "
+     "a date alone is the end of that day), person (a person's or agent's name, or owner), task (T-7) and kind. With "
+     "no words, the newest come first. Each record has its date, who else took part and its ref; read_history opens "
+     "one in full. The steps of your sessions (TR- records) are kept for 90 days after their task ended.",
      S({"query": {"type": "string", "description": "A few words of the topic, and their other forms"},
         "from": {"type": "string", "description": "From this date, or date and time, for example 2026-10-26"},
         "to": {"type": "string", "description": "To this date (all of it), or date and time"},
@@ -57824,6 +58127,8 @@ def call_record(agent, tid, attempt, name, ok, args, detail, window, own=None, m
         if (window is not None and not q1("SELECT 1 FROM conversations WHERE id=?", (window,))) or \
                 removed_task(tid) or removed_task(own) or conversation_heads_gone():
             args, detail = "{}", REMOVED_WORDS
+        elif ok and name in RAW_READ_TOOLS and raw_gone(tid):
+            detail = None       # F14-3: a read that names a task whose raw records are let go keeps no answer
         ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,conversation,scope_person) "
             "VALUES(?,?,?,?,?,?,?,?,?,?)", (now(), agent, tid, attempt, name, args, ok, detail, window, mark))
 
@@ -58003,6 +58308,7 @@ def overview_text(scope):
         running = [r for r in q("SELECT id, scope_person FROM tasks WHERE owner=? AND state IN ('working',"
                                 "'input-required','submitted')", (name,)) if shown(r)]
         lim = active_limit(name)
+        screen = None if lim else active_limit(name, "screen")     # a hold of its screen route: its desktop tasks only
         out.append(f"  {name}{'' if agent_active(name) else ' (in setup: no tasks)'}: {a.get('role')}"
                    + (f" ({a['title']})" if a.get("title") else "") + f", {a.get('runtime')} on {a.get('machine')}, can: "
                    f"{', '.join(a.get('can', [])) or '-'}" + (f"; expertise: {', '.join(a['expertise'])}" if a.get("expertise") else "")
@@ -58010,7 +58316,10 @@ def overview_text(scope):
                    f"open tasks: {', '.join(tref(r['id']) for r in running) or 'none'}"
                    + (f"; HELD until {clock(lim['until'])}: a session of {limit_source(lim)} on the account they "
                       f"share reached its usage limit" if lim and limit_source(lim) else
-                      f"; AT ITS USAGE LIMIT until {clock(lim['until'])}" if lim else ""))
+                      f"; AT ITS USAGE LIMIT until {clock(lim['until'])}" if lim else "")
+                   + (f"; its desktop tasks HELD until {clock(screen['until'])}: " +
+                      (f"a session of {limit_source(screen)} on the account they share reached its usage limit"
+                       if limit_source(screen) else "they reached the usage limit of their account") if screen else ""))
     out.append("")
     out.append("OPEN TASKS")
     rows = [t for t in q("SELECT * FROM tasks WHERE state NOT IN ('completed','failed','rejected','canceled') ORDER BY "
@@ -59338,9 +59647,9 @@ def check_decision(t, r, value, t0):
                  (last["id"],)) if last else None
     if unknown:
         return "waiting", outcome_wait_words(unknown, last), None
-    lim = active_limit(agent)
+    lim = needs_limit(agent, task["needs"])     # its own limit, or for a screen task its screen route's
     if lim:
-        return "waiting", f"{agent} is at its usage limit until {clock(lim['until'])}.", None
+        return "waiting", limit_until_words(lim), None
     try:            # the create_task rules for a task that the manager requests: capability, goal, login text
         return "started", None, check_task(manager_name(), {
             "owner": agent, "title": task["title"], "details": watch_details(t, task), "done_when": task["done_when"],
@@ -59723,7 +60032,8 @@ def check_result(t, r, body, t0, stored=None, held=None):
     if state == "waiting" and retry is None:
         # the one thing it waits for: the reset of a usage limit, or the end of the rule's open task
         spec_route = wakeups.wake_route(wake_org(), t["agent"])[0] if agent_rule(t) else None
-        lim = active_limit(spec_route["to"] if spec_route and spec_route["kind"] == "message" else t["agent"])
+        lim = active_limit(spec_route["to"]) if spec_route and spec_route["kind"] == "message" else \
+            needs_limit(t["agent"], json.loads(t["task"]).get("needs"))     # a task's: its own route's too
         last = q1("SELECT id, state FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
         if lim:
             retry = lim["until"]
@@ -59914,9 +60224,9 @@ def case_lines(t, r, new, t0):
         return "not_started", "Check now never starts a wake-up.", None, dict(cases, later=list(new))
     why = duty_block(dict(t, watch=DUTY_OWN), r["due"], t0)      # the duty itself: there is no key of the whole check
     route, route_why = wakeups.wake_route(wake_org(), t["agent"])
-    lim = active_limit(t["agent"])
+    lim = needs_limit(t["agent"], json.loads(t["task"]).get("needs"))     # its own, or its screen route's
     if why or route is None or lim:
-        why = why or route_why or f"{t['agent']} is at its usage limit until {clock(lim['until'])}."
+        why = why or route_why or limit_until_words(lim)
         return "not_started", why, None, dict(cases, later=list(new))
     try:
         admission = wake_admission(t, route, json.loads(t["task"]))
@@ -60003,9 +60313,9 @@ def lines_held(t, r, route, t0):
                  (done["id"],)) if done else None
     if unknown:
         return outcome_wait_words(unknown, done)
-    lim = active_limit(t["agent"])
+    lim = needs_limit(t["agent"], json.loads(t["task"]).get("needs"))     # its own, or its screen route's
     if lim:
-        return f"{t['agent']} is at its usage limit until {clock(lim['until'])}."
+        return limit_until_words(lim)
     return None
 
 
@@ -61012,6 +61322,11 @@ def save_runtime(agent, body):
             DB.execute("UPDATE agent_usage SET data=? WHERE name=?", (json.dumps(usage), agent))
         if hold:
             DB.execute("UPDATE agent_limits SET ended=?, resumed=? WHERE id=?", (t0, t0, hold))
+        if to == APP_SERVER_RUNTIME:
+            # Its desktop tasks run on its own runtime from now on (needs_route), so a hold of its screen route would
+            # hold nothing: the account of that hold is its own route's now, and the hold holds all of its work.
+            DB.execute(f"UPDATE agent_limits SET route='primary' WHERE agent=? AND ended IS NULL AND "
+                       f"{LIMIT_ROUTE_SQL}='screen'", (agent,))
         DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                    ("runtime_since:" + agent, str(t0)))
         if a.get("role") == "manager":      # its messages wait for its new session (manager_held)
@@ -61058,8 +61373,8 @@ def reminder_sweep(t0):
         if r["goal"] and not q1("SELECT 1 FROM goals WHERE id=? AND state IN ('active','paused')", (r["goal"],)):
             q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))     # the goal closed; nothing to look at again
             continue
-        if t and (active_hold(t["id"]) or active_limit(t["owner"]) or os_user_held(t["owner"])):
-            continue            # held work and an agent at its usage limit wait; the reminder waits with them
+        if t and (active_hold(t["id"]) or task_limit(t) or os_user_held(t["owner"])):
+            continue            # held work and work that a usage limit holds wait; the reminder waits with them
         note = (f"Reminder R-{r['id']}: {r['note']}"
                 + (f" -- carry on with {tref(t['id'])} now. First check what was already done (rule 9): never "
                    f"repeat an outside action that already happened." if t else "")
@@ -61076,6 +61391,260 @@ def reminder_sweep(t0):
             DB.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (t0, r["id"]))
             event_rows([(agent, "say", filed, "[hub] " + note, None)], t0)
         log("hub", f"reminder R-{r['id']} delivered to {agent}")
+
+
+# ---------------------------------------------------------------- the raw records that the hub lets go (F14-3)
+#
+# The owner, 22 November 2026: "The hub lets go of the raw records and start texts of tasks that ended more than 90
+# days ago, and keeps every task, result, conversation and case", and to the exact list of what goes: "Yes, all five
+# lines" (~/dev/founderizer-plans/owner-feedback-2026-11-22/F14-3-design.md, section 8.2). So RAW_KEEP after a task
+# ended (a state of TERMINAL, at tasks.delivered), the hub lets go of: (1) its session records that hold work text
+# (thread_events of RAW_TYPES), with their rows in the history; (2) the hub's answer to each of its done calls of a
+# tool that reads (calls.detail of RAW_READ_TOOLS): what the agent read; (3) the start text of each of its attempts
+# (events.text of kind 'task'), which becomes RAW_START. And (5) the answer of each done read of no task (the
+# manager's own session, an owner chat, a conversation window), RAW_KEEP after the call. What stays in those tables
+# is what a reader needs: the frame of each session (its records of type session, model, result and error), each
+# call's row with its arguments, the answer of each call that is no read (what it sent, wrote, kept or did), each
+# refusal, and each start event with its id, its times and its extra. The
+# sweep reads and writes no other table: every task, result, note, question, message, conversation and case stays.
+#
+# It runs on the tick (raw_sweep), one batch at most each RAW_SWEEP_EVERY seconds while rows wait and one look each
+# RAW_SWEEP_IDLE seconds when none does. A batch is one transaction under the lock with RAW_ROWS rows at most, and it
+# takes no row after RAW_STEP seconds but the first: what every other caller of the hub waits, as for one step of the
+# history. Its writes are quiet, so no app reads again for them. Its cursor is kv raw_swept, "<delivered>:<id>" of
+# the last task whose rows are all let go, which moves in the transaction that takes that task's last row. It is in
+# the records, so a restore puts back rows and cursor of one moment, and the sweep takes those rows again. It is no
+# column of tasks: a write to an ended task moves the mark of its block, and each app reads that block again
+# (older_triggers). The newest session record stays, whoever's it is: SQLite gives a deleted newest id again, and the
+# history's stream and every TR-<id> read by that id. A record or a call's answer that comes for a task whose rows
+# are let go is not stored (raw_gone): the cursor is past it, so it would stay for good. No VACUUM: SQLite writes a
+# freed page over with zeros (secure_delete) and gives it to the next rows, so the file stops growing, and the copy,
+# which packs those pages, gets smaller.
+RAW_KEEP = 90 * 86400           # seconds after a task's end that its raw records stay (CFG["raw_keep"] for tests only)
+RAW_ROWS = ID_LIST              # rows of one batch at most
+RAW_STEP = HISTORY_STEP         # seconds of one batch under the lock at most, but its first row
+RAW_SWEEP_EVERY = 30            # seconds from one batch to the next while rows wait
+RAW_SWEEP_IDLE = 3600           # and from a batch that found none to the next look
+RAW_TOLD_EVERY = 86400          # seconds from one line of the sweep in the hub's log to the next, at the least
+# The session records that hold work text: what the session said, what was typed into it, its thinking, each tool
+# call with its output, and its plan list. A session's frame stays: session (the goals' tokens and a removal read its
+# id), model (reported_model), result and error (account_problem, turn_worked_since).
+RAW_TYPES = ("agent_message", "user_message", "agent_thought", "tool_call", "tool_call_update", "plan")
+# The tools that only read: their answer is what the agent read (lines 2 and 5 of the owner's list), and only their
+# answers go. Every other tool keeps its answer, also a tool that comes later, until it is named here: what it sent,
+# wrote, kept, asked or did stays readable (outward_done, the receipts, a removal's keys, a review's reading). By the
+# tools' own words: the inbox and the task list, the owner's file, the history, the knowledge files and the lessons,
+# the see_ tools, Google's reads and a repository's reads. Not summarize_knowledge (it writes a summary), not
+# ask_reporter (it asks), not call_api (a request that can write, which the cap keeps whole).
+RAW_READ_TOOLS = ("read_messages", "list_my_tasks", "read_attachment", "see_earlier_work", "see_team", "see_capacity",
+                  "see_history", "see_goals", "see_responsibilities", "see_notes", "see_standing", "see_triggers",
+                  "recall", "search_history", "read_history", "search_knowledge", "read_knowledge",
+                  "repo_files", "repo_read", "repo_search", "repo_checks") + GOOGLE_READS
+RAW_SWEPT = "raw_swept"                 # kv: "<delivered>:<id>" of the last task whose raw records are let go
+RAW_CALLS_SWEPT = "raw_calls_swept"     # kv: the id of the last call of no task that the sweep read
+RAW_START = "[hub] The hub does not keep the start text of this attempt: its task ended more than 90 days ago."
+RAW_TOLD = {"at": None, "records": 0, "answers": 0, "starts": 0}     # the counts since the sweep's last line
+
+
+def raw_keep():
+    """Seconds that a task's raw records stay after it ended: CFG["raw_keep"], else RAW_KEEP."""
+    return float(CFG.get("raw_keep", RAW_KEEP))
+
+
+def raw_cursor():
+    """(delivered, id) of the last task whose raw records are let go (kv raw_swept), or None before the first.
+    read_row only: it is read inside the sweep's transaction and inside a writer's hold of the lock."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (RAW_SWEPT,))
+    try:
+        at, _, tid = str(row["v"]).partition(":")
+        return float(at), int(tid)
+    except (TypeError, ValueError):
+        return None
+
+
+def raw_gone(tid):
+    """Whether task `tid` is let go: it ended, it has its time of delivery, and (that time, its id) is at or before
+    the sweep's cursor. Its session records and the answers of its calls are not stored any more (helper_events,
+    conversation_records, call_record): the sweep is past it, so a row that came late would stay for good. read_row
+    only: each writer asks it inside the hold of the lock that writes the row."""
+    cursor = raw_cursor() if tid is not None else None
+    if cursor is None:
+        return False
+    t = read_row("SELECT state, delivered FROM tasks WHERE id=?", (tid,))
+    return bool(t and t["state"] in TERMINAL and t["delivered"] is not None and
+                (float(t["delivered"]), int(tid)) <= cursor)
+
+
+def raw_record_gone(record_id):
+    """Whether TR-<record_id> was a session record that the sweep let go: the sweep has let go of a task, no record
+    has that id, and it is below the newest record, which the sweep never takes, so the id was given. read_row only."""
+    if raw_cursor() is None or read_row("SELECT 1 FROM thread_events WHERE id=?", (record_id,)):
+        return False
+    return record_id < (read_row("SELECT MAX(id) m FROM thread_events")["m"] or 0)
+
+
+def raw_room(b):
+    """Whether batch `b` may take one more row: fewer than RAW_ROWS taken, and its time (b["end"], a
+    time.monotonic()) not over, but for its first row or task, so that each batch moves."""
+    return b["taken"] < RAW_ROWS and not ((b["taken"] or b["passed"]) and time.monotonic() >= b["end"])
+
+
+def raw_task_rows(tid, top, b):
+    """Inside raw_batch's transaction: what task `tid` lets go, in this order, one row at a time while the batch has
+    room (raw_room): (a) its session records of RAW_TYPES, but the newest record of all (`top`, the largest id), each
+    with its rows in the history, which history_drop_row takes out in the same write, so that no history row is ever
+    without its record (they are found through the task and their time, the index history_of_task: a tool record's
+    row has the record's own time, history_tool); (b) the answer of each of its done calls of RAW_READ_TOOLS, and the
+    row stays with its arguments; (c) the start text of each of its attempts, which becomes RAW_START, and the
+    event stays. The budget is read after each row: an answer from before the cap can be 165 KiB. True when the task
+    has no such row left."""
+    in_transaction("raw_task_rows")
+    kinds = ",".join("?" * len(RAW_TYPES))
+    while True:
+        rows = DB.execute(f"SELECT id, ts, created FROM thread_events WHERE task=? AND type IN ({kinds}) AND id<? "
+                          f"LIMIT ?", (tid, *RAW_TYPES, top, RAW_ROWS)).fetchall()
+        for r in rows:
+            if not raw_room(b):
+                return False
+            for h in DB.execute("SELECT id, agent, text FROM history WHERE task=? AND at=? AND src='tool' AND "
+                                "src_id=?", (tid, float(r["ts"] or r["created"] or 0), r["id"])).fetchall():
+                if HISTORY_FTS[0] and h["text"] is None:        # its words are not in the row: they leave later
+                    DB.execute("INSERT OR IGNORE INTO history_unindexed(id) VALUES(?)", (h["id"],))
+                history_drop_row(h)
+            DB.execute("DELETE FROM thread_events WHERE id=?", (r["id"],))
+            b["taken"], b["records"] = b["taken"] + 1, b["records"] + 1
+        if len(rows) < RAW_ROWS:
+            break
+    reads = ",".join("?" * len(RAW_READ_TOOLS))
+    while True:
+        rows = DB.execute(f"SELECT id FROM calls WHERE task=? AND ok=1 AND detail IS NOT NULL AND name IN ({reads}) "
+                          f"LIMIT ?", (tid, *RAW_READ_TOOLS, RAW_ROWS)).fetchall()
+        for r in rows:
+            if not raw_room(b):
+                return False
+            DB.execute("UPDATE calls SET detail=NULL WHERE id=?", (r["id"],))
+            b["taken"], b["answers"] = b["taken"] + 1, b["answers"] + 1
+        if len(rows) < RAW_ROWS:
+            break
+    while True:
+        rows = DB.execute("SELECT id FROM events WHERE task=? AND kind='task' AND text IS NOT NULL AND text<>? LIMIT ?",
+                          (tid, RAW_START, RAW_ROWS)).fetchall()
+        for r in rows:
+            if not raw_room(b):
+                return False
+            DB.execute("UPDATE events SET text=? WHERE id=?", (RAW_START, r["id"]))
+            b["taken"], b["starts"] = b["taken"] + 1, b["starts"] + 1
+        if len(rows) < RAW_ROWS:
+            return True
+
+
+def raw_tasks_rows(cutoff, top, b):
+    """Inside raw_batch's transaction: the tasks past the mark, from the cursor on, in the order (delivered, id), each
+    through the index task_delivered: one that ended and whose delivery is before `cutoff`. A task that ended with no
+    time of delivery, or that is not ended, is never taken, and its rows stay. The cursor moves past a task in the
+    write that takes its last row, never before. True when the batch ended with a task left."""
+    in_transaction("raw_tasks_rows")
+    while True:
+        if not raw_room(b):
+            return True
+        cursor = raw_cursor()
+        after = " AND delivered>=? AND (delivered>? OR id>?)" if cursor else ""
+        t = read_row(f"SELECT id, delivered FROM tasks WHERE delivered IS NOT NULL AND delivered<?{after} AND state IN "
+                     f"{ENDED_STATES} ORDER BY delivered, id LIMIT 1",
+                     (cutoff, *((cursor[0], cursor[0], cursor[1]) if cursor else ())))
+        if not t:
+            return False
+        if not raw_task_rows(t["id"], top, b):
+            return True
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (RAW_SWEPT, f"{float(t['delivered'])!r}:{t['id']}"))
+        b["passed"] += 1
+
+
+def raw_calls_rows(cutoff, b):
+    """Inside raw_batch's transaction, once no task past the mark is left: the answers of the done reads of no task
+    (RAW_READ_TOOLS with calls.task IS NULL: the manager's own session, an owner chat, a conversation window) from
+    before `cutoff`, in the order of their ids from the cursor kv raw_calls_swept, through the index call_task_ok, up to
+    the first call that is not that old. A refusal keeps its answer, and so do a call that is no read and a call with no
+    time. Each call that
+    it reads counts in the batch, so that a long run of calls that keep theirs holds the lock no longer. True when
+    the batch ended with calls left."""
+    in_transaction("raw_calls_rows")
+    row = read_row("SELECT v FROM kv WHERE k=?", (RAW_CALLS_SWEPT,))
+    start = last = int(row["v"]) if row and str(row["v"]).isdigit() else 0
+    more = None
+    while more is None:
+        rows = DB.execute("SELECT id, ts, name, detail IS NOT NULL AS said FROM calls WHERE task IS NULL AND ok=1 AND "
+                          "id>? ORDER BY id LIMIT ?", (last, RAW_ROWS)).fetchall()
+        for r in rows:
+            if r["ts"] is not None and r["ts"] >= cutoff:
+                more = False
+                break
+            if not raw_room(b):
+                more = True
+                break
+            if r["ts"] is not None and r["said"] and r["name"] in RAW_READ_TOOLS:
+                DB.execute("UPDATE calls SET detail=NULL WHERE id=?", (r["id"],))
+                b["answers"] += 1
+            b["taken"] += 1
+            last = r["id"]
+        else:
+            if len(rows) < RAW_ROWS:
+                more = False
+    if last != start:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (RAW_CALLS_SWEPT, str(last)))
+    return more
+
+
+def raw_told_rows(t0, b):
+    """Inside raw_batch's transaction: the sweep's line in the hub's log, in counts only and with no name, as
+    attachment_sweep's: what it let go since its last line, at most once in RAW_TOLD_EVERY seconds (the counts are
+    the hub's own, so a start of the hub begins them again). True when it wrote the line."""
+    total = {k: RAW_TOLD[k] + b[k] for k in ("records", "answers", "starts")}
+    if not any(total.values()) or (RAW_TOLD["at"] is not None and t0 - RAW_TOLD["at"] < RAW_TOLD_EVERY):
+        return False
+    log_row("hub", f"raw records let go: {total['records']} session records, {total['answers']} answers of calls and "
+                   f"{total['starts']} start texts")
+    return True
+
+
+def raw_batch(t0, end=None):
+    """One batch of the sweep (raw_sweep), in one transaction or not at all: RAW_ROWS rows at most, and no row after
+    `end` (a time.monotonic(), RAW_STEP seconds from now by default) but the first. The mark is raw_keep() before now,
+    or before the newest delivery of a task when that is earlier (A2 of the design): a clock that runs 90 days ahead
+    lets go of nothing that the newest work of the fleet does not. The tasks past the mark first (raw_tasks_rows),
+    then the calls of no task (raw_calls_rows). True when it ended with rows left."""
+    b = {"end": time.monotonic() + RAW_STEP if end is None else end, "taken": 0, "passed": 0, "records": 0,
+         "answers": 0, "starts": 0}
+    with area("quiet"), transaction():
+        newest = read_row("SELECT delivered FROM tasks WHERE delivered IS NOT NULL ORDER BY delivered DESC LIMIT 1")
+        cutoff = (t0 if newest is None else min(t0, float(newest["delivered"]))) - raw_keep()
+        top = read_row("SELECT MAX(id) m FROM thread_events")["m"] or 0
+        more = raw_tasks_rows(cutoff, top, b) or raw_calls_rows(cutoff, b)
+        told = raw_told_rows(t0, b)
+    if told:
+        RAW_TOLD.update(at=t0, records=0, answers=0, starts=0)
+    else:
+        for k in ("records", "answers", "starts"):
+            RAW_TOLD[k] += b[k]
+    return more
+
+
+def raw_sweep(t0):
+    """The tick's step of F14-3: one batch (raw_batch), when its time came. kv raw_sweep_at holds the time of the next
+    look, and its writes are quiet (kv_set): RAW_SWEEP_EVERY seconds on, and RAW_SWEEP_IDLE after a batch that left
+    nothing. A time further on than that is of a clock that went back (a restore, a clock put right), and does not
+    hold the sweep."""
+    try:
+        due = float(kv_get("raw_sweep_at") or 0)
+    except ValueError:
+        due = 0.0
+    if t0 < due <= t0 + RAW_SWEEP_IDLE:
+        return
+    kv_set("raw_sweep_at", t0 + RAW_SWEEP_EVERY)        # first, so that a batch that raises waits as long
+    if not raw_batch(t0):
+        kv_set("raw_sweep_at", t0 + RAW_SWEEP_IDLE)
 
 
 # ---------------------------------------------------------------- a wait for the CI of a commit (set_reminder ci)
@@ -62199,7 +62768,7 @@ def liveness(t0):
         # The step that the helper's loop is inside now starts this task: its window may not be there yet
         busy = presence_of(owner, t0)
         starting = online and busy and busy["task"] == tref(tid)
-        hold, lim, park = active_hold(tid), active_limit(owner), parked(tid)
+        hold, lim, park = active_hold(tid), task_limit(t), parked(tid)     # lim: its own route's, or its screen route's
         # plan C6: a helper that starts each attempt once says so with its ack, so a submitted task whose window it
         # started and lost is a loss like any other (also for attempt 1), not a start that still waits
         once = online and START_ONCE in helper_features(owner)
@@ -62237,7 +62806,9 @@ def liveness(t0):
             source = limit_source(lim)
             path = (f"waiting for the usage limit of the account {owner} shares with {source} to reset at "
                     f"{clock(lim['until'])}" if source else
-                    f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
+                    f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}"
+                    if limit_route(lim) == "primary" else       # a screen hold is no limit of the agent's own
+                    f"waiting for the usage limit of {limit_words(lim)} to reset at {clock(lim['until'])}")
         # A sign-out comes before a live window: a session that runs signed out ends each turn at "Not logged in"
         # (16 November 2026, seven hours of "live session" while no turn of the agent worked), and the delivery keeps
         # its messages and starts until the sign-in (runtime_signed_out). Read once for each agent in a pass.
@@ -62958,6 +63529,7 @@ def tick():
         step(pin_end_sweep, t0)             # package 4 of the vault's gates: the owner's trust in a vault that ends
         step(settle_checks, t0)
         step(attachment_sweep, t0)          # owner feature attachments: the files that the hub may let go
+        step(raw_sweep, t0)                 # F14-3: the raw records of the tasks that ended RAW_KEEP ago
         step(release_sweep, t0)             # owner feature releases: the automatic poll, when the owner opted in
         step(teams_sweep, t0)               # Founderizer for Teams: the package of the code that runs (design 2, 3.5)
         step(names_sweep, t0)               # devops task 1.1: the Tailscale names, when the start found none
@@ -75964,6 +76536,11 @@ open then is open again now, and its agent cannot know what the old machine did 
 tasks first and cancel anything whose work may already have left the building. A send, a post, a payment or an ad
 launch does not come back.
 
+The hub lets go of the steps of a task's sessions, of its answers to what the agents read and of the start texts of
+the task's attempts 90 days after the task ended, and of its answers to what an agent read outside a task 90 days
+after it read it. So after a restore, those of each task that ended more than 90 days before go, as the fleet works
+again, and this file still holds them.
+
 A copy nobody has ever put back is not a copy. Try it once on a spare machine before you need it.
 """
 
@@ -81162,9 +81739,14 @@ def phone_task(task_id, query):
         # the last 20 that ended).
         subtasks = [{k: r[k] for k in MOBILE_HEAD} for r in q("SELECT * FROM tasks WHERE parent=? ORDER BY id", (task_id,))]
         parent = q1("SELECT * FROM tasks WHERE id=?", (task["parent"],)) if task["parent"] else None
-    return 200, scrub({"db": generation, "task": dict(task), "notes": notes, "holds": holds, "outcomes": outcomes,
-                       "permissions": permissions, "steers": steers, "subtasks": subtasks,
-                       "parent_task": {k: parent[k] for k in MOBILE_HEAD} if parent else None,
+        held = limit_reads(q)[0]            # owner API 1.330: the hold that keeps each of these tasks waiting
+        for head in subtasks:
+            head["limit"] = held_task_limit(head, held, task=False)
+        parent = dict({k: parent[k] for k in MOBILE_HEAD}, limit=held_task_limit(parent, held, task=False)) \
+            if parent else None
+    return 200, scrub({"db": generation, "task": dict(task, limit=held_task_limit(task, held, task=False)),
+                       "notes": notes, "holds": holds, "outcomes": outcomes,
+                       "permissions": permissions, "steers": steers, "subtasks": subtasks, "parent_task": parent,
                        "cursor": notes[-1]["id"] if notes else since}), \
         {"Cache-Control": "no-store"}
 
@@ -84194,6 +84776,10 @@ class Handler(BaseHTTPRequestHandler):
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
             since = task_since(parks, agents_read)
+            # owner API 1.330: the open holds for each task's `limit`, from the state's one read of agent_limits; a
+            # read with no AgentReads reads them here, in the lock, as task_since does
+            task_holds = (agents_read.held, agents_read.usage) if agents_read is not None else \
+                (limit_reads(q)[0], NOT_READ)
             turns = task_turns()
             # a window holds a task without the tasks that it is a part of: from_conversation walks through these
             above = tasks_above(plain_rows["tasks"]) if window else {}
@@ -84209,6 +84795,8 @@ class Handler(BaseHTTPRequestHandler):
         for key, got in plain_rows.items():
             result[key] = [dict(r) for r in got]
         for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
+            # owner API 1.330: the hold that keeps it waiting, from the one read of agent_limits (AgentReads)
+            task["limit"] = held_task_limit(task, task_holds[0], usage=task_holds[1])
             if task["id"] in parks:
                 task["parked_until"] = parks[task["id"]]
             if since.get(task["id"]) is not None:    # owner API 1.237: since when it is in its state
@@ -87494,9 +88082,11 @@ class Handler(BaseHTTPRequestHandler):
         rows = q("SELECT * FROM thread_events WHERE task=? AND id>? ORDER BY id LIMIT ?", (int(task_id), after, limit + 1))
         events = [dict(json.loads(r["data"]), id=r["id"], attempt=r["attempt"], session=r["session"], seq=r["seq"],
                        ts=r["ts"], type=r["type"]) for r in rows[:limit]]
-        return self.json(200, scrub(dict(db=generation, task=int(task_id), events=events,
-                                         next=events[-1]["id"] if events else after, more=len(rows) > limit)),
-                         {"Cache-Control": "no-store"})
+        answer = dict(db=generation, task=int(task_id), events=events, next=events[-1]["id"] if events else after,
+                      more=len(rows) > limit)
+        if raw_gone(int(task_id)):
+            answer["let_go"] = True     # F14-3: the steps of its sessions are let go, and their frame records stay
+        return self.json(200, scrub(answer), {"Cache-Control": "no-store"})
 
     def ui_command(self, route, read, act, limit=65536, keep=None, outside=None, kit=False, unlocked=False):
         """Owner task controls. The same UUID, generation and client rules as owner messages.
@@ -89387,6 +89977,8 @@ class Handler(BaseHTTPRequestHandler):
                 gone = set()        # own tasks whose started window the helper's list of this poll does not have
                 worker = conf.get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
+                # the hold of its screen route holds only its screen tasks' events (needs_limit)
+                screen_limited = active_limit(agent, "screen")
                 shared = os_user_held(agent)           # one OS user for each agent: no session of it starts
                 held = manager_held(agent)             # owner feature runtime_switch: until its new session runs
                 pending = worker and settings_pending(agent)        # owner API 1.9: wait for the new settings
@@ -89403,7 +89995,9 @@ class Handler(BaseHTTPRequestHandler):
                     # about to go quiet, and held until the reset it arrives stale and says nothing.
                     if shared and r["kind"] in OS_USER_HELD_EVENTS:
                         continue        # it shares its OS user with another agent: the event waits in the hub
-                    if limited and r["kind"] in ("task", "say", "chat") and not extra.get("limit"):
+                    if (limited or screen_limited and t and t["owner"] == agent and
+                            needs_route(agent, t["needs"], held=True) == "screen") and \
+                            r["kind"] in ("task", "say", "chat") and not extra.get("limit"):
                         continue        # held until the usage limit resets; the read receipt stays open
                     if sign_in_holds(r, t, conf):
                         # A session of it would end each turn at "Not logged in": the event waits for the sign-in. A
@@ -91649,6 +92243,12 @@ class Handler(BaseHTTPRequestHandler):
         error, failed = None, None      # the error of the turn that is read now; (seq, error) of a turn that failed
         with LOCK:
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
+            if raw_gone(tid):
+                # F14-3: the sweep let go of this task's records and is past it, so what comes late would stay for
+                # good: nothing is stored, and the batch is taken, as a record at or below last is skipped
+                return self.json(200, {"ok": True, "stored": 0, "last_seq": max([last] + [
+                    e["seq"] for e in events if isinstance(e, dict) and isinstance(e.get("seq"), int)
+                    and not isinstance(e["seq"], bool)])})
             before = turn_state(tid, attempt)
             state = turn_records(before, session, records, now())
             # a task of a removed person's conversation: what its session still sends is kept with no word, as
@@ -91742,8 +92342,8 @@ class Handler(BaseHTTPRequestHandler):
             # record only while it is less than 900 seconds old (fleet.py, report_limit). So one case starts a second
             # hold of an hour: a usage reading ended the hold early, and the helper started again in that time. The
             # next reading that shows the windows open ends that hold too (limit_reading).
-            seen = reset is not None and q1("SELECT 1 FROM agent_limits WHERE agent=? AND until=? AND reset_known=1",
-                                            (agent, reset))
+            seen = reset is not None and q1("SELECT 1 FROM agent_limits WHERE agent=? AND until=? AND reset_known=1 "
+                                            f"AND {LIMIT_ROUTE_SQL}='primary'", (agent, reset))     # its own route
             if (runtime is None or runtime == agents()[agent].get("runtime")) and not seen:
                 start_limit(agent, reset)
             lim = active_limit(agent)
@@ -92875,6 +93475,8 @@ def main():
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)
     threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
     threading.Thread(target=skill_marks_warm, name="skill-marks", daemon=True).start()     # the start list's marks
+    # F14-3, part 3b: the index lets go of the words of session records that the raw sweep took
+    threading.Thread(target=history_unindexer, name="history-unindex", daemon=True).start()
     diagnostics.watch_stalls()      # Hub core: a stall names itself in faults (kind "stall"), after the start's own work
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     capp_sync_later()           # the connected apps' socket, with guard 6(b) (nothing runs while it cannot be on)

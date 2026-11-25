@@ -708,6 +708,11 @@ class Capacity(OwnerAPI):
         self.assertEqual(hub.capacity_view(["pma"])["agents"][0]["routes"][0]["state"], "unknown")    # never seen
 
     def test_a_hold_limits_the_account_that_hit_it_and_holds_the_agents_work(self):
+        """A hold limits the account that reached the limit, and holds the work of each route that spends it. seo's
+        screen task reached it: seo's screen route is limited, and its own route and its own work are not (the owner,
+        24 November 2026: a hold of a screen route showed its agent at its usage limit). big's own route spends that
+        account, so big's work is held. The bugs: a hold of a screen route read as the agent's own "hold"; a spread
+        that does not hold the other agent's own route."""
         later = self.baseline()
         self.reading("big", self.limits(SHARED, 30, later))
         hub.TEAM["agents"]["seo"]["reports_to"] = "pma"
@@ -718,7 +723,7 @@ class Capacity(OwnerAPI):
         view = hub.capacity_view()
         seo = next(a for a in view["agents"] if a["agent"] == "seo")
         self.assertEqual([(r["route"], r["state"]) for r in seo["routes"]], [("primary", "available"), ("screen", "limited")])
-        self.assertEqual((seo["hold"]["route"], seo["hold"]["until"]), ("screen", later))
+        self.assertIsNone(seo["hold"])                                         # its own work goes on
         # account_limits: a hold belongs to one agent, an allowance to one account. big spends the same Codex
         # allowance through its primary route, so seo's report holds big as well -- with the same reset, and with
         # seo named as where it came from, which is what big's own session and the manager read.

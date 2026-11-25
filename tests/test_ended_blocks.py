@@ -88,7 +88,7 @@ class Together(EndedCase):
         self.assertEqual((window["mark"], window["older"]["before"], window["older"]["block"]),
                          (self.get("/ui/mobile")["ended_mark"], 12, self.BLOCK))
         self.assertEqual([t["id"] for t in window["tasks"]], [12, 13, 14, 16, 17])
-        self.assertEqual(sorted(window["tasks"][0]), sorted(hub.MOBILE_HEAD + ("trigger_id",)))
+        self.assertEqual(sorted(window["tasks"][0]), sorted(hub.MOBILE_HEAD + ("trigger_id", "limit")))   # 1.330
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (ids[4],))         # in the block of 4 to 7
         self.assertIn(ids[4], [t["id"] for t in self.ended("&block=4")["tasks"]])
         self.assertEqual(self.held(), self.ended()["tasks"])

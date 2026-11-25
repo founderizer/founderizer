@@ -822,8 +822,11 @@ class Values(test_checks_v2.Lines):
     def test_a_run_that_waits_behind_a_limit_records_its_value_at_once(self):
         """Spec 5.2: the value is recorded at the run's first decision, also when the run then waits behind a usage
         limit with its wake lines. Protects against a waiting run that loses its value."""
-        limit = {"until": self.clock + 7200, "since": self.clock, "reset_known": 1, "task": None, "id": 1}
-        with patch.object(hub, "active_limit", lambda agent, *a, **k: limit if agent == "seo" else None):
+        # a whole row of agent_limits, as active_limit gives it: the hold of seo's own route, and of no other route
+        limit = dict({c["name"]: None for c in hub.q("PRAGMA table_info(agent_limits)")}, id=1, agent="seo",
+                     since=self.clock, until=self.clock + 7200, reset_known=1, route="primary")
+        with patch.object(hub, "active_limit", lambda agent, route="primary": limit
+                          if (agent, route) == ("seo", "primary") else None):
             answer, run = self.once(self.rule, ["kpi drafts_sent 77", "T-9 new"])
         self.assertEqual((answer["decision"], self.points()), ("waiting", [77.0]))
 

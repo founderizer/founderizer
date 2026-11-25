@@ -249,7 +249,7 @@ class ScreenFailure(unittest.TestCase):
         limit = error(1, code="usage_limit", message="You have hit your usage limit.", retryable=True, resets_at=time.time() + 600)
         self.assertEqual(self.records(tid, [limit, result(2)])[0], 200)
         self.assertEqual(self.holds(tid), [])
-        self.assertIsNotNone(hub.active_limit("dana"))
+        self.assertIsNotNone(hub.active_limit("dana", "screen"))       # the hold of the route of a screen task
         self.assertFalse(any("paused" in text for text in self.said("manager")))
         # Also when the limit's error came in an earlier batch, and when its reset time is over (no wait starts).
         other = self.task()
