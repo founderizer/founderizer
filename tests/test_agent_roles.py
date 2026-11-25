@@ -24,6 +24,12 @@ class Roles(Capacity):
         return self.request(f"/ui/team/agents/{agent}", dict(request_id=str(uuid.uuid4()), db="test-generation",
                                                              base_sha256=self.sha(), **fields))
 
+    def respell(self, agent, spelling):
+        """The owner's spelling of an agent's name (owner feature agent_spelling): a rename to the same name."""
+        return self.request(f"/ui/team/agents/{agent}/rename", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                                    base_sha256=self.sha(), name=agent,
+                                                                    spelling=spelling))
+
     def test_a_name_in_any_case_or_a_role_in_any_case_and_spacing_names_one_agent(self):
         for word, agent in (("seo", "seo"), ("SEO", "seo"), ("Deva", "deva"), ("seo expert", "seo"),
                             ("  SEO   Expert ", "seo"), ("SEO Expert", "seo")):
@@ -110,6 +116,24 @@ class Roles(Capacity):
         self.assertEqual(hub.name_and_role("big"), "big")
         # a card that signs an agent in names it by its role or by its name: card_signs_in reads the role itself
         self.assertTrue(hub.card_signs_in("Sign Builder in again") and hub.card_signs_in("Sign Deva in again"))
+        # The owner's spelling takes the place of the name with a capital (owner feature agent_spelling, 25 November
+        # 2026: "it ends up showing lowercase and looks bad because it is a name"), and never the place of a role that
+        # holds the name, which stays the label alone, as in the apps. Bugs: a word of the hub, a tag or a refusal
+        # still says "Deva" or "Big" after the owner wrote "DeVa" and "BiG"; the owner reads "MANAGER" where the apps
+        # say "Fleet Manager", or a person reads "SEO (SEO Expert)", the name twice; the agents' own words lose the id.
+        for agent, spelling in (("deva", "DeVa"), ("manager", "MANAGER"), ("big", "BiG"), ("seo", "SEO")):
+            self.assertEqual(self.respell(agent, spelling)[0], 200, agent)
+        self.assertEqual(tuple(hub.shown_role(n) for n in ("deva", "manager", "seo", "big", "gone")),
+                         ("DeVa", "Fleet Manager", "SEO Expert", "BiG", "Gone"))
+        self.assertIn("DeVa has been silent since", hub.silent_words("deva", hub.now() - 7200))
+        self.assertEqual((hub.agent_display("deva"), hub.agent_introduced("deva"), hub.agent_introduced("seo")),
+                         ("DeVa", "DeVa (Builder)", "SEO Expert"))
+        self.assertEqual((hub.tag_label("big"), hub.tag_label("deva")), ("BiG", "Builder"))   # a tag: a sole role first
+        self.assertEqual((hub.team_said_role(hub.TEAM, "big"), hub.team_said_role(hub.TEAM, "manager")),
+                         ("BiG", "Fleet Manager"))                                # a plan of team changes
+        code, data = self.settings("seo", title="deva")
+        self.assertEqual((code, data.get("error")), (409, "DeVa has this name. Give SEO another role."), data)
+        self.assertEqual(hub.name_and_role("deva"), "deva (Builder)")
 
     def test_the_rules_and_the_tool_texts_tell_an_agent_to_name_a_colleague_by_its_name(self):
         """F16, the owner's "Yes, as written" to the sentence of RULES.md: an agent names a colleague by its name, and
@@ -129,10 +153,25 @@ class Roles(Capacity):
         self.assertEqual([n for n, text in tools.items() if "an agent by its role" in text], [])
 
     def test_the_phone_reads_each_agent_s_role(self):
+        """And each agent's spelling, where the owner gave one, on the phone and on the Mac (owner feature
+        agent_spelling), with the feature name that tells an app to read it. Bugs: a view leaves it out, and that app
+        shows "deva"; it gives null for an agent with none, which the agreed views leave out; or it gives a value that
+        a team.json written by hand holds and that is no spelling of the name ("Nova" for seo), or the name in small
+        letters, which is no spelling either."""
+        self.assertEqual(self.respell("deva", "DeVa")[0], 200)
+        hub.TEAM["agents"]["seo"]["spelling"] = "Nova"          # the running team of a hand edit: the board says it
+        hub.TEAM["agents"]["big"]["spelling"] = "big"
         code, data = self.request("/ui/mobile?db=test-generation")
         self.assertEqual(code, 200, data)
         roles = {a["name"]: a["title"] for a in data["agents"]}
         self.assertEqual((roles["seo"], roles["deva"]), ("SEO Expert", None))
+        code, state = self.request("/ui/state?db=test-generation")
+        self.assertEqual(code, 200, state)
+        for view in (data, state):
+            said = {a["name"]: a for a in view["agents"]}
+            self.assertEqual((said["deva"].get("spelling"), "spelling" in said["seo"], "spelling" in said["big"]),
+                             ("DeVa", False, False))
+            self.assertIn("agent_spelling", view["ui_features"])
 
 
 if __name__ == "__main__":

@@ -146,6 +146,7 @@ class Rename(Servers):
         team["agents"]["vps"]["reports_to"] = "scout"
         team["chat_apps"] = {"wa-scout": {"app": "whatsapp", "label": "Scout", "agents": ["scout"],
                                           "unknown": "ignore", "enabled": True}}
+        team["agents"]["scout"]["spelling"] = "Scout"           # the owner's spelling of the old name
         self.write_team(json.loads(json.dumps(team)))           # the hub's own copy, which the rename changes
         before, profile = self.head(), self.show("profiles/scout.md")
         # While git gives no answer for its profile, or for one at the new name, the rename waits and commits nothing:
@@ -157,13 +158,16 @@ class Rename(Servers):
             self.assertEqual((status, answer.get("code"), answer.get("names")), (503, "profile_unread",
                                                                                  {"agent": shown}), answer)
         self.assertEqual(self.head(), before)
-        status, receipt = self.rename()
+        status, receipt = self.rename(spelling="NoVa")
         self.assertEqual(status, 200, receipt)
-        self.assertEqual({k: receipt[k] for k in ("agent", "was", "server", "replayed")},
-                         {"agent": "nova", "was": "scout", "server": "box", "replayed": False})
+        self.assertEqual({k: receipt[k] for k in ("agent", "was", "server", "replayed", "spelling")},
+                         {"agent": "nova", "was": "scout", "server": "box", "replayed": False, "spelling": "NoVa"})
         after = self.origin_team()
         self.assertEqual(list(after["agents"]), [("nova" if n == "scout" else n) for n in team["agents"]])
-        self.assertEqual(after["agents"]["nova"], dict(team["agents"]["scout"], user="fleet-scout"))
+        # The new spelling takes the old one's place (owner feature agent_spelling). Bug: "Scout" stays, which is no
+        # spelling of nova, or the new one is lost and the apps show "nova".
+        self.assertEqual(after["agents"]["nova"], dict({k: v for k, v in team["agents"]["scout"].items()
+                                                        if k != "spelling"}, user="fleet-scout", spelling="NoVa"))
         self.assertEqual(after["agents"]["vps"]["reports_to"], "nova")
         self.assertEqual(after["chat_apps"]["wa-scout"]["agents"], ["nova"])
         self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-list", "--count", f"{before}..main"), "1")
@@ -171,7 +175,11 @@ class Rename(Servers):
         files = git("--git-dir", str(self.root / "origin.git"), "diff", "--no-renames", "--name-status", before, "main").split("\n")
         self.assertEqual(sorted(f.split()[-1] for f in files), ["profiles/nova.md", "profiles/scout.md", "team.json"])
         self.assertTrue(profile.startswith("# Profile: scout\n"))
-        self.assertEqual(self.show("profiles/nova.md"), profile.replace("# Profile: scout", "# Profile: nova", 1))
+        # its title takes the new spelling; a title with capitals takes them as the apps write them, not "Web-dev"
+        self.assertEqual(self.show("profiles/nova.md"), profile.replace("# Profile: scout", "# Profile: NoVa", 1))
+        self.assertEqual((hub.renamed_profile(b"# Profile: Scout\nx", "scout", "web-dev"),
+                          hub.renamed_profile(b"# Profile: scout\nx", "scout", "web-dev")),
+                         (b"# Profile: Web-Dev\nx", b"# Profile: web-dev\nx"))
         self.assertEqual(sorted(hub.agents()), sorted(after["agents"]))
         self.assertEqual(receipt["sha256"], self.team_sha())
 
@@ -347,23 +355,70 @@ class Rename(Servers):
         self.assertEqual((again[0], again[1]["job"], again[1]["replayed"]), (200, first[1]["job"], True))
         self.assertEqual(self.count("server_jobs"), 2)          # the install and one rename
 
+    def test_the_same_name_with_a_new_spelling_changes_only_the_spelling(self):
+        """The owner, 25 November 2026: "it doesn't let me use upper case the first letter of the bot! then everywhere
+        it ends up showing lowercase". The name stays the id; a rename to the same name with a spelling commits that
+        spelling alone: for the manager too, while the agent has an open task, and while its server is silent, since
+        no record, file, key, job or session moves. Bugs: the route refuses it as "has this name already", or it runs
+        a rename (a job, revoked sessions, moved records) for a change of capitals."""
+        task = hub.ins("INSERT INTO tasks(title,owner,requester,state) VALUES('t','manager','scout','working')")
+        hub.q("UPDATE server_status SET reported=reported-601 WHERE server='box'")
+        plant("session_credentials", "agent", "scout")
+        hub.q("INSERT OR IGNORE INTO agent_keys(agent,sha256,created,source) VALUES('scout',?,0,'enrolled')", ("a" * 64,))
+        key = "SELECT agent, sha256 FROM agent_keys WHERE agent='scout'"
+        jobs, keys = self.count("server_jobs"), [tuple(r) for r in hub.q(key)]
+        before, team = self.head(), self.origin_team()
+        status, receipt = self.rename(name="scout", spelling="ScOut")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual({k: receipt[k] for k in ("agent", "was", "server", "job", "spelling")},
+                         {"agent": "scout", "was": "scout", "server": None, "job": None, "spelling": "ScOut"})
+        self.assertEqual(self.origin_team(), dict(team, agents=dict(team["agents"], scout=dict(team["agents"]["scout"],
+                                                                                              spelling="ScOut"))))
+        files = git("--git-dir", str(self.root / "origin.git"), "diff", "--name-only", before, "main").split()
+        self.assertEqual((files, receipt["revision"]), (["team.json"], self.head()))
+        # no job, and its key stays: a rename takes the key back
+        self.assertEqual((self.count("server_jobs"), [tuple(r) for r in hub.q(key)], len(keys)), (jobs, keys, 1))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM session_credentials WHERE agent='scout' AND revoked IS NULL")["n"],
+                         1)
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (task,))["state"], "working")
+        # the same spelling again is the name that it has; a spelling of another name is refused
+        for spelling, status, words in (("ScOut", 409, "ScOut has this name already."),
+                                        ("Nova", 400, "spelling must be the name scout")):
+            code, answer = self.rename(name="scout", spelling=spelling)
+            self.assertEqual(code, status, answer)
+            self.assertIn(words, answer["error"])
+        # The name in small letters is no spelling: it takes the kept one away, and the name with a capital is back.
+        # Bug: the hub keeps "scout" and shows it in small letters everywhere, the owner's own complaint.
+        status, receipt = self.rename(name="scout", spelling="scout")
+        self.assertEqual((status, receipt.get("spelling"), "spelling" in self.origin_team()["agents"]["scout"]),
+                         (200, None, False), receipt)
+        code, answer = self.rename(name="scout", spelling="scout")
+        self.assertEqual((code, answer.get("error")), (409, "Scout has this name already."))
+        status, receipt = self.rename("manager", "manager", spelling="MANAGER")
+        self.assertEqual((status, receipt.get("job"), self.origin_team()["agents"]["manager"]["spelling"]),
+                         (200, None, "MANAGER"), receipt)
+
     def test_a_rename_that_stopped_is_given_again_by_the_command_that_gives_an_install_again(self):
         job = self.rename()[1]["job"]
         self.job("box", job, "failed", "service", "The service of scout did not stop.")
-        status, again = self.add_agent("box", "nova", "codex")
+        status, again = self.add_agent("box", "nova", "codex", spelling="NoVa")
         self.assertEqual(status, 200, again)
         self.assertNotEqual(again["job"], job)
+        # the job again, and nothing else: no spelling that the rename did not give (add_server_agent)
+        self.assertEqual((again["spelling"], "spelling" in self.origin_team()["agents"]["nova"]), (None, False))
         shown = self.service("/server/box/jobs", source=OTHER)[1]["jobs"]
         self.assertEqual([(j["kind"], j["agent"], j["was"]) for j in shown], [("rename", "nova", "scout")])
         self.assertEqual(self.add_agent("box", "nova", "claude")[0], 409)    # another agent, not the same job again
 
     def test_on_a_mac_the_agent_keeps_the_one_user_of_its_server(self):
         self.joined()                                                       # mini, a Mac
-        self.assertEqual(self.add_agent(agent="piper")[0], 200)
+        self.assertEqual(self.add_agent(agent="piper", spelling="Piper")[0], 200)
         self.job("mini", self.servers()[1]["mini"]["job"]["id"], "done", "sign_in", source=NEW)
         status, receipt = self.rename("piper", "ace")
         self.assertEqual(status, 200, receipt)
         self.assertNotIn("user", self.origin_team()["agents"]["ace"])
+        # a rename with no spelling keeps none: "Piper" is no spelling of ace (owner feature agent_spelling)
+        self.assertNotIn("spelling", self.origin_team()["agents"]["ace"])
         self.assertNotIn("user", self.service("/server/mini/jobs", source=NEW)[1]["jobs"][0])
 
     def test_refusals(self):
@@ -374,12 +429,14 @@ class Rename(Servers):
         refused(404, "no such agent", "nobody")
         refused(409, "The manager keeps its name.", "manager", "boss")
         refused(409, "Scout has this name already.", name="scout")
-        refused(409, "An agent named studio exists.", name="studio")
+        refused(409, "An agent named Studio exists.", name="studio")
         hub.q("INSERT INTO agents(name) VALUES('gone')")                   # an agent removed by hand
-        refused(409, "An agent named gone was in this fleet before", name="gone")
+        refused(409, "An agent named Gone was in this fleet before", name="gone")
         for name in ("Nova", "n", "owner", "hub", "nova\n", 5):
             self.assertEqual(self.rename(name=name)[0], 400, name)
         self.assertEqual(self.rename(extra="x")[0], 400)
+        for spelling in ("Scout", "NOVA ", "Nov4", 5):       # a spelling is the new name with other capitals only
+            self.assertEqual(self.rename(spelling=spelling)[0], 400, spelling)
         code, conflict = self.rename(base="0" * 64)
         self.assertEqual((code, conflict["sha256"]), (409, self.team_sha()))
         refused(409, "vps runs no Founderizer service", "vps", "vega")     # a machine from before servers
@@ -401,7 +458,7 @@ class Rename(Servers):
         git("push", "-q", "origin", "HEAD:main", cwd=work)
         git("pull", "-q", "--ff-only", cwd=self.kit)
         hub._revision_cache.update(at=0.0, value=None)
-        refused(409, "A profile for nova is in the fleet already.")
+        refused(409, "A profile for Nova is in the fleet already.")
         status, receipt = self.rename(name="vega")
         self.assertEqual(status, 200, receipt)
         refused(409, "box renames scout to vega now", "vega", "rigel")     # one job at a time on a server
@@ -415,7 +472,7 @@ class Rename(Servers):
         self.job("mini", self.servers()[1]["mini"]["job"]["id"], "failed", "sign_in", source=NEW)
         code, answer = self.rename("piper", "ace")
         self.assertEqual(code, 409, answer)
-        self.assertIn("The install of piper stopped. Try it again before you rename it.", answer["error"])
+        self.assertIn("The install of Piper stopped. Try it again before you rename it.", answer["error"])
 
     def test_an_install_that_stopped_at_its_sign_in_is_done_once_a_later_sign_in_ended_done(self):
         """Two DevOps agents, 3 November 2026: each install stopped at its sign-in, the owner signed the
@@ -456,7 +513,22 @@ class Rename(Servers):
 
     def test_team_json_takes_no_agent_named_owner_or_hub_and_no_name_with_a_final_newline(self):
         """The audit of 7 November 2026: `$` let "scout\\n" through every AGENT_NAME.match, and team.json took an
-        agent named "owner" or "hub", which only the rename route refused."""
+        agent named "owner" or "hub", which only the rename route refused. And a spelling is the name with other
+        capitals, or absent (owner feature agent_spelling): a team.json written by hand with another one is refused,
+        so that no app shows another agent's name. The Kelvin sign is "k" in small letters, and no letter of a name."""
+        for spelling in ("ScOut", "SCOUT", "scout"):
+            good = json.loads(json.dumps(hub.TEAM))
+            good["agents"]["scout"]["spelling"] = spelling
+            hub.validate_team(good)
+        for spelling in ("Nova", "Scout ", "", None, 5, "Sco-ut"):
+            bad = json.loads(json.dumps(hub.TEAM))
+            bad["agents"]["scout"]["spelling"] = spelling
+            with self.assertRaisesRegex(ValueError, "agent scout: spelling must be its name", msg=spelling):
+                hub.validate_team(bad)
+        self.assertEqual((hub.spelling_fits("kai", "\u212aai"), hub.spelling_fits("kai", "KAI")), (False, True))
+        # the name in small letters passes, and is no spelling: the name with a capital stays
+        self.assertEqual((hub.agent_spelling("scout", {"scout": {"spelling": "scout"}}),
+                          hub.agent_name("scout", {"scout": {"spelling": "scout"}})), (None, "Scout"))
         for name in ("owner", "hub", "scout\n"):
             bad = json.loads(json.dumps(hub.TEAM))
             bad["agents"][name] = bad["agents"].pop("scout")
@@ -535,6 +607,7 @@ class Columns(unittest.TestCase):
         "takeover_tries:": "a take-over's stop (an event)", "takeover_told:": "the owner's held answer (an event)",
         "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_name_who:": "a KPI's standing item (lanes/agent-kpis.md)",
+        "kpi_link_step:": "a KPI's standing item (lanes/agent-kpis.md)",
         "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):

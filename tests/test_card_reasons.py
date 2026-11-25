@@ -590,7 +590,34 @@ class Reasons(OwnerAPI):
         said = self.refused("dev (write) holds the GitHub repository acme/web", reason="access",
                             needs_access="repo:acme/web")
         self.assertIn("create_task", said)
+        # owner feature pool_default: the default gives a repository up to write, so deploy stays the owner's
         self.assertIsInstance(self.card(reason="access", needs_access="repo:acme/web", needs_level="deploy"), int)
+        give = dict(title="Let Ivy deploy acme/web", why="Its release deploys acme/web.", what_to_do=None,
+                    options=None, reason="access", needs_access="repo:acme/web", needs_agent="ivy")
+        # A Give card at a level that stays the owner's: deploy, above the default's write, whose name the card's words
+        # carry as Give asks.
+        nid = self.card(**give, needs_level="deploy")
+        self.assertIsInstance(nid, int, nid)
+        hub.q("DELETE FROM needs WHERE id=?", (nid,))
+        # What the default gives is the manager's own give, to the agent that the card names (dev holds read here).
+        # Bug: the refusal names no agent, and the manager guesses one.
+        hub.TEAM["agents"]["dev"]["repos"] = {"acme/web": "read"}
+        self.refused('is yours to give: grant_access(agent="ivy", resource="repo:acme/web", level="write")', **give,
+                     needs_level="write")
+        hub.TEAM["agents"]["dev"]["repos"] = {"acme/web": "write"}
+        # What the owner keeps: the named agent's own lower hold is no refusal, so its level change is one Give at the
+        # higher level. Another agent's hold at the needed level refuses the card, with or without needs_agent, and
+        # names that agent, which does that part of the work (the owner, 29 October 2026). Bugs: Ivy's own read
+        # refuses its card for deploy; or a Give card goes up while dev holds the level that it asks for.
+        hub.TEAM["resources"] = {"repo:acme/web": {"owner": True}}
+        hub.TEAM["agents"]["ivy"]["repos"] = {"acme/web": "read"}
+        nid = self.card(**give, needs_level="deploy")
+        self.assertIsInstance(nid, int, nid)
+        hub.q("DELETE FROM needs WHERE id=?", (nid,))
+        self.refused("dev (write) holds", **give, needs_level="write")
+        self.refused("dev (write) holds", reason="access", needs_access="repo:acme/web", needs_level="write")
+        del hub.TEAM["agents"]["ivy"]["repos"]
+        hub.TEAM["resources"] = {}
         hub.TEAM["agents"]["dev"]["repos"] = {"Acme/Web": "write"}            # a name in another case is the same
         self.refused("holds the GitHub repository", reason="access", needs_access="repo:acme/web")
         self.refused("not one thing that the fleet's record names", reason="access",

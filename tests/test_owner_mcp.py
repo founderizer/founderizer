@@ -502,9 +502,14 @@ class FromNothing(WithServer):
 
         # 4. An agent on it: one commit of team.json and its profile, and the install job.
         made = client.call("add_agent", server="mini", agent="scout", runtime="claude", role="worker",
-                           reports_to="manager")
+                           reports_to="manager", spelling="ScOut")
         self.assertEqual((made["agent"], made["server"], made["runtime"]), ("scout", "mini", "claude"))
         self.assertEqual(self.origin_team()["agents"]["scout"]["machine"], "mini")
+        # the name as the owner typed it reaches the hub (owner feature agent_spelling), and the overview gives it, so
+        # that the client names the agent as the owner reads it. Bugs: the tool drops the field, or the overview does
+        self.assertEqual(self.origin_team()["agents"]["scout"]["spelling"], "ScOut")
+        listed = {a["name"]: a for a in client.call("fleet_overview")["agents"]}
+        self.assertEqual((listed["scout"].get("spelling"), "spelling" in listed["manager"]), ("ScOut", False))
         self.assertEqual(self.origin_team()["agents"]["scout"]["active"], False)
         self.assertIn("scout", [p["agent"] for p in client.call("fleet_read", page="profiles")["profiles"]])
         with_agent = {s["name"]: s for s in client.call("fleet_read", page="servers")["servers"]}["mini"]
@@ -516,7 +521,7 @@ class FromNothing(WithServer):
         #    itself. The refusal says what is still missing, so the agent can see it and act on it.
         with self.assertRaises(Refused) as caught:
             client.call("activate_agent", agent="scout", active=True)
-        self.assertIn("Scout cannot be activated yet.", str(caught.exception))
+        self.assertIn("ScOut cannot be activated yet.", str(caught.exception))     # by the owner's spelling
         left = json.loads(str(caught.exception).split("\n", 1)[1])["missing"]
         self.assertEqual({item["kind"] for item in left}, {"machine", "check"})
         self.assertIn("Check this server", " ".join(item["detail"] for item in left))
@@ -4262,7 +4267,8 @@ PARITY_NO_REFUSAL = ("/ui/vault",)
 
 
 def parity_state(db):
-    return {"db": db, "time": 1763078400, "ui_features": sorted(set(owner_mcp.FEATURES.values())),
+    return {"db": db, "time": 1763078400, "ui_features": sorted(set(owner_mcp.FEATURES.values()) |
+                                                                set(owner_mcp.FIELD_FEATURES.values())),
             "manager_warning": None,
             "agents": [{"name": "manager", "role": "manager", "runtime": "claude", "active": True, "secret": "x"}],
             "tasks": [{"id": 1, "title": "Write the page", "state": "working", "owner": "worker-1"},
@@ -5502,6 +5508,11 @@ class Table(unittest.TestCase):
             self.assertIn(feature, hub.UI_FEATURES, name)
             self.assertIn(table[name]["kind"], self.TABLE_KINDS, name)
             self.assertEqual(table[name]["feature"], feature)
+        # and each field's feature (field_ready): a name that no hub lists refuses that field on every hub
+        for field, feature in owner_mcp.FIELD_FEATURES.items():
+            self.assertIn(feature, hub.UI_FEATURES, field)
+        self.assertEqual({name: t["field_features"] for name, t in table.items() if "field_features" in t},
+                         {"add_agent": {"spelling": "agent_spelling"}, "rename_agent": {"spelling": "agent_spelling"}})
 
     def test_the_marked_reads_are_the_reads(self):
         for t in owner_mcp.dump_tools()["tools"]:
@@ -5688,6 +5699,35 @@ class Table(unittest.TestCase):
         owner_mcp.GENERATION["db"] = None
         self.assertEqual(held, [("GET", False), ("POST", True), ("GET", False)])
         self.assertEqual(stat.S_IMODE(home.stat().st_mode) & 0o077, 0)
+
+    def test_a_field_that_an_older_hub_would_drop_is_refused_before_any_command(self):
+        """The spelling of a name (owner feature agent_spelling): a hub from before it drops the field from Add agent
+        with a 200 and no word, so the tool says so first, in plain words, and sends nothing. The hub's features come
+        with the read of its generation, read again once before a refusal. Bugs: the tool sends the add, and the agent
+        shows the name with a capital where the owner typed another spelling; or a hub that took the release while
+        this server ran is still refused."""
+        sent, features = [], [[], []]
+
+        def call(method, path, body=None, **_kw):
+            sent.append((method, path))
+            if path == owner_mcp.STATE_HEAD:
+                return owner_mcp.Answer(200, {"db": "g1", "ui_features": features.pop(0)}, b"", {})
+            return owner_mcp.Answer(200, {"ok": True}, b"", {})
+        add = {t["name"]: t for t in owner_mcp.tools()}["add_agent"]["run"]
+        args = {"server": "mini", "agent": "scout", "runtime": "claude", "role": "worker", "spelling": "ScOut",
+                "base_sha256": "0" * 64}
+        owner_mcp.GENERATION.update(db=None, features=None)
+        with patch.object(owner_mcp, "call", call), \
+                patch.object(owner_mcp, "HOME", pathlib.Path(tempfile.mkdtemp(prefix="fleet-field-"))) as home:
+            self.addCleanup(shutil.rmtree, str(home), True)
+            with self.assertRaises(owner_mcp.Refused) as caught:
+                add(args)
+            self.assertIn("This hub keeps no spelling of an agent's name yet", str(caught.exception))
+            self.assertEqual(sent, [("GET", owner_mcp.STATE_HEAD)] * 2)       # read again once, and no command
+            features[:] = [["agent_spelling"]]                                 # the hub took the release
+            self.assertEqual(add(args), {"ok": True})
+        owner_mcp.GENERATION.update(db=None, features=None)
+        self.assertEqual([m for m, _ in sent], ["GET", "GET", "GET", "POST"])
 
     def test_a_folder_that_cannot_lock_sends_the_command_with_no_lock(self):
         scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-nolock-"))

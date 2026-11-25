@@ -64,7 +64,9 @@ FAMILIES = (
     ("grok-4.5", "xai", "grok-4.5"),
     ("grok-4.3", "xai", "grok-4.3"),
     ("grok-4.20", "xai", "grok-4.20-0309-reasoning"),
-    ("grok-build", "xai", "grok-build-0.1"),
+    # a stand-in for xAI's own price: the list's xai entry dropped grok-build-0.1 on 25 November 2026, and OpenCode
+    # Zen, like nine other sellers, lists it at the same price
+    ("grok-build", "opencode", "grok-build-0.1"),
     # The open models, at the sellers of several makers
     ("deepseek", "opencode-go", "deepseek-v4-pro"),
     ("deepseek-v4.1-flash", "opencode-go", "deepseek-v4.1-flash"),

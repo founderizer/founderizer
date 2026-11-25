@@ -3,6 +3,7 @@ owner's one step that takes a hold back. The grant is the authorization (the own
 held back for the owner afterwards and the record is the control. In-process hub and temporary Git repositories; no
 helper, vault, GitHub, Google or AI call. No secret value anywhere: a secret is its bws:// reference and
 its name."""
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import subprocess
@@ -805,7 +806,8 @@ class Resources(OwnerAPI):
     def test_give_on_a_card_gives_its_repository_at_the_press_and_never_lowers_a_level(self):
         """The owner's press of Give is the grant: one real commit of team.json before his answer, and the manager
         reads what it gave. No gives nothing, a replay gives nothing twice, and a level that the agent holds already,
-        higher than the card's, stays."""
+        higher than the card's, stays. Since pool_default a Give card is for what stays the owner's: what he keeps, a
+        level above his own, also of a thing that another agent holds; and the manager's own give is no card."""
         nid = self.give_card()
         self.assertIsInstance(nid, int, nid)
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
@@ -851,9 +853,7 @@ class Resources(OwnerAPI):
         self.assertEqual(self.request(f"/ui/needs/{third}", self.command(choice=0))[0], 200)
         self.assertEqual(self.committed()["agents"]["lead"]["repos"], {"acme/docs": "deploy"})
         # what one press cannot give is refused before it reaches the owner
-        for fields, words in ((dict(needs_access=f"secret:{KEY}"), "or one gmail:, drive: or tool: alone"),
-                              (dict(needs_access=f"secret:{KEY}", needs_level="use"),    # its kind before its level
-                               "or one gmail:, drive: or tool: alone"),
+        for fields, words in ((dict(needs_access=f"secret:{KEY}"), "needs_level must be one of use, read"),
                               (dict(needs_agent="nobody"), "there is no agent nobody"),
                               (dict(needs_agent="manager"), "manager is not one now"),
                               (dict(needs_level="admin"), "the level that Give gives"),
@@ -865,6 +865,64 @@ class Resources(OwnerAPI):
                 said = self.give_card(**fields)
                 self.assertIsInstance(said, str)
                 self.assertIn(words, said)
+        def raw(**fields):      # the manager's own item, with no "Only you" before it, which give_card presses
+            said, error = hub.call_tool("manager", "raise_needs_you", dict(
+                {"title": "Let Dev write to acme/web", "why": "Its fix needs a push to acme/web.", "reason": "access",
+                 "needs_access": "repo:acme/web", "needs_level": "write", "needs_agent": "dev", "options": ["No"]},
+                **fields))
+            return said if error else int(said.split("N-")[1].split(".")[0])
+        # A key that the default gives is the manager's own give to the agent that the card names. Bug: the refusal
+        # sends the manager to write the owner's steps, also for a key that it gives itself (N-300, N-313).
+        self.assertIn(f'is yours to give: grant_access(agent="dev", resource="secret:{LOGIN}", level="use")',
+                      raw(needs_access=f"secret:{LOGIN}", needs_level="use"))
+        # A key that the owner keeps (give_card kept DEPLOY_KEY above): the central vault seals it only by the owner's
+        # Mac's signed grant, and a press of Give signs nothing. Bug: a Give of a key that answers as given while no session of the
+        # agent gets it.
+        self.assertIn("The secret DEPLOY_KEY is a key or a login, whose grant the owner's Mac signs, so Give does not "
+                      "give it: leave needs_agent out.",
+                      self.give_card(needs_access=f"secret:{KEY}", needs_level="read"))
+        # The owner's own level, write, keeps deploy theirs: a Give card for deploy, whose press gives exactly that
+        # level.
+        self.stand("repo:acme/web", {"max": "write"})
+        deploy = self.give_card(title="Let Dev deploy acme/web", why="Its release deploys acme/web.",
+                                needs_level="deploy")
+        self.assertIsInstance(deploy, int, deploy)
+        self.assertEqual(self.request(f"/ui/needs/{deploy}", self.command(choice=0))[0], 200)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "deploy"})
+        # What the owner keeps and another agent holds at the needed level is no card: that agent does that part of the
+        # work (the owner, 29 October 2026: asked only for what no agent holds), and so does the named agent with its
+        # own hold. Bug: a Give card goes up while dev holds deploy, a card that the owner need not answer.
+        self.keep("repo:acme/web")
+
+        def reached():      # the fleet's GitHub App reaches acme: with none, each card for a repository goes up
+            stack = ExitStack()
+            stack.enter_context(patch.object(hub, "github_app", lambda: ("7", "key")))
+            stack.enter_context(patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
+                "pages": {}, "all": {"acme"}, "repos": set(), "install": None}}))
+            return stack
+        with reached():
+            self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web",
+                          self.give_card(title="Let Shopper write to acme/web", needs_agent="shopper"))
+            self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web", self.give_card())
+        # A repository whose commits the door checks. Bug: Give writes a grant that lets a session commit around the
+        # door's checks (.github/**, policy.hujson): of one that an Operator holds (lead, with a server), raised before
+        # or after that, or of one that the door made, at deploy or to an Operator (new-projects plan N3).
+        api = dict(title="Let Dev write to acme/api", why="Its fix needs acme/api.", needs_access="repo:acme/api")
+        early = raw(**api)
+        self.assertIsInstance(early, int, early)
+        hub.TEAM["agents"]["lead"].update(servers={"web-1": "fix"}, repos={"acme/api": "write"})
+        words = ("The door checks each commit to acme/api, which it syncs to a server or which an Operator holds, so "
+                 "Give does not give it")
+        self.assertIn(words, raw(**api))
+        code, said = self.request(f"/ui/needs/{early}", self.command(choice=0))
+        self.assertEqual((code, said.get("code")), (409, "request_answered"), said)
+        self.assertIn(words, hub.q1("SELECT answer FROM needs WHERE id=?", (early,))["answer"])
+        self.assertNotIn("acme/api", self.committed()["agents"]["dev"]["repos"])
+        with patch.object(hub, "door_made", lambda repo: repo == "acme/new"):
+            new = dict(title="Let Dev deploy acme/new", why="Its release needs acme/new.", needs_access="repo:acme/new")
+            self.assertIn("The door made acme/new: nobody gets deploy there", raw(**new, needs_level="deploy"))
+            self.assertIn("Lead holds a server through the door, so Give does not give it",
+                          raw(**dict(new, title="Let Lead write to acme/new", needs_agent="lead")))
 
     def test_a_give_card_for_several_repositories_closes_by_itself_once_given_another_way(self):
         """And a card for a mailbox, once the owner gave it on its own page (F6 piece 2). Believable bug: a card that

@@ -34,11 +34,11 @@ credit, and section 4 of the license says how a copy that you share keeps them. 
 repository is under this license, including the versions that we published earlier under the Functional Source
 License (FSL-1.1-ALv2) or with no license file.
 
-**The name.** The name Founderizer and its logo belong to Amura Ventures SL, and the license gives no right to use
+**The name.** The name Founderizer and its logo belong to Azimut Ventures SL, and the license gives no right to use
 them (section 6). You can say that your work is based on Founderizer. A changed copy that you share uses a different
 name and a different logo.
 
 **Changes from outside.** Issues and pull requests are welcome. [CONTRIBUTING.md](.github/CONTRIBUTING.md) says how a
 change gets in, and how to test it before you send it.
 
-**Credit.** Created by Miguel Pieras, <https://x.com/mpieras>. Copyright 2026 Amura Ventures SL.
+**Credit.** Created by Miguel Pieras, <https://x.com/mpieras>. Copyright 2026 Azimut Ventures SL.

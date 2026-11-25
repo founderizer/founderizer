@@ -423,6 +423,67 @@ class Parents(Kpis):
         self.assertNotEqual(now["setup_task"], setup["id"])
 
 
+    def test_an_accepted_setup_links_its_kpi_and_an_old_one_gives_the_parent_a_step(self):
+        """A KPI's setup task that finished with a check is accepted only once its KPI is linked, and the link accepts
+        it; one accepted with no link gives its parent one step "Link <name>", and the parent's start names each such
+        KPI. Protects against the gap of 22 and 23 November 2026: ten setups with working checks were accepted in the
+        owner's fleet, none was linked, and 22 of 24 KPIs got no value."""
+        def check(who, tid, ok=True):       # in the session of the lead's team-results task, which holds the setup
+            session = hub.q1("SELECT parent FROM tasks WHERE id=?", (tid,))["parent"] or self.tasks[who]
+            return hub.call_tool(who, "check_result", {"task_id": hub.tref(tid), "accepted": ok},
+                                 ("test-generation", hub.tref(session), 1))
+        accepted = lambda r: hub.q1("SELECT accepted FROM tasks WHERE id=?", (r["setup_task"],))["accepted"]
+        steps = lambda: [tuple(t) for t in hub.q("SELECT owner, title FROM tasks WHERE title LIKE 'Link %'")]
+
+        def daily():
+            for _ in range(2):              # a second pass gives no second step
+                with hub.transaction():
+                    hub.kpi_daily_rows(self.clock)
+        r, _ = self.set_kpi("lead", "hand")
+        rule = self.rule("hand", saved_in=r["setup_task"])
+        self.end(r["setup_task"])
+        self.assertIn(f'set_kpi(id="{hub.iref(r["id"])}", check={rule["id"]}, how=', hub.kpi_parent_text("lead"))
+        text, err = check("lead", r["setup_task"])
+        self.assertTrue(err, text)
+        self.assertIn(f'set_kpi(id="{hub.iref(r["id"])}", check={rule["id"]}, how=', text)
+        self.assertIsNone(accepted(r))
+        daily()                             # finished and not checked: the start names it, and no step comes
+        self.assertEqual(steps(), [])
+        self.link("lead", r, rule)
+        self.assertEqual(accepted(r), 1)
+        self.assertNotIn(hub.iref(r["id"]), hub.kpi_parent_text("lead"))
+        self.assertFalse(check("lead", r["setup_task"])[1])         # linked: accepted as always
+        # a setup that failed, or that saved no rule (its source holds no data yet), is checked as always
+        failed, _ = self.set_kpi("lead", "hand", name="Drafts kept")
+        self.rule("hand", saved_in=failed["setup_task"])
+        hub.q("UPDATE tasks SET state='failed', delivered=? WHERE id=?", (self.clock, failed["setup_task"]))
+        self.assertFalse(check("lead", failed["setup_task"])[1])
+        empty, _ = self.set_kpi("lead", "hand", name="Drafts read")
+        self.end(empty["setup_task"])
+        self.assertFalse(check("lead", empty["setup_task"])[1])
+        # one accepted before this rule gives its parent one step at the daily pass, and none while kpis is off
+        back, _ = self.set_kpi("lead", "sublead", name="Team drafts")
+        self.rule("sublead", saved_in=back["setup_task"])
+        self.end(back["setup_task"])
+        self.assertFalse(check("lead", back["setup_task"], ok=False)[1])         # given back: no refusal
+        self.assertNotIn(hub.iref(back["id"]), hub.kpi_parent_text("lead"))       # and no line: its new setup comes
+        hub.q("UPDATE tasks SET accepted=1 WHERE id=?", (back["setup_task"],))
+        hub.TEAM["settings"]["kpis"] = False
+        daily()
+        self.assertEqual(steps(), [])
+        hub.TEAM["settings"]["kpis"] = True
+        daily()
+        self.assertEqual(steps(), [("lead", "Link Team drafts")])
+        # a link that its rule's deletion removed later is no gap of the setup: its own step names who measures
+        hub.TEAM["settings"]["kpis"] = False
+        hub.q("UPDATE tasks SET state='completed', accepted=NULL WHERE id=?", (failed["setup_task"],))
+        self.assertFalse(check("lead", failed["setup_task"])[1])            # kpis off: checked as always
+        hub.TEAM["settings"]["kpis"] = True
+        with hub.transaction():
+            hub.kpi_unlink_rows(rule["id"], "Its rule was deleted.", self.clock)
+        daily()
+        self.assertEqual(steps(), [("lead", "Link Team drafts"), ("lead", "Link Drafts kept")])
+
 class Steps(Kpis):
     def linked(self, agent, parent="lead"):
         r, _ = self.set_kpi(parent, agent, measured_by=parent if hub.shell_off(agent) else None)

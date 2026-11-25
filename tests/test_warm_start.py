@@ -615,14 +615,27 @@ class WarmStart(Capacity):
         text they were installed with is the same sentence for every worker."""
         hub.TEAM["agents"]["deva"].update(repos={"acme/api-node": "write"}, tools=["github"])
         hub.TEAM["agents"]["big"].update(google={"drive": {"account": "a@b.com", "level": "write"}})
+        # The owner's spelling of a name (owner feature agent_spelling) follows the id that the tools take, where it is
+        # not the capital that RULES.md asks for anyway. Bug: an agent writes "Deva" to a person who reads "DeVa" in the
+        # owner's apps, or the id leaves the line and message_agent gets a name that it does not take.
+        hub.TEAM["agents"]["deva"]["spelling"] = "DeVa"
+        hub.TEAM["agents"]["big"]["spelling"] = "Big"
+        # A team.json written by hand that the hub runs from its start says its rule on the board and still runs:
+        # a spelling of another name there names nobody, or pma reads as "Nova" everywhere
+        hub.TEAM["agents"]["pma"]["spelling"] = "Nova"
+        # and the agent's own spelling, in this block of the task and not in its cached start
+        hub.TEAM["agents"]["seo"]["spelling"] = "SeO"
         said = hub.start_text("seo", self.first)
         self.assertIn("YOUR TEAM, from the fleet's own record and not from profiles:", said)
         self.assertIn("pma [lead, Codex] -- it gives you your tasks:", said)         # its requester, marked
-        self.assertIn("deva [worker, Codex] -- your peer: expertise development; GitHub "      # both report to pma
-                      "acme/api-node (write); MCP servers github", said)
+        self.assertIn("deva, written DeVa [worker, Codex] -- your peer: expertise development; GitHub "  # both report
+                      "acme/api-node (write); MCP servers github", said)                                # to pma
         self.assertIn("big [worker, Codex]: Drive at the level write", said)
         self.assertIn("manager [manager, Claude Code]", said)
         self.assertNotIn("seo (SEO Expert)", said)                                  # never itself
+        own = "The owner writes your name as SeO: write it so to people."
+        self.assertIn(own, hub.task_start_text("seo", self.first))
+        self.assertNotIn("writes your name", hub.task_start_text("big", self.first))    # "Big": the plain capital
         # And the two routes to a colleague, by use. message_agent is named in no worker start text today, which
         # is why a worker that needed a colleague's repository had nothing to reach for.
         self.assertIn("name the thing in ask_my_requester's needs_access and say who you think holds it", said)

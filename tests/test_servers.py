@@ -268,9 +268,10 @@ class Servers(OwnerAPI):
         hub.TEAM = team
         return team
 
-    def add_agent(self, server="mini", agent="scout", runtime="claude", role="worker", reports_to=None, base=None):
+    def add_agent(self, server="mini", agent="scout", runtime="claude", role="worker", reports_to=None, base=None,
+                  **extra):
         return self.owner(f"/ui/servers/{server}/agents", base_sha256=base or self.team_sha(), agent=agent,
-                          runtime=runtime, role=role, reports_to=reports_to)
+                          runtime=runtime, role=role, reports_to=reports_to, **extra)
 
     @staticmethod
     def not_given(path):
@@ -815,18 +816,22 @@ class Servers(OwnerAPI):
     def test_add_agent_registers_it_with_its_profile_and_gives_the_server_a_job(self):
         self.joined()
         before = git("--git-dir", str(self.root / "origin.git"), "rev-parse", "main")
-        status, receipt = self.add_agent()
+        # The owner types the name with its capitals (owner feature agent_spelling, 25 November 2026): team.json keeps
+        # it beside the name, and the receipt gives it. Bug: the route drops it, and the apps show "scout" again.
+        status, receipt = self.add_agent(spelling="ScOut")
         self.assertEqual(status, 200, receipt)
+        self.assertEqual(receipt["spelling"], "ScOut")
         team = self.origin_team()
         self.assertEqual(team["agents"]["scout"], {     # a Mac's agent holds its desktop (hub.with_desktop)
             "start": "claude --permission-mode dontAsk {chrome} {settings} {prompt}",
             "allow": ["mcp__fleet__*", "mcp__claude-in-chrome__*"], "role": "worker", "machine": "mini",
             "runtime": "claude", "can": ["shell", "web", "browser", "screen"], "screen_command": hub.MAC_SCREEN_COMMAND,
-            "active": False, "vault": "none"})
+            "active": False, "vault": "none", "spelling": "ScOut"})
         files = git("--git-dir", str(self.root / "origin.git"), "diff", "--name-only", before, "main").split()
         self.assertEqual(sorted(files), ["profiles/scout.md", "team.json"])
         self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-list", "--count", f"{before}..main"), "1")
         profile = git("--git-dir", str(self.root / "origin.git"), "show", "main:profiles/scout.md")
+        self.assertTrue(profile.startswith("# Profile: ScOut\n"), profile[:40])          # its title: the spelling
         self.assertIn("**Responsible for.** Research, writing, code and files on its server.", profile)
         self.assertNotIn("browser", profile)
         self.assertEqual(hub.agents()["scout"]["machine"], "mini")
@@ -935,10 +940,19 @@ class Servers(OwnerAPI):
         self.assertEqual(self.add_agent(agent="hub")[0], 400)               # the hub signs its own messages
         self.assertEqual(self.add_agent(agent="scout\n")[0], 400)           # `$` let a final newline through
         self.assertEqual(self.add_agent(runtime="grok")[0], 400)
+        # A spelling is the name with other capitals, and nothing else (owner feature agent_spelling). Bug: the hub
+        # keeps "Nova" for scout, and the apps and the hub's words name scout as another agent.
+        for spelling in ("Nova", "Scout ", "Sc0ut", "Scout\n", "S", 5, ["Scout"]):
+            status, refused = self.add_agent(spelling=spelling)
+            self.assertEqual(status, 400, (spelling, refused))
+        self.assertIn("spelling must be the name scout with the capitals that you want, such as Scout", refused["error"])
         status, conflict = self.add_agent(base="0" * 64)
         self.assertEqual((status, conflict["sha256"]), (409, self.team_sha()))
         self.assertIsNone(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "scout"))    # no refusal above began anything
-        self.assertEqual(self.add_agent()[0], 200)
+        # The name in small letters is no spelling, and no fault either: an app may send its field's text as it is.
+        # Bug: team.json keeps "scout", and the hub shows the name in small letters everywhere.
+        self.assertEqual(self.add_agent(spelling="scout")[0], 200)
+        self.assertNotIn("spelling", self.origin_team()["agents"]["scout"])
         self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "scout"), "wait")     # it writes to the owner first, once
         self.assertEqual(self.add_agent(agent="second")[0], 409)            # busy, and it has an agent
 
@@ -1186,7 +1200,7 @@ class Servers(OwnerAPI):
         self.service(f"/server/mini/jobs/{job}", {"state": "failed", "step": "sign_in", "detail": "No sign-in."})
         status, refused = self.add_agent()
         self.assertEqual(status, 409, refused)
-        self.assertIn("an agent named scout exists", refused["error"])
+        self.assertIn("An agent named Scout exists.", refused["error"])
         status, again = self.prepare()
         self.assertEqual(status, 200, again)
         self.assertNotEqual(again["job"], job)

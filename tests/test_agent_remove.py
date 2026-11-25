@@ -283,7 +283,7 @@ class Remove(Servers):
         self.assertEqual(hub.q1("SELECT COUNT(*) c FROM tasks WHERE owner='scout'")["c"], 1)
         self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))
         status, answer = self.add_agent("box", "scout", "codex")
-        self.assertEqual((status, answer["error"]), (409, "An agent named scout was in this fleet before, and its "
+        self.assertEqual((status, answer["error"]), (409, "An agent named Scout was in this fleet before, and its "
                                                           "records are still here. Choose another name."))
 
     def held_by_its_limit(self):
@@ -695,7 +695,7 @@ class Spent(Remove):
         self.assertEqual((status, receipt["job"]), (200, None), receipt)
         self.assertIsNotNone(hub.q1("SELECT 1 FROM agents WHERE name='vps'"))
         status, answer = self.add_agent("box", "vps", "codex")
-        self.assertEqual((status, answer["error"]), (409, "An agent named vps was in this fleet before, and its records "
+        self.assertEqual((status, answer["error"]), (409, "An agent named Vps was in this fleet before, and its records "
                                                          "are still here. Choose another name."))
         person = hub.ins("INSERT INTO people(name,role,added) VALUES('Dana','customer',?)", (t0,))
         chat = hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) "

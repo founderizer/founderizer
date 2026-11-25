@@ -1225,9 +1225,9 @@ def role_clash(agent, word, team):
         if other == agent or not said:
             continue
         if other.casefold() == said:
-            return f"{shown_name(other)} has this name. Give {shown_name(agent)} another role."
+            return f"{agent_name(other, team)} has this name. Give {agent_name(agent, team)} another role."
         if agent_words(a.get("title")) == said:
-            return f"{shown_name(other)} has this role already."
+            return f"{agent_name(other, team)} has this role already."
     return None
 
 
@@ -1239,12 +1239,13 @@ def role_holds_name(name, role):
     return str(name or "").lower() in words
 
 
-def agent_label(name, role):
+def agent_label(name, role, spelling=None):
     """The label of an agent with this name and this role (shown_role): its name as shown_name writes it ("Nova"),
     and its role only when the role holds the name ("Fleet Manager" for manager, role_holds_name), as the apps show
-    it, so that the label does not say the name twice."""
+    it, so that the label does not say the name twice. spelling: the owner's spelling of the name (agent_spelling),
+    which takes the place of shown_name and never of such a role (UI-PATTERNS.md, the owner's F16 yes)."""
     role = " ".join(str(role or "").split())
-    return role if role and role_holds_name(name, role) else shown_name(name)
+    return role if role and role_holds_name(name, role) else (spelling or shown_name(name))
 
 
 def name_and_role(name):
@@ -1254,13 +1255,49 @@ def name_and_role(name):
     return f"{name} ({role})" if role else name
 
 
+def spelling_fits(name, spelling):
+    """True for a spelling of this agent's name (owner feature agent_spelling): the same letters, digits and hyphens,
+    with the capitals that the owner typed, so that in small letters it is the name ("Nova" for nova, "Web-Dev" for
+    web-dev). ASCII only: the Kelvin sign is "k" in small letters too, and it is no letter of a name."""
+    return isinstance(spelling, str) and spelling.isascii() and spelling.lower() == name
+
+
+def agent_spelling(name, team=None):
+    """The agent's name as the owner typed it (team.json agents.<name>.spelling, owner feature agent_spelling), or None
+    when the owner gave none. team: the agents of a team.json that the caller reads, else the running team. A value
+    that is not a spelling of the name is none (validate_team refuses one), and so is one with no capital letter: the
+    name in small letters is the id, and RULES.md writes a name with a capital."""
+    said = ((agents() if team is None else team).get(name) or {}).get("spelling")
+    return said if spelling_fits(name, said) and said != name else None
+
+
+def agent_name(name, team=None):
+    """An agent's name in the words that a person or an agent reads: the owner's spelling of it ("McKenzie"), else its
+    name with capitals as the apps write it (shown_name). The agent's id stays in each tool, code and record."""
+    return agent_spelling(name, team) or shown_name(name)
+
+
+def spelling_read(data, name):
+    """The `spelling` of a request that adds an agent or gives it a name (owner feature agent_spelling): None when it
+    gives none, and "" for the name in small letters, which is no spelling (agent_spelling), so that an app may send
+    the text of its name field as it is. A ValueError, which the route answers with 400, for one that is not this
+    name with other capitals."""
+    if data.get("spelling") is None:
+        return None
+    if not spelling_fits(name, data["spelling"]):
+        raise ValueError(f"spelling must be the name {name} with the capitals that you want, such as "
+                         f"{shown_name(name)}: the same letters, digits and hyphens")
+    return "" if data["spelling"] == name else data["spelling"]
+
+
 def shown_role(name):
-    """An agent as the owner's apps name it (agent_label): its name with capitals ("Nova"), and its role only when the
-    role holds the name ("Fleet Manager"). The words he reads from the hub name an agent this way (the owner, 22
-    November 2026, F16: an agent's name in each place; from 10 November it was the role). The function keeps its name
-    of that time, because other branches call it. A use that reads the role as data reads team.json "title" itself
+    """An agent as the owner's apps name it (agent_label): its role when the role holds the name ("Fleet Manager");
+    else the spelling that the owner typed, where there is one (owner feature agent_spelling, 25 November 2026), or
+    its name with capitals ("Nova"). The words he reads from the hub name an agent this way (the owner, 22 November
+    2026, F16: an agent's name in each place; from 10 November it was the role). The function keeps its name of that
+    time, because other branches call it. A use that reads the role as data reads team.json "title" itself
     (card_signs_in)."""
-    return agent_label(name, (agents().get(name) or {}).get("title"))
+    return agent_label(name, (agents().get(name) or {}).get("title"), agent_spelling(name))
 
 
 def agent_active(name):
@@ -2218,9 +2255,13 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # ("Yes, as drawn" to the given skill): POST /ui/messages takes `skills`, a skill to
                                     # use and the ZIP of a skill that the owner gives, and messages[].skills of GET
                                     # /ui/state gives them (UI-API.md 1.304)
-               "task_limit"]        # owner API 1.330: each task's `limit` in GET /ui/state, GET /ui/mobile and GET
+               "task_limit",        # owner API 1.330: each task's `limit` in GET /ui/state, GET /ui/mobile and GET
                                     # /ui/mobile/task/<id> is its own wait (held_task_limit); an app reads a task's wait
                                     # from it alone, and from its agent's `limit` on a hub without this name
+               "agent_spelling"]    # the owner, 25 November 2026 ("it doesn't let me use upper case the first letter
+                                    # of the bot"): agents[].spelling of GET /ui/state and GET /ui/mobile, kept in
+                                    # team.json, and the `spelling` of the routes that add and rename an agent
+                                    # (UI-API.md 1.339)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -4769,6 +4810,8 @@ def mobile_agent(name, config, stops=None, waiting=None):
               "ORDER BY created DESC LIMIT 1", (name, name))
     return {"name": name, "role": config["role"], "title": config.get("title"), "runtime": config["runtime"],
             "active": agent_active(name),
+            # owner feature agent_spelling: the name as the owner typed it, only where there is one (agent_spelling)
+            **({"spelling": agent_spelling(name)} if agent_spelling(name) else {}),
             "can": config.get("can", []), "direct_chat": owner_chat(config), "machine": config.get("machine"),
             "last_seen": row["last_seen"] if row else None, "alive": row["alive"] if row else None,
             "alive_ts": row["alive_ts"] if row else None,
@@ -10079,10 +10122,14 @@ def colleague_facts(name):
 def colleague_line(name, who="", looks=""):
     """One other agent in one line: who it is, how it stands to the reader, what it holds, and what it looks after
     (looks_after). The two readers of it are a session's opening text and message_agent's own directory, so the fact
-    that tells two agents apart is in both."""
+    that tells two agents apart is in both. The name is the id that the tools take; the owner's spelling of it follows
+    where it is not the name with a capital that RULES.md asks for (owner feature agent_spelling): "mckenzie, written
+    McKenzie", so that an agent writes the name to a person as the owner reads it."""
     a = agents().get(name) or {}
     facts = colleague_facts(name)
-    return (f"{name}" + (f" ({a['title']})" if a.get("title") else "")
+    written = agent_name(name)
+    return (f"{name}" + (f", written {written}" if written != shown_name(name) else "")
+            + (f" ({a['title']})" if a.get("title") else "")
             + f" [{a.get('role')}" + (f", {runtime_label(a['runtime'])}" if a.get("runtime") else "") + "]" + who
             + ": " + ("; ".join(facts) or "no repository, service or server of its own")
             + (f"; looks after: {looks}" if looks else ""))
@@ -10691,6 +10738,11 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
             f'yet: your helper gives the rules with your start. Your helper brought this folder up to date just before '
             f'this session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and '
             f'whenever signalled. ')
+    # owner feature agent_spelling: the owner's spelling of the agent's own name, where it is not the capital that
+    # RULES.md asks for anyway. In this block of the task and not in the stable text, so that a new spelling changes
+    # no cached start.
+    if agent_name(agent) != shown_name(agent):
+        said += f"The owner writes your name as {agent_name(agent)}: write it so to people. "
     closed = shell_off(agent)           # support plan F1: its own tools, and no way up but its typed result
     # A message started this attempt for a task that waits for its reminder (liveness): its work now is the message,
     # so this start does not say "continue and finish", which the note after it would then have to take back.
@@ -11642,6 +11694,8 @@ def agent_view(name, config, reads=None):
     stop = chat_stoppable(name, reads, turn=turn)
     return dict(name=name, role=config["role"], runtime=config["runtime"],
                 title=config.get("title"), active=agent_active(name),
+                # owner feature agent_spelling: the name as the owner typed it, only where there is one (agent_spelling)
+                **({"spelling": agent_spelling(name)} if agent_spelling(name) else {}),
                 can=config.get("can", []), usage=used,
                 reports_to=None if config["role"] == "manager" else
                 (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
@@ -16483,6 +16537,8 @@ def t_check_result(agent, a):
     in_scope(agent, t)
     if t["state"] not in TERMINAL:
         raise ToolError(f"{tref(tid)} is still {t['state']}; there is no result to check yet.")
+    if accepted:
+        kpi_setup_unlinked(agent, t)
     q("UPDATE tasks SET accepted=?, check_note=?, checked_at=? WHERE id=?", (1 if accepted else 0, note, now(), tid))
     if accepted:
         return f"{tref(tid)} accepted." + open_items_line(agent, t)
@@ -18658,10 +18714,11 @@ def t_hand_over(agent, a):
     return helper_job(agent, tid, "handover", a.get("login"), to)
 
 
-def need_is_yours(agent, *texts, level=None):
+def need_is_yours(agent, *texts, level=None, checked=()):
     """The refusal of a Needs-you item that asks the owner for something this manager may already give, or None. The
     owner's own rule is that a grant is the authorization and the manager answers for giving it; that rule only works
-    if the owner is never asked for what he has already delegated."""
+    if the owner is never asked for what he has already delegated. checked: the ids that the item's needs_access names,
+    which card_access checks at its level and for its agent, so that their names here refuse nothing."""
     import door_targets
     if level in ("value", "placeholder"):
         return None         # a new value of a key, or its placeholder: no grant gives it (card_access routes it)
@@ -18673,7 +18730,7 @@ def need_is_yours(agent, *texts, level=None):
     # each resource that the owner's page shows (resource_ids), with the standing that counts (pool_default)
     for rid in resource_ids(TEAM, google_services_now()[0]):
         kind, what = resource_parts(rid)
-        if not kind or rid not in blob and not (len(what) >= 4 and what in loose):
+        if not kind or rid not in blob and not (len(what) >= 4 and what in loose) or rid.lower() in checked:
             continue
         entry = resource_standing(rid) or {}
         if not entry.get("max") or not resource_known(kind, what, TEAM):
@@ -18968,7 +19025,8 @@ CARD_REASON_REFUSAL = (
     "Not raised: give the item its reason. A card is your last step, because it rings the owner's phone. First decide "
     "yourself where a policy or a standing rule of the owner's lets you, check the claim of the agent that asks in the "
     "record, and give the work to the agent that holds the access, or grant what the pool holds. Then reason is one "
-    "of: money, for new money; access, for access that the fleet does not hold, named in needs_access; decision, for "
+    "of: money, for new money; access, for access that the fleet does not hold or that stays the owner's, named in "
+    "needs_access; decision, for "
     "a decision that the owner's own words keep for them, quoted in owner_words; or person, for a step that only a "
     "person can do: the owner's sign-in to an AI provider's own account or to an MCP server in their app, their phone, "
     "or a hand at a machine, to switch it on or to change a setting that it takes only from its own keyboard or mouse.")
@@ -19339,11 +19397,17 @@ def value_route(ref, entry, placeholder=False):
             f'owner makes the new key): its card is the secure form where the owner types it.{then}')
 
 
-def card_access(words, level):
+def card_access(words, level, agent=None):
     """The refusal of an item for access that the fleet already holds, else None. The thing is <kind>:<what> as
     grant_access names it, which the hub reads, or a few plain words for what the fleet's record does not name (a role
     in a cloud account, a database login, a new agent), which only the owner settles. So are a thing that no holder can
-    use now (card_dead). A secret's value, which the hub cannot see, has its own route (value_route)."""
+    use now (card_dead). A secret's value, which the hub cannot see, has its own route (value_route).
+
+    agent: the agent that needs it (needs_agent), whose card carries Give (owner feature pool_default, the Needs-you
+    area). A hold at the needed level refuses the card, the agent's own or another agent's, which then does that part
+    of the work (the owner, 29 October 2026: asked only for what no agent holds); the agent's own lower hold does not,
+    so a level that stays the owner's is one Give at the owner's press. Of the manager's own grants, only one to that
+    agent refuses it, and the refusal names that agent in its grant_access call."""
     text = str(words or "").strip()
     if not text:
         raise ToolError("An item for access names the thing in needs_access: <kind>:<what> for what the fleet's record "
@@ -19396,15 +19460,15 @@ def card_access(words, level):
     top = resource_top(rid)
     if kind == "drive" and drive_folders_held(what, active=True):
         return None         # the item can be about an agent that holds folders of it: only the owner widens them
-    for name in sorted(agents()):
+    for name in sorted(agents()) if agent is None else [agent]:
         if not (agent_active(name) and role_of(name) in ("worker", "lead")):
             continue
         for lv in [want] if want else [RESOURCE_LEVELS[kind][0]] if top else list(RESOURCE_LEVELS[kind]):
             try:
                 if grant_check(name, rid, lv) is None:
                     return (f'Not raised: {resource_phrase(kind, what)} ({rid}) is yours to give: grant_access('
-                            f'agent="<the agent that needs it>", resource="{rid}", level="{lv}") gives it, and the '
-                            f'owner is not needed.{value}')
+                            f'agent="{agent or "<the agent that needs it>"}", resource="{rid}", level="{lv}") gives '
+                            f'it, and the owner is not needed.{value}')
             except ToolError:
                 continue
     # the owner's card could give it to nobody: the fleet manager cannot use it either. What a plan refuses now (a
@@ -19641,7 +19705,7 @@ def card_reason(a, title, why, todo, options):
             raise ToolError(f"{field} goes with reason {own}, and this item's reason is {reason}.")
     if reason == "access":
         for thing in need_give_things(a) or [a.get("needs_access")]:   # each repository that a Give gives
-            held = card_access(thing, a.get("needs_level"))
+            held = card_access(thing, a.get("needs_level"), str(a.get("needs_agent") or "").strip() or None)
             if held:
                 raise ToolError(held)
     elif reason == "decision":
@@ -19714,8 +19778,10 @@ def need_give(a):
     one MCP server (resources, F6 piece 2). None when it names none. A ToolError for a grant that one press cannot
     give: an agent that is not an active worker or lead (the manager holds none: validate_team), a level that the thing
     does not take, a thing of another kind, one of the product's own repositories, which the door refuses in every
-    fleet, or what need_give_refusal refuses. card_reason checks each thing against the fleet's record after this
-    (card_access): no agent holds it at that level, and it is not in the pool that the manager grants from."""
+    fleet, a repository whose commits the door checks (need_give_door), a key or a login, whose grant the owner's
+    Mac signs, or what need_give_refusal refuses. card_reason checks each thing against the fleet's record after this
+    (card_access): no agent holds it at that level, and the manager may not give it to that agent (resource_standing,
+    grant_check)."""
     things = need_give_things(a)
     if things is None:
         return None
@@ -19739,6 +19805,18 @@ def need_give(a):
         if refused:
             raise ToolError(refused)
         return {"agent": agent, "level": level, "repos": [], "resources": [f"{kind}:{what}"]}
+    if kind == "secret":
+        # A key or a login (owner feature pool_default, the Needs-you area): the central vault seals one only by the
+        # owner's signed grant or pool, which the owner's Mac signs on the Secrets page and in its vault round, and a
+        # press of Give signs nothing. So the manager's own grant, or the agent that holds it, comes first, in
+        # card_access's words; one that stays the owner's is a card with the owner's steps, and never a Give that would
+        # give nothing.
+        refused = card_access(things[0], level, agent)
+        if refused:
+            raise ToolError(refused)
+        phrase = resource_phrase(kind, what)
+        raise ToolError(f"{phrase[0].upper() + phrase[1:]} is a key or a login, whose grant the owner's Mac signs, so "
+                        f"Give does not give it: leave needs_agent out.")
     mixed = next((t for t in things if resource_parts(t)[0] in NEED_GIVE_SAID), None)
     if mixed:
         raise ToolError(f"With needs_agent, a gmail:, drive: or tool: goes alone in needs_access: give {mixed} in an "
@@ -19760,6 +19838,9 @@ def need_give(a):
         kind, what = resource_parts(thing)
         if door_targets.vendor(what):       # the words of every grant of one (vendor_repo_check, grant_check)
             raise ToolError(refusal_words.words("repo_vendor", {"repo": what}))
+        door = need_give_door(agent, what, level)
+        if door:
+            raise ToolError(door)
         repos.append(what)
     return {"agent": agent, "level": level, "repos": sorted(repos), "resources": []}
 
@@ -19881,6 +19962,28 @@ def need_gives(need_id):
               (need_id,)) is not None
 
 
+def need_give_door(agent, repo, level):
+    """Why Give cannot give `agent` this repository at this level because the door checks its commits, in words for
+    the manager, or None (owner feature pool_default, the coordinator's read of 25 November 2026): one that the door
+    syncs to a server (door.gitops) or that an Operator holds as a commit target (resource_kept "fleet"), whose commits
+    the door checks (NEVER_PATHS), so a token of a grant would let a session commit around those checks; and one that
+    the door made (new-projects plan N3), which goes at write at most, and never to an agent that holds a server
+    through the door (grant_check). The product's own repositories have their own words (repo_vendor)."""
+    import door_targets
+    if door_targets.vendor(repo):
+        return None
+    if resource_kept(f"repo:{repo}") == "fleet":
+        return (f"The door checks each commit to {repo}, which it syncs to a server or which an Operator holds, so "
+                f"Give does not give it: a grant would let a session commit around those checks. Give that part of "
+                f"the work to the agent that commits to it through the door.")
+    if door_made(repo) and (agents().get(agent) or {}).get("servers"):
+        return (f"The door made {repo}, and {shown_role(agent)} holds a server through the door, so Give does not "
+                f"give it: its Operator commits there through the door.")
+    if door_made(repo) and level_at_least("repo", level, "deploy"):
+        return f"The door made {repo}: nobody gets deploy there, so Give gives it at write at most."
+    return None
+
+
 def need_give_gone(give):
     """The words that close an item whose Give has nobody to give to any more: an item of a kind that this hub cannot
     read (no repository and no thing that it knows: a secret of a later code, or a row of this piece after a revert of
@@ -19895,6 +19998,9 @@ def need_give_gone(give):
     vendor = [r for r in give["repos"] if door_targets.vendor(r)]
     if vendor:
         return f"Closed by the hub: the door refuses {vendor[0]} in every fleet, so Give gives nothing."
+    door = next((w for w in (need_give_door(agent, r, give["level"]) for r in give["repos"]) if w), None)
+    if door:
+        return f"Closed by the hub: {door}"
     if agent in agents() and role_of(agent) in ("worker", "lead"):
         return None
     return f"Closed by the hub: {shown_role(agent)} cannot take this access any more, so Give gives nothing."
@@ -20584,14 +20690,19 @@ def t_raise_needs_you(agent, a):
     # card, or a decision or a person's step whose words only name a held repository, would be refused as a grant (the
     # Needs-you area's survey of 24 November 2026: N-202 named a held argocd repository).
     about_access = str(a.get("reason") or "").strip().lower() == "access" or a.get("needs_access") not in (None, "")
+    # A card is the manager's last step: the hub's own kinds (the door's, an App's, a phone's, an App key's and a key
+    # swap's) carry their reason, and every other item names its own, which the hub checks.
+    fixed = any(x is not None for x in (door_call, door_host, github_app, add_device, github_key, key_swap_server))
+    # What needs_access names, card_access checks at the item's own level and for its own agent (card_reason), so a
+    # look at the words only would refuse a level above the owner's, or a card that names the thing as Give asks
+    # (the Needs-you area, pool_default: a Give of deploy where the owner allows write was refused as the manager's)
+    checked = {str(t).strip().lower() for t in need_give_things(a) or [a.get("needs_access")] if t} \
+        if str(a.get("reason") or "").strip().lower() == "access" and not fixed else set()
     # An item that names its thing in needs_access is about that thing alone: its other words are its reasons, and a
     # held resource that they name by its short name ("the GitHub App" beside the GitHub MCP server) is no grant that
     # it asks for (the pool default's test run of 25 November 2026)
     asked = str(a.get("needs_access") or "").strip()
     guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
-    # A card is the manager's last step: the hub's own kinds (the door's, an App's, a phone's, an App key's and a key
-    # swap's) carry their reason, and every other item names its own, which the hub checks.
-    fixed = any(x is not None for x in (door_call, door_host, github_app, add_device, github_key, key_swap_server))
     if give and fixed:
         raise ToolError("needs_agent goes on an item for access, with no door_call, door_host, github_app, add_device, "
                         "github_key or key_swap_server.")
@@ -20607,7 +20718,7 @@ def t_raise_needs_you(agent, a):
     # part, and the door's refusal of the product's own repositories stands, also where the default gives the rest
     mine = None if key_swap_server is not None or sign_in or not about_access else \
         need_is_yours(agent, *((asked,) if asked else (title, why, todo)),
-                      level=str(a.get("needs_level") or "").strip().lower() or None)
+                      level=str(a.get("needs_level") or "").strip().lower() or None, checked=checked)
     if mine:
         raise ToolError(mine)
     ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
@@ -25098,7 +25209,7 @@ def t_start_task(agent, a):
         raise ToolError(busy + " No task is open for this message: tell the owner so with tell_owner.")
     # the owner's words with their lines: the Task page shows them in the owner's bubble (FleetTask.ownersWords)
     details = HISTORY_OWNER_TASK + agent + "'s chat: " + clip_lines(source["text"] or "", 2000)
-    why = f"The owner asked {agent} for it in its own chat."
+    why = f"The owner asked {agent_name(agent)} for it in its own chat."
     guard(agent, details, why)
     t0 = now()
     about = message_about_read(source["about"])     # owner feature message_about: the task that the message is about
@@ -25933,7 +26044,7 @@ def mentions_read(stored):
 
 def tag_label(agent, team=None):
     """The words of an agent's tag (`@` + this): its role, on single spaces, when no other agent has the same role or
-    that role as its name, without regard to case; else its name as the apps show it (shown_name). So each label names
+    that role as its name, without regard to case; else its name as the apps show it (agent_name). So each label names
     one agent, as CardNames does in the apps: a role that two agents hold names neither."""
     team = agents() if team is None else team
     role = " ".join(str((team.get(agent) or {}).get("title") or "").split())
@@ -25941,7 +26052,7 @@ def tag_label(agent, team=None):
     if role and not any(other != agent and (agent_words(a.get("title")) == said or other.casefold() == said)
                         for other, a in team.items()):
         return role
-    return shown_name(agent)
+    return agent_name(agent, team)
 
 
 def tag_start(text, at):
@@ -49531,13 +49642,14 @@ def team_section_change(was, now_):
 
 
 def team_said_role(team, name):
-    """An agent as the owner's apps name it, from this team: shown_role's label, with the role that the plan gives it
-    (agent_label). An agent that the plan adds has no name yet, since the owner presses one of the plan's names: its
-    role, as "Add <role> on <server>" says it."""
+    """An agent as the owner's apps name it, from this team: shown_role's label, with the spelling and the role that
+    the plan gives it (agent_spelling, agent_label). An agent that the plan adds has no name yet, since the owner
+    presses one of the plan's names: its role, as "Add <role> on <server>" says it."""
     a = (team.get("agents") or {}).get(name) or {}
     if name not in agents() and a.get("title"):
         return a["title"]
-    return agent_label(name, a.get("title") or (agents().get(name) or {}).get("title"))
+    role = a.get("title") or (agents().get(name) or {}).get("title")
+    return agent_label(name, role, agent_spelling(name, team.get("agents") or {}))
 
 
 def server_free_memory(server):
@@ -52841,18 +52953,22 @@ def chat_kpi_text(agent):
 
 
 def kpi_parent_text(agent):
-    """The parent's one line (spec 7.4), for the session of a lead's team-results task and the fleet manager's brief,
-    only while the setting kpis is on and only when an active agent whose tasks it gives has no KPI. Reads only:
-    start_text runs inside admit_task's transaction."""
+    """The parent's lines (spec 7.4), for the session of a lead's team-results task and the fleet manager's brief,
+    only while the setting kpis is on: the active agents whose tasks it gives that have no KPI, and its KPIs whose setup
+    finished with no link since, with the call that links each (kpi_setup_unlinked). Reads only: start_text runs
+    inside admit_task's transaction."""
     if not setting("kpis"):
         return ""
     held = {r["agent"] for r in read_rows("SELECT DISTINCT agent FROM standing WHERE kind='kpi' AND ended IS NULL")}
     none = [n for n in agents() if n != agent and n not in held and agent_active(n) and role_of(n) != "manager"
             and task_giver(n) == agent]
-    if not none:
-        return ""
-    return (f"\nSet KPIs with set_kpi on the agents whose tasks you give that have no KPI: "
-            f"{', '.join(name_and_role(n) for n in none)}.\n")
+    unlinked = kpi_unlinked_setups(agent)       # a setup that finished links nothing by itself: they get no value
+    return ((f"\nSet KPIs with set_kpi on the agents whose tasks you give that have no KPI: "
+             f"{', '.join(name_and_role(n) for n in none)}.\n" if none else "") +
+            (f"\nLink the KPIs whose setup finished: they get no value until you do. " + "; ".join(
+                f"{r['name']} of {r['agent']}, {tref(r['setup_task'])}: {kpi_setup_call(r, kpi_setup_rules(r['setup_task']))}"
+                for r in unlinked[:ITEMS_NAMED]) + (f"; and {len(unlinked) - ITEMS_NAMED} more" if len(unlinked) >
+                                                    ITEMS_NAMED else "") + ".\n" if unlinked else ""))
 
 
 def kpi_readable(caller):
@@ -53054,6 +53170,66 @@ def kpi_setup_done_rows(r, why, t0, setup=None):
                            "have, and change nothing more for it.", t0, "{}"))
 
 
+def kpi_setup_rules(task_id):
+    """The wake-up rules that a KPI's setup task saved (trigger_history saved_by_task), not deleted, oldest first."""
+    return [t["id"] for t in read_rows(
+        "SELECT DISTINCT t.id FROM trigger_history h JOIN triggers t ON t.id=h.trigger_id WHERE h.saved_by_task=? AND "
+        "t.state!='deleted' ORDER BY t.id", (task_id,))]
+
+
+def kpi_unlinked_setups(parent=None, accepted=False):
+    """The active KPIs whose setup task finished (state completed) with a rule that it saved and that have had no link
+    since that setup began: of one parent, or of all; with accepted, only those whose setup's result was accepted, else
+    also those not checked yet (one that was given back waits for its new setup). A
+    link that a deleted rule or a move removed later (kpi_unlink_rows) is no gap of the setup: that KPI has its own
+    step. A setup that saved no rule says why in its result (the source holds no data yet). Read only."""
+    rows = read_rows('SELECT s.* FROM standing s JOIN tasks t ON t.id=s.setup_task WHERE s.kind=\'kpi\' AND '
+                     's.ended IS NULL AND s."check" IS NULL AND s.source IS NULL AND t.state=\'completed\''
+                     + (' AND t.accepted=1' if accepted else ' AND (t.accepted IS NULL OR t.accepted=1)')
+                     + ' AND EXISTS (SELECT 1 FROM trigger_history h '
+                     'JOIN triggers g ON g.id=h.trigger_id WHERE h.saved_by_task=t.id AND g.state!=\'deleted\') '
+                     'AND NOT EXISTS (SELECT 1 FROM kpi_changes c '
+                     'WHERE c.item=s.id AND c.at>=t.created AND c.words LIKE \'linked to %\') ORDER BY s.id')
+    return [r for r in rows if r["agent"] in agents() and (parent is None or kpi_parent(r["agent"]) == parent)]
+
+
+def kpi_setup_call(r, rules):
+    """The set_kpi call that links KPI row r, with the rule that its setup saved when there is one."""
+    return (f"set_kpi(id=\"{iref(r['id'])}\", check={rules[0] if len(rules) == 1 else '<its rule>'}, how=..., "
+            f"agent_part=...)" + (f" (the rules that it saved: {', '.join(map(str, rules))})" if len(rules) > 1 else ""))
+
+
+def kpi_setup_unlinked(agent, t):
+    """check_result's accept of task row t: refused while t is the finished setup task of an active KPI with no link
+    that `agent` may link (its parent or an agent above it), with the call that links it. On 22 and 23 November 2026
+    ten setups with working checks were accepted in the owner's fleet and none was linked, so 22 of its 24 KPIs got no
+    value. A link accepts the setup's result itself (kpi_setup_accept_rows); a setup that failed or saved no rule is
+    accepted as always; for one accepted before, the parent gets the step "Link <name>" (kpi_link_step_rows)."""
+    if t["state"] != "completed" or not setting("kpis"):
+        return
+    r = read_row('SELECT * FROM standing WHERE kind=\'kpi\' AND ended IS NULL AND setup_task=? AND "check" IS NULL '
+                 'AND source IS NULL', (t["id"],))
+    rules = kpi_setup_rules(t["id"]) if r and kpi_rank(agent, r["agent"]) is not None else []
+    if not rules:                   # none saved: its result says why the source holds no data yet
+        return
+    raise ToolError(f"{tref(t['id'])} is the setup of the KPI {iref(r['id'])} ({r['name']}) of "
+                    f"{name_and_role(r['agent'])}, which has no link yet, so it gets no value. Read the check that it "
+                    f"saved, then link it: "
+                    f"{kpi_setup_call(r, rules)}, which accepts this result too. If the check is not "
+                    f"right, or cannot measure it yet, give the result back with check_result(accepted=false, "
+                    f"note=why) and open a new setup with set_kpi(id=\"{iref(r['id'])}\", measured_by=...), which "
+                    f"asks for the check again.")
+
+
+def kpi_setup_accept_rows(r, t0):
+    """Inside a transaction: a link of KPI row r accepts the result of its finished setup task that nobody checked:
+    the link is that check (kpi_setup_unlinked)."""
+    in_transaction("kpi_setup_accept_rows")
+    if r["setup_task"]:
+        DB.execute("UPDATE tasks SET accepted=1, checked_at=?, check_note=? WHERE id=? AND state='completed' AND "
+                   "accepted IS NULL", (t0, f"accepted by the link of the KPI {iref(r['id'])}", r["setup_task"]))
+
+
 def kpi_link(agent, r, a, task, asked=(None, "")):
     new_measure = str(a.get("check") or "").startswith("hub:") and r["source"] != str(a["check"]).strip()
     refused = kpi_locked(agent, r, {"check", "measured_by"} if new_measure else {"check"}, asked[0])  # 4.4: it
@@ -53127,6 +53303,7 @@ def kpi_link(agent, r, a, task, asked=(None, "")):
                     "no_data", t0, kept["off_task"], kept["parent_task"], r["id"]))
         quicker = kpi_check_often_rows(t, t0)
         kpi_step_over_rows(r["id"])
+        kpi_setup_accept_rows(r, t0)
         kpi_change_row(r["id"], agent, f"linked to wake-up rule {rule}; how: {how}"
                                        + (f"; the agent's part: {part}" if part else ""), t0, reads, ["check"],
                        asked[0])
@@ -53217,6 +53394,7 @@ def kpi_link_measure(agent, r, a, task, name, asked=(None, "")):
         kpi_setup_done_rows(r, f"{agent} linked the KPI {iref(r['id'])} to the hub's own measure {name}", t0)
         kpi_measure_rows(DB.execute("SELECT * FROM standing WHERE id=?", (r["id"],)).fetchone(), t0, past=True)
         kpi_step_over_rows(r["id"])
+        kpi_setup_accept_rows(r, t0)
         kpi_change_row(r["id"], agent, f"linked to the hub measure {name}; how: {how}"
                                        + (f"; the agent's part: {part}" if part else ""), t0, reads, ["check"],
                        asked[0])
@@ -53789,6 +53967,34 @@ def kpi_daily_rows(t0):
         if step:                    # the spell has its step: none again until a new spell; else the next pass tries
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (f"kpi_spell:{r['id']}", repr(since)))
+    kpi_link_step_rows(t0)
+
+
+def kpi_link_step_rows(t0):
+    """Inside the hub's daily pass: each active KPI with no link whose setup task finished and was accepted gives its
+    parent one step "Link <name>" for that setup (kv kpi_link_step:<id> holds the setup task that had its step): the
+    acceptance of a setup did not link its KPI before check_result refused it (kpi_setup_unlinked), and a checker
+    that may not link it still accepts it."""
+    in_transaction("kpi_link_step_rows")
+    if not setting("kpis"):
+        return
+    for r in kpi_unlinked_setups(accepted=True):
+        told = DB.execute("SELECT v FROM kv WHERE k=?", (f"kpi_link_step:{r['id']}",)).fetchone()
+        parent = kpi_parent(r["agent"])
+        if (told and told["v"] == str(r["setup_task"])) or parent is None:
+            continue
+        step = kpi_step_rows(parent, {
+            "title": f"Link {r['name']}",
+            "details": (f"{tref(r['setup_task'])} built the check of the KPI {iref(r['id'])} of "
+                        f"{name_and_role(r['agent'])}: {full_stop(r['words'])} Its result was accepted, but the KPI was "
+                        f"never linked, so it gets no value. Read the check that it saved, then link it: "
+                        f"{kpi_setup_call(r, kpi_setup_rules(r['setup_task']))}."),
+            "done_when": (f"{r['name']} is linked with set_kpi, or a new setup is open (set_kpi with measured_by), or "
+                          f"the KPI ended with end_standing and why."),
+            "why": f"The KPI {r['name']} gets no value: its accepted setup was never linked."}, t0)
+        if step:
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (f"kpi_link_step:{r['id']}", str(r["setup_task"])))
 
 
 def session_task(agent, a):
@@ -56018,7 +56224,7 @@ TOOLS = [
      "this was decided by your reading and not by it. So asking costs you nothing and guessing in silence has no "
      "excuse. Never a default for access, money or anything that leaves the building -- a send, a post, a payment, "
      "a deployment: ask without one and wait. When what you lack is access, name the thing itself in needs_access: "
-     "the hub reads who holds it and what the owner made grantable, and tells your requester whether it can give "
+     "the hub reads who holds it and what the manager may give, and tells your requester whether it can give "
      "it, ask the agent that holds it, or take it to the owner. A thing you hold at a LOWER level than the work "
      "needs is access you do not have, so name that level in needs_level.",
      S({"task_id": TASK_ID, "question": STR,
@@ -56550,12 +56756,13 @@ TOOLS = [
     ("manager", "raise_needs_you", t_raise_needs_you,
      "Ask the owner for what only they can do or decide, as your last step, because it rings their phone. First decide "
      "yourself where a policy or a standing rule of the owner's lets you, check the claim of the agent that asks in "
-     "the record (its own runs, what it holds), and give the work to the agent that holds the access, or grant what "
-     "the pool holds. reason says why only the owner can do it, and the hub checks what it can of it: money, for new "
+     "the record (its own runs, what it holds), and give the work to the agent that holds the access, or grant it "
+     "yourself. reason says why only the owner can do it, and the hub checks what it can of it: money, for new "
      "money; access, "
-     "for access that the fleet does not hold, named in needs_access (an agent that holds it does that part of the "
-     "work, and a thing in the grantable pool is yours to grant; name the agent that needs it in needs_agent, and the "
-     "card's first option, Give, gives it at the owner's press); decision, for a decision that the owner's own words "
+     "for access that the fleet does not hold or that stays the owner's, named in needs_access (an agent that holds "
+     "it does that part of the work, and what you may give is yours; name the agent that needs it in needs_agent, and "
+     "the card's first option, Give, gives it at the owner's press); "
+     "decision, for a decision that the owner's own words "
      "keep for them, quoted word for word in owner_words from a policy file, a profile, a standing rule that they gave "
      "or their own message; or person, for a step that only a person can do: the owner's sign-in to an AI provider's "
      "own account or to an MCP server in their app, their phone, or a hand at a machine, to switch it on or to change a setting that it takes only "
@@ -56621,8 +56828,8 @@ TOOLS = [
                          "repositories separated by commas, or one gmail:, drive: or tool:."},
         "needs_agent": {"type": "string", "description": "With reason access: the agent that needs it, by its name or "
                         "its role: an active worker or lead. The card then carries the grant: its first option is "
-                        "Give <role> <needs_level>, which gives that level at the owner's press in Founderizer on "
-                        "their Mac or a PC, in one commit, so do not grant it or ask for it again; the hub writes "
+                        "Give <role> <needs_level>, which gives that level at the owner's press on their Mac or a "
+                        "PC, so do not grant it or ask for it again; the hub writes "
                         "what_to_do, and your options are only the no (No when you give none). The title or the why "
                         "names the one thing (a repository as owner/name); Details lists several. The card closes by "
                         "itself when the agent gets that access another way."},
@@ -67047,6 +67254,9 @@ def validate_team(team, kept=None, shared_ok=None, browser_ok=None):
             raise ValueError(f"agent {name}: a vault broker needs vault_recipient, its broker's public handover key")
         if "title" in a and not (isinstance(a["title"], str) and 1 <= len(a["title"].strip()) <= 60 and "\n" not in a["title"]):
             raise ValueError(f"agent {name}: title must be one line of 1 to 60 characters")
+        if "spelling" in a and not spelling_fits(name, a["spelling"]):     # owner feature agent_spelling
+            raise ValueError(f"agent {name}: spelling must be its name with the capitals that the owner typed, such as "
+                             f"{shown_name(name)}, or absent")
         if WEB_HOSTS in a:      # the host list: only where a session can be held to it, and absent for none
             try:
                 lifecycle.web_hosts(a[WEB_HOSTS])
@@ -70426,11 +70636,13 @@ def add_server_refusal(team, server):
     return None
 
 
-def new_agent_refusal(team, server, agent, parent, account):
+def new_agent_refusal(team, server, agent, parent, account, spelling=None):
     """The checks of a new agent of this name on this server (add_server_agent), with no write: the refusal of the
-    first that fails, or None. The manager's team changes run them too, as add_server_refusal says."""
+    first that fails, or None. The manager's team changes run them too, as add_server_refusal says. spelling: the
+    owner's spelling of the new name (owner feature agent_spelling), with which the words name it. A name that the
+    fleet uses itself stays in small letters: it is the name of a service or a user (fleet-git), not a person's word."""
     if q1("SELECT 1 FROM agents WHERE name=?", (agent,)):     # agent_remove: its work stays under its name
-        return Refusal(409, f"An agent named {agent} was in this fleet before, and its records are still here. "
+        return Refusal(409, f"An agent named {spelling or shown_name(agent)} was in this fleet before, and its records are still here. "
                             f"Choose another name.")
     here = server_agents(server, team)
     # On the hub's own server the server service runs as the hub's user, whose home has the hub's own services and
@@ -70472,7 +70684,9 @@ def add_server_agent(server, body):
     it in team.json with its profile, inactive and with no credential access, and gives the server's service the job to
     install it under its own OS user (a Mac runs one agent, as its desktop account), which also gives it its agent
     key. The same command for
-    the agent on this server whose last install or rename failed gives that job again, and changes nothing else."""
+    the agent on this server whose last install or rename failed gives that job again, and changes nothing else: its
+    `spelling` too stays as team.json has it. `spelling` (owner feature agent_spelling): the name as the owner typed
+    it, which team.json keeps beside the name."""
     agent, runtime, role, parent, t0 = body["agent"], body["runtime"], body["role"], body["reports_to"], now()
     account = body.get("account")       # the AI providers build: an account with a key or a model server's address
     rev = kit_revision(fresh=True)
@@ -70488,16 +70702,18 @@ def add_server_agent(server, body):
     if a is not None:
         if (a.get("machine"), a.get("runtime"), a.get("role")) != (server, runtime, role) or not last or \
                 last["kind"] not in ("install", "rename") or last["agent"] != agent or last["state"] != "failed":
-            raise Refusal(409, f"an agent named {agent} exists")
+            raise Refusal(409, f"An agent named {agent_name(agent, team['agents'])} exists.")
         commit, digest = rev, current           # the job again: the agent is in team.json already
         kind, was = last["kind"], last["was"]
     else:
-        refused = new_agent_refusal(team, server, agent, parent, account)
+        refused = new_agent_refusal(team, server, agent, parent, account, body.get("spelling"))
         if refused:
             raise refused
         boss = team["agents"].get(parent) if parent else None
         team["agents"][agent] = server_agent_entry(team, agent, server, runtime, role,
                                                    parent if boss and boss.get("role") == "lead" else None, account)
+        if body.get("spelling"):            # "" is the name in small letters: no spelling (spelling_read)
+            team["agents"][agent]["spelling"] = body["spelling"]
         try:
             validate_team(team)
         except ValueError as e:
@@ -70508,8 +70724,8 @@ def add_server_agent(server, body):
         try:
             held = kit_file(rev, f"profiles/{agent}.md") is not None
         except KitUnread:
-            raise Refusal(503, code="profile_unread", names={"agent": shown_name(agent)}) from None
-        profile = None if held else (SERVER_PROFILE % {"name": agent}).encode()
+            raise Refusal(503, code="profile_unread", names={"agent": agent_name(agent, team["agents"])}) from None
+        profile = None if held else (SERVER_PROFILE % {"name": body.get("spelling") or agent}).encode()
         commit = commit_kit_file("team.json", data, f"Owner added agent {agent} on server {server}",
                                  more={f"profiles/{agent}.md": profile} if profile else None)
         apply_team(team)
@@ -70519,7 +70735,8 @@ def add_server_agent(server, body):
               (server, kind, agent, runtime, "queued", t0, t0, was))
     log("owner", f"added agent {agent} ({runtime}) on server {server}: job {job}" if kind == "install" else
         f"asked server {server} again to rename {was} to {agent}: job {job}")
-    return {"agent": agent, "server": server, "runtime": runtime, "job": job, "revision": commit, "sha256": digest}
+    return {"agent": agent, "server": server, "runtime": runtime, "job": job, "revision": commit, "sha256": digest,
+            "spelling": agent_spelling(agent, team["agents"])}
 
 
 def set_shape(body):
@@ -71112,14 +71329,16 @@ def renamed_team(team, old, new):
     return out
 
 
-def renamed_profile(data, old, new):
+def renamed_profile(data, old, new, spelling=None):
     """The agent's profile under its new name. Its title line names the agent (`# Profile: <name>`, as Add agent
-    writes it) and takes the new name in the same case; every other word is the owner's own and stays."""
+    writes it), in any case, and takes the new name: the owner's spelling of it where there is one (owner feature
+    agent_spelling), else the name as it is where the title held the old name as it is, else the name with capitals
+    as the apps write it (shown_name; Python's capitalize() gave "Web-dev", review A9). Every other word is the
+    owner's own and stays."""
     first, sep, rest = data.decode("utf-8").partition("\n")
-    for was, now_ in ((old, new), (old.capitalize(), new.capitalize())):
-        if first.strip() == f"# Profile: {was}":
-            first = f"# Profile: {now_}"
-            break
+    title = first.strip()
+    if title.casefold() == f"# profile: {old}":
+        first = f"# Profile: {spelling or (new if title == f'# Profile: {old}' else shown_name(new))}"
     return (first + sep + rest).encode("utf-8")
 
 
@@ -71190,8 +71409,12 @@ def rename_agent(agent, body):
     yet (unplaced). Nothing of it is on a server: no OS user, no checkout, no key, no session. So its rename has no
     job, no server to ask and no open task to wait for, and the receipt's `job` and `server` are null. Its name has
     the installer's rule (hubsetup.manager_name), because its OS user is made from the name when it gets its server.
-    From then on it keeps its name, as each manager."""
-    new, t0 = body["name"], now()
+    From then on it keeps its name, as each manager.
+
+    `spelling` (owner feature agent_spelling): the new name as the owner typed it, which team.json keeps; without one
+    the entry keeps none, because the spelling of the old name is not one of the new name. The same name with another
+    spelling changes only the spelling (respell_agent)."""
+    new, spelling, t0 = body["name"], body.get("spelling"), now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     if body["base_sha256"] != current:
@@ -71199,21 +71422,24 @@ def rename_agent(agent, body):
     a = team["agents"].get(agent)
     if a is None:
         raise Refusal(404, code="no_such_agent")
+    if new == agent:
+        if spelling is None or (spelling or None) == agent_spelling(agent, team["agents"]):
+            raise Refusal(409, f"{agent_name(agent, team['agents'])} has this name already.")
+        return respell_agent(team, agent, spelling)
+    said = spelling or shown_name(new)      # the new name in the words of a refusal
     placing = a.get("role") == "manager" and unplaced(agent, team)      # owner feature manager_rename
     if a.get("role") == "manager" and not placing:
         raise Refusal(409, "The manager keeps its name.")
-    if new == agent:
-        raise Refusal(409, f"{shown_name(agent)} has this name already.")
     if new in team["agents"]:
-        raise Refusal(409, f"An agent named {new} exists.")
+        raise Refusal(409, f"An agent named {agent_name(new, team['agents'])} exists.")
     if fleet_own_name(new):     # its service and its folder take the new name: `git` would get the hub's git service
         raise Refusal(409, f"Founderizer uses the name {new} itself on a server. Choose another name.")
     held = next((n for n, x in team["agents"].items() if n != agent and agent_words(x.get("title")) == new), None)
     if held:                    # a name that is another agent's role would take that role's place (agent_called)
-        raise Refusal(409, f"{team['agents'][held]['title'].strip()} is the role of {shown_name(held)}. Choose another "
-                           f"name.")
+        raise Refusal(409, f"{team['agents'][held]['title'].strip()} is the role of {agent_name(held, team['agents'])}. "
+                           f"Choose another name.")
     if q1("SELECT 1 FROM agents WHERE name=?", (new,)):
-        raise Refusal(409, f"An agent named {new} was in this fleet before, and its records are still here. Choose "
+        raise Refusal(409, f"An agent named {said} was in this fleet before, and its records are still here. Choose "
                            f"another name.")
     if placing and not AGENT_OS_USER.fullmatch("fleet-" + new):
         raise Refusal(409, "The manager's name has at most 26 characters, because its account on its server is "
@@ -71235,7 +71461,8 @@ def rename_agent(agent, body):
         # its user, runtime, checkout, key and service are there (server.py install), and the agent runs.
         if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed" and not (
                 last["step"] == "sign_in" and (finished_sign_in(agent, last["runtime"]) or 0) > last["updated"]):
-            raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
+            raise Refusal(409, f"The install of {agent_name(agent, team['agents'])} stopped. Try it again before you "
+                               f"rename it.")
         reading = server_reading(server, [])
         if reading is None or reading["stale"]:
             raise Refusal(409, code="server_silent", names={"server": server})
@@ -71253,10 +71480,13 @@ def rename_agent(agent, body):
     try:
         taken = kit_file(rev, f"profiles/{new}.md") is not None
     except KitUnread:
-        raise Refusal(503, code="profile_unread", names={"agent": shown_name(new)}) from None
+        raise Refusal(503, code="profile_unread", names={"agent": said}) from None
     if taken:
-        raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
+        raise Refusal(409, f"A profile for {said} is in the fleet already. Choose another name.")
     renamed = renamed_team(team, agent, new)
+    renamed["agents"][new].pop("spelling", None)        # the old name's spelling is none of the new name
+    if spelling:
+        renamed["agents"][new]["spelling"] = spelling
     try:
         validate_team(renamed, shared_ok=renamed_breaches(agent, new),     # what it shared, it shares under its new name
                       browser_ok={(kind, new if n == agent else n) for kind, n in browser_breaches(TEAM)})
@@ -71264,7 +71494,7 @@ def rename_agent(agent, body):
         raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
     data = (json.dumps(renamed, indent=2) + "\n").encode()
     more = None if profile is None else {f"profiles/{agent}.md": None,
-                                         f"profiles/{new}.md": renamed_profile(profile, agent, new)}
+                                         f"profiles/{new}.md": renamed_profile(profile, agent, new, spelling)}
     # its skills move with it, byte for byte (design v4 D1): skills/<agent>/ is its own folder, as its profile is
     # A list or a skill file that git does not give now is no skill that is not there either: it would stay at the old
     # name, or come to the new one empty.
@@ -71293,7 +71523,28 @@ def rename_agent(agent, body):
             log_row("owner", f"renamed agent {agent} to {new} on server {server} in {commit[:12]}: job {job}")
     apply_team(renamed)
     return {"agent": new, "was": agent, "server": server, "job": job, "revision": commit,
-            "sha256": hashlib.sha256(data).hexdigest()}
+            "sha256": hashlib.sha256(data).hexdigest(), "spelling": spelling or None}
+
+
+def respell_agent(team, agent, spelling):
+    """POST /ui/team/agents/<agent>/rename with the agent's own name and a new `spelling` (owner feature
+    agent_spelling): one commit of team.json changes the spelling, and nothing else. The id stays, so no record, file,
+    key, job or session moves, and every agent may take one: the manager, an agent with open tasks, and one whose
+    server is silent. The owner's apps and the hub's words name it by the spelling from then on (agent_name). The
+    name in small letters ("", spelling_read) takes a kept spelling away: the name with a capital comes back."""
+    entry = {k: v for k, v in team["agents"][agent].items() if k != "spelling"}
+    team["agents"][agent] = dict(entry, spelling=spelling) if spelling else entry
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    written = spelling or shown_name(agent)
+    commit = commit_kit_file("team.json", data, f"Owner wrote the name of agent {agent} as {written}")
+    apply_team(team)
+    log("owner", f"wrote the name of agent {agent} as {written} in {commit[:12]}")
+    return {"agent": agent, "was": agent, "server": None, "job": None, "revision": commit,
+            "sha256": hashlib.sha256(data).hexdigest(), "spelling": spelling or None}
 
 
 # ---- an agent moves to an empty server (owner feature agent_move, DevOps plan C7)
@@ -71402,7 +71653,7 @@ def move_agent(agent, body, by="owner"):
         except ValueError as e:         # a coded refusal keeps its code (build plan 04, D2)
             raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
         data = (json.dumps(team, indent=2) + "\n").encode()
-        actor = "Owner" if by == "owner" else shown_name(by)
+        actor = "Owner" if by == "owner" else agent_name(by)
         commit = commit_kit_file("team.json", data, f"Owner gave agent {agent} its server {server}, with {runtime}"
                                  if placing else f"{actor} moved agent {agent} from {old} to server {server}")
         digest = hashlib.sha256(data).hexdigest()
@@ -85700,6 +85951,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("base_sha256 must be the SHA-256 of team.json")
             if not (isinstance(agent, str) and AGENT_NAME.match(agent)) or agent in RESERVED_AGENT_NAMES:
                 raise ValueError("agent must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner")
+            spelling = spelling_read(data, agent)       # owner feature agent_spelling
             # the AI providers build: an account with a key or a model server's address, whose program the agent runs
             account = data.get("account")
             if account is not None and not (isinstance(account, str) and ENTRY_ID.fullmatch(account)):
@@ -85719,7 +85971,8 @@ class Handler(BaseHTTPRequestHandler):
             if parent is not None and not (isinstance(parent, str) and AGENT_NAME.match(parent)):
                 raise ValueError("reports_to must be the manager, a lead or null")
             return dict({"server": server, "base_sha256": base, "agent": agent, "runtime": runtime, "role": role,
-                         "reports_to": parent}, **({"account": account} if account is not None else {}))
+                         "reports_to": parent}, **({"account": account} if account is not None else {}),
+                        **({"spelling": spelling} if spelling is not None else {}))
         return self.ui_command(f"servers/{server}/agents", read, lambda body: add_server_agent(server, body), kit=True)
 
     def ui_server_prepare(self, server):
@@ -92183,7 +92436,7 @@ class Handler(BaseHTTPRequestHandler):
     def ui_agent_rename(self, agent):
         """POST /ui/team/agents/<agent>/rename (owner feature agent_rename): the agent's new name, everywhere."""
         def read(data):
-            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "name"})
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "name", "spelling"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
             base, name = data.get("base_sha256"), data.get("name")
@@ -92192,7 +92445,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (isinstance(name, str) and AGENT_NAME.fullmatch(name)) or name in RESERVED_AGENT_NAMES:
                 raise ValueError("name must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner "
                                  "or hub")
-            return {"agent": agent, "base_sha256": base, "name": name}
+            return {"agent": agent, "base_sha256": base, "name": name, "spelling": spelling_read(data, name)}
         return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body), kit=True)
 
     def ui_agent_move(self, agent):

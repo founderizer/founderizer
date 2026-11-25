@@ -268,6 +268,10 @@ MANAGER_NAME_STARTS_TAKEN = ("login-", "vault-")
 MANAGER_NAME_RULE = ("2 to 26 characters a-z 0-9 -, a letter first, and none of the names that the fleet uses itself ("
                      + ", ".join(MANAGER_NAMES_TAKEN) + ", and each name that starts with "
                      + " or ".join(MANAGER_NAME_STARTS_TAKEN) + ")")
+# The field `spelling` of add_agent and rename_agent (the hub's owner feature agent_spelling, UI-API.md 1.339)
+SPELLING = {"type": "string", "description": "The exact letters of the agent's name as the owner writes it, with "
+                                             "capitals (\"Nova\" for nova): equal to the name when lowercased. The "
+                                             "apps and the hub's words show the name so."}
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is an answer, never a second request: this computer's key for the hub must not go to another place
     with it (`urllib` would send the same headers there)."""
@@ -812,7 +816,8 @@ def refusal(answer, what):
                    + (f"\n{json.dumps(rest, indent=1, sort_keys=True, default=str)}" if rest else ""))
 
 
-GENERATION = {"db": None}               # the hub generation, as the app holds it between reads
+# the hub generation, as the app holds it between reads, and the hub's ui_features of the same read (field_ready)
+GENERATION = {"db": None, "features": None}
 # The words after a 409 whose base moved (`command`), the same in the program inside the app (`OwnerHub.moved`).
 MOVED = ("Another change came after the read that this command was made from: read it again, make the change again "
          "from what is there now, and send that.")
@@ -855,6 +860,7 @@ def generation(fresh=False):
         if answer.status != 200 or not isinstance(answer.data, dict) or not answer.data.get("db"):
             raise refusal(answer, "a read of the fleet")
         GENERATION["db"] = answer.data["db"]
+        GENERATION["features"] = answer.data.get("ui_features")
     return GENERATION["db"]
 
 
@@ -1127,8 +1133,12 @@ def overview(_args):
     state = get("/ui/state", "a read of the fleet", tasks="window", rest="window").data
     found = {"hub": hub_base(), "generation": state.get("db"), "time": state.get("time"),
              "features": state.get("ui_features"), "manager_warning": state.get("manager_warning")}
-    found["agents"] = [{k: a.get(k) for k in ("name", "role", "runtime", "active", "reports_to",
-                                              "last_seen", "alive", "limit")} for a in state.get("agents") or []]
+    # an agent's spelling (owner feature agent_spelling) only where it has one, so that the client names it as the
+    # owner reads it
+    found["agents"] = [dict({k: a.get(k) for k in ("name", "role", "runtime", "active", "reports_to",
+                                                   "last_seen", "alive", "limit")},
+                            **({"spelling": a["spelling"]} if a.get("spelling") else {}))
+                       for a in state.get("agents") or []]
     open_states = ("submitted", "working", "input-required", "auth-required")
     found["open_tasks"] = [{k: t.get(k) for k in ("id", "title", "owner", "requester", "state", "waiting_on",
                                                   "last_activity")}
@@ -1307,6 +1317,7 @@ def with_base(route, fields, what, whole=()):
     nothing. With no base of the client's, the base is `GET /ui/team` read immediately before the command, and a
     change that arrived meanwhile is the hub's own 409."""
     def run(args):
+        field_ready(run, args)
         body = sent(run, fields, args)
         if args.get("base_sha256") is not None:
             body["base_sha256"] = args["base_sha256"]
@@ -1317,6 +1328,31 @@ def with_base(route, fields, what, whole=()):
             body["base_sha256"] = team()["sha256"]
         return command(route_for(route, args), body, what, args.get("request_id"))
     return table_tool(run, "with_base", route, fields, what, whole=whole)
+
+
+# A field that only a hub with one of its `ui_features` keeps (`field_features` of a tool in the table): an older hub
+# drops it from Add agent with no word, so the tool says so before it sends anything. The program inside the
+# Founderizer app reads the same fact from the table.
+FIELD_FEATURES = {"spelling": "agent_spelling"}
+FIELD_WORDS = {"spelling": "This hub keeps no spelling of an agent's name yet: it is older than the feature "
+                           "agent_spelling. Update the hub, or leave spelling out; the apps then show the name with a "
+                           "capital."}
+
+
+def field_ready(run, args):
+    """Refused, with that field's words, when the arguments give a field that the hub does not keep yet
+    (FIELD_FEATURES). The hub's features come with the read of its generation, which each call makes once: a list
+    without the name is read again once, because a hub can take a release while this server runs."""
+    wanted = [f for f in run.fields if f in FIELD_FEATURES and args.get(f) is not None]
+    if not wanted:
+        return
+    generation()
+    missing = [f for f in wanted if FIELD_FEATURES[f] not in (GENERATION["features"] or [])]
+    if missing:
+        generation(fresh=True)
+        missing = [f for f in wanted if FIELD_FEATURES[f] not in (GENERATION["features"] or [])]
+    if missing:
+        raise Refused(FIELD_WORDS[missing[0]])
 
 
 def with_profile_base(args):
@@ -2633,7 +2669,7 @@ def use_hub(args):
     if answer.status != 200:
         raise refusal(answer, f"a read of the hub at {base}")
     set_hub(base)
-    GENERATION["db"] = (answer.data or {}).get("db")
+    GENERATION["db"], GENERATION["features"] = (answer.data or {}).get("db"), (answer.data or {}).get("ui_features")
     state = answer.data or {}
     return {"hub": base, "generation": state.get("db"), "features": state.get("ui_features"),
             "agents": [a.get("name") for a in state.get("agents") or []],
@@ -5148,10 +5184,10 @@ def tools():
               "account": {"type": "string", "description": "The ID of an account that save_account saved with a "
                                                            "kind (key or server)."},
               "role": {"type": "string", "enum": ["worker", "lead"]},
-              "reports_to": {"type": ["string", "null"]}, **rid},
+              "reports_to": {"type": ["string", "null"]}, "spelling": SPELLING, **rid},
              ("server", "agent", "role"),
-             with_base("/ui/servers/{server}/agents", ("agent", "runtime", "account", "role", "reports_to"),
-                       "the new agent")),
+             with_base("/ui/servers/{server}/agents", ("agent", "runtime", "account", "role", "reports_to",
+                                                       "spelling"), "the new agent")),
         tool("Team",
              "remove_agent", "Delete an agent: it leaves team.json with its profile and skills, the hub drops what is "
                              "its own (keys, chat, notes, memory, rules, standing items, wake-up rules, grants; its "
@@ -5171,9 +5207,10 @@ def tools():
                              "server yet (placed false in state, on a hub with the feature manager_rename): its "
                              "new name then has the rule of a new manager's name, " + MANAGER_NAME_RULE + "; no "
                              "server has anything of it, and no job runs. Once it has its server, the manager keeps "
-                             "its name. Read servers to see the job end.",
-             {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
-             with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
+                             "its name. Read servers to see the job end. The same name with a new spelling changes "
+                             "only the spelling: nothing moves and no job runs, for every agent, the manager too.",
+             {"agent": S["text"], "name": S["text"], "spelling": SPELLING, **rid}, ("agent", "name"),
+             with_base("/ui/team/agents/{agent}/rename", ("name", "spelling"), "the new name of this agent")),
         tool("Team",
              "move_agent", "Move an agent to another server that joined with a join code: a Linux server, where each "
                            "agent has its own user account, also beside other agents, or an empty Mac, because a Mac "
@@ -5864,7 +5901,8 @@ def dump_tools(listed=None):
     kind. A tool that `plain`, `with_base` or `with_revision` builds carries its route, its fields, its words for a
     refusal, whether the request id comes from the arguments, the page of its revision (`with_revision`), the fields
     that replace a whole value and need the client's own base (`whole`, of `with_base`), the fields whose null goes to
-    the hub (`nulls`) and the hub's feature that gates it. Each other tool is `swift` or `absent`, and a tool of none of
+    the hub (`nulls`), the hub's feature that gates it, and the fields that only a hub with a feature keeps
+    (`field_features`, field_ready), only where it has one. Each other tool is `swift` or `absent`, and a tool of none of
     these kinds stops the dump: somebody decides which it is. Beside the tools: the facts that the program's own reads
     take from this file, its first words to a client (with the map of the tools that the program lists, by category),
     the categories, and a `version`, a SHA-256 of all the rest (this file does not know the repository's revision)."""
@@ -5877,6 +5915,9 @@ def dump_tools(listed=None):
             entry.update(kind=kind, route=run.route, fields=list(run.fields), what=run.what,
                          revision_page=run.revision_page, request_id_from_args=run.rid_from_args,
                          feature=FEATURES.get(name), whole=list(run.whole), nulls=list(run.nulls))
+            fielded = {f: FIELD_FEATURES[f] for f in run.fields if f in FIELD_FEATURES}
+            if fielded:                 # a field that only a hub with that feature keeps (field_ready)
+                entry["field_features"] = fielded
             if run.wait is not None:
                 entry["wait"] = run.wait
         elif name in SWIFT_READS or name in SWIFT_WRITES:
