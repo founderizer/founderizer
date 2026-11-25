@@ -410,15 +410,16 @@ class Verify:
         return self.answer(OK, f"{self.address} is up, and it is {self.machine}'s address.")
 
     def firewall(self):
-        """The firewall is on: only the private network reaches this machine, SSH included."""
+        """The firewall is on: only the private network reaches this machine, SSH included. On a Mac an off firewall
+        is the owner's choice and no fault (the owner, 25 November 2026: "All Macs: no fault"); the installer and the
+        join line still turn it on by default."""
         state, _how = self.firewall_state()
         mac = self.platform == "darwin"
         if state is True:
             return self.answer(OK, "The firewall is on.")
         if state is False:
             if mac:
-                return self.answer(FAIL, "The firewall is off.",
-                                   "Turn the firewall on in System Settings, Network, Firewall.")
+                return self.answer(OK, "The firewall is off. On a Mac this is allowed.")
             return self.answer(FAIL, "The firewall is off.", "Turn the firewall on.", "sudo ufw --force enable")
         return self.answer(WARN, "The firewall could not be read.", "Read the firewall's state by hand on this server.",
                            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate" if mac
