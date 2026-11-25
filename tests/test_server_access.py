@@ -81,17 +81,18 @@ class ServerKind(Access):
         self.assertEqual(hub.resource_recorded("server:web-1", "vps"), "read")
         status, receipt = self.grant(level="fix")
         self.assertEqual((status, receipt["level"]), (200, "fix"))
-        status, receipt = self.grant(server="mac-studio", level="fix")
+        status, receipt = self.grant(server="mac-studio", level="read")
         self.assertEqual(receipt["mode"], "rule-only")           # a machine of the fleet: rule calls only
+        self.assertEqual(self.grant(server="mac-studio", level="fix")[0], 409)     # Studio runs there (owner API 1.336)
         status, receipt = self.grant(level=None)
         self.assertEqual((status, receipt["changed"]), (200, True))
-        self.assertEqual(self.origin_team()["agents"]["vps"]["servers"], {"mac-studio": "fix"})
+        self.assertEqual(self.origin_team()["agents"]["vps"]["servers"], {"mac-studio": "read"})
         self.assertEqual(hub.resource_recorded("server:web-1", "vps"), None)
         # The Access page shows nothing new: the app gives a server by its business tag (plan C5, "Yes, by business")
         view = self.request("/ui/resources?db=test-generation", source=OWNER)[1]
         self.assertNotIn("server", [k["kind"] for k in view["kinds"]])
         self.assertFalse([r for r in view["resources"] if r["id"].startswith("server:")])
-        self.assertEqual(hub.resource_holders("server", "mac-studio"), [{"agent": "vps", "level": "fix"}])
+        self.assertEqual(hub.resource_holders("server", "mac-studio"), [{"agent": "vps", "level": "read"}])
 
     def test_the_refusals_of_the_owner_route(self):
         self.assertEqual(self.grant(agent="nobody")[0], 404)
@@ -179,6 +180,13 @@ class ServerKind(Access):
         status, answer = self.grant(agent="lead", server="lead-box", level="fix")
         self.assertEqual((status, answer["error"]), (409, "lead-box is Lead's own server, where it has free root with "
                                                           "no door."))
+        # Fix is root: never on a server where an agent runs, the manager's own among them (owner API 1.336; the
+        # security read of 22 November 2026), which would reach that agent's key
+        for server in ("vps", "hub"):
+            status, answer = self.grant(agent="lead", server=server, level="fix")
+            self.assertEqual(status, 409, answer)
+            self.assertIn(f"on {server}: Fix, which is root there, goes only to a server where no agent runs.",
+                          answer["error"])
         # patch is the level of a machine of the fleet, and of no other host
         for server in ("web-1", "mac-studio"):
             status, answer = self.grant(agent="lead", server=server, level="patch")
@@ -204,6 +212,19 @@ class ServerKind(Access):
                       hub.access_route("studio", "server:vps", "manager"))
         self.assertNotIn("door_fleet", hub.access_route("studio", "server:vps", "manager", "fix"))
         self.assertIn("the owner's alone to give", hub.grant_check("vps", "server:web-1", "read"))     # as before
+        # a Fix of before on a server where an agent runs, which no grant gives now: the manager hears of it once, to
+        # ask the owner (the validator's S3 of 24 November 2026). The bug: such root stays and nobody is told
+        team = self.origin_team()
+        team["agents"]["lead"]["servers"] = {"vps": "fix"}
+        self.write_team(team)
+        said = []
+        with patch.object(hub, "emit", lambda agent, kind, text, *a, **k: said.append((agent, text)) or 1):
+            for _ in range(2):
+                hub.keys_and_roots_told(hub.TEAM, hub.manager_name())
+        told = [(agent, text) for agent, text in said if "holds Fix on vps" in text]
+        self.assertEqual(len(told), 1, said)
+        self.assertEqual(told[0][0], hub.manager_name())
+        self.assertIn("root on vps reaches their keys", told[0][1])
 
     def test_a_machine_that_leaves_or_gets_another_name_takes_its_patch_holding_with_it(self):
         """A holding at patch names a machine of the fleet. Remove server, a machine's new Tailscale name and a restore

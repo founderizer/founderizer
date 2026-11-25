@@ -30,7 +30,7 @@ import hubsetup
 import vault
 from leftovers import scratch_home
 from test_servers import NEW, OTHER, OWNER, Servers, git, sha
-from test_ui_api import OwnerAPI
+from test_ui_api import OwnerAPI, session_bearer
 
 SPARE = "127.0.0.11"            # an empty Linux server
 OWN_USERS = {"scout": {"user": "fleet-scout", "uid": 1001}, "writer": {"user": "fleet-writer", "uid": 1002}}
@@ -175,14 +175,19 @@ class Rule(unittest.TestCase):
 
     def test_the_hubs_own_server_takes_held_agents_only_on_a_hub_that_takes_agents(self):
         """os_user_targets, the Linux servers that the manager names in its Needs-you options for a held group: never
-        the group's own machine, and the hub's own server only on a hub whose own server takes agents (hub_shared)."""
+        the group's own machine, and the hub's own server only on a hub whose own server takes agents (hub_shared).
+        Never the manager's own server either, where it runs alone (owner API 1.336), except that hub's. The bug: a
+        card offers the owner the manager's server, and the press is refused."""
         t = team(mini=("mac", "macuser", ["desk", "coder"]), box=("linux", "fleet", []))
         t["servers"]["hub"] = {"kind": "linux", "user": "fleet"}
         group = {"machine": "mini", "agents": ["desk", "coder"]}
         hub.TEAM = t
         with patch.object(hub, "service_user_agents", lambda names: []):
-            self.assertIn("Linux servers that can take them: base, box.", hub.os_user_targets(group))
+            # not base, the manager's own
+            self.assertIn("Linux servers that can take them: box.", hub.os_user_targets(group))
             t["hub"]["shared"] = True
+            self.assertIn("Linux servers that can take them: box, hub.", hub.os_user_targets(group))
+            t["agents"]["manager"]["machine"] = "hub"
             self.assertIn("Linux servers that can take them: base, box, hub.", hub.os_user_targets(group))
 
 
@@ -412,6 +417,60 @@ class Moves(Servers):
         self.assertEqual(status, 200, receipt)
         self.assertNotIn("user", self.origin_team()["agents"]["scout"])
 
+    def shape(self, step):
+        """The step of the slider "Your fleet's servers" that the owner chose last, as set_shape keeps it (None: no
+        step)."""
+        team_now = self.origin_team()
+        if step:
+            team_now["shape"] = {"step": step}
+        else:
+            team_now.pop("shape", None)
+        (self.kit / "team.json").write_text(json.dumps(team_now, indent=2) + "\n")
+        git("commit", "-q", "-am", f"the fleet's servers: {step}", cwd=self.kit)
+        git("push", "-q", "origin", "HEAD", cwd=self.kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        hub.TEAM = json.loads(json.dumps(team_now))
+
+    def test_the_manager_runs_alone_on_its_server(self):
+        """The security read of 22 November 2026, its open point (owner API 1.336): an agent beside the manager that
+        has, or gets, root on that server could read the manager's key and act as it. So at the step "each" the manager
+        moves to no server where an agent runs, and no agent moves beside it. The step "2 servers", which the owner
+        approved (the hub alone, the manager and every agent on a second server), takes agents beside it, and so does a
+        fleet that keeps no step and runs an agent beside it already (the validator of 24 November 2026, M1). The bugs
+        this catches: a move that puts an agent beside the manager at "each", an Add agent that the app offers there
+        and the hub then refuses, and a fleet at "2 servers" that can add or move no agent."""
+        hub.q("INSERT OR REPLACE INTO agent_keys(agent,sha256,created,source) VALUES('manager',?,?,'server')",
+              (sha("manager"), hub.now()))
+        self.shape("each")
+        status, answer = self.move("manager", "box")
+        self.assertEqual(status, 409, answer)
+        self.assertIn("runs alone on its server, and Scout runs on box.", answer["error"])
+        self.assertNotIn("manager_alone", self.servers()[1]["box"]["why"])
+        self.write_can("manager", machine="box")        # a fleet from before the rule, by hand
+        status, answer = self.move("desk", "box")
+        self.assertEqual(status, 409, answer)
+        self.assertIn("runs alone on its server, so no other agent runs on box beside it.", answer["error"])
+        self.assertEqual(hub.agents()["desk"]["machine"], "mini")
+        # the app offers no Add agent there: the servers view gives the manager's server its own code (owner API 1.336)
+        box = self.servers()[1]["box"]
+        self.assertEqual((box["available"], "manager_alone" in box["why"]), (False, True), box["why"])
+        # the step "2 servers": Add agent and a move there, as the slider's own moves need
+        self.shape("two")
+        self.assertNotIn("manager_alone", self.servers()[1]["box"]["why"])
+        status, receipt = self.move("desk", "box")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(hub.agents()["desk"]["machine"], "box")
+        self.assertEqual(self.service(f"/server/box/jobs/{receipt['job']}", {"state": "done", "step": "sign_in"},
+                                      source=OTHER)[0], 200)
+        hub.q("INSERT OR REPLACE INTO agent_keys(agent,sha256,created,source) VALUES('desk',?,?,'server')",
+              (sha("desk"), hub.now()))                 # the service registers its key at the install, as add_and_done
+        status, receipt = self.add_agent("box", "second", "codex")
+        self.assertEqual(status, 200, receipt)
+        # a fleet that keeps no step, and runs agents beside the manager already: as before
+        self.shape(None)
+        self.assertNotIn("manager_alone", self.servers()[1]["box"]["why"])
+        self.assertIsNone(hub.placement_refusal(hub.TEAM, "box", "third", hub.server_agents("box")))
+
     def test_a_name_too_long_for_a_linux_user_is_refused(self):
         self.write_can("desk", user="fleet-" + "x" * 30)             # not a user name that Linux takes
         status, answer = self.move("desk", "box")
@@ -487,6 +546,10 @@ class Held(Servers):
         self.assertEqual(status, 200, answer)
 
     def test_a_held_task_waits_with_its_words_and_is_not_stalled(self):
+        """And a task whose session the hold ended in a turn beside the manager (owner API 1.336) waits the same way,
+        then starts again by itself once its agent runs in a user account of its own. The bugs this catches: a cut
+        turn that reads as failed or as a loss of the task's own (two of those in a row stop a task), or a cut task
+        that never starts again."""
         tid = hub.ins("INSERT INTO tasks(owner,requester,title,state,created,attempt) VALUES('coder','manager','t',"
                       "'submitted',?,1)", (hub.now(),))
         with hub.LOCK:
@@ -496,6 +559,33 @@ class Held(Servers):
         self.assertEqual(t["stalled_reason"], hub.os_user_held_words("coder"))
         self.assertIsNone(t["stalled_since"])
         self.assertEqual(t["live_path"], t["stalled_reason"])
+        # a turn of coder's that the hold cut beside the manager, after one loss of the task's own
+        t0 = hub.now()
+        cut = hub.ins("INSERT INTO tasks(owner,requester,title,state,created,attempt,started,restarts) VALUES('coder',"
+                      "'manager','c','working',?,1,?,1)", (t0 - 900, t0 - 900))
+        hub.ins("INSERT INTO events(agent,kind,task,text,created,extra,helper_ack) VALUES('coder','task',?,'go',?,?,?)",
+                (cut, t0 - 900, json.dumps({"attempt": 1}), t0 - 890))
+        hub.TEAM["agents"]["manager"]["machine"] = "mini"
+        hub.os_user_refresh()
+        with hub.LOCK:
+            hub.liveness(t0)
+        t = hub.q1("SELECT state, attempt, stalled_reason, stalled_since FROM tasks WHERE id=?", (cut,))
+        self.assertEqual(tuple(t), ("working", 1, hub.os_user_held_words("coder"), None))
+        # the owner moves the others out: coder runs alone, and its helper's list has no window of the cut task
+        hub.TEAM["agents"]["manager"]["machine"] = "hub"
+        hub.TEAM["agents"]["desk"]["machine"] = "vps"
+        hub.os_user_refresh()
+        self.assertFalse(hub.os_user_held("coder"))
+        hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES('coder',?,?)",
+              (json.dumps({"features": [hub.START_ONCE]}), t0))
+        hub.know("coder")
+        hub.q("UPDATE agents SET last_seen=?, alive='', alive_ts=? WHERE name='coder'", (t0, t0))
+        with hub.LOCK:
+            hub.liveness(t0)
+        t = hub.q1("SELECT state, attempt, restarts, stalled_reason FROM tasks WHERE id=?", (cut,))
+        self.assertEqual((t["state"], t["attempt"], t["restarts"]), ("working", 2, 0), dict(t))
+        self.assertNotEqual(t["stalled_reason"], hub.os_user_held_words("coder"))
+        self.assertIsNone(hub.kv_get(hub.HELD_CUT + str(cut)))
 
     def test_the_manager_hears_once_when_it_starts_and_once_when_it_ends(self):
         said = []
@@ -538,12 +628,24 @@ class Held(Servers):
             call(agent="vps", server="box", need=f"N-{nid}")            # not held: any move of it is the owner's
 
 
-    def test_the_manager_in_a_group_is_never_held(self):
+    def test_the_manager_in_a_group_is_never_held_and_the_others_stop_at_once(self):
+        """The security read of 22 November 2026, claim 3 (owner API 1.336). The bug: a held agent's running session
+        keeps working beside the manager. Its window closed only when its turn ended, so a turn of it beside the
+        manager could read the manager's key and act as it. The manager keeps running (it moves the others), no route
+        gives the others a credential, and the poll of each of them says hold_now, so that its helper ends its sessions
+        at once, also in a turn. A group without the manager waits for its turns' ends, as before."""
+        status, answer = self.as_agent("coder", "/events/coder?delivery=1&after=0&wait=0")
+        self.assertEqual((status, answer.get("hold"), answer.get("hold_now")), (200, "os_user", None), answer)
         hub.TEAM["agents"]["manager"]["machine"] = "mini"       # the manager on the Mac too, from before the rule
         hub.os_user_refresh()
         self.assertIn("manager", hub.OS_USERS["groups"][0]["agents"])
         self.assertFalse(hub.os_user_held("manager"))
         self.assertTrue(hub.os_user_held("desk"))
+        status, answer = self.as_agent("coder", "/events/coder?delivery=1&after=0&wait=0")
+        self.assertEqual((status, answer.get("hold"), answer.get("hold_now")), (200, "os_user", True), answer)
+        status, answer = self.as_agent("coder", "/helper/session/coder",
+                                       {"kind": "chat", "generation": hub.kv_get("db_id")})
+        self.assertEqual((status, answer.get("auth")), (403, "os_user_shared"))
 
     def test_a_lone_agent_of_the_service_user_is_held_by_nothing_and_a_pair_names_it(self):
         t = copy.deepcopy(hub.TEAM)
@@ -982,9 +1084,12 @@ class ServiceReading(unittest.TestCase):
 
 
 class HelperHold(unittest.TestCase):
-    """fleet.Helper.close_held: a held agent's windows close once their turns end, with their processes."""
+    """fleet.Helper.close_held: a held agent's windows close once their turns end, with their processes; beside the
+    manager (the poll's hold_now, owner API 1.336) at once, also in a turn."""
 
     def test_only_idle_windows_of_its_sessions_close(self):
+        """The bug of hold_now: a held agent's running session keeps working beside the manager, whose key it can
+        read, until its turn ends."""
         h = fleet.Helper.__new__(fleet.Helper)
         h.session, h.typed_at = "fleet-scout", {"T-3": 200.0}
         h.hub_turns = ({"T-2"}, 100.0)
@@ -999,6 +1104,12 @@ class HelperHold(unittest.TestCase):
         self.assertEqual([a[2] for a in killed if a[0] == "kill-window"],
                          ["=fleet-scout:=T-1", "=fleet-scout:=owner-chat"])
         self.assertEqual(quiet, ["T-1", "owner-chat"])
+        del killed[:], quiet[:]
+        with patch.object(fleet, "tmux", lambda *a, **k: killed.append(a)):
+            h.close_held(now=True)
+        self.assertEqual([a[2] for a in killed if a[0] == "kill-window"],
+                         [f"=fleet-scout:={w}" for w in ("T-1", "T-2", "T-3", "C-4", "owner-chat")])
+        self.assertEqual(quiet, ["T-1", "T-2", "T-3", "C-4", "owner-chat"])
 
 
 class OldMachine(unittest.TestCase):

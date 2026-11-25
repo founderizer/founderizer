@@ -518,6 +518,17 @@ class SourceHandler(hub.Handler):
 PATIENCE = float(os.environ.get("FLEET_TEST_PATIENCE") or 5)
 
 
+def session_bearer(agent, kind, task=None, attempt=None, generation=None):
+    """{"Authorization": ...} of one session of `agent` (owner API 1.12): a credential that the hub keeps as its own
+    mint does (helper_session), written here so that a test needs no key route. On a hub that pins addresses no MCP
+    call passes without one (owner API 1.336). generation: the hub's DB generation by default."""
+    token = "test-" + uuid.uuid4().hex + uuid.uuid4().hex
+    hub.q("INSERT INTO session_credentials(sha256,agent,kind,generation,task,attempt,created) VALUES(?,?,?,?,?,?,?)",
+          (hashlib.sha256(token.encode()).hexdigest(), agent, kind,
+           hub.kv_get("db_id") if generation is None else generation, task, attempt, hub.now()))
+    return {"Authorization": "Bearer " + token}
+
+
 class LandingLock:
     """hub.LOCK for one call of a test: before the nth time that the call's own thread takes the lock from outside,
     `land` runs. A delete and a rename hold the lock for their whole run, so these are all the moments at which one of

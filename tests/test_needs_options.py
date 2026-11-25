@@ -166,9 +166,9 @@ class Options(NeedsCase):
             self.assertIn(refusal, str(refused.exception))
         # a press of the recommended words is the agent's words, not the owner's typed ones (CARD_TYPED)
         row = self.row(words)
-        self.assertEqual(hub.need_words_note(row, None, None, "No refund, a store credit"),
+        self.assertEqual(hub.need_words_note(row, None, None, "No refund, a store credit", "app"),
                          " The owner pressed the answer that you recommended.")
-        self.assertIn("in their own words", hub.need_words_note(row, None, None, "Refund it all"))
+        self.assertIn("in their own words", hub.need_words_note(row, None, None, "Refund it all", "app"))
 
 
 class Choice(NeedsCase):
@@ -774,7 +774,7 @@ class Talk(NeedsCase):
         the manager, which has carried the mark since 21 November 2026; a row whose line has no mark, or that has no
         line, stays his own words, and a second start changes nothing."""
         self.raise_item(options=["Tide", "Harbour"])
-        hub.need_talk_said({"need": 1, "text": "Is it cheaper?"})                     # his own: its line has no mark
+        hub.need_talk_said({"need": 1, "text": "Is it cheaper?"}, hand="app")        # his own: its line has no mark
         hub.ins("INSERT INTO need_talk(need, ts, who, text) VALUES(1, ?, 'owner', 'From the old Discuss box')",
                 (hub.now(),))                                                       # no line to the manager
         hub.need_talk_said({"need": 1, "text": "And next month?"}, hand="other")   # a program's

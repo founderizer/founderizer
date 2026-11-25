@@ -2333,7 +2333,8 @@ OWNER_TOOL_VIA = "ai-session"           # the mark of a tool's request in its he
 OWNER_PROGRAM_VIA = "program"           # and of an "other" request (any label that no app of the owner's gives)
 # The hands whose words are the owner's own (Fable's check of 20 November 2026, finding 1: a request with any label
 # that no client lists, `curl/8.7.1` for one, had the owner's force, so the whole chain of N-230 ran again): the Mac
-# app's own screen, an app on an enrolled device and a chat app's message, and a row of before the hand was kept (None).
+# app's own screen, an app on an enrolled device and a chat app's message. No hand (None) is none of them (owner API
+# 1.336).
 OWNER_FORCE_HANDS = ("app", "device", "chat")
 
 
@@ -2347,8 +2348,10 @@ def board_hand():
 def owner_force(hand):
     """True when words with this hand (request_hand) are the owner's own: they can be the source of the owner's
     standing item, the owner's words of a decision card, and the answer in words of a card that has its own answers.
-    A row of before the hand was kept has none, and keeps its force."""
-    return hand is None or hand in OWNER_FORCE_HANDS
+    No hand has no force (owner API 1.336; the security read of 22 November 2026, claim 9): a caller that forgot its
+    hand, or an act of the manager without its own, must not count as the owner. So a row of before the hand
+    was kept (21 November 2026) is no longer the owner's word for a new standing item or a skill's retire."""
+    return hand in OWNER_FORCE_HANDS
 
 
 def request_via(hand):
@@ -20601,8 +20604,9 @@ def need_talk_said(body, via=None, hand=None):
         not manager_has_no_turn(need["by"], t0) and turn_ended(need["by"]) > 0
     head = (f"[owner{f' via {mark}' if mark else ''}] About Needs-you N-{need['id']} ({need['title']}), "
             f"before answering it: {body['text']}\n(The hub: the item stays open")
-    talk_hand = hand if not owner_force(hand) and not via else None     # need_talk.hand: words that are not his
-    not_his = NEED_TALK_NOT_HIS if not owner_force(talk_hand) else ""
+    # need_talk.hand: words that are not his; none for his own (talk_his). No hand is no hand of his (owner API 1.336)
+    talk_hand = (hand or "other") if not owner_force(hand) and not via else None
+    not_his = NEED_TALK_NOT_HIS if not talk_his(talk_hand) else ""
     if waits:
         text = (f"{head}, and its card waits for your answer.{not_his} {need_wait_ways(need)} Their answer to the "
                 f"item comes as its own message.)")
@@ -20657,6 +20661,13 @@ def need_wait_ways(need):
         said += (f" Answering Q-{need['question']} closes the card with no word to the owner: reply under it "
                  f"first.")
     return said
+
+
+def talk_his(hand):
+    """True when a row of need_talk with this hand holds the owner's own words: need_talk_said writes no hand for his
+    own and one for every other (owner API 1.316), and a row from before that column that settle_talk_hands could not
+    mark stays his. Only for that table: elsewhere no hand has no owner's force (owner_force, owner API 1.336)."""
+    return hand is None or owner_force(hand)
 
 
 NEED_TALK_NOT_HIS = (" An AI session or a program on the owner's Mac wrote these words for the owner: the owner did not "
@@ -20764,7 +20775,7 @@ def need_wait_sweep(t0):
             said = read_row("SELECT text, hand FROM need_talk WHERE need=? AND who='owner' ORDER BY id DESC LIMIT 1",
                             (r["id"],))
             quoted = (f" Their newest words there, quoted: \"{clip(said['text'], NEED_ASK_QUOTE)}\"." +
-                      (NEED_TALK_NOT_HIS if not owner_force(said["hand"]) else "")) if said else ""
+                      (NEED_TALK_NOT_HIS if not talk_his(said["hand"]) else "")) if said else ""
             text = (f"[hub] The owner's words under Needs-you N-{r['id']} ({r['title']}) have no answer from you yet, "
                     f"and its card waits for one.{quoted} {need_wait_ways(r)} If your next turn ends with none of "
                     f"these, the card stops waiting for you, and a later second look names it.")
@@ -20942,7 +20953,7 @@ def need_look_hints(r):
     if said and said["who"] == "owner" and said["ts"] >= (r["raised"] or 0):
         # his words, quoted, and whose they are (need_talk.hand): the manager has no tool that reads a card's talk
         words = NEED_TALK_NOT_HIS.strip().rstrip(".")
-        mark = "" if owner_force(said["hand"]) else "; " + words[0].lower() + words[1:]
+        mark = "" if talk_his(said["hand"]) else "; " + words[0].lower() + words[1:]
         hint = (f"the owner's words under it have no reply (quoted: \"{clip(said['text'], NEED_LOOK_QUOTE)}\""
                 f"{mark})")
         if need_unclarified(r) is None:
@@ -50948,6 +50959,10 @@ def plain_words(text):
 
 # the review of 20 November 2026, issue 4: the manager kept the words that a Claude Code session wrote in the owner's
 # voice (N-230) as the owner's standing item I-98 for the whole fleet, and ended I-97 on another session's message
+# A message or a steer from before Fleet kept the hand that sent it (21 November 2026): no hand has no owner's force
+# (owner_force, owner API 1.336), and the hub cannot tell whose words it holds.
+STANDING_NO_HAND = ("M-{n} is from before Fleet kept who sent a message, so it is the owner's word for no item: ask "
+                    "the owner to say it again.")
 STANDING_NOT_HIS = ("M-{n} came from an AI session or an app that acts for the owner (request_hand), not from the "
                     "owner's own hand: it keeps no item as the owner's, and it changes or ends none of theirs. Keep "
                     "these words as your own item, without source, or put the rule's words on a card: when the owner "
@@ -50987,7 +51002,7 @@ def standing_source(agent, source, words=None, whole=False, ending=False):
     customer's role gives no item. Words, when given, must be part of that message: a line inside a customer's email
     cannot pass for another person's wish. An M-<n> that an AI session sent through the owner tools, or a connected
     app, is the owner's word for no item (STANDING_NOT_HIS): its row's hand says so (request_hand); a row of before
-    the hand was kept has none, and stays as it was.
+    the hand was kept has none, which is no force either (owner_force).
 
     whole: the words must be that whole message and nothing else, as the chat read it (no hidden character) and as
     plain_words compares (straight quotes, one space, no case: a phone writes curly marks), for the owner chat of an
@@ -51012,6 +51027,8 @@ def standing_source(agent, source, words=None, whole=False, ending=False):
                      "WHERE s.event_id=?", (n,))
         if not said or said["recipient"] not in [agent] + line_above(agent):
             raise ToolError(f"M-{n} is no message of the owner's to you or to an agent above you in your line.")
+        if said["hand"] is None and said["connection"] is None:     # owner API 1.336: no hand has no owner's force
+            raise ToolError(STANDING_NO_HAND.format(n=n))
         if not owner_force(said["hand"]) or said["connection"] is not None:
             raise ToolError(STANDING_NOT_HIS.format(n=n) if not chat_context(agent) else
                             STANDING_NOT_HIS_END.format(n=n) if ending else
@@ -61776,6 +61793,10 @@ def liveness(t0):
             q("UPDATE tasks SET live_path=?, stalled_reason=?, stalled_since=NULL, stall_told=0 WHERE id=? AND "
               "(live_path IS NOT ? OR stalled_reason IS NOT ? OR stalled_since IS NOT NULL OR IFNULL(stall_told, 0) != 0)",
               (words, words, tid, words, words))
+            # Beside the manager its helper ends this attempt's session at once, also in a turn (hold_now): that loss
+            # is the hub's, so it never counts as the task's own when the attempt starts again (session_lost)
+            if os_user_beside_manager(owner) and kv_get(HELD_CUT + str(tid)) != str(t["attempt"]):
+                kv_set(HELD_CUT + str(tid), str(t["attempt"]))
             continue
         if not is_conversation_task(t) and sign_in_restart_due(t) and not parked(tid) and \
                 fresh_refusal(t, t["attempt"]) is None:
@@ -62016,7 +62037,9 @@ def session_lost(t, t0):
     last acted, it gets one quiet note, for the loop that keeps a note and dies at the same step."""
     tid, owner = t["id"], t["owner"]
     up = read_row("SELECT started FROM attempts WHERE task=? AND attempt=?", (tid, t["attempt"]))
-    counted = not (up and up["started"]) or not attempt_progress(t)
+    # a session that the hub's hold ended beside the manager (HELD_CUT, owner API 1.336) is no loss of the task's own
+    cut = kv_get(HELD_CUT + str(tid)) == str(t["attempt"])
+    counted = not cut and (not (up and up["started"]) or not attempt_progress(t))
     why = kv_get(f"start_failed:{tid}")
     if counted and t["restarts"] + 1 >= LOST_IN_A_ROW:
         if t["restarts"] < LOST_IN_A_ROW:
@@ -62030,6 +62053,8 @@ def session_lost(t, t0):
     if not counted:
         q("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
     new_attempt(t, "restart", counted=counted)
+    if cut:
+        kv_set(HELD_CUT + str(tid), None)
     lost = int(kv_get(f"lost:{tid}") or 0) + 1
     kv_set(f"lost:{tid}", lost)
     log("hub", f"session for {tref(tid)} on {owner} was lost; attempt {t['attempt'] + 1} starts" +
@@ -64750,7 +64775,9 @@ def placement_refusal(team, server, agent, here):
     """Why `agent` may not run on `server` beside the agents `here`, in one sentence that says what it protects, or
     None (one OS user for each agent). A server whose own reading names the other system than the kind it joined as
     takes no agent; a Mac runs one; and a Linux server takes no second agent beside one that its server service
-    reported running as the service's own user, which can become any agent there (service_user_agents)."""
+    reported running as the service's own user, which can become any agent there (service_user_agents). The manager
+    runs alone: no agent goes beside it, and it goes to no server where an agent runs, except on a hub's own server
+    that takes agents (hub_shared)."""
     recorded = ((team.get("servers") or {}).get(server) or {}).get("kind")
     read = server_kind(server_reading(server, []))
     if recorded and read and recorded != read:
@@ -64759,6 +64786,12 @@ def placement_refusal(team, server, agent, here):
     others = [n for n in here if n != agent]
     if not others:
         return None
+    mgr = next((n for n in [agent] + others if ((team.get("agents") or {}).get(n) or {}).get("role") == "manager"),
+               None)
+    if mgr is not None and not manager_beside_ok(team, server):
+        return (f"{shown_role(mgr)} runs alone on its server, so no other agent runs on {server} beside it."
+                if mgr != agent else
+                f"{shown_role(agent)} runs alone on its server, and {shown_role(others[0])} runs on {server}.")
     if (recorded or read) == "mac":
         return (f"A Mac runs one agent, and {shown_role(others[0])} runs on {server}: a second agent there would run "
                 f"as the same user account and could act as it.")
@@ -64768,6 +64801,37 @@ def placement_refusal(team, server, agent, here):
                 f"agent there, so {server} takes no second agent until {shown_role(service[0])} moves to a server of "
                 f"its own.")
     return None
+
+
+def manager_alone_on(team, server):
+    """True when `server` is one where the manager runs alone (owner API 1.336; the security read of 22 November 2026,
+    its open point): an agent beside it that has, or gets, root there could read the manager's key and act as it. So no
+    agent goes there (placement_refusal), and the servers view says so (`manager_alone`). False for a server with no
+    manager, for a server where an agent may run beside it (manager_beside_ok), and for the hub's own server in each
+    fleet: the one-server fleet takes agents there, and every other fleet takes none there at all, which its own code
+    says (hub_machine)."""
+    if server == (team.get("hub") or {}).get("machine") or manager_beside_ok(team, server):
+        return False
+    return any(((team.get("agents") or {}).get(n) or {}).get("role") == "manager" for n in server_agents(server, team))
+
+
+def manager_beside_ok(team, server):
+    """True where an agent may run beside the manager on `server`: the shapes in which the owner chose that, and a fleet
+    that was built so before it kept a shape. Step "1 server" (hub_shared): the hub's own server. Step "2 servers": the
+    hub alone, and the manager and every agent on a second server (shape_view, the step that the personal fleet opens
+    on). A fleet that keeps no step and already runs an agent beside the manager on `server`. Each agent there has its
+    own OS user, and no agent gets Fix there (grant_server). A limit: there the manager shares its server, so an agent
+    of it that gets root in another way can read the manager's key. Only step "each" keeps the manager alone."""
+    hub_machine = (team.get("hub") or {}).get("machine")
+    if server == hub_machine:
+        return hub_shared(team)
+    step = (shape_view(team) or {}).get("step")
+    if step == "two":
+        return True
+    if step is not None:
+        return False
+    here = server_agents(server, team)
+    return len(here) > 1 and any(((team.get("agents") or {}).get(n) or {}).get("role") == "manager" for n in here)
 
 
 def move_refusal(team, agent, a, server):
@@ -64853,6 +64917,8 @@ OS_USER_HELD_EVENTS = ("task", "say", "chat", "conversation", "request", "deposi
 OS_USERS = {"at": 0.0, "groups": None}      # the newest os_user_faults: at the start, at each apply_team, each minute
 OS_USER_EVERY = 60                  # seconds between two passes of os_user_sweep
 OS_USER_TOLD = "os_user_told"       # kv: since when the manager knows of each held agent, and of hub_user
+KEYS_ROOTS_TOLD = "keys_roots_told"     # kv: what keys_and_roots_told told the manager of, {"keyless", "fix"}
+HELD_CUT = "held_cut:"              # kv: <task> -> the attempt whose session the hold ended beside the manager
 INSTALL_TOLD = "install_told:"      # kv: the end of a moved agent's install job, told to the manager once
 INSTALL_TOLD_FROM = "install_told_from"     # kv: the newest job before the first pass, whose ends nobody waits for
 
@@ -65023,13 +65089,25 @@ def os_user_held(agent):
     """True while this agent is in a group of os_user_faults: no new session starts for it, and no route gives a
     credential for it (the owner, 10 November 2026: stop their work). The manager is never held: it is the owner's chat
     and the agent that gets the others out (move_agent), and in a group with it the others are held, so no session of
-    theirs runs that could act as it."""
+    theirs runs that could act as it. Their sessions that run already end at once, also in a turn, not when the turn
+    ends (os_user_beside_manager; owner API 1.336, the security read of 22 November 2026, claim 3)."""
     if agent not in agents() or agent == manager_name():
         return False
     groups = OS_USERS["groups"]
     if groups is None:      # before the first os_user_refresh: the faults of the team that this read sees (a read
         groups = OS_USERS["groups"] = os_user_faults(team_read())     # of the state reads it only through its moment)
     return any(agent in g["agents"] for g in groups)
+
+
+def os_user_beside_manager(agent):
+    """True while this held agent (os_user_held) is in a group of os_user_faults with the manager, which runs: a
+    session of it that runs could read the manager's key and credential and act as it. Its helper then ends each of
+    its sessions at once, also in a turn (the poll's hold_now, Helper.close_held), where a held agent's window closes
+    only when its turn ends. Its cut task keeps the held line (os_user_held_words) and starts again by itself once its
+    agent runs in a user account of its own, as every held task does (liveness)."""
+    mgr = manager_name()
+    return agent != mgr and os_user_held(agent) and \
+        any(agent in g["agents"] and mgr in g["agents"] for g in OS_USERS["groups"] or [])
 
 
 def os_user_since(agent):
@@ -65127,6 +65205,8 @@ def os_user_targets(group):
         if name == group.get("machine") or (name == hub_machine and not hub_shared(TEAM)):
             continue                # the own server of a hub that takes agents (hub_shared) takes them as any other
         here = server_agents(name)
+        if manager_alone_on(TEAM, name):
+            continue                # the manager runs alone on its server: a move there is refused (placement_refusal)
         if server.get("kind") == "linux" and not service_user_agents(here):
             linux.append(name)
         elif server.get("kind") == "mac" and not here:
@@ -65139,6 +65219,67 @@ def os_user_targets(group):
                   f"or screen, so {'it goes' if len(desktop) == 1 else 'they go'} to an empty Mac" +
                   (f": {', '.join(macs)}." if macs else ", and none is free yet."))
     return words
+
+
+def keys_and_roots_told(team, mgr):
+    """Inside os_user_sweep: tell the manager once of each agent that cannot run and of each root beside agents (owner
+    API 1.336), so that it asks the owner in a Needs-you item. An agent alone on its address with no key, on a server
+    whose service registers keys (key_by_server): its helper may not register one, and the hub refuses each MCP call of
+    it with no credential, so no session of it runs. Not while its install runs (install_open), whose key step
+    registers the key by itself (the validator's M3 of 24 November 2026: each Add agent and each move on such a server
+    told the manager in that time, and the owner got a card for nothing). An install that ended before its key step
+    (failed, canceled) is the app's Try again on the agent's page, which runs it again, not a root command; after a
+    move it is not told here, because the line of that install's end tells the manager to run the move again. And an
+    agent that holds Fix on a server where agents run, from before grant_server refused such a grant: root there
+    reaches their keys. A thing that ends and comes again is told again; a rename tells again once."""
+    try:
+        told = json.loads(kv_get(KEYS_ROOTS_TOLD) or "{}")
+    except (ValueError, TypeError):
+        told = {}
+    agents_ = team.get("agents") or {}
+    keyless = sorted(n for n in agents_ if n in agents() and not unplaced(n) and not shared_machine(n)
+                     and agent_key(n) is None and key_by_server(n) and not install_open(n)
+                     and not (kv_get(MOVED + n) and install_cut_short(n)))
+    roots = sorted(f"{n}@{s}" for n, a in agents_.items() for s, level in ((a or {}).get("servers") or {}).items()
+                   if level == "fix" and [x for x in server_agents(s, team) if x != n])
+    for n in keyless:
+        if n not in (told.get("keyless") or []):
+            machine, cut = agents_[n]["machine"], install_cut_short(n)
+            if cut:
+                emit(mgr, "say", f"[hub] {shown_role(n)} on {machine} has no agent key: its install there "
+                                 f"{'failed' if cut['state'] == 'failed' else 'was stopped'}"
+                                 + (f" at its step {cut['step']}" if cut["step"] else "")
+                                 + f" before it registered one, so no session of {shown_role(n)} runs. Ask the owner "
+                                 f"in a Needs-you item to press Try again on {shown_role(n)}'s page in the app: that "
+                                 f"installs it there again, and the install registers its key.")
+                log("hub", f"the manager heard that {n} has no agent key after its install ended")
+                continue
+            emit(mgr, "say", f"[hub] {shown_role(n)} on {machine} has no agent key, and the server service of "
+                             f"{machine} registers keys only at an install, so no session of {shown_role(n)} runs. Ask "
+                             f"the owner in a Needs-you item to register one: on {machine}, as {shown_role(n)}'s own "
+                             f"user, `fleet.py key {n} --rotate` prints its SHA-256, which the owner registers with "
+                             f"the agent_key tool of an AI session that has the Founderizer tools.")
+            log("hub", f"the manager heard that {n} has no agent key and cannot register one")
+    for held in roots:
+        if held not in (told.get("fix") or []):
+            n, s = held.split("@", 1)
+            here = [x for x in server_agents(s, team) if x != n]
+            emit(mgr, "say", f"[hub] {shown_role(n)} holds Fix on {s} through the door, and {roles_phrase(here)} "
+                             f"{'runs' if len(here) == 1 else 'run'} there: root on {s} reaches their keys. The hub "
+                             f"gives no such grant now. Ask the owner in a Needs-you item whether {shown_role(n)} "
+                             f"keeps it.")
+            log("hub", f"the manager heard that {n} holds Fix on {s}, where agents run")
+    if told != {"keyless": keyless, "fix": roots}:
+        kv_set(KEYS_ROOTS_TOLD, json.dumps({"keyless": keyless, "fix": roots}))
+
+
+def install_cut_short(agent):
+    """The newest install job of `agent` on its own server, when it ended before its end (failed or canceled), or
+    None: its key step may not have run (keys_and_roots_told)."""
+    machine = (agents().get(agent) or {}).get("machine")
+    job = q1("SELECT state, step FROM server_jobs WHERE agent=? AND server=? AND kind='install' "
+             "ORDER BY id DESC LIMIT 1", (agent, machine))
+    return job if job and job["state"] in ("failed", "canceled") else None
 
 
 def os_user_sweep(t0):
@@ -65202,12 +65343,14 @@ def os_user_sweep(t0):
                          + (f" when the install of {roles_phrase(installing)} on "
                             f"{'its' if len(installing) == 1 else 'their'} new server has ended with the owner's "
                             f"sign-in there" if installing else "") + ".")
+    keys_and_roots_told(team, mgr)          # owner API 1.336: an agent that cannot run, or root beside agents
     hub_user = manager_hub_user(team)
     if hub_user and told.get("hub_user") is None:
         emit(mgr, "say", "[hub] You run as the hub's own user account on its server, which can read every login of "
                          "the hub's vault. Ask the owner in a Needs-you item which server takes you, with an option "
-                         "for each server by its exact name, then move yourself with move_agent(agent=\"" + mgr +
-                         "\", server, need). Your session here ends with the move, and the owner signs you in there.")
+                         "for each server where no agent runs, by its exact name, then move yourself with "
+                         "move_agent(agent=\"" + mgr + "\", server, need). Your session here ends with the move, and "
+                         "the owner signs you in there.")
     kv_set(OS_USER_TOLD, json.dumps({"agents": {n: since.get(n) or t0 for n in sorted(set(held_now))},
                                      "hub_user": (told.get("hub_user") or t0) if hub_user else None}))
     floor = kv_get(INSTALL_TOLD_FROM)
@@ -68236,7 +68379,8 @@ def servers_view():
              ["agent_not_ready"] if [n for n in not_shareable(team, here) if not installing(job, n)] or
              service_user_agents(here) else []) + \
             (["fix_holder"] if fix_holders(team, name) else []) + \
-            (["door_caller"] if door_callers_at(team, name) else [])
+            (["door_caller"] if door_callers_at(team, name) else []) + \
+            (["manager_alone"] if manager_alone_on(team, name) else [])      # owner API 1.336: no agent beside it
         if name not in keys:
             why.append("no_service")
         elif reading is None or reading["source"] != "server":
@@ -73237,6 +73381,10 @@ def grant_server(body):
                            f"agents and of the hub's server.")
     if a.get("machine") == server and level not in (None, "patch"):
         raise Refusal(409, f"{server} is {shown_role(agent)}'s own server, where it has free root with no door.")
+    here = server_agents(server)
+    if level == "fix" and here:         # owner API 1.336: root there would reach the keys of the agents that run there
+        raise Refusal(409, f"{roles_phrase(here)} {'runs' if len(here) == 1 else 'run'} on {server}: Fix, which is "
+                           f"root there, goes only to a server where no agent runs.")
     # The reverse of door_callers_at: the door knows a caller by its server's address alone, so an agent beside the
     # holder on one server would be the holder to the door. The app's own check of the box says the same.
     mates = sorted(n for n in machine_agents(agent) if n != agent)
@@ -82938,15 +83086,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def session_allowed(self, agent, context):
         """An MCP call (owner API 1.12): from the agent's machine, with a session credential whose binding matches this
-        route. A call without any credential only while the agent is alone on its address and has no key yet, as
-        allowed() takes a helper route: an agent with a key sends its session's credential on every call, also while
-        it is alone, so that no other user of its machine can act as its owner chat, a conversation, one of its
-        tasks or its standing session (the access review of 10 November 2026). Its helper enrolls the key before it
-        starts the standing session (Helper.enroll). A window that started without a credential, before its agent had
-        a key, is refused from then on, and its helper closes the standing session and the owner chat among them, so
-        that each starts again with one (Helper.close_keyless). A credential that is sent but does not match is
-        refused, never taken as absent. An agent whose machine has no address is refused on a hub that checks
-        addresses (address_checked)."""
+        route. A call without a credential is refused (owner API 1.336), also while the agent is alone on its address
+        and has no key yet: the address alone names no session, so any user of that machine could act as its owner
+        chat, a conversation, one of its tasks or its standing session (the access review of 10 November 2026; the
+        security read of 22 November 2026, claim 2). The one exception is a hub that pins no address at all and an
+        agent with no key: such a hub takes every name as it is given on every route (address_checked), so the refusal
+        would hold nothing there. Only the throwaway hubs of selftest.py and some fixtures are in that state, never a
+        fleet (validate_team gives each machine an address). A new agent's first session gets its credential this
+        way: its helper registers its key by the address alone (helper_key), asks for the credential with that key
+        (helper_session), and only then starts the session (Helper.enroll before Helper.manage). A window that started
+        without a credential is refused, and its helper closes the standing session and the owner chat among them when
+        it has the key, so that each starts again with one (Helper.close_keyless). A credential that is sent but does
+        not match is refused, never taken as absent. An agent whose machine has no address is refused on a hub that
+        checks addresses (address_checked)."""
         if unplaced(agent):
             return self.no_server(agent)
         want, src = address_of(agent), self.client_address[0]
@@ -82958,13 +83110,14 @@ class Handler(BaseHTTPRequestHandler):
             return False
         token, self.credential = self.bearer(), None
         if token is None:
+            if not address_checked() and agent_key(agent) is None:
+                return True             # a hub that tells nobody apart by address (selftest.py), never a fleet
             shared = shared_machine(agent)
-            if not shared and agent_key(agent) is None:
-                return True             # alone, and its helper has not enrolled its key yet: the address rule
             return self.refuse(agent, "credential_required",
                                f"{agent} shares its machine with other agents: this session needs its credential and "
                                f"must start again" if shared else
-                               f"{agent} has an agent key: this session needs its credential and must start again")
+                               f"{agent} has an agent key: this session needs its credential and must start again"
+                               if agent_key(agent) is not None else keyless_words(agent))
         row = q1("SELECT * FROM session_credentials WHERE sha256=?", (hashlib.sha256(token.encode()).hexdigest(),)) \
             if token else None
         if row and row["revoked"] is None and row["agent"] == agent and binding_matches(row, context):
@@ -89087,8 +89240,10 @@ class Handler(BaseHTTPRequestHandler):
                 # AUTONOMY.md P2: how each open conversation runs now, with contacts.v2; a window that started another
                 # way closes, because its tools were fixed at its start
                 "conversation_modes": conversation_modes(agent) if worker and contacts_v2() else None,
-                # one OS user for each agent: its helper closes its windows when their turns end (Helper.close_held)
-                **({"hold": "os_user"} if shared else {}),
+                # one OS user for each agent: its helper closes its windows when their turns end (Helper.close_held),
+                # and at once, also in a turn, beside the manager (os_user_beside_manager, owner API 1.336)
+                **({"hold": "os_user", **({"hold_now": True} if os_user_beside_manager(agent) else {})}
+                   if shared else {}),
                 "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                             "text": r["text"], "extra": json.loads(r["extra"] or "{}"),
                             # plan C6: the helper started this attempt once; only the hub starts it again
@@ -91588,6 +91743,23 @@ class Handler(BaseHTTPRequestHandler):
         if not out:
             return self.send(202, b"")
         self.json(200, out if isinstance(msg, list) else out[0], headers)
+
+
+def key_by_server(agent):
+    """True for an agent whose machine's own server service registers its key, at an install (INSTALL_KEY): its helper
+    may not register one (helper_key), so only that service or the owner gives it one."""
+    machine = (agents().get(agent) or {}).get("machine")
+    return bool(machine) and INSTALL_KEY in server_features(machine)
+
+
+def keyless_words(agent):
+    """Why an MCP call of an agent with no key is refused (owner API 1.336), in words that are true for its machine."""
+    if key_by_server(agent):
+        machine = agents()[agent]["machine"]
+        return (f"{agent} has no agent key: the server service of {machine} registers its key, at an install, or the "
+                f"owner does; until then no session of it runs")
+    return (f"{agent} has no agent key yet: its helper registers one first, and this session must start again with "
+            f"its credential")
 
 
 def binding_matches(row, context):

@@ -2321,6 +2321,9 @@ def ports_install(hub_user="fleet", kit=None, check=False, run=None, hub_port=87
         say(f"  {line}")
     if check:
         return answer
+    if answer.get("ok") is not True and answer.get("part") == "ssh":     # after the rule and its units: they hold
+        raise Stop(f"the hub's ports are kept for their own users, but the SSH part of their step did not hold: "
+                   f"{answer.get('reason') or 'no reason given'}")
     if answer.get("ok") is not True:
         raise Stop(f"the hub's ports are not kept for their own users: {answer.get('reason') or 'no reason given'}. "
                    f"An agent's user on this server could answer as the hub, so this step stops here")

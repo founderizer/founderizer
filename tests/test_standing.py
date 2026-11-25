@@ -411,11 +411,21 @@ class Provenance(Base):
         self.assertEqual(self.item(3)["author_kind"], "agent")
 
     def test_a_steer_is_the_owner_s_own_words_too(self):
+        """A steer from the owner's own app keeps his item. One with no hand is no word of his (owner API 1.336; the
+        security read of 22 November 2026, claim 9): a caller that writes no hand, the manager's CLI among them,
+        must not get the owner's force. The bug this catches: owner_force(None) true again."""
         event = hub.emit("hand", "say", "[owner] Steering", task=self.tasks["hand"])
-        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
-              (self.tasks["hand"], "Always attach the invoice", event, str(uuid.uuid4()), "test", hub.now()))
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,hand) VALUES(?,1,?,?,?,?,?,?)",
+              (self.tasks["hand"], "Always attach the invoice", event, str(uuid.uuid4()), "founderizer-swift/1/t",
+               hub.now(), "app"))
         self.ok("hand", "keep_instruction", words="Always attach the invoice", scope="agent", source=f"M-{event}")
         self.assertEqual(self.item(1)["author"], "owner")
+        event = hub.emit("hand", "say", "[owner] Steering", task=self.tasks["hand"])
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
+              (self.tasks["hand"], "Always copy the CFO", event, str(uuid.uuid4()), "test", hub.now()))
+        text = self.refused("hand", "keep_instruction", words="Always copy the CFO", scope="agent", source=f"M-{event}")
+        self.assertIn("is from before Fleet kept who sent a message, so it is the owner's word for no item", text)
+        self.assertFalse(hub.owner_force(None) or hub.owner_force(hub.MANAGER_HAND))
         # an AI session's steer (request_hand "tool") is no owner's word
         event = hub.emit("hand", "say", "[owner via ai-session] Steering", task=self.tasks["hand"])
         hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,hand) VALUES(?,1,?,?,?,?,?,?)",
@@ -552,16 +562,17 @@ class Provenance(Base):
         """The owner's answer to a Needs-you item that `recipient` raised, as owner_message_rows stores one: a
         ui_requests row of kind answer. Returns its event id: M-<id>."""
         event = hub.emit(recipient, "say", f"[owner] Answer to Needs-you N-1 (Which rule?): {text}")
-        hub.q("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient) "
-              "VALUES(?,'answer',1,?,?,?,'founderizer-swift/1/test',?)",
+        hub.q("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,hand) "
+              "VALUES(?,'answer',1,?,?,?,'founderizer-swift/1/test',?,'app')",
               (str(uuid.uuid4()), text, event, hub.now(), recipient))
         return event
 
     def owner_steers(self, agent, text):
         """The owner's steer of `agent`'s task. Returns its event id: M-<id>."""
         event = hub.emit(agent, "say", "[owner] Steering", task=self.tasks[agent])
-        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
-              (self.tasks[agent], text, event, str(uuid.uuid4()), "test", hub.now()))
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,hand) "
+              "VALUES(?,1,?,?,?,?,?,'app')",
+              (self.tasks[agent], text, event, str(uuid.uuid4()), "founderizer-swift/1/test", hub.now()))
         return event
 
     def session_says(self, recipient, text):

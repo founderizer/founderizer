@@ -1389,6 +1389,7 @@ class Look(HostCase):
             "/var/www/.bash_history": "mysql -psecret", "/var/www/index.html": "page",
             "/home/deploy/.ssh/id_ed25519": "key", "/home/deploy/.npmrc": "token", "/home/deploy/notes.txt": "notes",
             "/srv/api/app.py": "code", "/srv/api/local_settings.py": "SECRET", "/srv/api/data/app.sqlite3": "rows",
+            "/srv/api/old-agent/.fleet/sessions/ada.manager.1a2b.json": '{"Authorization": "Bearer x"}',
             "/srv/api/bootstrap/cache/config.php": "<?php", "/srv/api/web/config.php": "<?php // no secret by name",
             "/opt/pg/data/PG_VERSION": "16", "/opt/pg/data/base/1/123": "rows", "/opt/pg/readme.txt": "text",
             "/etc/systemd/system/shop.service": "[Service]\nEnvironmentFile=-/etc/shop/settings\nExecStart=/bin/true\n",
@@ -1416,7 +1417,10 @@ class Look(HostCase):
         for hidden in ("/var/www/shop/shared/.env", "/var/www/shop/current/config/Database.YML",
                        "/var/www/shop/current/node_modules", "/srv/api/local_settings.py", "/srv/api/data/app.sqlite3",
                        "/srv/api/bootstrap/cache/config.php", "/etc/nginx/ssl/site.key", "/mnt/volume/app/.env.production",
-                       "/usr/local/etc/tool/secrets.yaml"):
+                       "/usr/local/etc/tool/secrets.yaml",
+                       # an agent's Founderizer folder outside a home: its key and its sessions' credentials (owner
+                       # API 1.336), which no name of a file gives away
+                       "/srv/api/old-agent/.fleet"):
             self.assertIn(hidden, paths)
         # the dot entries of each account's home, the home of the web server's account too
         for hidden in ("/home/deploy/.ssh", "/home/deploy/.npmrc", "/var/www/.bash_history"):

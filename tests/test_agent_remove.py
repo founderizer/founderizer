@@ -20,7 +20,9 @@ import hub
 import hubsetup
 from test_servers import KEY, NEW, OTHER, OWNER, ServerService, Servers, git
 from test_agent_users import TOOLS
-from test_ui_api import PATIENCE
+from test_ui_api import PATIENCE, session_bearer
+
+JSON = {"Content-Type": "application/json"}
 
 
 def load_tests(loader, _tests, _pattern):
@@ -905,6 +907,9 @@ class Leaving(Remove):
         self.pat = pat["person"]["id"]
         self.asked = hub.ins("INSERT INTO needs(title,why,todo,raised,by) VALUES('Choose a label','scout asks',"
                              "'say which',?,'scout')", (hub.now(),))
+        # its sessions' credentials: no MCP call passes without one (owner API 1.336)
+        self.chat_auth = dict(JSON, **session_bearer("scout", "chat"))
+        self.task_auth = dict(JSON, **session_bearer("scout", "task", task=self.done, attempt=1))
         self.back, self.printed = self.kept(), []
         for name, stand_in in (("commit_kit_file", lambda *a, **k: "f" * 40), ("central_due", lambda: None)):
             patcher = patch.object(hub, name, stand_in)
@@ -970,23 +975,24 @@ class Leaving(Remove):
         chat, task = "/mcp/scout/test-generation/owner-chat/1", f"/mcp/scout/test-generation/T-{self.done}/1"
         tool = lambda name, **args: {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                      "params": {"name": name, "arguments": args}}
-        return [("the tool list of its chat", chat, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
-                ("its chat reads its messages", chat, tool("read_messages")),
+        return [("the tool list of its chat", chat, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, OTHER,
+                 self.chat_auth),
+                ("its chat reads its messages", chat, tool("read_messages"), OTHER, self.chat_auth),
                 ("its helper's usage-limit report", "/helper/limit/scout", {}),
                 ("its helper's key enrollment", "/helper/key/scout", {"sha256": "a" * 64}),
                 ("its helper's poll", "/events/scout?delivery=1&after=0&wait=0&alive=owner-chat", None),
-                ("a search of its history", task, tool("search_history", query="work"))]
+                ("a search of its history", task, tool("search_history", query="work"), OTHER, self.task_auth)]
 
     def test_the_calls_reach_their_writes_when_no_command_comes(self):
         """The same calls with no delete: each one is answered, and three of them write what a delete takes. So the
         moments of the next two tests are real ones, after which a call had more to do."""
-        for what, path, body in self.calls():
+        for what, path, body, *more in self.calls():
             self.again()
-            self.assertEqual(self.request(path, body, source=OTHER)[0], 200, what)
+            self.assertEqual(self.request(path, body, headers=more[1] if more else None, source=OTHER)[0], 200, what)
             self.assertEqual(self.printed, [], what)
         self.again()
         chat = self.calls()[0]
-        self.assertEqual(self.request(chat[1], chat[2], source=OTHER)[0], 200)
+        self.assertEqual(self.request(chat[1], chat[2], headers=chat[4], source=OTHER)[0], 200)
         self.assertEqual(hub.kv_get("listed:scout:owner-chat"), "1")
         self.assertEqual(self.request("/helper/limit/scout", {}, source=OTHER)[0], 200)
         self.assertEqual(hub.q1("SELECT COUNT(*) c FROM agent_limits WHERE agent='scout'")["c"], 1)
@@ -1134,7 +1140,8 @@ class Leaving(Remove):
             return hub.agents()[agent]
         with patch.object(hub, "tools_for", leaves_then_reads):
             answer = self.request("/mcp/scout/test-generation/owner-chat/1",
-                                  {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, source=OTHER)
+                                  {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=self.chat_auth,
+                                  source=OTHER)
         self.assertEqual((answer, self.printed), ((404, {"error": "unknown agent"}), []))
 
     def test_the_lock_is_not_given_to_a_request_of_a_name_that_left(self):

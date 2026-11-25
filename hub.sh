@@ -618,7 +618,7 @@ those ports"
     python3 "$tree/hubsetup.py" firewall \
         || stop "the firewall of this server could not be set: the line above says why. Run the line again."
     python3 "$tree/hubsetup.py" ports --hub-user "$HUB_USER" --hub-port "$port" </dev/null \
-        || stop "the hub's ports could not be kept for $HUB_USER: the line above says why. Run the line again."
+        || stop "the step of the hub's ports for $HUB_USER did not end: the line above says why. Run the line again."
 }
 
 repository() {
@@ -751,7 +751,8 @@ this hub keeps none" ;;
     # in every case, also with a kill, and a start of the server empties /run. The claim runs as the hub's user and
     # does not get the file (9>&-).
     if [ "$reclaim" = yes ]; then
-        (umask 077 && : >> "$PAUSE_MARK") || stop "$PAUSE_MARK could not be made."
+        (umask 077 && : >> "$PAUSE_MARK") \
+            || stop "$PAUSE_MARK could not be made: the disk or its rights refused it. Run the line again."
         exec 9>>"$PAUSE_MARK"
         flock -w 10 9 || stop "another second claim runs on this server: let it end, then run the line again."
     fi

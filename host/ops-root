@@ -1427,7 +1427,8 @@ LOOK_NAMES = (
 # agent has in its repository, whose test keys would fill the list. A Python cache folder is not one of them: it
 # holds no key file, each one costs the unit a path (803 of the 1,180 paths of one real server), and the compiled
 # file of a file with a secret's name has a name of the list too (local_settings*, secrets.*, env.*).
-LOOK_DIRS = frozenset(("secrets", ".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".terraform",
+# .fleet: an agent's own folder of Founderizer, with its agent key and its sessions' credentials (owner API 1.336).
+LOOK_DIRS = frozenset(("secrets", ".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".terraform", ".fleet",
                        "actions-runner", "node_modules", "vendor", ".venv", "venv", "site-packages", "dist-packages",
                        ".git"))
 # The names as one pattern: a walk matches each entry's name one time. With one match for each of the names above,

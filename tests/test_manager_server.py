@@ -9,6 +9,7 @@ import unittest
 import hub
 import hubsetup
 from test_servers import HUB, NEW, OWNER, Servers
+from test_ui_api import session_bearer
 
 SPARE = "127.0.0.11"            # the address of the empty Linux server that the manager goes on
 
@@ -177,6 +178,7 @@ class FirstMessage(NewFleet):
     def listed(self):
         """Its standing session on spare lists its tools, as every session does at its start (listed_window)."""
         status, answer = self.request(f"/mcp/{self.M}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                                      dict({"Content-Type": "application/json"}, **session_bearer(self.M, "standing")),
                                       source=SPARE)
         self.assertEqual(status, 200, answer)
 

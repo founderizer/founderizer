@@ -118,6 +118,11 @@ class Refused(Exception):
     """A step that cannot be done. Its words say why, and nothing changed after them."""
 
 
+class SSHRefused(Refused):
+    """The SSH part of root's step cannot be done, after the rule and its units hold: its words say why. Its answer
+    names the part ("part": "ssh"), so that the caller does not say that the hub's ports are open to each user."""
+
+
 def run_argv(argv, input=None, timeout=120):
     """(exit code, standard output, standard error) of one command. A command that cannot start is code 1."""
     try:
@@ -857,16 +862,21 @@ def install(hub_user, gate_user=GATE_USER, check=False, run=run_argv, root="", s
     return {"ok": True, "state": "made" if made else "there", "said": said, "lines": lines, "sets": sets}
 
 
+def sshd_words(code, out, err):
+    """The last words of a refusal of sshd's, on one line: its standard error, else its output, else its exit code."""
+    return " ".join((err or out or "").split())[-200:] or f"exit {code}"
+
+
 def sshd_denies(run):
-    """True when sshd's own reading of its settings (`sshd -T`) denies the agents' group, False when it does not, None
-    when sshd cannot say."""
-    code, out, _err = run(["sshd", "-T"])
+    """(True, "") when sshd's own reading of its settings (`sshd -T`) denies the agents' group, (False, "") when it
+    does not, and (None, sshd's words) when it cannot say."""
+    code, out, err = run(["sshd", "-T"])
     if code != 0:
-        return None
+        return None, sshd_words(code, out, err)
     for line in (out or "").lower().splitlines():
         if line.startswith("denygroups "):
-            return AGENT_GROUP in line.split()[1:]
-    return False
+            return AGENT_GROUP in line.split()[1:], ""
+    return False, ""
 
 
 def sshd_agents(run, root="", check=False):
@@ -874,15 +884,20 @@ def sshd_agents(run, root="", check=False):
     owns its home and could put a key of its own there, and a login of it would run also when the rule did not load at
     a start of the server (the Door area's read of 24 November 2026). Only where OpenSSH has a folder of its own files.
     sshd checks the file (`sshd -t`, which needs its privilege separation folder) before it reloads, and a file that it
-    refuses is taken back. Then sshd's own reading of its settings (`sshd -T`) must deny the group, which a file of
+    refuses is taken back. Each run that is not a check reloads sshd, after its check, so that the running sshd reads
+    what `sshd -T` reads. Then sshd's own reading of its settings (`sshd -T`) must deny the group, which a file of
     the folder does only where sshd_config reads the folder (the Door area: a test of the file's text alone said so
-    for nothing). Returns (changed, its words); with check, (would change, or does not hold, its words). Raises
-    Refused when sshd refuses the file or does not deny the group."""
+    for nothing). Before it writes the file or reloads, sshd checks the settings of this server as they are: a fault
+    there is not the file's, and the words say so; only a file of ours with other text, which this step's text may
+    mend, is written over then, and put back when sshd still refuses. Returns (changed, its words); with check, (would change, or does not hold,
+    its words). Raises SSHRefused when sshd refuses the settings as they are or the file, when the file cannot be
+    written, when the reload fails, when sshd cannot say what it reads (`sshd -T` fails), and when it does not deny the
+    group; each with its own words."""
     if not os.path.isdir(root + SSHD_DIR) or not os.path.exists(root + "/usr/sbin/sshd"):
         return False, "this server has no OpenSSH with a folder of its own files, so no agent user logs in by SSH"
     path = root + SSHD_AGENTS
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, "rb") as f:            # bytes: a damaged file need not be UTF-8
             before = f.read()
     except OSError:
         before = None
@@ -891,29 +906,57 @@ def sshd_agents(run, root="", check=False):
               f"{AGENT_GROUP}: this server's sshd_config reads no file of {SSHD_DIR}, so an agent user can still log in "
               f"by SSH")
     if check:
-        if before != SSHD_AGENTS_TEXT:
+        if before != SSHD_AGENTS_TEXT.encode():
             return True, f"would write {SSHD_AGENTS}: sshd lets no member of {AGENT_GROUP} log in"
-        held = sshd_denies(run)
+        held, why = sshd_denies(run)
         return (False, held_words) if held else (True, unread if held is False else
-                                                  "sshd cannot say whether it denies the agents' group (sshd -T failed)")
+                                                  f"sshd cannot say whether it denies {AGENT_GROUP}: sshd -T failed "
+                                                  f"({why})")
     with contextlib.suppress(OSError):
         os.makedirs(root + "/run/sshd", 0o755, exist_ok=True)       # sshd -t and -T need it
-    changed = before != SSHD_AGENTS_TEXT
-    if changed:
-        put(path, SSHD_AGENTS_TEXT.encode(), 0o644)
-        code, out, err = run(["sshd", "-t"])
-        if code != 0:
-            if before is None:
-                with contextlib.suppress(OSError):
+    changed = before != SSHD_AGENTS_TEXT.encode()
+    code, out, err = run(["sshd", "-t"])                    # the settings as they are, before any change or reload
+    first = sshd_words(code, out, err) if code != 0 else None
+    if first is not None and (not changed or before is None):
+        raise SSHRefused(f"sshd refuses this server's own settings before any change ({first}), so "
+                         f"{'sshd was not reloaded' if not changed else f'{SSHD_AGENTS} was not written'}. The rule "
+                         f"holds; an agent user may still log in by SSH. Correct what `sshd -t` says, and run the step "
+                         f"again")
+    try:
+        if changed:             # also a file of ours with other text that sshd refused: this step's text may mend it
+            put(path, SSHD_AGENTS_TEXT.encode(), 0o644)
+            code, out, err = run(["sshd", "-t"])
+            if code != 0:
+                if before is None:
                     os.unlink(path)
-            else:
-                put(path, before.encode(), 0o644)
-            raise Refused(f"sshd refused {SSHD_AGENTS} ({' '.join((err or out).split())[-200:] or code}), so it was "
-                          f"taken back. The rule holds; an agent user can still log in by SSH. Run the step again")
-        run(["systemctl", "try-reload-or-restart", "ssh.service"])      # a session that is open keeps going
-    if not sshd_denies(run):
-        raise Refused(f"{unread}. The rule holds. Add `Include {SSHD_DIR}/*.conf` at the top of /etc/ssh/sshd_config, "
-                      f"or `DenyGroups {AGENT_GROUP}` there, and run the step again")
+                else:
+                    put(path, before, 0o644)
+                if first is not None:
+                    raise SSHRefused(f"sshd refuses this server's own settings ({sshd_words(code, out, err)}), also "
+                                     f"with {SSHD_AGENTS} as this step writes it, so the file of before was put back. "
+                                     f"The rule holds; an agent user may still log in by SSH. Correct what `sshd -t` "
+                                     f"says, and run the step again")
+                raise SSHRefused(f"sshd refused {SSHD_AGENTS} ({sshd_words(code, out, err)}), so it was taken back. "
+                                 f"The rule holds; an agent user can still log in by SSH. Run the step again")
+    except SSHRefused:
+        raise
+    except (OSError, Refused) as e:            # put's own refusal of a folder too: still the SSH part's
+        raise SSHRefused(f"{SSHD_AGENTS} could not be written or taken back ({e}). The rule holds; an agent user may "
+                         f"still log in by SSH. Run the step again") from e
+    # At each run, not only when the file changed: sshd -T reads the files, not the running sshd, which a reload that
+    # failed or a run that ended before it leaves with the settings of before. A session that is open keeps going.
+    code, out, err = run(["systemctl", "try-reload-or-restart", "ssh.service"])
+    if code != 0:
+        raise SSHRefused(f"sshd did not take its settings again (systemctl try-reload-or-restart ssh.service: "
+                         f"{sshd_words(code, out, err)}). The rule holds; the running sshd may still let an agent user "
+                         f"log in until it starts again. Run the step again")
+    held, why = sshd_denies(run)
+    if held is None:
+        raise SSHRefused(f"sshd cannot say whether it denies {AGENT_GROUP}: sshd -T failed ({why}). The rule holds; an "
+                         f"agent user may still log in by SSH. Correct what `sshd -T` says, and run the step again")
+    if not held:
+        raise SSHRefused(f"{unread}. The rule holds. Add `Include {SSHD_DIR}/*.conf` at the top of "
+                         f"/etc/ssh/sshd_config, or `DenyGroups {AGENT_GROUP}` there, and run the step again")
     return changed, held_words
 
 
@@ -929,7 +972,9 @@ def check_state(conf, differ, run=run_argv, uid=uid_of, rounds=None, root=""):
         said.append(f"the units {SERVICE}.service and {SERVICE}.path are active")
     version, sets = kernel(run, uid)
     want = wanted(conf, uid)
-    if version != TABLE or sets != want:
+    if version is not None and version != TABLE:        # the rules of another release, whatever its sets
+        problems.append(f"the kernel's table is of version {version}, not {TABLE}, so root's step is owed")
+    elif version != TABLE or sets != want:
         now = json.dumps(sets, sort_keys=True) if version else "not there"
         problems.append(f"the kernel's sets are {now}, and not the UIDs of the users of now "
                         f"({json.dumps(want, sort_keys=True)})")
@@ -1008,7 +1053,8 @@ def main(argv=None):
             raise Refused(f"run it as root on the hub's server: python3 -I {os.path.realpath(__file__)} install")
         answer = install(args.hub_user, args.gate_user, check=args.check, hub_port=args.hub_port)
     except (Refused, OSError) as e:
-        print(json.dumps({"ok": False, "reason": str(e)}), flush=True)
+        print(json.dumps({"ok": False, "reason": str(e), **({"part": "ssh"} if isinstance(e, SSHRefused) else {})}),
+              flush=True)
         return 1
     for line in answer["said"] + answer["lines"] + answer.get("problems", []):
         print(line, flush=True)

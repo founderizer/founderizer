@@ -18,6 +18,7 @@ import hub
 import owner_mcp
 import test_manager_server
 from test_servers import HUB, OWNER, Servers
+from test_ui_api import session_bearer
 from leftovers import ROOT
 
 NAME = "juno"
@@ -133,7 +134,9 @@ class Juno(Servers):
         """Its tools are its role's, and each tool that reads the team runs. Its session starts with RULES.md, the
         lead's and the manager's parts of the rules, and its own profile: the hub names the parts, and the helper
         reads the files by the agent's name."""
-        status, listed = self.request(f"/mcp/{NAME}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, source=HUB)
+        status, listed = self.request(f"/mcp/{NAME}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                                      dict({"Content-Type": "application/json"}, **session_bearer(NAME, "standing")),
+                                      source=HUB)
         self.assertEqual(status, 200, listed)
         tools = {t["name"] for t in listed["result"]["tools"]}
         self.assertEqual({"create_task", "raise_needs_you", "see_team", "see_capacity", "grant_access", "set_duty",

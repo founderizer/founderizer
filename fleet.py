@@ -5355,12 +5355,15 @@ class Helper:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(argv, capture_output=True, timeout=30)
 
-    def close_held(self):
+    def close_held(self, now=False):
         """The hub holds this agent (the events answer's hold "os_user"): it may share its OS user with another agent,
         so either could act as the other, and the hub starts no session of it and gives it no credential. Each of its
         windows closes once its turn has ended, with that window's processes, so that a background command or the
         runtime's own wake-up cannot run a session of it meanwhile. A window whose turn runs stays until that turn
-        ends; the hub opens none while the hold lasts."""
+        ends; the hub opens none while the hold lasts. now: the answer's hold_now (owner API 1.336), for an agent that
+        shares its OS user with the manager, which runs: each window closes at once, also in a turn, because a turn of
+        it could read the manager's key. Its task waits with the hub's held line and starts again by itself when the
+        agent runs in a user account of its own."""
         names = self.look_known()
         if not names:
             return
@@ -5369,7 +5372,7 @@ class Helper:
             if not (re.fullmatch(r"T-\d+", window) or CONVERSATION_WINDOW.fullmatch(window) or window == "owner-chat"):
                 continue
             target = f"={self.session}:={window}"
-            if window in turns or self.typed_at.get(window, float("-inf")) >= at or self.working(target):
+            if not now and (window in turns or self.typed_at.get(window, float("-inf")) >= at or self.working(target)):
                 continue
             before = self.task_work(window, "", keep_runtime=False)
             tmux("kill-window", "-t", target)
@@ -6543,8 +6546,10 @@ class Helper:
         """One round of the helper's loop (owner API 1.12): this agent's key. The loop asks before the standing
         session's start (manage), which then starts with its credential: the hub refuses an MCP call without one from
         an agent that has a key, also while it is alone on its address. The key file is the key. Without it, the
-        helper registers a key while no task window runs, so that no hook of a running task can call the hub between
-        the hub's registration and the key file's arrival, and tries again every minute, also after a lost answer. On a
+        helper registers a key, also while a task window runs, and tries again every minute, also after a lost answer.
+        Such a window started with no credential, which the hub refuses on each MCP call (owner API 1.336), so it can do
+        nothing, and held back the key that it needs; a hook of it may meet one refusal between the hub's registration
+        and the key file's arrival. On a
         server whose own service registers its agents' keys the hub takes none from a helper (enroll_key gives None):
         it then asks no more, until the hub next answers no_key (key_removed), and waits for the key file, which that
         service or the owner makes. A window list that tmux did not give is unknown, never empty (look_known): no
@@ -6557,7 +6562,7 @@ class Helper:
         if new:
             names = self.look_known()
             if self.key_by_server or (self.enrolled_at is not None and time.monotonic() - self.enrolled_at <= 60) or \
-                    names is None or any(re.fullmatch(r"T-\d+", w) for w in names):
+                    names is None:
                 return False
             self.enrolled_at = time.monotonic()     # before the call: a lost answer, which raises, waits the minute too
             got = enroll_key(self.agent)
@@ -6587,13 +6592,21 @@ class Helper:
         had a key, and an owner chat can start while a task window keeps the key from being registered. They are the
         ones that legacy_windows names. revoked: a credential that a window holds was for a key that is gone (this
         helper registered a key just now, or the owner removed or replaced the key, which revoked every credential):
-        both windows close, whatever they hold. A window that has its credential stays otherwise, and so does a task
-        window or a conversation's window: a task's credential comes from the hub at its start, and a conversation's
-        is the hub's own. Returns the windows that closed."""
+        both windows close, whatever they hold. So does each task window that started with no credential of this key
+        (owner API 1.336: it can make no MCP call), with its processes, so that the hub starts the task's next attempt
+        with one. A window that has its credential stays otherwise, and so does a conversation's window, whose
+        credential is the hub's own. Returns the windows that closed."""
         legacy = [] if revoked else (self.legacy_windows() or [])
-        return self.close_windows([w for w in ("manager", "owner-chat") if revoked or w in legacy],
-                                  "no session credential of this agent's key, which the hub needs from an agent "
-                                  "with a key")
+        tasks = [w for w in (self.look_known() or []) if re.fullmatch(r"T-\d+", w) and (revoked or w in legacy)]
+        for window in tasks:
+            before = self.task_work(window, "", keep_runtime=False)
+            tmux("kill-window", "-t", f"={self.session}:={window}")
+            self.quiesce(window, "", keep_runtime=False, also=before)
+            self.say(f"{window}: closed, because it has no session credential of this agent's key; the hub starts the "
+                     f"task again with one")
+        return tasks + self.close_windows([w for w in ("manager", "owner-chat") if revoked or w in legacy],
+                                          "no session credential of this agent's key, which the hub needs from an "
+                                          "agent with a key")
 
     def close_revoked(self, windows, alive):
         """The hub's word in its poll answer (revoked, owner API 1.12): the standing session and the owner chat whose
@@ -11607,7 +11620,9 @@ def cmd_run(args):
             h.open_tasks = data.get("open_tasks") if isinstance(data.get("open_tasks"), list) else None
             h.poll_db = data.get("db")
             if data.get("hold") == "os_user":
-                h.close_held()      # one OS user for each agent: no window of it runs while the hub holds it
+                # one OS user for each agent: no window of it runs while the hub holds it; beside the manager none
+                # runs on to the end of its turn either (hold_now, owner API 1.336)
+                h.close_held(now=data.get("hold_now") is True)
             h.sweep_browser()       # before this round's starts: a unit that no open task holds goes first
             h.browser_waits(data.get("waits"))      # build plan 04, D10: a wait closes the browser, its end opens it
             h.keep_places(data.get("browser_places"))       # D6: the setup check says a server with no room

@@ -2287,7 +2287,7 @@ class PortStep(unittest.TestCase):
                           "ROOT: python3 /root/fleet-kit/hubsetup.py ports --hub-user fleet --hub-port 8790"])
         code, out = run_shell(body, extra=root + "PORTS=1\n")
         self.assertEqual(code, 1, out)
-        self.assertIn("the hub's ports could not be kept for fleet: the line above says why", out)
+        self.assertIn("the step of the hub's ports for fleet did not end: the line above says why", out)
         self.assertNotIn("after-the-step", out)
         self.assertNotIn("hubsetup.py\" ports", (KIT / "join.sh").read_text())
         main = shell_function(SCRIPT, "main")

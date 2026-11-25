@@ -162,10 +162,14 @@ class Routes(OwnerAPI):
 
     def test_a_hub_whose_team_pins_no_address_checks_none(self):
         """The throwaway hubs of selftest.py: no machine has an address, so there is nothing to compare a caller
-        with, and a name is taken as it is given. A fleet is never in this state (validate_team)."""
+        with, and a name is taken as it is given. A fleet is never in this state (validate_team). There an agent with
+        a key still needs its session's credential on an MCP route (owner API 1.336), as on a helper route its key."""
         hub.TEAM["addresses"] = {machine: "" for machine in hub.TEAM["addresses"]}
         self.assertEqual(self.call("/helper/ack/solo", {"ids": []}, source="127.0.0.9")[0], 200)
         self.assertEqual(self.mcp("/mcp/solo", "127.0.0.9")[0], 200)
+        hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('solo',?,?,'owner')", (sha(KEYS["solo"]),
+                                                                                                 hub.now()))
+        self.assertEqual(self.mcp("/mcp/solo", "127.0.0.9")[1].get("auth"), "credential_required")
 
     # ---- session credentials
     def test_a_session_credential_works_only_on_its_own_route(self):
@@ -209,19 +213,30 @@ class Routes(OwnerAPI):
             self.assertEqual(self.mcp(route, SOLO, token=token)[0], 200, route)
             self.assertEqual(self.mcp(route, BOX, token=token)[0], 403, route)          # from another machine
 
-    def test_an_agent_without_a_key_alone_on_its_address_keeps_the_address_rule_on_its_mcp_routes(self):
-        """Its helper's first round, before the hub has its key (fleet.Helper.enroll), and the round after the owner
-        removed its key: the address alone names it, as on its helper routes."""
+    def test_an_agent_without_a_key_gets_no_mcp_call_and_its_first_session_gets_its_credential(self):
+        """The security read of 22 November 2026, claim 2 (owner API 1.336): an agent alone on its address with no key
+        yet took an MCP call with no credential, so any user of its machine could act as its standing session, its
+        owner chat or one of its tasks. Now no call without a credential passes, before the key and after the owner
+        removed it. Its first session still gets one: its helper registers the key by the address alone, asks for the
+        credential with the key, and the session's call with it passes (fleet.Helper.enroll before Helper.manage).
+        The bug this catches: a keyless call that passes again, or an enrollment that needs a credential."""
         t = self.task("solo")
         route = f"/mcp/solo/test-generation/T-{t}/1"
-        self.assertEqual(self.mcp(route, SOLO)[0], 200)
-        self.assertEqual(self.mcp(route, BOX)[0], 403)                                     # another machine
+        for source in (SOLO, BOX):
+            code, data = self.mcp(route, source)
+            self.assertEqual(code, 403, source)
+        code, data = self.mcp(route, SOLO)
+        self.assertEqual(data.get("auth"), "credential_required")
+        self.assertIn("solo has no agent key yet", data["error"])
         for wrong in ({"token": "wrong"}, {"auth": "Basic x"}, {"auth": "Bearer "}):       # sent: never taken as absent
             self.assertEqual(self.mcp(route, SOLO, **wrong)[1].get("auth"), "credential_invalid", wrong)
-        self.register("solo")
-        self.assertEqual(self.mcp(route, SOLO)[1].get("auth"), "credential_required")      # its key ends that rule
+        self.assertEqual(self.call("/helper/key/solo", {"sha256": sha(KEYS["solo"])}, source=SOLO)[0], 200)
+        code, data = self.credential("solo", SOLO, kind="task", task=f"T-{t}", attempt=1)
+        self.assertEqual(code, 200, data)
+        self.assertEqual(self.mcp(route, SOLO, token=data["token"])[0], 200)
+        self.assertEqual(self.mcp(route, SOLO)[1].get("auth"), "credential_required")
         self.assertEqual(self.owner_key("solo", delete=True)[0], 200)
-        self.assertEqual(self.mcp(route, SOLO)[0], 200)                    # without a key it is legacy until it enrolls
+        self.assertEqual(self.mcp(route, SOLO)[1].get("auth"), "credential_required")     # never the address alone
 
     def test_a_credential_is_given_only_for_a_current_binding_and_the_current_key(self):
         self.register("alpha", "beta")
@@ -330,7 +345,11 @@ class Routes(OwnerAPI):
         install and registers it (hub.install_key). The address of such a server names nobody for a key: any user of
         it could send the first key of an agent without one and then act as it (the access review of 10 and 11
         November 2026). So the hub takes no first key from that address, and the owner replaces such a key and never
-        removes it. A machine whose service registers no keys keeps the address rule."""
+        removes it. A machine whose service registers no keys keeps the address rule. An agent there with no key gets
+        no session (owner API 1.336): the refusal says who gives the key, and the manager hears it once, to ask the
+        owner (the validator's M2 of 24 November 2026). Not while its install runs, whose key step registers it, and
+        after an install that failed before it the step is the app's Try again (M3). The bugs: words that send the
+        agent to a step that its helper cannot take, nobody told, and a card with a root command at each Add agent."""
         def features(*names):
             hub.q("INSERT OR REPLACE INTO server_status(server,data,reported) VALUES(?,?,?)",
                   ("solo", json.dumps({"features": list(names)}), hub.now()))
@@ -340,6 +359,35 @@ class Routes(OwnerAPI):
         self.assertIsNone(hub.agent_key("solo"))
         self.assertIn(f"REFUSED key enrollment for solo from {SOLO}: the server service of solo registers its key",
                       [r["what"] for r in hub.q("SELECT what FROM log WHERE agent='hub'")])
+        code, data = self.mcp("/mcp/solo", SOLO)
+        self.assertEqual((code, data.get("auth")), (403, "credential_required"))
+        self.assertIn("the server service of solo registers its key, at an install, or the owner does", data["error"])
+        said = []
+
+        def sweeps(state=None, step=None, moved=False):
+            """Two passes of the sweep (it runs each minute), with the newest install job of solo in `state` (None:
+            no job, as for an agent from before the service registered keys); the lines that said "no agent key"."""
+            hub.q("DELETE FROM server_jobs WHERE agent='solo'")
+            if state:
+                hub.q("INSERT INTO server_jobs(server,kind,agent,runtime,state,step,created,updated) "
+                      "VALUES('solo','install','solo','codex',?,?,?,?)", (state, step, hub.now(), hub.now()))
+            hub.kv_set(hub.MOVED + "solo", "box" if moved else None)
+            del said[:]
+            with patch.object(hub, "emit", lambda agent, kind, text, *a, **k: said.append((agent, text)) or 1):
+                for _ in range(2):
+                    hub.keys_and_roots_told(hub.TEAM, "manager")
+            return [(agent, text) for agent, text in said if "has no agent key" in text]
+        self.assertEqual(sweeps("running", "runtime"), [])          # its install's key step registers it: no card
+        told = sweeps("failed", "checkout")
+        self.assertEqual([agent for agent, _ in told], ["manager"], said)
+        self.assertIn("its install there failed at its step checkout before it registered one", told[0][1])
+        self.assertIn("press Try again on Solo's page in the app", told[0][1])
+        self.assertNotIn("fleet.py key", told[0][1])
+        self.assertEqual(sweeps("running", "user"), [])             # Try again: it runs again, so nothing is told
+        self.assertEqual(sweeps("failed", "checkout", moved=True), [])     # a move's own line says to move it again
+        told = sweeps()
+        self.assertEqual([agent for agent, _ in told], ["manager"], said)
+        self.assertIn("fleet.py key solo --rotate", told[0][1])
         self.register("solo")       # as the install job's key step does, with the server's own key
         self.assertEqual(self.call("/helper/key/solo", {"sha256": sha(KEYS["solo"])}, source=SOLO)[0], 200)  # the same
         self.assertEqual(self.call("/helper/key/solo", {"sha256": sha("other")}, source=SOLO)[0], 409)
@@ -764,8 +812,10 @@ class HelperSide(unittest.TestCase):
         """The first round that a helper has its key (Helper.enroll) closes the standing session and the owner chat
         that cannot use it, and the hub refuses their calls from then on: a key that it registered just now closes
         both, whatever they hold, because the credentials of a key that is gone are revoked; a key file that was there
-        closes the ones that started without any credential (legacy_windows). A window that has its credential, a
-        task window and a conversation's window stay."""
+        closes the ones that started without any credential (legacy_windows). A window that has its credential and a
+        conversation's window stay. A task window that started with no credential no longer holds the registration
+        back, and closes with it (owner API 1.336): the hub refuses each of its MCP calls, so it can do nothing. The bug
+        that this catches: a keyless task window keeps the key that it needs from being registered."""
         running, killed, answers, reading = [], [], [], {}
 
         def tmux(*args, **kw):
@@ -789,7 +839,9 @@ class HelperSide(unittest.TestCase):
             return h
         with patch.object(fleet, "tmux", side_effect=tmux), patch.object(fleet, "enroll_key", side_effect=enroll_key), \
                 patch.object(fleet.Helper, "look_known", lambda h: None if reading.get("tmux") is None else list(running)), \
-                patch.object(fleet.Helper, "legacy_windows", lambda h: reading["legacy"]):
+                patch.object(fleet.Helper, "legacy_windows", lambda h: reading["legacy"]), \
+                patch.object(fleet.Helper, "task_work", lambda h, window, text, keep_runtime=False: set()), \
+                patch.object(fleet.Helper, "quiesce", lambda h, window, text, keep_runtime=False, also=None: None):
             reading["tmux"] = True
             # A Mac's first start: no key file, and the standing session started before the key.
             manager = helper("manager", "manager", ["manager", "other"], ["manager", "other"])
@@ -808,26 +860,24 @@ class HelperSide(unittest.TestCase):
             # longer a credential that works, so the new key closes both whatever legacy_windows says.
             worker = helper("alpha", "worker", ["owner-chat", "T-3"], [])
             answers[:] = [True]
-            self.assertFalse(worker.enroll())           # a task window runs: no registration now
             reading["tmux"] = None
-            running.remove("T-3")
-            self.assertFalse(worker.enroll())           # tmux gave no list: unknown, never "no task window"
+            self.assertFalse(worker.enroll())           # tmux gave no list: unknown, never "no window"
             self.assertEqual((answers, killed), ([True], ["manager"]))
             reading["tmux"] = True
-            self.assertTrue(worker.enroll())
-            self.assertEqual((killed[1:], running, worker.chat_started), (["owner-chat"], [], None))
+            self.assertTrue(worker.enroll())            # a task window with no credential holds back nothing; it closes
+            self.assertEqual((killed[1:], running, worker.chat_started), (["T-3", "owner-chat"], [], None))
             # A helper that an update started again, with its key file in place: no call to the hub, also while a task
             # window runs, and only the windows without a credential close.
             self.key("beta", KEYS["beta"])
             answers[:] = []
             known = helper("beta", "worker", ["owner-chat", "T-5", "C-4"], ["owner-chat", "C-4"])
             self.assertTrue(known.enroll())
-            self.assertEqual((killed[2:], running, known.chat_started), (["owner-chat"], ["T-5", "C-4"], None))
+            self.assertEqual((killed[3:], running, known.chat_started), (["owner-chat"], ["T-5", "C-4"], None))
             fine = helper("beta", "worker", ["owner-chat"], [])             # its window has its credential
             self.assertTrue(fine.enroll())
             unknown = helper("beta", "worker", ["owner-chat"], None)        # tmux gave no list: never "no window"
             self.assertTrue(unknown.enroll())
-            self.assertEqual((killed[3:], running, fine.chat_started, unknown.chat_started),
+            self.assertEqual((killed[4:], running, fine.chat_started, unknown.chat_started),
                              ([], ["owner-chat"], ("g", 2), ("g", 2)))
 
     def test_a_key_that_the_owner_removed_is_registered_again(self):

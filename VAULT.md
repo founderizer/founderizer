@@ -1223,8 +1223,13 @@ host.
     of `/etc/passwd`, the next start of the gate or the next start of the server; a sub-uid range of an agent that holds
     the hub user's UID lets a process of that agent take that UID (the outgoing gate's step names such a range); and a
     hub's server that no root step reached since this release has no rule until its next one (`hubsetup.py one-server`,
-    or `hub.sh` again). Root and the hub's own user are trusted for these ports. A hub on a server with no agents does
-    not have this limit (`ports.py`, `hub.py`, `vault.py`, `lifecycle.py`).
+    or `hub.sh` again). Where the step cannot take back a file of sshd's that sshd refused, that file stays in sshd's
+    folder, and the step's words say that it could not be taken back; sshd then does not start again until root removes
+    it; and `--check` reads sshd's files, not the running sshd, which takes them at the step's next run. A `Match` block
+    of sshd's settings that sets `DenyGroups` again for some connections (for example `Match Address 127.0.0.1` with
+    `DenyGroups nobody`) lets an agent user in by such a connection, while `sshd -T`, which the step reads with no
+    connection, still names the deny; the fleet writes no such block. Root and the hub's own user are trusted for these
+    ports. A hub on a server with no agents does not have this limit (`ports.py`, `hub.py`, `vault.py`, `lifecycle.py`).
 
 30. **A hub's own server that took agents before its key swap and its gate.** A hub whose owner chose one server for all
     after its install, with a release before this one, or that was installed with that word before 16 and 17 November

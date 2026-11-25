@@ -24,6 +24,7 @@ from unittest.mock import patch
 import desktop
 import hub
 from test_host_origin import LocalHub
+from test_ui_api import session_bearer
 
 ASKS = "gzip, deflate, br"          # what URLSession sends by itself
 PLAIN = ["Server", "Date", "Content-Type", "Content-Length"]       # the header names of an answer before this change
@@ -46,9 +47,9 @@ class Answers(LocalHub):
                                (None, "manager", 1.0 + n, f"note {n}: " + "the same few words " * 12))
             hub.commit()
 
-    def read(self, path, accept=None, method="GET", body=None, conn=None):
+    def read(self, path, accept=None, method="GET", body=None, conn=None, auth=None):
         """(status, body bytes, header names in their order, headers) of one request. accept: its Accept-Encoding
-        lines (a string for one line, a list for more); None sends none."""
+        lines (a string for one line, a list for more); None sends none. auth: its Authorization headers."""
         own = conn is None
         conn = conn or http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
@@ -59,6 +60,8 @@ class Answers(LocalHub):
                 conn.putheader("Content-Length", str(len(body)))
             for line in [accept] if isinstance(accept, str) else accept or []:
                 conn.putheader("Accept-Encoding", line)
+            for name, value in (auth or {}).items():
+                conn.putheader(name, value)
             conn.endheaders(body)
             answer = conn.getresponse()
             data, headers = answer.read(), answer.getheaders()
@@ -289,11 +292,13 @@ class OtherAnswers(Answers):
         hub.TEAM["agents"]["worker"] = {"role": "worker", "runtime": "claude", "machine": "box", "can": [],
                                         "reports_to": "manager"}
         call = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
-        plain = self.read("/mcp/worker", method="POST", body=call)
+        hub.kv_set("db_id", "gzip-test")        # the generation of its chat's credential and of its route
+        route, auth = "/mcp/worker/gzip-test/owner-chat/1", session_bearer("worker", "chat")
+        plain = self.read(route, method="POST", body=call, auth=auth)
         self.assertEqual((plain[0], plain[2]), (200, PLAIN))
         with patch.object(hub, "GZIP_MIN", 1000):
             self.assertGreater(len(plain[1]), hub.GZIP_MIN)
-            status, body, names, _ = self.read("/mcp/worker", ASKS, method="POST", body=call)
+            status, body, names, _ = self.read(route, ASKS, method="POST", body=call, auth=auth)
         self.assertEqual((status, names, body), (200, PLAIN, plain[1]))
         self.assertIn("read_messages", [tool["name"] for tool in json.loads(body)["result"]["tools"]])
 

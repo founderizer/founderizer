@@ -309,8 +309,8 @@ class Holder(unittest.TestCase):
         self.assertEqual([alive(one) for one in (agent, setuid, *forked)], [False] * 7)
         killed = {pid for pid, sig in through if sig == signal.SIGKILL}
         self.assertEqual(killed, {one.pid for one in (agent, setuid, *forked)}, "each SIGKILL through its stop's pidfd")
-        self.assertEqual([pid for pid, sig in by_number if sig in (signal.SIGKILL, signal.SIGCONT)], [],
-                         "no signal after a stop by the process's number (its number may be another process's now)")
+        self.assertEqual(by_number, [], "no signal by the process's number, the stop included (after a stop its "
+                                        "number may be another process's now)")
 
     def test_a_hub_on_another_port_keeps_that_port_and_8765_is_none_of_its_own(self):
         """hub.sh --port 8800 (team.json's hub.port): the configuration names the hub's port, the rule's lines and its
@@ -412,6 +412,8 @@ class Install(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.calls, self.active, self.nft, self.sshd = [], "inactive", (0, "", ""), (0, "", "")
         self.sshd_settings = "port 22\ndenygroups fleet-agents\n"        # what sshd -T says
+        self.sshd_before, self.sshd_reading = (0, "", ""), None          # sshd -t with no file of ours; a failed -T
+        self.sshd_other, self.reload = (0, "", ""), (0, "", "")          # with a file of ours of other text; the reload
         self.units_at_load = None
 
     def run_(self, argv, input=None, timeout=120):
@@ -425,9 +427,14 @@ class Install(unittest.TestCase):
         if argv[:2] == ["systemctl", "start"]:
             self.active = "active"
         if argv == ["sshd", "-t"]:
-            return self.sshd
+            path = self.root / ports.SSHD_AGENTS.lstrip("/")
+            if not path.exists():
+                return self.sshd_before
+            return self.sshd if path.read_bytes() == ports.SSHD_AGENTS_TEXT.encode() else self.sshd_other
+        if argv[:2] == ["systemctl", "try-reload-or-restart"]:
+            return self.reload
         if argv == ["sshd", "-T"]:
-            return 0, self.sshd_settings, ""
+            return self.sshd_reading or (0, self.sshd_settings, "")
         return 0, "", ""
 
     def install(self, **more):
@@ -507,7 +514,10 @@ class Install(unittest.TestCase):
         November 2026): an agent's user that puts a key of its own in its home and logs in by SSH after a start of the
         server whose rule did not load, so that its program takes the hub's free port, and a file that sshd refuses
         left in place, which keeps SSH from its next start; and a step or a check that says that sshd denies the group
-        where sshd_config reads no file of the folder, so the file does nothing."""
+        where sshd_config reads no file of the folder, so the file does nothing. And each failure says its own cause
+        (the coordinator's validator, 24 November 2026): settings that sshd refused before the step are not blamed on
+        the file, and an `sshd -T` that fails is not "reads no file of the folder" with an Include that fixes
+        nothing."""
         self.assertIn("this server has no OpenSSH", " ".join(self.install()["said"]))
         self.assertFalse((self.root / ports.SSHD_AGENTS.lstrip("/")).exists())
         (self.root / "etc/ssh/sshd_config.d").mkdir(parents=True)
@@ -519,7 +529,15 @@ class Install(unittest.TestCase):
                         self.calls.index(["systemctl", "try-reload-or-restart", "ssh.service"]))
         self.calls.clear()
         self.assertEqual(self.install()["state"], "there")
-        self.assertNotIn(["sshd", "-t"], self.calls)
+        # a run that writes nothing still checks and reloads: sshd -T reads the files, not the running sshd, which a
+        # reload that failed before left with the settings of before (the Door area's read of 4b1673182)
+        self.assertEqual([argv for argv in self.calls if argv[0] == "sshd" or "try-reload-or-restart" in argv],
+                         [["sshd", "-t"], ["systemctl", "try-reload-or-restart", "ssh.service"], ["sshd", "-T"]])
+        self.reload = (1, "", "Job for ssh.service failed because the control process exited with error code.\n")
+        with self.assertRaisesRegex(ports.SSHRefused, "sshd did not take its settings again .*Job for ssh.service "
+                                                      "failed.*may still let an agent user log in"):
+            self.install()
+        self.reload = (0, "", "")
         (self.root / ports.SSHD_AGENTS.lstrip("/")).unlink()
         self.sshd = (255, "", "/etc/ssh/sshd_config.d/10-founderizer-agents.conf line 4: Bad configuration option\n")
         with self.assertRaisesRegex(ports.Refused, "sshd refused .* Bad configuration option.*so it was taken back"):
@@ -534,6 +552,59 @@ class Install(unittest.TestCase):
         self.assertIn("does not deny fleet-agents", " ".join(check["problems"]))
         self.sshd_settings = "port 22\ndenygroups fleet-agents\n"
         self.assertNotIn("fleet-agents", " ".join(self.install(check=True)["problems"]))
+        # sshd -T fails (a privilege separation user that is not there): its words, not the Include's advice
+        self.sshd_reading = (255, "", "Privilege separation user sshd does not exist\n")
+        with self.assertRaisesRegex(ports.SSHRefused, "sshd -T failed \\(Privilege separation user sshd does not "
+                                                      "exist\\)\\. The rule holds") as refused:
+            self.install()
+        self.assertNotIn("Include", str(refused.exception))
+        self.assertIn("sshd -T failed (Privilege separation user sshd does not exist)",
+                      " ".join(self.install(check=True)["problems"]))
+        self.sshd_reading = None
+        # settings that sshd refuses before the step: no file is written, and the words do not blame it
+        (self.root / ports.SSHD_AGENTS.lstrip("/")).unlink()
+        self.sshd_before = (255, "", "/etc/ssh/sshd_config line 9: Bad configuration option: Foo\n")
+        self.calls.clear()
+        with self.assertRaisesRegex(ports.SSHRefused, "refuses this server's own settings before any change "
+                                                      "\\(/etc/ssh/sshd_config line 9: .*was not written"):
+            self.install()
+        self.assertFalse((self.root / ports.SSHD_AGENTS.lstrip("/")).exists())
+        self.assertNotIn(["systemctl", "try-reload-or-restart", "ssh.service"], self.calls)
+        # nor is a file of ours that is right reloaded on such settings: a reload there can end sshd on some systems
+        self.sshd_before = (0, "", "")
+        self.install()
+        self.sshd = self.sshd_other = (255, "", "/etc/ssh/sshd_config line 9: Bad configuration option: Foo\n")
+        self.calls.clear()
+        with self.assertRaisesRegex(ports.SSHRefused, "before any change \\(/etc/ssh/sshd_config line 9.*so sshd was "
+                                                      "not reloaded"):
+            self.install()
+        self.assertNotIn(["systemctl", "try-reload-or-restart", "ssh.service"], self.calls)
+        # a file of ours with other text that sshd refuses (damaged, or of a release before): this step's text mends it
+        # (the Vault area's read of 4b1673182); where sshd refuses that too, the fault is the settings', and the file
+        # of before goes back, byte for byte: a damaged file need not be UTF-8 (the coordinator's validator)
+        file = self.root / ports.SSHD_AGENTS.lstrip("/")
+        damaged = b"DenyGroup fleet-agents \xff\n"
+        file.write_bytes(damaged)
+        self.sshd_other = (255, "", f"{ports.SSHD_AGENTS} line 1: Bad configuration option: DenyGroup\n")
+        with self.assertRaisesRegex(ports.SSHRefused, "own settings \\(/etc/ssh/sshd_config line 9.*also with .* as "
+                                                      "this step writes it, so the file of before was put back"):
+            self.install()
+        self.assertEqual(file.read_bytes(), damaged)
+        self.sshd = (0, "", "")
+        self.assertEqual(self.install()["state"], "made")
+        self.assertEqual(file.read_text(), ports.SSHD_AGENTS_TEXT)
+        # a file that cannot be written is the SSH part's refusal too, so its words do not say that the ports are open
+        file.unlink()
+        put = ports.put
+
+        def read_only(path, data, mode):
+            if path.endswith(ports.SSHD_AGENTS):
+                raise OSError(30, "Read-only file system")
+            return put(path, data, mode)
+
+        with patch.object(ports, "put", read_only), \
+                self.assertRaisesRegex(ports.SSHRefused, "could not be written or taken back .*Read-only file system"):
+            self.install()
 
     def test_a_rule_that_does_not_load_writes_no_unit_and_says_nfts_words(self):
         """nft refuses the table (an old nft, a kernel with no nf_tables): the step stops with nft's words, and
@@ -585,11 +656,39 @@ class Install(unittest.TestCase):
                                rounds=lambda conf, end=True, uid=None: (["port 8765: own (fleet)"], False),
                                source=str(Path(ROOT) / "ports.py"))
         self.assertFalse(answer["ok"], answer)
-        self.assertEqual(len(answer["problems"]), 1, answer)
+        self.assertEqual(answer["problems"], [f"the kernel's table is of version {ports.TABLE - 1}, not {ports.TABLE}, "
+                                              f"so root's step is owed"], answer)
 
 
 class Callers(unittest.TestCase):
     """What the other files of the fleet hold of the port piece."""
+
+    def test_an_ssh_refusal_is_named_as_such_and_not_as_ports_open_to_each_user(self):
+        """The SSH part of root's step comes after the rule and its units, so its refusal says that the hub's ports are
+        kept: the command's answer names the part, and hubsetup's stop (one-server, hub.sh's firewall step) says so.
+        Bug it catches (the coordinator's validator, 24 November 2026): a stop that tells the owner that an agent
+        could answer as the hub, where only an agent's SSH login is still open."""
+        def stop_of(refusal):
+            """The command's answer to the refusal, and hubsetup's stop when the command gives that answer."""
+            out = []
+            with patch.object(ports.platform, "system", lambda: "Linux"), \
+                    patch.object(ports.os, "geteuid", lambda: 0), patch.object(ports, "install", side_effect=refusal), \
+                    patch("builtins.print", lambda text, **kw: out.append(text)):
+                self.assertEqual(ports.main(["install"]), 1)
+            with patch.object(hubsetup, "say", lambda *a, **k: None), self.assertRaises(hubsetup.Stop) as stop:
+                hubsetup.ports_install(run=lambda command, timeout=None: (1, "\n".join(out), ""))
+            return json.loads(out[-1]), str(stop.exception)
+
+        words = "sshd refused the file (line 4: Bad configuration option), so it was taken back"
+        answer, stop = stop_of(ports.SSHRefused(words))
+        self.assertEqual(answer, {"ok": False, "reason": words, "part": "ssh"})
+        self.assertEqual(stop, f"the hub's ports are kept for their own users, but the SSH part of their step did not "
+                               f"hold: {words}")
+        # the rule's own refusal keeps its words
+        answer, stop = stop_of(ports.Refused("nft did not load it"))
+        self.assertEqual(answer, {"ok": False, "reason": "nft did not load it"})
+        self.assertIn("not kept for their own users: nft did not load it. An agent's user on this server could answer "
+                      "as the hub", stop)
 
     def test_the_root_command_takes_no_argument_and_its_sudo_line_says_so(self):
         """sudo runs a command written with no argument list with any arguments, so each line ends with "", and the

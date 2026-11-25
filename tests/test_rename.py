@@ -523,6 +523,7 @@ class Columns(unittest.TestCase):
         "key_swap_read:": "a server", "knowledge_read:": "a knowledge file", "read_base:": "a wake-up rule",
         "read_gap:": "a wake-up rule", "sign_in_refused:": "a task",
         "history:": "a stream of the history", "knowledge_asked:": "a knowledge file", "lead_unread:": "an unread item",
+        "held_cut:": "a task",
         "lost:": "a task", "mcp_renew:": "an MCP server: the manager's notice that its access ended or ends soon",
         "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
         "row_floor:": "a table", "screen_frozen:": "a task", "screen_limit:": "a task", "screen_question:": "a task",

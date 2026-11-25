@@ -1540,7 +1540,22 @@ def refused(code):
     return code == 403
 
 
-check("a name is accepted from its own machine", rpc("manager", "tools/list", base=hub2)[0] == 200)
+# Owner API 1.336: on a hub that pins addresses no MCP call passes without its session's credential, also for an
+# agent alone on its own address with no key yet. Its first session gets one as a helper gets it: the key by the
+# address alone (POST /helper/key), then the credential with that key (POST /helper/session).
+code, _, resp = rpc("manager", "tools/list", base=hub2)
+check("a name alone is refused from its own machine until its session sends its credential",
+      code == 403 and (resp or {}).get("auth") == "credential_required", f"{code} {resp}")
+agent_key = "selftest-key-" + uuid.uuid4().hex
+enrolled = raw("POST", "/helper/key/manager", {"sha256": hashlib.sha256(agent_key.encode()).hexdigest()}, base=hub2)[0]
+keyed = {"Authorization": "Bearer " + agent_key}
+db2 = json.loads(raw("GET", "/events/manager?after=-1&wait=0", headers=keyed, base=hub2)[2]).get("db")
+minted = json.loads(raw("POST", "/helper/session/manager", {"kind": "standing", "generation": db2}, keyed,
+                        base=hub2)[2])
+standing = {"Authorization": "Bearer " + str(minted.get("token")), "Accept": "application/json, text/event-stream"}
+code, _, text = raw("POST", "/mcp/manager", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, standing, base=hub2)
+check("a name is accepted from its own machine with the credential that its key gave",
+      enrolled == 200 and code == 200 and "create_task" in text, f"{enrolled} {code} {text[:120]}")
 check("a name whose machine has no address is refused, not taken from anybody",      # all: every call is counted
       all([refused(rpc("stray", "ping", base=hub2)[0]), refused(rpc("stray", "tools/list", base=hub2)[0]),
            refused(raw("GET", "/events/stray?after=0&wait=0", base=hub2)[0])]))
@@ -1563,7 +1578,8 @@ conn = http.client.HTTPConnection("127.0.0.1", int(hub2.rsplit(":", 1)[1]), time
 ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
 conn.request("POST", "/mcp/studio", body=ping, headers={"Content-Type": "application/json"})
 first = conn.getresponse(); first.read()
-conn.request("POST", "/mcp/manager", body=ping, headers={"Content-Type": "application/json"})
+conn.request("POST", "/mcp/manager", body=ping, headers={"Content-Type": "application/json",
+                                                          "Authorization": standing["Authorization"]})
 second = conn.getresponse(); answer = second.read()
 # the body too: a connection that kept half a request would answer the next one from the wrong bytes
 check("a refusal leaves a kept-alive connection usable",
