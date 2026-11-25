@@ -532,6 +532,7 @@ class Columns(unittest.TestCase):
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
         "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
         "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task", "no_tools:": "a task",
+        "takeover_tries:": "a take-over's stop (an event)", "takeover_told:": "the owner's held answer (an event)",
         "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_name_who:": "a KPI's standing item (lanes/agent-kpis.md)",
         "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}

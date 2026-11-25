@@ -400,9 +400,19 @@ class Entitlement(unittest.TestCase):
         return releases.sign_entitlement(seed, claims)
 
     def test_the_claims_are_read_and_our_signature_is_marked(self):
+        """The counts are read as the token names them: `users` (the coordinator's D81, 25 November 2026), and the
+        `agents` of a token that our side signed before it, each None when the token has none. The bugs: the hub
+        reads no `users`; a token is refused, or read as not ours, only because its count has the other name, so a
+        fleet loses its licence when our side moves from `agents` to `users`."""
         read = releases.read_entitlement(self.token(), KEY)
-        self.assertEqual((read["fleet"], read["plan"], read["machines"], read["agents"], read["verified"]),
-                         ("0123456789abcdef", "monthly", 4, 6, True))
+        self.assertEqual(tuple(read[k] for k in ("fleet", "plan", "machines", "agents", "users", "verified")),
+                         ("0123456789abcdef", "monthly", 4, 6, None, True))
+        # The claims that our side signs since D81, exactly these five keys, sorted: no `agents`.
+        after = releases.sign_entitlement(SEED, {"fleet": "0123456789abcdef", "plan": "teams", "until": 2000000000,
+                                                 "machines": 0, "users": 3})
+        read = releases.read_entitlement(after, KEY)
+        self.assertEqual((read["plan"], read["machines"], read["agents"], read["users"], read["verified"]),
+                         ("teams", 0, None, 3, True))
         self.assertFalse(releases.read_entitlement(self.token(seed=OTHER_SEED), KEY)["verified"])
         self.assertFalse(releases.read_entitlement(self.token(), None)["verified"])
         self.assertFalse(releases.read_entitlement(self.token(), ())["verified"])
@@ -420,7 +430,7 @@ class Entitlement(unittest.TestCase):
     def test_a_token_that_cannot_be_read_is_refused(self):
         for wrong in ["", "nodot", "a.b.c", "!!!.!!!", base64.urlsafe_b64encode(b"[]").decode() + ".x",
                       self.token(fleet="nothex"), self.token(plan=""), self.token(until=0),
-                      self.token(machines="many")]:
+                      self.token(machines="many"), self.token(users="2")]:
             with self.assertRaises(releases.Untrusted, msg=wrong[:30]):
                 releases.read_entitlement(wrong, KEY)
 
@@ -701,7 +711,7 @@ class Channel(unittest.TestCase):
         for code in (301, 302, 303, 307, 308):
             answer = releases.renew(f"{base}/renew/{code}", "tok.en", 3)
             self.assertEqual((answer["status"], answer["token"], answer["ended"]), (code, None, None))
-            self.assertEqual(channel.seen[-1], ("POST", f"/renew/{code}", "Bearer tok.en", b'{"agents":3}'))
+            self.assertEqual(channel.seen[-1], ("POST", f"/renew/{code}", "Bearer tok.en", b'{"users":3}'))
         self.assertEqual(len(elsewhere.seen), 1)        # the release's GET alone
 
     def test_the_licence_goes_only_to_our_own_site_over_https(self):
@@ -727,7 +737,8 @@ class Channel(unittest.TestCase):
         """3.10: the answer's token and its word go to the hub unchecked (it checks their signatures), and of each
         other answer only its status and its `error` code are kept, for the hub's log. The bugs: a refusal of our
         side is read as a token or as the end; words of the answer, which anybody on the way can write, reach the
-        log that the manager's resume reads; the count goes after the end, or a count that is no count goes out."""
+        log that the manager's resume reads; the count goes after the end, or a count that is no count goes out; the
+        count goes as `agents`, which our side reads no more after its next release (D81: `users`)."""
         word = {"state": "ended", "fleet": "0" * 16, "token_sha256": "a" * 64, "at": 1797811200, "signature": "c2ln"}
         sent = []
         for (status, body), want in (
@@ -753,7 +764,7 @@ class Channel(unittest.TestCase):
                 got = releases.renew("https://founderizer.com/api/entitlement/renew", "t.k", 7 if status else None)
             self.assertEqual(got, dict({"status": status, "token": None, "renews": None, "ended": None, "says": None},
                                        **want), str(body)[:40])
-        self.assertEqual((sent[0], sent[-1]), ({"agents": 7}, {}))
+        self.assertEqual((sent[0], sent[-1]), ({"users": 7}, {}))
         for count in (-1, True, 10001, 2.5):
             with self.assertRaises(ValueError):
                 releases.renew("https://founderizer.com/api/entitlement/renew", "t.k", count)
@@ -2229,8 +2240,10 @@ class HubRoutes(OwnerAPI):
         return woke.is_set()
 
     def licence(self, seed=PLAN_SEED, **change):
-        """A licence of Founderizer for Teams, as the platform signs it (3.2)."""
-        return self.token(seed, **dict({"plan": "teams", "agents": 5, "machines": 0}, **change))
+        """A licence of Founderizer for Teams, as the platform signs it (3.2), with `users` (D81) and no `agents`."""
+        claims = dict({"fleet": hub.fleet_id(), "plan": "teams", "until": 2000000000, "machines": 0, "users": 2},
+                      **change)
+        return releases.sign_entitlement(seed, claims)
 
     @contextlib.contextmanager
     def ours(self):
@@ -2377,21 +2390,35 @@ class HubRoutes(OwnerAPI):
 
     # ---- Founderizer for Teams: the licence's own poll (teams-design-1-shop-and-licence.md, 3.10)
 
-    def test_the_licence_poll_sends_the_token_and_the_count_of_active_agents_and_nothing_else(self):
-        """J6, read on the wire as the platform gets it: POST /api/entitlement/renew with the licence as the bearer and
-        {"agents": n}, the count of the agents of team.json that are active, the manager among them and an agent in
-        setup not. The bugs: an agent in setup goes on the invoice, or the manager is left off it; a name, a machine or
-        anything of the work rides along; the renewed token that comes back is not kept."""
-        hub.TEAM["agents"]["new"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": [],
-                                     "active": False}
-        licence, renewed = self.licence(), self.licence(until=2100000000)
+    def test_the_licence_poll_sends_the_token_and_the_count_of_users_and_nothing_else(self):
+        """J6 and the coordinator's D81 (25 November 2026), read on the wire as the platform gets it: POST
+        /api/entitlement/renew with the licence as the bearer and {"users": n}, n = 1 for the owner and 1 for each
+        person who can write to an agent (D85): a chat handle whose app has an account that is on, whose agent
+        person_reaches lets the person reach (not blocked, on their list, a daily limit above 0); no agent is
+        counted. For one release a token and an answer that carry `agents`, as our side signs them until its own
+        release, keep the licence as those with `users` do. The bugs: the owner is left off the invoice (0 users for
+        an empty list), a person is not counted, or a person with two handles and two agents counts more than once;
+        a person whom no message path takes is on the invoice: blocked, with no way to write, with no agent, with a
+        handle whose app's account goes to another agent, with a handle on an account that the owner turned off, or
+        with a daily limit of 0, or whose handle became the owner's own; or such a person stays off it after the
+        owner closes that gap; or a person goes off it for what D85 leaves out, because it is no mark of the person
+        (Pause all, an agent that is off, a day's count that reached its limit); a fault of the count stops the poll,
+        and with it the signed word "ended"; the active agents are counted, as before D81; the body still names
+        `agents`, which the platform reads no more after its next release; a person's name, a machine or anything of
+        the work rides along; a renewed token is not kept because of its count's name."""
+        held = self.token(plan="teams", machines=0, agents=5)       # what a hub holds today: signed before D81
+        renewed = self.licence(until=2100000000, users=3)          # our side after its release: `users`
+        older = self.token(plan="teams", machines=0, agents=5, until=2200000000)   # and before it: `agents`
+        answers = [{"token": renewed, "fleet": hub.fleet_id(), "plan": "teams", "until": 2100000000, "machines": 0,
+                    "users": 3, "renews": False},
+                   {"token": older, "fleet": hub.fleet_id(), "plan": "teams", "until": 2200000000, "machines": 0,
+                    "agents": 5, "renews": True}]
 
         class Platform(BaseHTTPRequestHandler):
             def do_POST(self):
                 self.server.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()},
                                          self.rfile.read(int(self.headers["Content-Length"]))))
-                out = json.dumps({"token": renewed, "fleet": hub.fleet_id(), "plan": "teams", "until": 2100000000,
-                                  "machines": 0, "agents": 5, "renews": False}).encode()
+                out = json.dumps(answers[min(len(self.server.seen), len(answers)) - 1]).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(out)))
                 self.end_headers()
@@ -2404,20 +2431,80 @@ class HubRoutes(OwnerAPI):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        self.assertEqual(self.press("entitlement", token=licence)[0], 200)
+        self.assertEqual(self.press("entitlement", token=held)[0], 200)
+        self.assertTrue(hub.teams_on())
         address = f"http://127.0.0.1:{server.server_port}/api/entitlement/renew"
+        t0 = hub.now()
+
+        def owner(path, **fields):
+            """One command of the owner on the People page: the person's id."""
+            code, receipt = self.request(path, dict({k: v for k, v in self.command().items() if k != "text"}, **fields))
+            self.assertEqual(code, 200, receipt)
+            return receipt["person"]["id"]
+
+        def polled(hour):
+            hub.licence_sweep(t0 + hour * hub.LICENCE_POLL)
+            hub._licence["thread"].join(30)
         with self.ours(), patch.object(releases, "_post", REAL_POST), \
                 patch.object(releases, "licence_endpoint", lambda channel: address):
-            hub.licence_sweep(hub.now())
-            hub._licence["thread"].join(30)
-        (path, headers, body), = server.seen
-        self.assertEqual((path, json.loads(body)), ("/api/entitlement/renew", {"agents": 2}))
-        self.assertEqual(headers["authorization"], "Bearer " + licence)
+            polled(0)                                               # the People list is empty: the owner alone
+            self.assertEqual(hub.entitlement_token(), renewed)
+            hub.TEAM["agents"]["studio"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": []}
+            accounts = hub.TEAM["chat_apps"] = {
+                "discord-vps": {"app": "discord", "label": "VPS", "agents": ["vps"], "unknown": "ignore"},
+                "whatsapp-vps": {"app": "whatsapp", "label": "VPS", "agents": ["vps"], "unknown": "ignore",
+                                 "enabled": False}}                 # an account that the owner turned off
+            listed = (("Ana Ruiz", [("discord", "1001"), ("discord", "1005")], ["vps", "studio"], None),
+                      ("Bo Lind", [("discord", "1002")], ["vps"], None),
+                      ("Cy Moss", [], ["vps"], None),                                   # no way to write
+                      ("Di Park", [("discord", "1004")], [], None),                     # no agent
+                      ("Eva Diaz", [("discord", "1006")], ["studio"], None),            # Discord goes to vps only
+                      ("Fay Lee", [("whatsapp", "34600111999@s.whatsapp.net")], ["vps"], None),     # turned off
+                      ("Gus Roy", [("discord", "1007")], ["vps"], 0),                   # a daily limit of 0
+                      ("Hal Kim", [("discord", "1008")], ["vps"], None))                # the owner's own, below
+            ana, _bo, cy, di, _eva, _fay, gus, _hal = (
+                owner("/ui/people", name=name, role="customer", agents=agents, daily=daily,
+                      handles=[{"app": app, "handle": handle} for app, handle in handles])
+                for name, handles, agents, daily in listed)
+            hub.ins("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES(?,?,?,?,?)",
+                    ("discord", "1008", None, None, hub.now()))     # as the owner's code link writes it
+            polled(1)                                   # Ana once, with two handles and two agents, and Bo
+            for hour, blocked in ((2, True), (3, False)):          # the owner blocks Ana, then lets her write again
+                owner("/ui/people", id=ana, blocked=blocked)
+                polled(hour)
+            for hour, close in enumerate((lambda: owner(f"/ui/people/{cy}/handles", app="discord", handle="1003"),
+                                          lambda: owner("/ui/people", id=di, agents=["vps"]),
+                                          lambda: accounts.update({"discord-studio": dict(accounts["discord-vps"],
+                                                                                          agents=["studio"])}),
+                                          lambda: accounts["whatsapp-vps"].update(enabled=True),
+                                          lambda: owner("/ui/people", id=gus, daily=5)), start=4):
+                close()                                 # each gap closed in turn: one more person each hour
+                polled(hour)
+            hub.kv_set("chat_apps_paused", "1")                     # Pause all
+            hub.TEAM["agents"]["vps"]["active"] = False             # an agent that is off
+            owner("/ui/people", id=gus, daily=1)                    # and a day's count at its limit
+            conv = hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) "
+                           "VALUES(?,?,?,?,?,?,?)", (gus, "vps", "discord-vps", "1007", "open", hub.now(), hub.now()))
+            hub.ins("INSERT INTO conversation_messages(conversation,who,text,created) VALUES(?,'person','Hi',?)",
+                    (conv, hub.now()))
+            self.assertEqual(hub.person_today(gus, hub.now()), 1)
+            polled(9)                                   # none of the three is a mark of the person: still 8
+            with patch.object(hub, "licence_users", side_effect=RuntimeError("a fault of the count")):
+                polled(10)                              # the poll still goes, with no count
+        bodies = [json.loads(one[2]) for one in server.seen]
+        (path, headers, _), (_, later_headers, _), *_rest = server.seen
+        self.assertEqual((path, [body.get("users") for body in bodies]),
+                         ("/api/entitlement/renew", [1, 3, 2, 3, 4, 5, 6, 7, 8, 8, None]))
+        self.assertEqual([sorted(body) for body in bodies], [["users"]] * 10 + [[]])    # no name, and no agents
+        self.assertEqual(len(self.logged("%could not count this fleet's users%")), 1)
+        self.assertEqual((headers["authorization"], later_headers["authorization"]),
+                         ("Bearer " + held, "Bearer " + renewed))
         self.assertEqual((headers["content-type"], headers["user-agent"]), ("application/json", "founderizer-hub"))
-        self.assertLessEqual(set(headers), {"accept", "accept-encoding", "authorization", "connection",
-                                            "content-length", "content-type", "host", "user-agent"})
-        self.assertEqual(hub.entitlement_token(), renewed)
-        self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 2100000000, "renews": False, "ended": None})
+        self.assertLessEqual(set(headers) | set(later_headers), {"accept", "accept-encoding", "authorization",
+                                                                 "connection", "content-length", "content-type",
+                                                                 "host", "user-agent"})
+        self.assertEqual(hub.entitlement_token(), older)
+        self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 2200000000, "renews": True, "ended": None})
 
     def test_a_licence_poll_ends_at_its_limit_however_slowly_the_channel_answers_and_the_next_one_runs(self):
         """J6: the poll runs in a thread of its own, and licence_sweep starts none while that thread lives. A socket's
@@ -2499,7 +2586,7 @@ class HubRoutes(OwnerAPI):
                 t0 += hub.LICENCE_POLL
                 self.assertEqual(len(self.licence_polled((200, {"token": wrong, "renews": True}), t0=t0)), 1)
                 self.assertEqual((hub.entitlement_token(), self.stored(), hub.teams_on()), (licence, first, True))
-            renewed = self.licence(until=2100000000, agents=7)
+            renewed = self.licence(until=2100000000, users=7)
             t0 += hub.LICENCE_POLL
             self.assertEqual(len(self.licence_polled((200, {"token": renewed, "renews": True}), t0=t0)), 1)
             self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 2100000000, "renews": True,
@@ -2518,7 +2605,7 @@ class HubRoutes(OwnerAPI):
         ended = (410, {"error": "ended", "ended": self.word(licence), "says": "Ended."})
         t0 = hub.now()
         with self.ours():
-            self.assertEqual(self.licence_polled(ended, t0=t0)[0][2], {"agents": 2})
+            self.assertEqual(self.licence_polled(ended, t0=t0)[0][2], {"users": 1})
             self.assertFalse(hub.teams_on())
             asks = []
             for day in range(1, 33):
@@ -2564,7 +2651,7 @@ class HubRoutes(OwnerAPI):
         licence, claimed = self.licence(), self.licence(until=2100000000)
         self.assertEqual(self.press("entitlement", token=licence)[0], 200)
         with self.ours():
-            self.licence_polled((200, {"token": self.licence(agents=7)}), during=lambda: hub.store_entitlement(claimed))
+            self.licence_polled((200, {"token": self.licence(users=7)}), during=lambda: hub.store_entitlement(claimed))
             self.assertEqual(hub.entitlement_token(), claimed)
             word = self.word(claimed, at=int(self.stored()) + hub.LICENCE_POLL)
             self.licence_polled((410, {"error": "ended", "ended": word}), t0=hub.now() + 1,

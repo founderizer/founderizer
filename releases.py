@@ -482,7 +482,14 @@ def read_entitlement(token, keys=None):
     entitlement with its release key would mark every real entitlement unverified.
 
     The hub carries this token and never acts on it: an expired entitlement changes nothing here, because only our
-    side refuses (4.2). So an unverifiable token is still kept and still shown; it is marked, not refused."""
+    side refuses (4.2). So an unverifiable token is still kept and still shown; it is marked, not refused.
+
+    The counts are read as the token gives them, each None when it has none: `machines`; `users`, the users that a
+    licence of Founderizer for Teams pays for (the coordinator's D81 and D85, 25 November 2026: the owner, and each
+    person of the fleet's People list who can write to an agent, by the gate that each of their messages passes;
+    hub.licence_users); and `agents`, the count of a token that our side signed before D81. Neither name is needed,
+    so a token of either form keeps its licence: since its release for D81 the platform signs only `users`, and it
+    still verifies a token with `agents` that it signed before that release."""
     if not (isinstance(token, str) and TOKEN.fullmatch(token)):
         raise Untrusted("an entitlement is <claims>.<signature>, both base64url")
     body, _, signature = token.partition(".")
@@ -494,17 +501,17 @@ def read_entitlement(token, keys=None):
     if not isinstance(claims, dict):
         raise Untrusted("the entitlement's claims are not an object")
     fleet, plan, until = claims.get("fleet"), claims.get("plan"), claims.get("until")
-    machines, agents = claims.get("machines"), claims.get("agents")
+    counts = {name: claims.get(name) for name in ("machines", "agents", "users")}
     if not (isinstance(fleet, str) and re.fullmatch(r"[0-9a-f]{16}", fleet)):
         raise Untrusted("the entitlement names no fleet")
     if not (isinstance(plan, str) and VERSION.fullmatch(plan)):
         raise Untrusted("the entitlement names no plan")
     if isinstance(until, bool) or not isinstance(until, (int, float)) or not 0 < until < 2 ** 40:
         raise Untrusted("the entitlement has no until date")
-    for name, number in (("machines", machines), ("agents", agents)):
+    for name, number in counts.items():
         if number is not None and (isinstance(number, bool) or not isinstance(number, int) or not 0 <= number <= 10000):
             raise Untrusted(f"the entitlement's {name} is not a count")
-    return {"fleet": fleet, "plan": plan, "until": float(until), "machines": machines, "agents": agents,
+    return {"fleet": fleet, "plan": plan, "until": float(until), **counts,
             "verified": signed_by_any(keys, body.encode(), raw_signature)}
 
 
@@ -566,7 +573,8 @@ def read_ended(raw, fleet, token, keys):
 # ---------------------------------------------------------------- POST /api/entitlement/renew: the licence's poll
 #
 # teams-design-1-shop-and-licence.md, 3.10 (J6). A hub that holds a licence of Founderizer for Teams asks the
-# channel for it one time each hour, with the count of its active agents, and keeps what comes back only by its
+# channel for it one time each hour, with the count of its users (D81 and D85: the owner and each person who can write
+# to an agent, hub.licence_users; no agent is counted), and keeps what comes back only by its
 # signature (hub.licence_take): a token that our key signed, or the signed word "ended". The licence goes only to our
 # own site over HTTPS, by the rule of errorreports.endpoint, and never to the address of a redirect.
 LICENCE_PATH = "/api/entitlement/renew"
@@ -575,7 +583,7 @@ CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
 # The `error` codes of the route's answers (the platform's docs/CONTRACTS.md, "The licence poll"): the only word of
 # an answer that the hub's log keeps, and only one of these, so that no sender writes a word of its own there.
 ERROR_CODES = frozenset(("ended", "lapsed", "unbound", "no_licence", "unavailable", "too_many"))
-COUNT_MOST = 10000                               # the agents that one count may name, as a token's `agents`
+COUNT_MOST = 10000                               # the users that one count may name, as a token's `users`
 ANSWER_MOST = 65536                              # bytes of an answer that the poll reads; a token is far less
 
 
@@ -723,20 +731,23 @@ def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
         conn.close()
 
 
-def renew(url, token, agents=None, *, timeout=CHANNEL_TIMEOUT):
+def renew(url, token, users=None, *, timeout=CHANNEL_TIMEOUT):
     """One licence's poll: POST `url` (licence_endpoint of the channel) with `token` as the bearer and the body
-    {"agents": <the count of the fleet's active agents>}, or {} with `agents` None (the asks after the word "ended"),
-    and nothing else of the fleet.
+    {"users": <the count of the fleet's users, hub.licence_users>}, or {} with `users` None (the asks after the word
+    "ended"), and nothing else of the fleet. Until D81 (25 November 2026) the body was {"agents": <the count of the
+    fleet's active agents>}; the platform still answers such a body, with a token, and records no count from it.
 
     Returns {"status", "token", "renews", "ended", "says"}, and no answer makes it raise. `token`: the token of a 200,
     unchecked (the hub keeps it only if our key signed it for this fleet), with `renews`, what the platform says of it
-    (None when the answer does not say it). `ended`: the word of a 410 `ended`, unchecked (hub.take_ended_word checks
-    it). `says`: one line for the hub's log, which holds the status and the answer's `error` code, never other words
-    of the answer. A status or a body that is none of these gives only `says`, and the hub changes nothing for it."""
-    if agents is not None and (isinstance(agents, bool) or not isinstance(agents, int)
-                               or not 0 <= agents <= COUNT_MOST):
-        raise ValueError("a count of agents is a whole number from 0 to 10000")
-    status, text = _post(url, token, {} if agents is None else {"agents": agents}, timeout)
+    (None when the answer does not say it). The answer's own count, `users` or the `agents` of before D81, is read by
+    nobody: no signature covers it, and the token that does carries the same count (read_entitlement). `ended`: the
+    word of a 410 `ended`, unchecked (hub.take_ended_word checks it). `says`: one line for the hub's log, which holds
+    the status and the answer's `error` code, never other words of the answer. A status or a body that is none of
+    these gives only `says`, and the hub changes nothing for it."""
+    if users is not None and (isinstance(users, bool) or not isinstance(users, int)
+                              or not 0 <= users <= COUNT_MOST):
+        raise ValueError("a count of users is a whole number from 0 to 10000")
+    status, text = _post(url, token, {} if users is None else {"users": users}, timeout)
     answer = {"status": status, "token": None, "renews": None, "ended": None, "says": None}
     if status == 0:
         return dict(answer, says="the licence's poll got no answer from the release channel: " + text)

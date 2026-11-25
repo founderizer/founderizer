@@ -332,6 +332,7 @@ class Refusals(Fixture):
 
 
 PASSWORD = "Ab3dEf7h"           # a one-time password of 8 letters and digits, as the helper makes one
+SESSION = "0b7d5a8e-3c1f-4e2a-9d6b-1f2e3d4c5b6a"     # a session of nora's task, as its helper names it
 
 
 class Linux(Fixture):
@@ -353,10 +354,13 @@ class Linux(Fixture):
     call, code, enroll, enrolled = (test_mobile.Devices.call, test_mobile.Devices.code, test_mobile.Devices.enroll,
                                     test_mobile.Devices.enrolled)
 
-    def reading(self, state="ready", user="fleet-nora", screen=5911):
-        """The server's own reading of its browser parts (S1b): their state, and the ports of the agent's OS user."""
+    def reading(self, state="ready", user="fleet-nora", screen=5911, room=None):
+        """The server's own reading of its browser parts (S1b): their state, and the ports of the agent's OS user; and
+        the room of its user.slice (D6), which gives its browser tasks their places."""
         data = {"browser": {"state": state, "ports": [{"user": user, "devtools": 9301, "screen": screen}]},
                 "agents": {"nora": {"user": "fleet-nora"}}}
+        if room:
+            data["room"] = room
         hub.q("DELETE FROM server_status WHERE server='srv1'")
         hub.q("INSERT INTO server_status(server, data, reported) VALUES('srv1', ?, ?)", (json.dumps(data), hub.now()))
 
@@ -557,6 +561,142 @@ class Linux(Fixture):
         self.assertFalse(self.ask(mac)[1])
         self.assertEqual(self.answer(hub.q1("SELECT id FROM needs WHERE by='ivy'")["id"], answer="Done")[0], 200)
         self.assertEqual(hub.q("SELECT * FROM events WHERE kind='takeover_close' AND task=?", (mac,)), [])
+
+    def test_an_answer_whose_stop_never_ends_is_heard_by_the_tasks_line_once(self):
+        """S6 holds his answer until the helper acknowledges the stop of the sharing. A stop that never ends left the
+        task silent: its idle session got nothing, no turn end came, and liveness saw a live session (the fleet's
+        T-2362). Each poll answer that carries the stop again is one more try that did not end it; at the second, the
+        answer is no message that waits any more, and the task's line hears of it once for each answer, with its cause,
+        from liveness once the session is idle; a turn end before that asks the agent nothing. While the helper is
+        silent, its machine's notice is the one line."""
+        seq = iter(range(1, 10000, 10))
+
+        def turn(tid, ends=True):       # a turn of its session, which reads what it can: never the held answer
+            hub.q("UPDATE events SET read_at=? WHERE agent='nora' AND task=? AND read_at IS NULL AND "
+                  "json_extract(extra, '$.takeover') IS NULL", (hub.now(), tid))
+            first = next(seq)
+            records = [{"seq": first, "type": "user_message", "text": "Go on."}] + (
+                [{"seq": first + 1, "type": "agent_message", "text": "I wait for the owner."},
+                 {"seq": first + 2, "type": "result", "stop_reason": "end_turn"}] if ends else [])
+            body = {"generation": "test-generation", "task": f"T-{tid}", "attempt": 1, "session": SESSION,
+                    "events": records}
+            self.assertEqual(self.request("/helper/events/nora", body)[0], 200)
+
+        def poll(tid):              # one round of nora's helper, whose list has the task's window
+            return [e["id"] for e in self.request(f"/events/nora?delivery=1&after=0&wait=0&alive=T-{tid}")[1]["events"]]
+
+        def told(tid):
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND task=? AND kind='say' "
+                                             "ORDER BY id", (tid,))]
+
+        def notice(tid):
+            return (f"[hub] T-{tid} (Read the supplier's report, owner nora) has no live path: {why}. It is still "
+                    f"working. Decide what to do: wait, cancel it and give it to another worker, or raise a Needs-you "
+                    f"item.")
+
+        def stuck():
+            return " ".join(line for _, line in hub.tasks_stuck(hub.now()))
+
+        def end(tid):               # the task ends, and its session's confirmed close gives its browser place back
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+            hub.browser_kv(hub.BROWSER_HOLD + str(tid), None)
+
+        why = ("the sharing of Nora's screen did not stop after the take-over, so its session does not get the answer to "
+               "the take-over")
+        self.reading(room={"memory_max": 16 << 30})     # its browser task holds its place, as one that runs does
+        tid, nid = self.asked()
+        turn(tid)                                       # the turn that asked ends on the open request: a live reason
+        self.assertEqual(self.answer(nid, answer="Done")[0], 200)
+        close = hub.q1("SELECT id FROM events WHERE kind='takeover_close' AND task=?", (tid,))["id"]
+        stalled = lambda: dict(hub.q1("SELECT live_path, stalled_reason, stall_told, nudge_level FROM tasks WHERE id=?",
+                                      (tid,)))
+        for _ in range(2):
+            self.assertIn(close, poll(tid))             # handed out, then one try that did not end it
+            hub.liveness(hub.now())
+        # bug: the first hand-out counted as a try, so a stop that may still end read as one that does not
+        self.assertEqual((told(tid), stalled()["live_path"]), ([], "live session"))
+        question = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?, 'nora', 'manager', "
+                           "'Go on?', ?)", (tid, hub.now()))
+        self.assertIn(close, poll(tid))                 # the second try that did not end it
+        hub.liveness(hub.now())
+        self.assertEqual(told(tid), [])                 # bug: a notice beside its open question (the fleet's T-2472)
+        hub.q("UPDATE questions SET answer='Yes', answered=? WHERE id=?", (hub.now(), question))
+        hub.liveness(hub.now())
+        # bug: in the usual order (no turn end after his answer) the task stayed silent and its requester heard nothing
+        self.assertEqual(told(tid), [notice(tid)])
+        # bug: the board read a live session; and a Stalled mark outlived a late ack (the fleet's T-2482)
+        self.assertEqual(stalled(), {"live_path": None, "stalled_reason": why, "stall_told": 1, "nudge_level": 0})
+        poll(tid)
+        hub.liveness(hub.now())
+        self.assertEqual(len(told(tid)), 1)             # bug: the same answer told again at a later pass
+        hub.kv_set("turn_ended:manager", hub.now() + 5)     # its requester had a turn and left the notice unread
+        # bug: nobody above the requester heard of it (tasks_stuck's list, as for liveness's notices)
+        self.assertIn(f"T-{tid} (Read the supplier's report, owner nora) has no live path and is still working: {why}",
+                      stuck())
+        self.assertEqual(self.request("/helper/ack/nora", {"ids": [close]})[0], 200)       # the stop ends late
+        hub.liveness(hub.now())
+        self.assertEqual(stalled()["live_path"], "live session")    # bug: the ack ended no stall (an ack is read)
+        # bug: a false "ended two turns in a row" once a late ack ended the stall (the fleet's T-2482, its first fault)
+        self.assertNotIn(f"T-{tid} ", stuck())
+        self.assertIn("Done", hub.call_tool("nora", "read_messages", {}, ("test-generation", f"T-{tid}", "1"))[0])
+        self.assertFalse(self.ask(tid, agent="nora")[1])            # a second take-over of the same task
+        turn(tid)
+        second = hub.q1("SELECT id FROM needs WHERE takeover_task=? AND answer IS NULL", (tid,))["id"]
+        self.assertEqual(self.answer(second, answer="Done")[0], 200)
+        for _ in range(3):
+            poll(tid)                                   # handed out, and two tries that did not end it
+        hub.liveness(hub.now())
+        # bug: one notice for each task and not for each answer, so the second answer that never came was silent
+        self.assertEqual(told(tid), [notice(tid)] * 2)
+        end(tid)
+
+        # His answer while a turn runs; that turn ends while the stop can still end, and a later one after its tries
+        other, nid = self.asked()
+        turn(other, ends=False)
+        self.assertEqual(self.answer(nid, answer="Done")[0], 200)
+        poll(other)
+        turn(other)
+        continues = lambda: [t for t in self.says(other) if t.startswith(f"[hub] T-{other} is open and nothing is")]
+        self.assertEqual(continues(), [])       # bug: an answer whose stop may still end read as nothing waiting
+        turn(other, ends=False)
+        poll(other)
+        poll(other)                                     # two tries that did not end it, while its turn runs
+        hub.liveness(hub.now())
+        self.assertEqual(told(other), [])       # bug: a notice while a turn of its session runs (the fleet's T-2465)
+        turn(other)
+        # bug: the agent read "nothing is waiting" for an answer that the hub holds, and its line never heard the cause
+        self.assertEqual(continues(), [])
+        hub.liveness(hub.now())
+        self.assertEqual(told(other), [notice(other)])  # bug: the turn end decided nothing, and the task was silent
+        hub.emit("nora", "say", "[manager] Go on without the owner's step.", task=other)   # its requester steers it
+        turn(other)
+        # bug: after the notice, a turn that its line started and that did nothing was asked nothing: silent again
+        self.assertEqual(len(continues()), 1)
+        turn(other)                                     # and the second empty turn tells the line as any other
+        self.assertIn(f"T-{other} (Read the supplier's report, owner nora) ended two turns in a row", told(other)[-1])
+        end(other)
+
+        # Its helper goes silent after the stop's tries and before liveness's next pass
+        silent, nid = self.asked()
+        turn(silent)
+        self.assertEqual(self.answer(nid, answer="Done")[0], 200)
+        for _ in range(3):
+            poll(silent)                                # handed out, and two tries that did not end it
+        floor = hub.q1("SELECT COALESCE(MAX(id), 0) m FROM events")["m"]
+        with patch.object(hub, "STARTED", hub.now() - 3600):
+            hub.q("UPDATE agents SET last_seen=? WHERE name='nora'", (hub.now() - 200,))
+            hub.liveness(hub.now())
+            hub.offline_sweep(hub.now())
+            lines = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' AND id>?",
+                                              (floor,))]
+            # bug: liveness told the task's line beside its machine's notice, and the manager of its own task twice
+            # (the fleet's T-2482, its second open fault)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("nora's machine went offline", lines[0])
+            self.assertIn(f"T-{silent}", lines[0])
+            hub.q("UPDATE agents SET last_seen=? WHERE name='nora'", (hub.now(),))      # it checks in again
+            hub.liveness(hub.now())
+        self.assertEqual(told(silent), [notice(silent)])    # bug: the answer stayed unheard after the helper came back
 
     def test_the_tasks_end_stops_the_sharing_of_its_screen(self):
         tid, nid = self.asked()

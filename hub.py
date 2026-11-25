@@ -11713,10 +11713,14 @@ SHELL_TITLES = ("Bash", "Monitor")      # a Claude background command or monitor
 def unread_for(t, but=None):
     """True when a message for the task's session waits that its helper will type: not a quiet one, and not one
     whose line the helper reported as not taken (plan C5) since it came. but: an event that does not count, the hub's
-    own continue line at a turn end after it (turn_end_check)."""
+    own continue line at a turn end after it (turn_end_check). The owner's answer to a take-over that the hub holds
+    until the sharing of the agent's screen stopped (takeover_held) counts while that stop can still end, and not once
+    its helper's tries did not end it (takeover_failed): then nothing types it, and the task's line hears of it from
+    liveness (takeover_unheard)."""
     rows = q("SELECT id, created, extra FROM events WHERE agent=? AND task=? AND kind IN ('say','task') AND "
              "read_at IS NULL", (t["owner"], t["id"]))
-    loud = [r["created"] for r in rows if not json.loads(r["extra"] or "{}").get("quiet") and r["id"] != but]
+    loud = [r["created"] for r in rows if not json.loads(r["extra"] or "{}").get("quiet") and r["id"] != but and
+            not takeover_failed(t["owner"], r["extra"])]
     untaken = float(kv_get(f"untaken:{t['owner']}:{tref(t['id'])}") or 0)
     return bool(loud) and max(loud) > untaken
 
@@ -11879,6 +11883,12 @@ def turn_end_check(t, state, t0, force=False, untaken=False):
     if reason:
         kv_set(f"turn_empty:{tid}", None)       # a live reason ends the empty stretch
         return reason[0]
+    if any(not kv_get(f"takeover_told:{r['id']}") for r in takeover_failed_rows(t)):
+        # build plan 04, S6: the owner's answer that its session cannot get (takeover_failed) makes this no empty turn
+        # of the agent's, which "nothing is waiting" would tell it: its line hears that cause first, once, from
+        # liveness, now that the session is idle (takeover_unheard). After that notice an empty turn is one as any other
+        kv_set(f"turn_empty:{tid}", None)
+        return "takeover"
     if stretch and q1("SELECT 1 FROM events WHERE agent=? AND task=? AND kind='say' AND id>? LIMIT 1",
                       (t["owner"], tid, stretch["event"])):
         stretch = None                          # a message came between: a new stretch
@@ -22743,6 +22753,92 @@ def takeover_held(event):
         "json_extract(extra, '$.need')=? LIMIT 1", (event["agent"], nid)))
 
 
+# A held answer whose stop does not end (build plan 04, S6). The helper tries the stop at each poll answer that carries
+# it, and a try that does not end the sharing leaves the event pending (fleet.Helper.takeover_close raises Refused, and
+# Helper.handle_events sends no ack then), so the next answer carries it again: each answer after the first that hands
+# it out is one more try that did not end it, which the poll route counts (kv takeover_tries:<event>). A count, and no
+# clock: the unit's own stop ends it within seconds (fleet.vnc_unit_text: TimeoutStopSec=5, then systemd kills it), so a
+# try that did not end it is a fault of the stop, and two of them are no passing fault. An answer that its helper did
+# not handle (a restart of the helper or of the hub between two polls) counts as a try too, and TAKEOVER_TRIES leaves
+# room for one. From there the answer is no message that waits to be typed (unread_for), and the task's line hears of it
+# once, with this cause, from liveness, when its session is idle with nothing else to bring it back (takeover_unheard):
+# a turn end before that notice asks the agent nothing (turn_end_check), and an empty turn after it is one as any other.
+# An ack that comes later ends it as before. While its helper is silent no try is counted, and its machine's notice is
+# the one line (offline_sweep).
+TAKEOVER_TRIES = 2
+TAKEOVER_STALL = ("the sharing of {agent}'s screen did not stop after the take-over, so its session does not get the "
+                  "answer to the take-over")
+
+
+def takeover_tried(close_ids):
+    """The poll route's count: each of these stops (takeover_close), handed to the agent's helper in an earlier answer
+    and not acknowledged since, was tried once more and did not end the sharing. The count stops at TAKEOVER_TRIES, all
+    that its reader asks (takeover_failed). Quiet: no screen reads it."""
+    with area("quiet"):
+        for cid in close_ids:
+            tries = int(kv_get(f"takeover_tries:{cid}") or 0)
+            if tries < TAKEOVER_TRIES:
+                kv_set(f"takeover_tries:{cid}", tries + 1)
+
+
+def takeover_failed(agent, extra):
+    """True when `extra` (an event's JSON) is that of the owner's answer to a take-over that the hub holds for `agent`
+    (takeover_held) behind a stop whose helper tried it TAKEOVER_TRIES times without its end. Commits nothing."""
+    try:
+        extra = json.loads(extra or "{}")
+    except (TypeError, ValueError):
+        return False
+    nid = extra.get("takeover") if isinstance(extra, dict) else None
+    return isinstance(nid, int) and bool(read_rows(
+        "SELECT 1 FROM events c JOIN kv k ON k.k='takeover_tries:' || c.id WHERE c.agent=? AND c.kind='takeover_close' "
+        "AND c.helper_ack IS NULL AND json_extract(c.extra, '$.need')=? AND CAST(k.v AS INTEGER)>=? LIMIT 1",
+        (agent, nid, TAKEOVER_TRIES)))
+
+
+def takeover_failed_rows(t):
+    """The owner's answers to a take-over of task row `t` that its session cannot get (takeover_failed), as event rows
+    (id, extra). Reads only."""
+    return [r for r in q("SELECT id, extra FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL AND "
+                         "json_extract(extra, '$.takeover') IS NOT NULL", (t["owner"], t["id"]))
+            if takeover_failed(t["owner"], r["extra"])]
+
+
+def takeover_unheard(t):
+    """The owner's answers to a take-over of open task row `t` that its session cannot get (takeover_failed_rows) while
+    nothing else brings that session back: no turn of it runs, and nothing waits for it (live_reason, which does not
+    count these answers). [] otherwise. For liveness, with its window alive and its helper online."""
+    rows = takeover_failed_rows(t)
+    if not rows:
+        return []
+    state = turn_state(t["id"], t["attempt"])
+    return [] if (state or {}).get("running") or live_reason(t, state) else rows
+
+
+def takeover_stall(t, rows, t0):
+    """liveness's step for open task row `t` whose window is alive and whose only wait is the owner's answers `rows`
+    (takeover_unheard): no live path, with its reason, and a notice to its requester, the manager too, because no
+    notice of a machine names this cause (offline_sweep). Once for each answer (kv takeover_told:<event>), and not once
+    for each stall: a turn of its session ends the stall, and the same answer can leave it idle again. No Stalled mark
+    of the turn-end check (nudge_level), which only a new turn takes off: the stop's late ack ends this stall with no
+    turn, liveness then finds the path again, and tasks_stuck reads nothing of it any more (the fleet's T-2482 left a
+    false "ended two turns in a row" there)."""
+    tid = t["id"]
+    reason = TAKEOVER_STALL.format(agent=shown_role(t["owner"]))
+    q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since, ?), stalled_reason=?, stall_told=1, "
+      "missing_since=NULL WHERE id=? AND (live_path IS NOT NULL OR stalled_since IS NULL OR stalled_reason IS NOT ? OR "
+      "IFNULL(stall_told, 0) != 1 OR missing_since IS NOT NULL)", (t0, reason, tid, reason))
+    new = [r["id"] for r in rows if not kv_get(f"takeover_told:{r['id']}")]
+    if not new:
+        return
+    event = emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {t['owner']}) has no live path: "
+                 f"{reason}. It is still {t['state']}. Decide what to do: wait, cancel it and give it to another "
+                 f"worker, or raise a Needs-you item.", task=tid)
+    stuck_told(tid, event)
+    for i in new:
+        kv_set(f"takeover_told:{i}", event)
+    log("hub", f"{tref(tid)} has no live path: {reason}")
+
+
 def t_request_takeover(agent, a):
     """request_takeover: in the session of an open browser or screen task, ask the owner to solve a CAPTCHA on the
     agent's own screen. One open request for each task: a second call names the first one."""
@@ -29324,14 +29420,36 @@ def conversation_signal(agent, cid, t0):
                                           "generation": generation["v"] if generation else None}))).lastrowid
 
 
+def person_reaches(person, agent):
+    """The owner's own marks that decide whether a message of this person can ever reach this agent, whatever the
+    message is: None when they can, else the first mark that stops them, in person_route's order. "blocked": the
+    owner blocked the person. "not_given": the agent is not on the person's list (person_may). "no_day": a daily limit
+    of 0 (person_daily; None is no limit), so that no message of any day goes in. It reads the limit, never the day's
+    count: a limit that today's messages reached is a state of the day, not of the person.
+
+    person_route asks it for each message, and licence_users asks it for the count of the licence's poll (the
+    coordinator's D85, 25 November 2026), so that a change of these marks changes the gate and the bill together.
+    conversation_refusal is not in it: it says whether the agent can chat now (on or off, its runtime, its Shell box,
+    the conversation's mode), which the owner changes for the agent and not for the person, and a message that it
+    refuses is still taken and answered. Plain reads (DB.execute, read_rows), so it needs no transaction."""
+    if person["blocked"] is not None:
+        return "blocked"
+    if not person_may(person["id"], agent):
+        return "not_given"
+    if person_daily(person, agent) == 0:
+        return "no_day"
+    return None
+
+
 def person_route(account, acc, person, m, t0, hit):
     """Inside chat_route's transaction: a message from a person the owner added. The checks are in order and every one
     of them fails closed. Returns stored or ignored."""
     in_transaction("person_route")
     agent = acc["agents"][0]
-    if person["blocked"] is not None:
+    reach = person_reaches(person, agent)
+    if reach == "blocked":
         return "ignored"                # the owner blocked this person: nothing is stored and nothing is sent
-    if not person_may(person["id"], agent):
+    if reach == "not_given":
         return "ignored"                # an agent the owner did not give them: it does not exist for this person
     refusal = conversation_refusal(agent, person)
     if refusal is None:
@@ -29361,7 +29479,8 @@ def person_route(account, acc, person, m, t0, hit):
     if chat_count(day_count, "inbound", t0) >= most:
         return "ignored"
     daily = person_daily(person, agent)     # None: no limit, which only contacts.v2 gives (staff, plan P1)
-    if daily is not None and person_today(person["id"], t0) >= daily:
+    # a limit of 0 (person_reaches' no_day) is the same answer as a day's count that reached its limit, here
+    if reach == "no_day" or daily is not None and person_today(person["id"], t0) >= daily:
         m["refusal"] = PERSON_DAY_LIMIT
         fixed_once(account, m["chat"], PERSON_DAY_LIMIT, t0, person["id"])
         return "ignored"
@@ -62800,6 +62919,7 @@ def liveness(t0):
         # minute would be one too many.
         woken = bool(park and once and launched and has_list and not alive and not starting and
                      (park["ci_open"] or park["due"] - t0 >= PARK_SOON) and message_waits(t, t0))
+        unheard = []
         if hold:
             path = held_word(hold)
         elif lim:
@@ -62823,8 +62943,12 @@ def liveness(t0):
                      "waiting for its session to start") if online else None)
         elif alive or (online and not has_list) or starting:
             asked = waits_on_message(tid) if alive else None        # plan C8: a named wait, in the path's own words
+            # build plan 04, S6: an idle session whose one wait is the owner's answer behind a stop that did not end
+            # has no path, as no session would: no event brings that answer, and no turn end comes to tell of it. A
+            # silent helper's tasks are its machine's notice (offline_sweep), as below
+            unheard = takeover_unheard(t) if alive and online and not asked else []
             path = (f"waiting for {asked['recipient']}'s answer to AM-{asked['id']}" if asked else
-                    "live session" if alive else "helper online")
+                    None if unheard else "live session" if alive else "helper online")
         elif once and not launched:
             path = "waiting for its session to start"           # the helper has not started this attempt yet
         elif question:
@@ -62838,6 +62962,9 @@ def liveness(t0):
             path = f"waiting for {owner} to load its new settings"
         else:
             path = None
+        if unheard:             # its window stands: nothing restarts it, and its requester hears once (takeover_stall)
+            takeover_stall(t, unheard, t0)
+            continue
         if path:
             q("UPDATE tasks SET live_path=?, stalled_since=NULL, stalled_reason=NULL, stall_told=0 WHERE id=? AND "
               "(live_path IS NOT ? OR stalled_since IS NOT NULL OR stalled_reason IS NOT NULL OR IFNULL(stall_told, 0) != 0)",
@@ -78878,9 +79005,9 @@ def take_ended_word(word, say=None):
 # ---- Founderizer for Teams: the licence's own poll (teams-design-1-shop-and-licence.md, 3.10; J6)
 #
 # While this fleet holds a licence, the hub asks the release channel for it one time each LICENCE_POLL, at the hub's
-# start and right after a new token, with the count of its active agents (POST /api/entitlement/renew,
+# start and right after a new token, with the count of its users (licence_users; POST /api/entitlement/renew,
 # releases.renew). It keeps what comes back by its signature, never by its status: a token that our key signed for
-# this fleet with plan `teams` (a new period, a new count of agents), or the signed word that the licence ended
+# this fleet with plan `teams` (a new period, a new count of users), or the signed word that the licence ended
 # (take_ended_word). Each other answer, and no answer, changes nothing: the launch's rule 5, silence changes nothing.
 # After the word it asks one time a LICENCE_DAY, LICENCE_ASKS times, with no count, and then makes no call: the way
 # back with no step of the owner, when our records have this fleet bound and live again. A fleet with no licence
@@ -78902,10 +79029,11 @@ _licence = {"thread": None, "token": None, "at": 0.0, "said": None}
 def licence_sweep(t0):
     """Once a pass of the tick (under LOCK): start the licence's poll when it is due, in a thread of its own. With a
     licence that did not end, the poll is due when the hub holds another token than the last poll sent (the hub's
-    start, a claim, the owner's route) or LICENCE_POLL after it, and it sends the count of the agents of team.json
-    that are active: the manager is one of them, and an agent in setup is not. After the word, one ask is due a
-    LICENCE_DAY after the one before, with no count, until LICENCE_ASKS asks went; an ask is counted before it goes,
-    so that a fault or a stop of the hub cannot make it go again and again."""
+    start, a claim, the owner's route) or LICENCE_POLL after it, and it sends the count of the fleet's users
+    (licence_users). A fault of the count sends the poll with no count, which the platform reads as no count, so
+    that the poll still brings a new token or the signed word. After the word, one ask is due a LICENCE_DAY after the
+    one before, with no count, until LICENCE_ASKS asks went; an ask is counted before it goes, so that a fault or a
+    stop of the hub cannot make it go again and again."""
     if not installed_hub():
         return
     thread = _licence["thread"]
@@ -78924,7 +79052,12 @@ def licence_sweep(t0):
         if digest == _licence["token"] and 0 <= t0 - _licence["at"] < LICENCE_POLL:
             return
         _licence.update(token=digest, at=t0)
-        count = sum(1 for name in agents() if agent_active(name))
+        try:
+            count = licence_users()
+        except Exception:       # a fault of the count never stops the poll, nor the signed word "ended" that it brings
+            print_fault()
+            licence_said("the licence's poll could not count this fleet's users, so it asks with no count")
+            count = None
     else:
         asked = licence_asked(digest)
         if asked["asks"] >= LICENCE_ASKS or 0 <= t0 - asked["at"] < LICENCE_DAY:
@@ -78935,6 +79068,44 @@ def licence_sweep(t0):
                               name="licence-poll", daemon=True)
     _licence["thread"] = thread
     thread.start()
+
+
+def licence_users():
+    """The count that the licence's poll sends (the coordinator's D81, 25 November 2026, for the price of D79 and D80:
+    each user of the fleet pays): 1 for the owner, and 1 for each person of the fleet's People list (POST /ui/people)
+    who can write to an agent, by the coordinator's D85: a way to write that reaches an agent which person_reaches,
+    the gate that person_route asks for each message, lets the person's messages reach. So the count asks the gate's
+    own function, never a copy of its checks: not blocked, the agent on the person's list, a daily limit above 0.
+    The ways, each found as the path of its messages finds it:
+    - a chat app's handle (person_handles) that is not the owner's own (owner_handle, which chat_route asks before
+      person_at: the owner's code link can make a person's handle the owner's): each account of chat_apps() of that
+      app that is not turned off (chat_enabled), as chat_route takes the account that a message came by, with that
+      account's agent (acc["agents"][0], as person_route takes it). An account that the owner removed is not in
+      chat_apps();
+    - a Founderizer app link: the agents that the Teams part's link_agents gives by link_inbound's own checks (an
+      active link; an agent of `list`). With no loaded part a link is no way: no message of it is taken. A fault of
+      the part gives one line, and no link is a way for the rest of this count.
+    Not counted, because they are no mark of the person: Pause all (chat_apps_paused, the owner's stop of every chat),
+    conversation_refusal (whether the agent can chat now: see person_reaches), and each check of one message or one
+    day (its words, its size, a saved secret, a link's rate or hold, the day's counts). No agent is counted, and the
+    count carries no name. The platform keeps its own minimum of 2."""
+    accounts = [acc for acc in chat_apps().values() if chat_enabled(acc)]
+    links = teams_part("person_links")
+    count = 1
+    for person in read_rows("SELECT * FROM people ORDER BY id"):
+        apps = {r["app"] for r in read_rows("SELECT app, handle, alias FROM person_handles WHERE person=?",
+                                            (person["id"],))
+                if not owner_handle(r["app"], r["handle"], r["alias"])}
+        agents_reached = [acc["agents"][0] for acc in accounts if acc["app"] in apps]
+        if links:
+            try:
+                agents_reached += links.link_agents(person)
+            except Exception:       # a fault of a part never stops the poll: one line, and no link is a way
+                print_fault()
+                links = None
+        if any(person_reaches(person, agent) is None for agent in agents_reached):
+            count += 1
+    return count
 
 
 def licence_asked(digest):
@@ -78971,7 +79142,7 @@ def licence_take(answer, token, stored, t0):
       came before the last poll. Its signature is not checked again, because the row's was at its store: so the
       hourly answer costs no check of a signature under LOCK, and a release that replaced the key refuses nothing.
     - Each other token is kept only when our key signed it for this fleet with plan `teams` (teams_token), and then
-      it takes the row's place through store_entitlement: a new period, a new count of agents, or a licence that is
+      it takes the row's place through store_entitlement: a new period, a new count of users, or a licence that is
       live again after the word. Another key's, another fleet's or another plan's token is not kept, because only the
       word turns Teams off.
     - The word "ended" goes to take_ended_word, which checks it, and the asks after it start from none.
@@ -90141,8 +90312,12 @@ class Handler(BaseHTTPRequestHandler):
                 # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
                 # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at
                 # once. So does a task's start, whose ack comes only once its session runs: from here its helper
-                # closes the window of the attempt before and starts this one (attempt_began).
-                handed = [r["id"] for r in rows if r["kind"] in ("conversation", "task") and r["handed"] is None]
+                # closes the window of the attempt before and starts this one (attempt_began). The stop of a
+                # take-over's sharing is marked too (build plan 04, S6): it comes in each answer until its helper's ack,
+                # so once handed out it comes again only after a try of the helper that did not end it (takeover_tried)
+                takeover_tried([r["id"] for r in rows if r["kind"] == "takeover_close" and r["handed"] is not None])
+                handed = [r["id"] for r in rows if r["kind"] in ("conversation", "task", "takeover_close") and
+                          r["handed"] is None]
                 if handed:
                     with area("quiet"):
                         q(f"UPDATE events SET handed=? WHERE handed IS NULL AND id IN ({','.join('?' * len(handed))})",
@@ -92985,9 +93160,9 @@ TEAMS_CALLS = {         # feature -> the names of the functions that Core calls 
     "role_sets": ("access_body", "set_write", "apply", "role_fields", "person_fields", "role_agents"),
     # design 4, the members' links (teams-design-4-members.md, 3.5): S1 start, S3 place, S6 handle, S7 handle_view,
     # S8 person_rows and link_rows, S9 join_check, join_rows and join_view (the item's `join`, D12), S10 ui_links,
-    # S11 count, S13 work_note
+    # S11 count, S13 work_note, S14 link_agents (D85: the count of the licence's poll, licence_users)
     "person_links": ("start", "place", "handle", "handle_view", "person_rows", "link_rows", "join_check", "join_rows",
-                     "join_view", "ui_links", "count", "work_note"),
+                     "join_view", "ui_links", "count", "work_note", "link_agents"),
 }
 # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
 TEAMS_TABLES = ("role_sets", "person_links", "person_link_asks")
