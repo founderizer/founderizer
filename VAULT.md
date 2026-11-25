@@ -1326,21 +1326,30 @@ host.
    of the central vault cannot be opened (`vault.py`). A vault with the list of the owner's devices makes no new backup.
 7. **Know what a new Mac changes.** The root step from a new Mac, whose key is not one of the central vault's owner
    keys, makes its key the only owner key of the central vault (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`),
-   while the vault has no list of the owner's devices. A
-   run of that step from a Mac whose key is one of them keeps all of them. The recovery key does not change: a backup still opens only
-   with the lost Mac's code, which only a phone that took a copy has (`Sources/FleetCore/CentralVaultPlan.swift`,
-   `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker, and Fleet Vault on a Mac that has the owner's keys,
-   keep the old owner key until a root step on that machine changes their keys: on Linux, `vault.py configure` adds
-   the new key (`--add-owner-key`) and takes the old one out (`--remove-owner-key`); on a Mac,
+   while the vault has no list of the owner's devices. A Mac that Migration Assistant or a Time Machine restore made
+   from another Mac takes the same path: the old Mac's owner key comes with the login keychain, but this Mac's chip
+   refuses to sign with it while a new key of the same chip signs (a locked Mac or a token daemon that restarts fails
+   that control and keeps the key), so Founderizer holds no owner key there, the Vault row says Set up, and only the
+   owner's Set up makes this Mac's own key in its place: no automatic round of the vault, and no Try again, replaces an
+   owner key. The first old item stays aside as "Founderizer · owner key of another Mac", so its form is not lost
+   (`Sources/FleetCore/OwnerKey.swift`, `Sources/Founderizer/CentralVaultSection.swift`). A token daemon that does not
+   answer keeps the key, and the Vault's steps stop with "The keychain refused the key (-25291)."; only a damaged item
+   stops them with -26275, and only then take "Founderizer · owner key" away in Keychain Access, then Set up. A virtual
+   machine has no enclave of its own, so an owner key that a copy of a Mac brings into one stops them with -25291 for
+   good: there, take the item away too, and Set up makes a software key. A run of the root step from a Mac whose key is
+   one of them keeps all of them. The recovery key does not change: a backup still opens only with the lost Mac's code,
+   which only a phone that took a copy has (`Sources/FleetCore/CentralVaultPlan.swift`,
+   `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker, and Fleet Vault on a Mac that has the owner's keys, keep
+   the old owner key until a root step on that machine changes their keys: on Linux, `vault.py configure` adds the new
+   key (`--add-owner-key`) and takes the old one out (`--remove-owner-key`); on a Mac,
    `Vault/install.py --owner-keys-only` with the new key alone (`vault.py`, `Vault/install.py`). Do that root step on
-   each such machine soon. Within 7 days the new Mac signs the pin of each machine again with its own
-   key, and such a broker refuses each pin that the new key signed. So that machine's broker hands no login over
-   until its root step (`Sources/FleetCore/CentralVaultPlan.swift`, `vault.py`). Keep Founderizer running on a Mac:
-   it signs each pin again after 7 days, and a pin lives 90 days. When the Mac stops, handovers go on for at least 83
-   more days, and the System status page warns 30 days before the end (`hub.py`). A server that
-   you removed on another Mac, or with `remove_machine`, is not in this Mac's record of removed servers. A server that
-   you removed on this Mac and add again another way has a row on the Secrets page: select Try again there to trust it
-   (limit 7).
+   each such machine soon. Within 7 days the new Mac signs the pin of each machine again with its own key, and such a
+   broker refuses each pin that the new key signed. So that machine's broker hands no login over until its root step
+   (`Sources/FleetCore/CentralVaultPlan.swift`, `vault.py`). Keep Founderizer running on a Mac: it signs each pin again
+   after 7 days, and a pin lives 90 days. When the Mac stops, handovers go on for at least 83 more days, and the System
+   status page warns 30 days before the end (`hub.py`). A server that you removed on another Mac, or with
+   `remove_machine`, is not in this Mac's record of removed servers. A server that you removed on this Mac and add again
+   another way has a row on the Secrets page: select Try again there to trust it (limit 7).
 8. **Replace a key after the end of "Reads it".** When you take "Reads it" from an agent, replace the key at its
    service. A session of the agent that runs keeps the old value until it ends, and the agent could copy the value
    while it had the grant (`fleet.py`, `hub.py`). A key that swaps is different: the agent had only a placeholder,
