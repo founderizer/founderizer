@@ -892,6 +892,54 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual(mobile["ui_features"], state["ui_features"])    # the phone reads /ui/state for nothing
         self.assertIn("mobile", mobile["ui_features"])
 
+    def test_each_message_says_its_hand_and_never_its_session(self):
+        """Owner feature message_hands (UI-API.md 1.332; the owner, 24 November 2026: "why does it look like I sent
+        that message? I didn't", and "B, go ahead"): each owner's message of GET /ui/state and of a phone's chat page,
+        and the owner's side of agents[].last of GET /ui/mobile (the phone's and the PC's chat list), give the hand
+        that sent it and the AI program of its session, and never the session's id. The apps draw his filled bubble
+        only for his own hand (app, device, chat) or a row of before; the AI's mark only for a tool with a runtime that
+        they know. Bugs: a view that drops the hand (an AI session's words in his filled bubble again), that gives the
+        session's id, that gives a runtime for any first part of a session (an app draws a mark of an AI that it does
+        not know) or for a hand that is no tool (here a connected app's row with a session), that passes on a hand
+        that no app knows (a later hub's "job", which an app could draw as his), or a route that names no feature (an
+        app reads no field)."""
+        self.message(text="From before the hand")              # a row of before owner API 1.289: no hand
+        for text, hand, session in (("From a connected app", "connected", "claude-code/3c4d5e6f7a"),
+                                    ("From a later hand", "job", None)):
+            self.message(text=text)
+            hub.q("UPDATE ui_requests SET hand=?, session=? WHERE text=?", (hand, session, text))
+        sent = (("From the Mac app", {}, ("app", None)),
+                ("From Codex", {"X-Fleet-Client": "founderizer-cli/1/test",
+                                "X-Fleet-Session": "codex/0d8aa41c"}, ("tool", "codex")),
+                ("From an unknown AI", {"X-Fleet-Session": "helper-ai/5b21c9e07a"}, ("tool", None)),
+                ("From curl", {"X-Fleet-Client": "curl/8.7.1"}, ("other", None)),
+                ("From Claude Code", {"X-Fleet-Client": "founderizer-mcp/1/test",
+                                      "X-Fleet-Session": "claude-code/7e350cc6"}, ("tool", "claude-code")))
+        for text, headers, _ in sent:
+            status, receipt = self.call("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                         "text": text}, headers=headers)
+            self.assertEqual(status, 200, receipt)
+        expected = dict([("From before the hand", (None, None)), ("From a connected app", ("connected", None)),
+                         ("From a later hand", ("other", None))] + [(text, hand) for text, _, hand in sent])
+        state = self.call("/ui/state")[1]
+        chat = self.call("/ui/mobile/chat/manager")[1]
+        mobile = self.call("/ui/mobile")[1]
+        self.assertEqual({m["text"]: (m["hand"], m["runtime"]) for m in state["messages"]}, expected)
+        self.assertEqual({i["text"]: (i["hand"], i["runtime"]) for i in chat["items"] if i["kind"] == "message"},
+                         expected)
+        last = lambda page: next(a for a in page["agents"] if a["name"] == "manager")["last"]
+        self.assertEqual({k: last(mobile)[k] for k in ("side", "preview", "hand", "runtime")},
+                         {"side": "owner", "preview": "From Claude Code", "hand": "tool", "runtime": "claude-code"})
+        self.assertFalse([m for m in state["messages"] + chat["items"] + [last(mobile)] if "session" in m])
+        for answer in (state, chat, mobile):
+            for session in ("7e350cc6", "0d8aa41c", "5b21c9e07a", "3c4d5e6f7a"):
+                self.assertNotIn(session, json.dumps(answer))
+        self.assertIn("message_hands", state["ui_features"])
+        self.assertIn("message_hands", mobile["ui_features"])
+        self.report(text="Done")                                # the agent's side has neither
+        self.assertEqual({k: last(self.call("/ui/mobile")[1])[k] for k in ("side", "hand", "runtime")},
+                         {"side": "agent", "hand": None, "runtime": None})
+
     def test_a_chat_page_says_which_report_the_agent_wrote_first(self):
         self.report(text="An answer")
         hub.ins("INSERT INTO owner_reports(text,about,created,agent,pushed) VALUES(?,'',?,'manager',1)",

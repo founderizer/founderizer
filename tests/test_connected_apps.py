@@ -151,10 +151,8 @@ class Dormant(Base):
         self.assertEqual(code, 200)
         self.assertNotIn("connection", state["messages"][0])
         self.assertEqual(state["messages"][0]["text"], "A goal")
-        # nor who sent it (the review of 20 November 2026, issue 4: UI-API.md 1.289 changes no answer field)
-        hub.q("UPDATE ui_requests SET hand='tool', session='claude-code/1'")
-        code, state = self.request()
-        self.assertTrue({"hand", "session"}.isdisjoint(state["messages"][0]), state["messages"][0])
+        # (who sent it is owner feature message_hands since UI-API.md 1.332: test_mobile's
+        # test_each_message_says_its_hand_and_never_its_session)
         # a request that names a connected app's label with no connection of the hub's is a program's claim: marked as
         # one, in its header as everywhere else (the last check of 21 November 2026)
         with hub.committed():
@@ -1746,7 +1744,17 @@ class Tools(Socket):
         self.assertTrue(said[0].startswith(f"[owner via program] Steering from the owner's program for T-{task}: "
                                            "Stop the export."), said)
         self.assertIn("through a program: Stop the export.", said[1])
-        self.assertNotIn("connection", own["steer"])                # the apps read no new field of a steer
+        self.assertNotIn("connection", own["steer"])                # the apps read no connection of a steer
+        # Owner feature message_hands (UI-API.md 1.332): each view of a steer gives its hand and the AI of its session,
+        # and never the session's id. Bug: steer_view gives neither, and the Mac's task page draws an AI session's
+        # steer (steer_task of the owner tools) in his filled bubble.
+        self.assertEqual([(s["hand"], s["runtime"]) for s in (own["steer"], tool["steer"], scripted["steer"])],
+                         [("app", None), ("tool", "claude-code"), ("other", None)])
+        steers = self.request()[1]["steers"]
+        self.assertEqual([(s["hand"], s["runtime"]) for s in steers],
+                         [("connected", None), ("app", None), ("tool", "claude-code"), ("other", None)])
+        self.assertFalse([s for s in steers if "session" in s])
+        self.assertNotIn("7e350cc6", json.dumps(steers))
         hub.history_catch_up()
         rows = hub.q("SELECT * FROM history WHERE src='steer' ORDER BY src_id")
         self.assertEqual([r["text"] for r in rows],

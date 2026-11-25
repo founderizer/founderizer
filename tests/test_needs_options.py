@@ -613,9 +613,15 @@ class Talk(NeedsCase):
         # The review of 20 November 2026, issue 4 (Fable's third check): an AI session's talk under a card says so in
         # its header and in one sentence, as its answer does
         self.raise_item(title="Which window?", options=["80", "70"])
-        code, _ = self.request("/ui/needs/2/talk", self.command(text="Is 80 safe?"), headers={
-            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test"})
+        code, receipt = self.request("/ui/needs/2/talk", self.command(text="Is 80 safe?"), headers={
+            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test",
+            "X-Fleet-Session": "claude-code/0d8aa41c"})
         self.assertEqual(code, 200)
+        # Owner feature message_hands (UI-API.md 1.332): the route's answer gives the hand of each entry and the AI
+        # program of its session, so that the app draws the outlined bubble with the AI's mark at once. Bug: need_talk
+        # gives who, text and ts only, and the session's words stand in his filled bubble until the next read.
+        self.assertEqual([(t["who"], t["hand"], t["runtime"]) for t in receipt["talk"]],
+                         [("owner", "tool", "claude-code")])
         said = hub.t_read_messages("manager", {})
         self.assertIn("[owner via ai-session] About Needs-you N-2 (Which window?), before answering it: Is 80 safe?",
                       said)
@@ -629,6 +635,27 @@ class Talk(NeedsCase):
         self.assertIn(hub.NEED_TALK_NOT_HIS, said)
         with self.assertRaisesRegex(hub.ToolError, "answered already"):
             hub.t_discuss_need("manager", {"need": "N-1", "text": "Late."})
+        # The card's talk in GET /ui/state and GET /ui/mobile (need_reads) gives the same: his own words and an agent's
+        # reply have null in both, and the session's id is in no answer. Bugs: need_reads drops the hand (the card
+        # shows the session's words as his), gives an agent's reply a hand or a runtime, or gives the session's id.
+        with mock.patch.object(hub, "ping_reply"):
+            hub.t_discuss_need("manager", {"need": "N-2", "text": "Both are safe, and 80 is faster."})
+        mobile = self.request("/ui/mobile")[1]
+        talks = {"state": (self.item(1)["talk"], self.item(2)["talk"]),
+                 "mobile": tuple(next(n for n in mobile["needs"] + mobile["answered_needs"] if n["id"] == nid)["talk"]
+                                 for nid in (1, 2))}
+        for read, (first, second) in talks.items():
+            self.assertEqual([(t["who"], t["hand"], t["runtime"]) for t in first],
+                             [("owner", None, None), ("manager", None, None)], read)
+            self.assertEqual([(t["who"], t["hand"], t["runtime"]) for t in second],
+                             [("owner", "tool", "claude-code"), ("owner", "other", None), ("manager", None, None)],
+                             read)
+        # the rows: a session only with words that he did not type, and none with his own (the Mac app's)
+        self.assertEqual([tuple(r) for r in hub.q("SELECT text, hand, session FROM need_talk WHERE who='owner' "
+                                                  "ORDER BY id")],
+                         [("Which one costs less?", None, None), ("Is 80 safe?", "tool", "claude-code/0d8aa41c"),
+                          ("And 75?", "other", None)])
+        self.assertNotIn("0d8aa41c", json.dumps(self.request()[1]) + json.dumps(mobile))
 
     def test_the_manager_replies_once_until_the_owner_writes_again(self):
         """The area's word of 20 November 2026: one reply to each message of the owner's, so that no loop of replies

@@ -138,6 +138,8 @@ class RowsCase(test_state_read.StateCase):
                                             "mac-app", self.messages[1]))
         hub.q("UPDATE ui_requests SET edits=? WHERE request_id=?",
               (json.dumps([{"request_id": "e-1", "text": "first words", "at": T0 - 100}]), self.messages[4]))
+        hub.q("UPDATE ui_requests SET hand='tool', session='claude-code/7e350cc6' WHERE request_id=?",
+              (self.messages[0],))     # an AI session's message (owner feature message_hands)
 
 
 class Together(RowsCase):
@@ -166,6 +168,10 @@ class Together(RowsCase):
         self.assertEqual([f["name"] for f in kept[self.messages[1]]["attachments"]], ["plan.pdf"])
         self.assertEqual(kept[self.messages[2]]["origin"]["label"], "Shop phone")
         self.assertEqual(kept[self.messages[4]]["edited"], T0 - 100)
+        # owner feature message_hands (UI-API.md 1.332): a block gives the hand and the runtime as the state does, and
+        # no session (bug: a block built without them shows an older message of an AI session as his own words)
+        self.assertEqual({k: kept[self.messages[0]].get(k, "none") for k in ("hand", "runtime", "session")},
+                         {"hand": "tool", "runtime": "claude-code", "session": "none"})
         said = {r["id"]: r for b in self.blocks("reports").values() for r in b["reports"]}
         self.assertEqual(said[self.grant]["grant"]["title"], "Shop key")
         self.assertEqual(said[self.reports[1]]["delivery"]["state"], "sent")

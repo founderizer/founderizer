@@ -2204,6 +2204,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "agent_tags",        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
                                     # now"): POST /ui/messages takes `mentions`, the @ tags of a message, and
                                     # messages[].mentions of GET /ui/state gives them (UI-API.md 1.288)
+               "message_hands",     # the owner, 24 November 2026 ("B, go ahead" to an outlined bubble with the AI's
+                                    # mark for words that an AI session sent for him): `hand` and `runtime` of each
+                                    # owner's message and of each entry of a card's talk (message_hand, UI-API.md 1.332)
                "chat_stop",         # the owner, 21 November 2026 ("Yes, add Stop (Recommended)": "While the agent
                                     # works on your message or your answer, Stop stands where Send stands. A press
                                     # interrupts that turn, as Pause does for a task."): agents[].chat_stop of GET
@@ -2390,6 +2393,30 @@ def request_hand(client, device=None, connection=None, origin=None, session=None
     if device:
         return "device" if label.startswith(OWNER_DEVICE_LABELS) else "other"
     return "app" if label.startswith(OWNER_APP_LABELS) else "other"
+
+
+# Owner feature message_hands (UI-API.md 1.332). On 24 November 2026 an AI session sent a message to the manager through
+# the owner tools, and the owner's Mac chat showed it as his own filled bubble: "why does it look like I sent that
+# message? I didn't". His answer to the pictures ("B, go ahead"): the apps draw words that he did not type with an
+# outlined bubble, and an AI session's with the mark of its AI. So each owner's message, steer and entry of a card's
+# talk, and the owner's side of agents[].last of GET /ui/mobile, give the apps their hand, and the AI program of a
+# session, from this list only: the part of X-Fleet-Session before its first "/" (owner_mcp.session_label sends
+# claude-code/<session id>). The session's id stays in the hub's records.
+MESSAGE_RUNTIMES = ("claude-code", "codex")
+# The hands that the apps read: a closed list, so that a hand that a later change adds to request_hand (the release
+# job's "job", for one) goes to the apps as "other", whatever the order of the merges, and never as a value that an app
+# may draw as the owner's own words.
+MESSAGE_HANDS = ("app", "device", "chat", "connected", "tool", "other")
+
+
+def message_hand(hand, session):
+    """{hand, runtime} of one owner's message, steer or entry of a card's talk, for the apps (owner feature
+    message_hands): hand is the row's request_hand when MESSAGE_HANDS names it, "other" for any other hand, and None
+    for a row of before it was kept (owner API 1.289); runtime is the AI program of a "tool" row's session when
+    MESSAGE_RUNTIMES names it, else None."""
+    hand = None if hand is None else hand if hand in MESSAGE_HANDS else "other"
+    runtime = str(session or "").split("/", 1)[0] if hand == "tool" else None
+    return {"hand": hand, "runtime": runtime if runtime in MESSAGE_RUNTIMES else None}
 
 
 def owner_device_key(device):
@@ -3883,10 +3910,19 @@ def door_card_fits(call, host):
 
 
 def need_talk(nid):
-    """The owner's discussion of one item and the replies to it, oldest first: [{who, text, ts}]. who is owner or the
-    agent that replied."""
-    return [{"who": r["who"], "text": r["text"], "ts": r["ts"]}
-            for r in q("SELECT who, text, ts FROM need_talk WHERE need=? ORDER BY id", (nid,))]
+    """The owner's discussion of one item and the replies to it, oldest first: [{who, text, ts, hand, runtime}]. who is
+    owner or the agent that replied (need_talk_entry)."""
+    return [need_talk_entry(r)
+            for r in q("SELECT who, text, ts, hand, session FROM need_talk WHERE need=? ORDER BY id", (nid,))]
+
+
+def need_talk_entry(row):
+    """One entry of a card's talk for the apps, from its need_talk row: who, text and ts, and (owner feature
+    message_hands) the hand and the runtime of an entry of the owner's (message_hand). need_talk.hand is set only for
+    words that he did not type (need_talk_said), so his own words and an entry from before have None, which the apps
+    draw as his own; an agent's reply has None in both."""
+    hand = message_hand(row["hand"], row["session"]) if row["who"] == "owner" else message_hand(None, None)
+    return dict({"who": row["who"], "text": row["text"], "ts": row["ts"]}, **hand)
 
 
 def need_unclarified(need):
@@ -3910,14 +3946,14 @@ def need_unclarified(need):
 
 def need_reads():
     """What need_view reads for each item, read once for all of them: (need_talk of every item as {item: [{who, text,
-    ts}]}, each list oldest first; the fleet's id; the task of each question that an item takes to the owner, as
-    {question: task}, for need_task; the rows of the items' pictures as {item: [row]}; the replaced items as
+    ts, hand, runtime}]}, each list oldest first; the fleet's id; the task of each question that an item takes to the
+    owner, as {question: task}, for need_task; the rows of the items' pictures as {item: [row]}; the replaced items as
     need_chain_rows gives them, for need_versions). The Mac app reads every item with its discussion every 3 seconds
     (GET /ui/state). need_talk has no index on its item, so each item's own read reads the whole table: on the first
     fleet, on 10 November 2026, 61 items made 61 such reads in each read of the state, all under the hub's lock."""
     talks, pictures = {}, {}
-    for r in q("SELECT need, who, text, ts FROM need_talk ORDER BY id"):
-        talks.setdefault(r["need"], []).append({"who": r["who"], "text": r["text"], "ts": r["ts"]})
+    for r in q("SELECT need, who, text, ts, hand, session FROM need_talk ORDER BY id"):
+        talks.setdefault(r["need"], []).append(need_talk_entry(r))
     asked = {r["id"]: r["task"] for r in q("SELECT id, task FROM questions WHERE id IN (SELECT question FROM needs "
                                            "WHERE question IS NOT NULL)")}
     # owner API 1.285: the picture files of all the items, {item: [row]}, by the index of their item (attachment_need)
@@ -4719,8 +4755,11 @@ def mobile_agent(name, config, stops=None, waiting=None):
     lim = active_limit(name)
     windows = [{"label": w.get("label"), "used_percent": w.get("used_percent"), "resets_at": w.get("resets_at")}
                for w in (((json.loads(usage["data"]) or {}).get("limits") or {}).get("windows") or [])[:4]]         if usage else []
-    last = q1("SELECT created, text, 'owner' AS side FROM ui_requests WHERE recipient=? "
-              "UNION ALL SELECT created, text, 'agent' AS side FROM owner_reports WHERE agent=? "
+    # hand and runtime of the owner's side (owner feature message_hands, message_hand), so that the phone's and the PC's
+    # chat list can tell his own words from an AI session's (they write "You: " before the owner's side); the agent's
+    # side has null in both
+    last = q1("SELECT created, text, 'owner' AS side, hand, session FROM ui_requests WHERE recipient=? "
+              "UNION ALL SELECT created, text, 'agent' AS side, NULL, NULL FROM owner_reports WHERE agent=? "
               "ORDER BY created DESC LIMIT 1", (name, name))
     return {"name": name, "role": config["role"], "title": config.get("title"), "runtime": config["runtime"],
             "active": agent_active(name),
@@ -4734,7 +4773,9 @@ def mobile_agent(name, config, stops=None, waiting=None):
             "chat_undelivered": bool(kv_get(f"chat_undelivered:{name}")),
             # owner feature chat_stop: the message whose turn a press of Stop stops now, only while there is one
             **({"chat_stop": stop} if stop else {}),
-            "last": {"ts": last["created"], "side": last["side"], "preview": last["text"] or ""} if last else None}
+            "last": dict({"ts": last["created"], "side": last["side"], "preview": last["text"] or ""},
+                         **message_hand(last["hand"] if last["side"] == "owner" else None, last["session"]))
+            if last else None}
 
 
 def mobile_state(generation, at=None):
@@ -5534,8 +5575,10 @@ def message_views(rows, attached, conf, named=None):
     attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps), named the
     titles of the tasks that they are about, read in the moment of the rows (message_about_reads)."""
     # ui_requests.connection is the hub's own record of a connected app's message, and hand and session the record of
-    # who sent it (request_hand): the apps do not read them
-    views = [{k: r[k] for k in r.keys() if k not in ("connection", "hand", "session")} for r in rows]
+    # who sent it (request_hand): the apps read the hand and the AI program of the session (owner feature
+    # message_hands, message_hand), never the connection or the session's id
+    views = [dict({k: r[k] for k in r.keys() if k not in ("connection", "hand", "session")},
+                  **message_hand(r["hand"], r["session"])) for r in rows]
     for m in views:                         # owner feature chat_apps: the chat app of a message, without its IDs
         o = json.loads(m["origin"]) if m.get("origin") else None
         m["origin"] = {"app": o["app"], "account": o["account"],
@@ -5680,12 +5723,14 @@ def mobile_chat(agent, since):
     # answer_to: the Needs-you item that a message answers, as the Mac's chat links it (its kind and need_id)
     # skills: the skill to use and the skills given (owner feature message_skills), as GET /ui/state gives them, and
     # a gift's ZIP is no file of the message there either
-    items = [{"kind": "message", "ts": r["created"], "id": r["request_id"], "text": r["text"], "client": r["client"],
-              "read_at": r["read_at"], "replaces": r["replaces_request_id"], "edited": message_edited(r),
-              "attachments": [f for f in files.get(r["request_id"], [])
-                              if f["id"] not in skill_gives(message_skills_read(r["skills"]))],
-              "answer_to": r["need_id"] if r["kind"] == "answer" else None,
-              "skills": message_skills_read(r["skills"])}
+    # hand and runtime: who sent it, as GET /ui/state gives them (owner feature message_hands, message_hand)
+    items = [dict({"kind": "message", "ts": r["created"], "id": r["request_id"], "text": r["text"],
+                   "client": r["client"], "read_at": r["read_at"], "replaces": r["replaces_request_id"],
+                   "edited": message_edited(r),
+                   "attachments": [f for f in files.get(r["request_id"], [])
+                                   if f["id"] not in skill_gives(message_skills_read(r["skills"]))],
+                   "answer_to": r["need_id"] if r["kind"] == "answer" else None,
+                   "skills": message_skills_read(r["skills"])}, **message_hand(r["hand"], r["session"]))
              for r in said]
     reports = q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))
     carried = carried_files("report", [r["id"] for r in reports])      # CHAT-APPS.md 20: an agent's files
@@ -9228,8 +9273,10 @@ def migrate():
         # owner API 1.316: the hand of a message of the owner's under a card that the owner did not type (an AI
         # session's or a program's, request_hand), else null: the hub's ask and its second look say that such words are
         # not the owner's, as the line that told them did (NEED_TALK_NOT_HIS). The row keeps it when the talk moves to
-        # a new version. No view gives it: need_talk and need_reads read who, text and ts
-        "need_talk": {"hand": "TEXT"},
+        # a new version. Owner API 1.332 (message_hands): the AI session that the message names (X-Fleet-Session) with
+        # that hand, else null; a talk entry gives the apps its hand and the session's runtime (need_talk_entry), never
+        # the session's id
+        "need_talk": {"hand": "TEXT", "session": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
@@ -20819,12 +20866,13 @@ def t_withdraw_need(agent, a):
 # record of an item's talk (need_talk) stayed, and the talk moves to an item that replaces it (t_raise_needs_you).
 
 
-def need_talk_said(body, via=None, hand=None):
+def need_talk_said(body, via=None, hand=None, session=None):
     """POST /ui/needs/<id>/talk, under LOCK: the owner's message under one open card goes to the manager, which replies
     there (discuss_need), and the item stays open. A refusal is the hub's line of need_unclarified. via: the shown name
     of the connected app that sent it, which its header says as app:<name>. hand: request_hand of the request; an AI
     session's or a program's message says so in its header and in one sentence (the review of 20 November 2026,
-    issue 4, Fable's third check)."""
+    issue 4, Fable's third check). session: its X-Fleet-Session, which the row keeps with its hand (owner feature
+    message_hands: the apps read its runtime, need_talk_entry)."""
     need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
     if not need:
         raise Refusal(404, code="request_unknown")
@@ -20854,8 +20902,8 @@ def need_talk_said(body, via=None, hand=None):
                 f"words and in a few sentences.{need_again(need)} Their answer to the item comes as its own message.)")
     filed, about = filed_about(need["by"], "say", None)
     with transaction():         # his message stands on the card only with its line to the manager
-        DB.execute("INSERT INTO need_talk(need, ts, who, text, hand) VALUES(?,?,?,?,?)",
-                   (need["id"], t0, "owner", body["text"], talk_hand))
+        DB.execute("INSERT INTO need_talk(need, ts, who, text, hand, session) VALUES(?,?,?,?,?,?)",
+                   (need["id"], t0, "owner", body["text"], talk_hand, session if talk_hand else None))
         told = DB.execute(*event_row(need["by"], "say", filed, text, t0, "{}", about)).lastrowid
         DB.execute("UPDATE needs SET awaits=?, awaits_told=?, awaits_asked=NULL WHERE id=?",
                    (t0 if waits else None, told if waits else None, need["id"]))
@@ -22546,8 +22594,15 @@ def t_request_secret(agent, a):
                 # clarify of the release before this one wrote them as its talk too, which came here with that talk
                 if not DB.execute("SELECT 1 FROM need_talk WHERE need=? AND who='owner' AND text=?",
                                   (nid, old["answer"])).fetchone():
-                    DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)",
-                               (nid, (need_secret(old) or {}).get("clarified") or now(), "owner", old["answer"]))
+                    # with the hand and the session of his clarify (its answer's row, answer_secret), as
+                    # need_talk_said writes them: words that he did not type keep their hand, and no app draws an AI
+                    # session's clarify as his own (owner feature message_hands, UI-API.md 1.332)
+                    clarify = DB.execute("SELECT hand, session FROM ui_requests WHERE need_id=? AND kind='answer' AND "
+                                         "text=? ORDER BY rowid DESC LIMIT 1", (old["id"], old["answer"])).fetchone()
+                    talk_hand = clarify["hand"] if clarify and not owner_force(clarify["hand"]) else None
+                    DB.execute("INSERT INTO need_talk(need, ts, who, text, hand, session) VALUES(?,?,?,?,?,?)",
+                               (nid, (need_secret(old) or {}).get("clarified") or now(), "owner", old["answer"],
+                                talk_hand, clarify["session"] if talk_hand else None))
     if tid:
         secret_parked(tid, nid)
     emit("owner", "notify", f"Needs you: {title}")
@@ -33855,12 +33910,14 @@ def budget_use(g):
 def steer_view(r, files=None):
     """One steer as the owner's apps read it. attachments (owner API 1.223): its files as a message's files are
     (attachment_view); files: those views, given by a caller that read every steer's files at once (GET /ui/state),
-    else read here."""
+    else read here. hand and runtime (owner feature message_hands): who sent it, as an owner's message says it
+    (message_hand); the steer's session id stays in its row."""
     if files is None:
         files = [attachment_view(f) for f in read_rows("SELECT * FROM attachments WHERE message=? ORDER BY id",
                                                        (r["request_id"],))]
-    return {"id": r["id"], "task": r["task"], "attempt": r["attempt"], "text": r["text"], "created": r["created"],
-            "read_at": r["read_at"], "request_id": r["request_id"], "client": r["client"], "attachments": files}
+    return dict({"id": r["id"], "task": r["task"], "attempt": r["attempt"], "text": r["text"], "created": r["created"],
+                 "read_at": r["read_at"], "request_id": r["request_id"], "client": r["client"], "attachments": files},
+                **message_hand(r["hand"], r["session"]))
 
 
 def budget_text(g):
@@ -87394,7 +87451,7 @@ class Handler(BaseHTTPRequestHandler):
         hand = request_hand(self.headers.get("X-Fleet-Client", "").strip(), owner_device_at(self.client_address[0]),
                             None, None, session)
         return self.ui_command(f"needs/{need_id}/talk", lambda data: need_talk_read(need_id, data),
-                               lambda body: need_talk_said(body, hand=hand))
+                               lambda body: need_talk_said(body, hand=hand, session=session))
 
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
