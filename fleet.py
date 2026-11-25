@@ -300,6 +300,12 @@ def tmux(*args, check=False, timeout=15):
 NO_SESSION = ("can't find session", "no server running", "No such file or directory")
 
 
+def unread(r):
+    """A window list that tmux did not carry out: a failure that is not NO_SESSION, a time-out included (code 124).
+    It says nothing about the windows, as `windows` gives Unlisted for it."""
+    return r.returncode != 0 and not (r.returncode == 1 and any(w in r.stderr for w in NO_SESSION))
+
+
 def windows(session, *, checked=False):
     """The names of a session's windows; none for a session that is not there.
 
@@ -8553,9 +8559,18 @@ class Helper:
         settings from needs: the screen runtime's for a screen task, the primary runtime's for every other task. A
         conversation's session with the agent's tools (AUTONOMY.md P2) has a session id too, and its window C-<id>
         and its conversation as the attempt: the hub files its records under that conversation's tasks. A closed
-        one has none, and keeps its records on this machine."""
+        one has none, and keeps its records on this machine.
+
+        **A list that tmux did not give raises Silent, never []** (the audit of 24 November 2026, finding 6): the
+        record reader (threads.Tailer.scan) closes the feed of each window that is not in the list, so an empty list
+        of a failed or timed-out read wrote false turn ends for every live session, its next feed's records lost by
+        their seq, and the hub's turn-end check could type "continue" into a session that still worked. The scan
+        then changes no feed and tries again at its next interval."""
         r = tmux("list-windows", "-t", f"={self.session}:", "-F",
                  "#{window_name}\t#{@fleet_attempt}\t#{@fleet_session}\t#{@fleet_needs}")
+        if unread(r):
+            raise Silent(f"tmux gave no list of the task windows of {self.session} "
+                         f"({' '.join(CONTROL.sub(' ', r.stderr).split())[:120]}); no record feed was closed")
         found = []
         for line in r.stdout.splitlines() if r.returncode == 0 else []:
             name, attempt, session, needs = (line.split("\t") + ["", "", ""])[:4]
@@ -8567,8 +8582,13 @@ class Helper:
         return found
 
     def manager_windows(self):
-        """The manager session, by its session id; a session started before session ids is found by its prompt."""
+        """The manager session, by its session id; a session started before session ids is found by its prompt. A list
+        that tmux did not give raises Silent, as in task_windows: the manager's feed stays, and so does its session
+        id."""
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_session}")
+        if unread(r):
+            raise Silent(f"tmux gave no list of the windows of {self.session} "
+                         f"({' '.join(CONTROL.sub(' ', r.stderr).split())[:120]}); the manager's feed was not closed")
         rows = dict(line.split("\t", 1) for line in r.stdout.splitlines() if "\t" in line) if r.returncode == 0 else {}
         if "manager" not in rows:
             self.manager_session = None

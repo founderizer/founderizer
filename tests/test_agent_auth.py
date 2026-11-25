@@ -743,6 +743,38 @@ class HelperSide(unittest.TestCase):
         self.assertFalse(fleet.holds_credential(legacy))
         self.assertEqual(fleet.launch_words(cases[1][1])[0], "codex")
 
+    def test_a_window_list_that_tmux_did_not_give_closes_no_record_feed(self):
+        """The audit of 24 November 2026, finding 6: task_windows and manager_windows gave [] when `tmux list-windows`
+        failed or did not answer in its 15 s, so the record reader's scan closed every live feed with false turn ends,
+        the next feed's records were lost by their seq, and the hub could type "continue" into a working session.
+        Such a read is unknown: both raise Silent, the scan changes no feed, and the manager keeps its session id. A
+        session or a server that is not there has no windows, as before."""
+        import threads
+        helper = fleet.Helper("alpha", self.conf("claude"))
+        for failed in (subprocess.CompletedProcess([], 124, "", "timed out"),
+                       subprocess.CompletedProcess([], 1, "", "lost server")):
+            with self.subTest(code=failed.returncode), patch.object(fleet, "tmux", return_value=failed):
+                with self.assertRaises(fleet.Silent):
+                    helper.task_windows()
+                helper.manager_session = "kept"
+                with self.assertRaises(fleet.Silent):
+                    helper.manager_windows()
+                self.assertEqual(helper.manager_session, "kept")
+                tailer = threads.Tailer("claude", helper.task_windows, lambda batch: (200, {}), home=str(self.home))
+                feed = tailer.feeds[("T-3", "s")] = threads.Feed(("T-3", "g", 1, "s"), "claude")
+                with self.assertRaises(fleet.Silent):
+                    tailer.scan()
+                self.assertEqual((tailer.feeds, feed.ended), ({("T-3", "s"): feed}, False))
+        # each way tmux says that the session or its server is not there (NO_SESSION): no windows, so the feeds of a
+        # server that died close and send their last records
+        for said in ("can't find session: fleet-alpha", "no server running on /tmp/tmux-1000/default",
+                     "error connecting to /tmp/tmux-1000/default (No such file or directory)"):
+            with self.subTest(said=said), patch.object(fleet, "tmux",
+                                                     return_value=subprocess.CompletedProcess([], 1, "", said)):
+                helper.manager_session = "kept"
+                self.assertEqual((helper.task_windows(), helper.manager_windows()), ([], []))
+                self.assertIsNone(helper.manager_session)
+
     def test_windows_without_a_credential_are_legacy_and_unused_files_go(self):
         """A file of SESSIONS goes a minute after it was made once no window's start command names it. The file of a
         task window's GitHub tokens (fleet.tokens_file), which no command names, stays while its window lives, because
