@@ -5137,8 +5137,9 @@ def tools():
              {"agent": S["text"], "lesson": S["int"], "why": S["text"], **rid}, ("agent", "lesson", "why"),
              plain("/ui/memory/{agent}/{lesson}/forget", ("why",), "the removal of this lesson")),
         tool("Team",
-             "add_agent", "Put a new agent on an available server. Not for a new server: use add_machine, or Add "
-                          "server in the Founderizer app. The hub writes the agent and its profile in one "
+             "add_agent", "Put a new agent on an available server. Not for a new server: use Add server in the "
+                          "Founderizer app, or a tool that adds a machine, where this list has one. The hub writes "
+                          "the agent and its profile in one "
                           "commit and makes the install job; read servers to follow its steps. Give runtime, or, "
                           "for an agent on an API key or on the owner's own model server, account and no runtime: "
                           "the agent then runs the program of that account, on a Linux server whose "
@@ -5168,9 +5169,9 @@ def tools():
                              "moves its checkout and service; it keeps its OS user, so nobody signs in again. Not "
                              "while the agent has an open task. The manager takes a new name only while it has no "
                              "server yet (placed false in state, on a hub with the feature manager_rename): its "
-                             "new name then has the rule of install_hub's manager_name, no server has anything of "
-                             "it, and no job runs. Once it has its server, the manager keeps its name. Read servers "
-                             "to see the job end.",
+                             "new name then has the rule of a new manager's name, " + MANAGER_NAME_RULE + "; no "
+                             "server has anything of it, and no job runs. Once it has its server, the manager keeps "
+                             "its name. Read servers to see the job end.",
              {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
              with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
         tool("Team",
@@ -5341,7 +5342,9 @@ def tools():
                                            "description": "server, then firewall; at Azure, group alone."}),
              ("cloud", "step", "name", "account", "place"), cloud_remove),
         tool("Servers",
-             "remove_machine", "A server with no agent leaves the fleet.",
+             "remove_machine", "A server with no agent leaves the fleet. It deletes nothing at the server's "
+                               "provider: a rented server stays there, and the provider bills it until it is deleted "
+                               "there.",
              {"server": S["text"], **rid}, ("server",),
              with_base("/ui/servers/{server}/remove", (), "the removal of this server")),
         tool("Servers",

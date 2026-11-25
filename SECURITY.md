@@ -328,3 +328,17 @@ on its server the holder, with the fixed forms above. It cannot add another devi
 than the fixed forms, and it cannot move to another address an entry of the door's file that holds a business's
 servers, a database, a commit target or an account that a Mac session wrote.
 
+
+## What the door's commit rules guard, and what they do not
+
+The door decides each commit that goes through it, on a repository that the door's file names for an agent. It
+refuses a change of the files that an agent's runtime reads as its instructions or settings (`AGENTS.md`,
+`CLAUDE.md`, `.claude/**` and the like), of `.github/**`, and of a tailnet policy file, and since 25 November 2026 a
+file at a folder's path, a file under a file, a delete of anything but a file, and a branch that moved while the door
+decided (`door_targets.py`, `NEVER_PATHS`, `head_refused`).
+
+These rules guard only the door's own commits. An agent that holds its own GitHub grant on a repository, a token at
+write or deploy, pushes with that token, and the door does not see that push. On a repository that the door's rules
+guard (each repository that an Operator holds through the door, and each GitOps repository), only the owner gives
+such a grant. Where the owner gives one, for example to the fleet's Operator on its own repositories, the door's rules
+there hold against every other agent, not against that one.

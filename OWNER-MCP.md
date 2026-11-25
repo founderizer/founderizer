@@ -1626,7 +1626,7 @@ Machines, accounts and sign-ins.
 | Tool | Route | What it does |
 | --- | --- | --- |
 | `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
-| `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
+| `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. It deletes nothing at its provider, which still bills a rented server until it is deleted there. |
 | `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
 | `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. The install job of a new or moved agent opens its sign-in by itself: the job's prompt on the page `servers` has the link and the code (Codex), or names a login of the page `machines` (Claude Code). |

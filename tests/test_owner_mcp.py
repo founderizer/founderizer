@@ -5878,6 +5878,15 @@ class Table(unittest.TestCase):
         names = [name for line in mapped.values() for name in line]
         self.assertEqual(len(names), len(set(names)))
         self.assertNotIn("add_machine", names)                       # absent: the app's own Add server does it
+        # **No words of the app's table name a tool that its program does not have** (F3, piece 1, 22 November 2026:
+        # add_agent sent an agent of the program to add_machine). Read here: a tool's own words and the words of its
+        # fields. Whole words only, so a field such as authkey_file does not count.
+        absent = {e["name"] for e in programs if e["kind"] == "absent"}
+        for entry in programs:
+            if entry["kind"] != "absent":
+                words = entry["description"] + " " + json.dumps(entry["inputSchema"])
+                named = set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", words)) & absent
+                self.assertEqual(named, set(), entry["name"])
         self.assertEqual(owner_mcp.dump_tools()["categories"], [list(c) for c in owner_mcp.CATEGORIES])
         for words, callable_ in ((server, {t["name"] for t in listed}), (table, set(names))):
             # and the pages of fleet_read, which a line of the rule of places names too (F15: profile_orders)
