@@ -643,6 +643,7 @@ class CentralVault(CentralFixture, unittest.TestCase):
         self.assertEqual(self.ask("status"), {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY,
                                               "store_recipient": STORE_KEY, "fleet": FLEET, "owner_keys": 3,
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
+                                              "money": [], "stored": [REF], "unpooled": [], "default_pools": True,
                                               "removes": True, "replaces": True, "key_addresses": True,
                                               "hub_keys": True, "hub_key_ids": {}, "values": {}, "lists": True,
                                               "clients": None, "source": None})
@@ -964,6 +965,68 @@ class CentralVault(CentralFixture, unittest.TestCase):
         self.assertEqual((status["grants"], status["pool"]),
                          ([{"login": REF, "agent": "studio", "machine": "studio"},
                            {"login": REF, "agent": "vps", "machine": "vps-2"}], []))
+
+    def test_a_default_pool_never_undoes_the_owners_unpool(self):
+        """Owner feature pool_default (the Door area's read of 24 November 2026): the owner's app signs a default_pool
+        for each secret of the hub's default, and the vault takes it as a pool; the owner's own unpool ("Only you") is
+        ended only by their own pool. Bug: a hub that is broken into drops their choice from team.json, their app pools the
+        secret again under the hood, and their "Only you" is gone with no word."""
+        self.intake()
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        self.assertEqual(self.granted(pooled(REF, T1, kind="default_pool")),
+                         {"ok": True, "kind": "default_pool", "login": REF, "saved": "new"})
+        self.assertEqual(self.ask("seal", login=REF, machine="vps")["recipient"], R1)
+        status = self.ask("status")
+        self.assertEqual((status["pool"], status["unpooled"], status["default_pools"]), ([REF], [], True))
+        self.granted(pooled(REF, T2, kind="unpool"))                    # their "Only you"
+        again = pooled(REF, T3, kind="default_pool")
+        self.assertIn("only their own pool statement puts it back",
+                      self.refused("default_pool", statement=again, signature=owner_sign(again)))
+        self.assertIn("has signed no grant of this secret", self.refused("seal", login=REF, machine="vps"))
+        self.assertEqual(self.ask("status")["unpooled"], [REF])
+        self.assertEqual(self.granted(pooled(REF, T3))["saved"], "new")                    # their own pool, later
+        self.assertEqual(self.ask("seal", login=REF, machine="vps")["recipient"], R1)
+        self.assertEqual(self.ask("status")["unpooled"], [])
+
+    def test_a_key_that_moves_money_is_named_by_its_value_and_never_pooled_by_default(self):
+        """The supervisor's decision of 24 November 2026 on the pool default: a key whose value moves money (Stripe's
+        unrestricted secret key, live or test) stays the owner's to give. The vault reads that from the value itself
+        and refuses its default_pool, so neither a name nor a hub that hides the mark gets it pooled by a round; the
+        owner's own pool still opens it. A restricted key and a webhook secret stay in the default. Bugs: the default
+        pools a key that charges and refunds, or a misleading name decides."""
+        tail = "4eC39HqLyjWDarjtT1zdp7dc"
+        money, restricted = "sk_" + "live_" + tail, "rk_" + "live_" + tail       # no key's shape in this file
+        self.intake(value={"password": money}, ref=KEY_REF, title="STRIPE_READ_KEY", item="api_key")
+        self.intake(value={"password": restricted}, ref=OTHER_REF, title="STRIPE_SECRET_KEY", item="api_key")
+        self.intake(value={"password": "whsec_" + tail}, title="STRIPE_WEBHOOK_SECRET", item="api_key")
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        self.assertEqual(self.ask("status")["money"], [KEY_REF])
+        self.assertEqual(self.ask("status")["stored"], sorted([REF, KEY_REF, OTHER_REF]))
+        statement = pooled(KEY_REF, T1, kind="default_pool")
+        self.assertIn("moves money", self.refused("default_pool", statement=statement, signature=owner_sign(statement)))
+        for ref in (OTHER_REF, REF):
+            self.assertEqual(self.granted(pooled(ref, T1, kind="default_pool"))["saved"], "new")
+        self.assertEqual(self.granted(pooled(KEY_REF, T2))["saved"], "new")       # the owner's own pool opens it
+        self.assertEqual(self.ask("seal", login=KEY_REF, machine="vps")["recipient"], R1)
+        # a key that the owner gave the door: no default pools it, and a pool from before the grant seals it nowhere
+        self.assertEqual(self.ask("seal", login=OTHER_REF, machine="vps")["recipient"], R1)
+        self.granted(grant(OTHER_REF, "door", "door", T2))
+        self.assertIn("has signed no grant of this secret", self.refused("seal", login=OTHER_REF, machine="vps"))
+        statement = pooled(OTHER_REF, T3, kind="default_pool")
+        self.assertIn("gave this secret to the door",
+                      self.refused("default_pool", statement=statement, signature=owner_sign(statement)))
+        # a default_pool for a name that holds no value yet: a later intake could put such a key under it
+        empty = "bws://" + "9c4d5e6f-7a8b-4c3d-8e4f-5a6b7c8d9e0f"
+        self.assertNotIn(empty, (REF, KEY_REF, OTHER_REF))
+        statement = pooled(empty, T1, kind="default_pool")
+        self.assertIn("holds no value of this secret yet",
+                      self.refused("default_pool", statement=statement, signature=owner_sign(statement)))
+        # the owner's replace of a pooled value with such a key takes it out of the pool: only their own pool ends that
+        self.assertEqual(self.ask("intake", **self.replace_fields({"password": money}, T3, ref=REF,
+                                                                  title="STRIPE_WEBHOOK_SECRET", item="api_key"))["saved"],
+                         "replaced")
+        self.assertEqual(self.state()["pool"][REF]["in"], False)
+        self.assertIn("has signed no grant of this secret", self.refused("seal", login=REF, machine="vps"))
 
     def test_a_signed_grant_is_kept_until_a_newer_statement_and_never_taken_from_the_hub_alone(self):
         statement = grant(REF, "vps", "vps", T2)
@@ -1298,9 +1361,10 @@ class Signers(CentralFixture, unittest.TestCase):
         return self.ask(json.loads(statement)["kind"], statement=statement, signature=owner_sign(statement, secret))
 
     def test_each_kept_record_has_its_signer_and_the_vaults_own_time_in_a_file_of_its_own(self):
-        """F17 1.1 and 1.5 (N4): pin, unpin, grant, ungrant, pool, unpool and replace. Bugs: after the end of a device
-        nobody can say what it gave; a record names the signer of the record before it; the signer is written into the
-        state, which the program from before refuses after a put-back (N6)."""
+        """F17 1.1 and 1.5 (N4): pin, unpin, grant, ungrant, pool, unpool, default_pool and replace. Bugs: after the end
+        of a device nobody can say what it gave; a record names the signer of the record before it; the signer is
+        written into the state, which the program from before refuses after a put-back (N6); a default_pool, which the
+        owner's app signs under the hood, keeps no signer, or the vault refuses it for want of a machine."""
         before = int(time.time())
         self.signed("pin", PIN_1, SIG_PIN_1)                                        # key A
         self.decide(grant(REF, "vps", "vps", T1))                                   # key C
@@ -1311,6 +1375,7 @@ class Signers(CentralFixture, unittest.TestCase):
         said = canon({"v": 1, "kind": "replace", "fleet": FLEET, "login": REF, "at": T2,
                       "sha256": hashlib.sha256(fields["ciphertext"].encode()).hexdigest()})
         self.ask("intake", **dict(fields, statement=said, signature=owner_sign(said)))
+        self.assertEqual(self.decide(pooled(REF, T1, kind="default_pool"))["saved"], "new")
         a, b, c = hashed(OWNER_A), hashed(OWNER_B), hashed(OWNER_C)
         kept = self.signers()
 
@@ -1321,6 +1386,7 @@ class Signers(CentralFixture, unittest.TestCase):
         self.assertEqual(of(kept["pins"]["vps"]), (a, T1))
         self.assertEqual(of(kept["grants"][REF]["vps"]), (c, T1))
         self.assertEqual(of(kept["pool"][OTHER_REF]), (c, T1))
+        self.assertEqual(of(kept["pool"][REF]), (c, T1))
         self.assertEqual(of(kept["values"][REF]), (c, T2))
         self.assertEqual(stat.S_IMODE(self.beside("signers.json").stat().st_mode), 0o600)
         # each record names the signer of its own newest statement, and the ends name theirs
@@ -1338,7 +1404,8 @@ class Signers(CentralFixture, unittest.TestCase):
         self.assertEqual(state["pins"], {"vps": {"recipient": None, "at": T3}})
         self.assertEqual(state["grants"], {REF: {"vps": {"machine": None, "at": T2}}})
         self.assertEqual((set(state["values"][REF]), state["pool"]), ({"sha256", "at"},
-                                                                      {OTHER_REF: {"in": False, "at": T2}}))
+                                                                      {OTHER_REF: {"in": False, "at": T2},
+                                                                       REF: {"in": True, "at": T1}}))
         self.assertEqual(set(self.conf), vault.CENTRAL_KEYS)
 
     def test_the_same_statement_again_changes_no_signer(self):

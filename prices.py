@@ -11,7 +11,9 @@ calls that address: lifecycle.py loads the file of its own checkout as the `toke
 file that is missing or wrong gives no prices and never an error (lifecycle.price_file).
 
 The file maps a model key to its list prices in dollars for a million tokens, {input, cache_read, cache_write,
-output}, with "default", at most 50 keys (lifecycle.weights_check). lifecycle.token_price gives a session's model the
+output}, with "default", at most 64 keys (lifecycle.weights_check). The list has only today's prices: a price that
+a provider announced for a later day is written in LATER, and the file keeps it under the key's "later" with that
+day, so that lifecycle.token_price takes it on that day by itself, with no new run of this tool. lifecycle.token_price gives a session's model the
 entry whose key is the longest part of its name, so a key here is a model FAMILY, and FAMILIES names each one with
 the model of the list whose price it takes. The hub keeps these prices, and not a program's own cost number, so that
 one period compares with another. On an account with a plan they are weights, not money spent.
@@ -42,7 +44,10 @@ FAMILIES = (
     ("default", "opencode-go", "kimi-k3.1-pro"),
     # Gemini, by key (the account provider `google`)
     ("gemini", "google", "gemini-pro-latest"),
-    ("gemini-4", "google", "gemini-4-carbon"),
+    ("gemini-4", "google", "gemini-4-argon"),
+    ("gemini-4-carbon", "google", "gemini-4-carbon"),
+    ("gemini-4-neon", "google", "gemini-4-neon"),
+    ("gemini-4-hydrogen", "google", "gemini-4-hydrogen"),
     ("gemini-3", "google", "gemini-flash-latest"),
     ("gemini-3.1-pro", "google", "gemini-3.1-pro-preview"),
     ("gemini-3.5-flash", "google", "gemini-3.5-flash"),
@@ -92,6 +97,13 @@ FAMILIES = (
     ("gpt-6-luna", "openrouter", "openai/gpt-6-luna"),
 )
 OWN = "own/"        # the owner's own model server, in OpenCode's configuration
+# {key of the file: ((the first day, in UTC, of a price that its provider announced, that price), ...)}, oldest first.
+# Google's price of Gemini 4 Carbon from 1 December 2026 (until then $2, $0.10 and $10). The family's key "gemini-4"
+# takes Argon's row, not Carbon's, so that Argon and the other gemini-4 models keep their price when the list moves
+# Carbon's: the announcement named Carbon alone. Remove a line here once the list gives its price.
+LATER = {
+    "gemini-4-carbon": (("2026-12-01", {"input": 4, "cache_read": 0.2, "cache_write": 4, "output": 20}),),
+}
 
 
 class Refused(Exception):
@@ -113,9 +125,14 @@ def price(listed, provider, model):
     return {"input": cost["input"], "cache_read": read, "cache_write": write, "output": cost["output"]}
 
 
-def made(listed, families=FAMILIES):
-    """The price file from the list: each family's key with its model's prices, and the owner's own server at 0."""
+def made(listed, families=FAMILIES, later=LATER):
+    """The price file from the list: each family's key with its model's prices and its announced later ones, and the
+    owner's own server at 0."""
     prices = {key: price(listed, provider, model) for key, provider, model in families}
+    for key, steps in later.items():
+        if key not in prices:
+            raise Refused(f"LATER names {key}, which no family has")
+        prices[key]["later"] = [dict(price, **{"from": day}) for day, price in steps]
     prices[OWN] = dict(FREE)
     if "default" not in prices:
         raise Refused("the families name no default")

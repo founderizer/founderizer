@@ -364,7 +364,8 @@ class Helper(unittest.TestCase):
                 patch.object(fleet, "read_env", side_effect=AssertionError("no key for a Shell-off session")), \
                 patch.object(fleet, "checkout_conf", lambda agent: desk), \
                 patch.object(fleet, "http", lambda *a, **k: (200, answer)), \
-                patch.object(fleet, "prepare_repos", lambda repos, values, place=None: {}):
+                patch.object(fleet, "prepare_repos", lambda repos, values, place=None: {}), \
+                patch.object(hub, "owner_gave", lambda agent, tool: True):     # a start with no list: each one held
             env = fleet.session_env("desk", desk, "task")       # the helper's own choice of this session's servers
             catalog = lifecycle.tool_catalog(team)
             for servers, loads in ((["crm"], ["crm"]), (["crm-review", "helpdesk"], ["crm-review", "helpdesk"]),
@@ -1231,8 +1232,10 @@ class Tools(Fleet):
         self.assertEqual(set(self.names("desk", context)) & FORBIDDEN, set())
         event = json.loads(hub.q1("SELECT extra FROM events WHERE kind='task' AND task=?",
                                   (hub.parse_task(context[1]),))["extra"])
+        # a duty that names no servers: an explicit list, never null, which a helper would read as each server that
+        # needs no token, the manager's gives by the default included (pool_default, the Door area's read)
         self.assertEqual(event["shell_off"], {"runtime": "claude", "version": hub.CLOSED_TESTED, "built_ins": [],
-                                              "servers": None})
+                                              "servers": []})
         ticket = self.duty(watch=[{"kind": "clock", "schedule": EVERY}], tools=["WebSearch"])
         tid, _ = self.task("desk", responsibility=ticket["id"])
         event = json.loads(hub.q1("SELECT extra FROM events WHERE kind='task' AND task=?", (tid,))["extra"])
@@ -1889,7 +1892,9 @@ class Reports(Cases):
                     ", ".join(sorted(n for n in tools if n not in base)))
 
         plain, plain_tools, start = give("lead", at_work)
-        self.assertIsNone(start["servers"])         # no duty: each server that needs no token of a session
+        # no duty: an explicit list of each server that needs no token of a session and that the owner gave, or that
+        # was held before the records (owner_gave); never null, which the helper reads as every such server
+        self.assertEqual(start["servers"], ["helpdesk"])
         self.assertIn(f"Its Fleet tools: {', '.join(plain_tools)}.", plain)
         self.assertIn("Its MCP servers: helpdesk. Its web tools: web search.", plain)
         self.assertNotIn(f"R-{same['id']}:", plain)

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import lifecycle
@@ -27,10 +28,21 @@ class Prices(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="fleet-prices-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         good = {"default": {"input": 1, "cache_read": 0.1, "cache_write": 1, "output": 2}}
+        step = lambda day, **more: dict(good["default"], **{"from": day}, **more)
+        later = lambda *steps: json.dumps({"default": dict(good["default"], later=list(steps))})
         cases = {"good.json": json.dumps(good), "broken.json": "{\"default\": ", "list.json": "[1, 2]",
                  "shape.json": json.dumps({"default": {"input": 1}}), "empty.json": "{}", "null.json": "null",
-                 "many.json": json.dumps({f"m{n}": good["default"] for n in range(51)}),
-                 "long.json": json.dumps(dict(good, pad="x" * 300000))}
+                 "many.json": json.dumps({f"m{n}": good["default"] for n in range(lifecycle.PRICE_KEYS + 1)}),
+                 "long.json": json.dumps(dict(good, pad="x" * 300000)),
+                 # a later price with no day, a day that is no date, two in the wrong order, one that is not a list
+                 "no-day.json": later(good["default"]), "no-date.json": later(step("2026-02-30")),
+                 "order.json": later(step("2027-01-01"), step("2026-12-01")),
+                 "same.json": later(step("2026-12-01"), step("2026-12-01")),
+                 "nested.json": later(step("2026-12-01", later=[])), "one.json": json.dumps(
+                     {"default": dict(good["default"], later=step("2026-12-01"))}),
+                 "five.json": later(*[step(f"2027-0{n}-01") for n in range(1, lifecycle.LATER_PRICES + 2)]),
+                 "price.json": later(dict(step("2026-12-01"), input="4")),
+                 "minus.json": later(dict(step("2026-12-01"), output=-1))}
         for name, text in cases.items():
             (tmp / name).write_text(text)
         self.assertEqual(lifecycle.price_file(str(tmp / "good.json")), good)
@@ -58,7 +70,7 @@ class Prices(unittest.TestCase):
     def test_the_file_of_this_checkout_prices_both_programs_and_the_owners_own_server_costs_nothing(self):
         file = lifecycle.price_file()
         self.assertIsNotNone(file)
-        self.assertLessEqual(len(file), 50)
+        self.assertLessEqual(len(file), lifecycle.PRICE_KEYS)
         self.assertIn("default", file)
         self.assertEqual(file["own/"], {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0})
         for name in ("grok", "opencode"):
@@ -80,15 +92,39 @@ class Prices(unittest.TestCase):
         self.assertIsNone(lifecycle.token_price(None, "x"))
         real = lifecycle.price_file()
         self.assertEqual(lifecycle.token_price(real, "own/gemini-4-carbon"), real["own/"])
-        self.assertEqual(lifecycle.token_price(real, "google/gemini-4-carbon"), real["gemini-4"])
+        self.assertEqual(lifecycle.token_price(real, "google/gemini-4-argon"), real["gemini-4"])
         self.assertEqual(lifecycle.token_price(real, "grok-4.7"), real["grok"])
         # the tables of the two first runtimes read as before
         claude = lifecycle.RUNTIMES["claude"]["token_weights"]
         self.assertEqual(lifecycle.token_price(claude, "claude-fable-5-2"), claude["fable"])
         self.assertEqual(lifecycle.token_price(claude, "claude-next"), claude["default"])
 
+    def test_a_price_that_a_provider_announced_holds_from_its_day_by_itself(self):
+        """Google's price of Gemini 4 Carbon doubles on 1 December 2026, and no run of prices.py comes that day: the
+        file holds it now under "later", and token_price takes it from that day in UTC, for that model alone."""
+        real = lifecycle.price_file()
+        carbon = lambda day: lifecycle.token_price(real, "google/gemini-4-carbon", day)
+        self.assertEqual(carbon("2026-11-30"), {"input": 2, "cache_read": 0.1, "cache_write": 2, "output": 10})
+        self.assertEqual([carbon(day) for day in ("2026-12-01", "2027-06-01")],
+                         [{"input": 4, "cache_read": 0.2, "cache_write": 4, "output": 20}] * 2)
+        for day in ("2026-11-30", "2026-12-01"):
+            self.assertEqual(lifecycle.token_price(real, "gemini-4-argon", day), real["gemini-4"])
+            self.assertEqual(lifecycle.token_price(real, "google/gemini-4-neon", day)["input"], 3)
+        # the newest price whose day has come, of several; with no day, today's
+        weights = {"default": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1, "later": [
+            dict.fromkeys(lifecycle.TOKEN_KINDS, 2) | {"from": "2026-12-01"},
+            dict.fromkeys(lifecycle.TOKEN_KINDS, 3) | {"from": "2027-01-01"}]}}
+        self.assertEqual(lifecycle.weights_check(weights), weights)
+        price = lambda day: lifecycle.token_price(weights, "x", day)["input"]
+        self.assertEqual([price("2026-11-30"), price("2026-12-31"), price("2027-01-01")], [1, 2, 3])
+        # with no day, today's in UTC: 23:30 UTC on 30 November is 1 December in Madrid, and the price is still November's
+        for at, want in ((1796081400, 1), (1796085000, 2)):         # 2026-11-30 23:30 and 2026-12-01 00:30 UTC
+            with unittest.mock.patch.object(lifecycle.time, "time", lambda: at):
+                self.assertEqual(lifecycle.token_price(weights, "x")["input"], want, at)
+        self.assertEqual(set(lifecycle.token_price(weights, "x", "2026-12-01")), set(lifecycle.TOKEN_KINDS))
+
     def test_the_tool_makes_the_file_from_the_public_list_and_refuses_a_family_with_no_price(self):
-        made = prices.made(self.LISTED, self.FAMILIES)
+        made = prices.made(self.LISTED, self.FAMILIES, {})
         self.assertEqual(made, {
             "default": {"input": 2, "cache_read": 0.2, "cache_write": 2, "output": 12},
             "gemini": {"input": 2, "cache_read": 0.2, "cache_write": 2, "output": 12},
@@ -96,12 +132,21 @@ class Prices(unittest.TestCase):
             "deepseek": {"input": 0.5, "cache_read": 0.5, "cache_write": 0.5, "output": 1.5},
             "own/": {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0}})
         self.assertEqual(json.loads(prices.text(made)), made)
+        # a price that the provider announced goes under its key, with its day; LATER of no family is refused
+        dated = prices.made(self.LISTED, self.FAMILIES, {"gemini": (("2026-12-01", {"input": 4, "cache_read": 0.4,
+                                                                                    "cache_write": 4, "output": 24}),)})
+        self.assertEqual(dated["gemini"]["later"], [{"from": "2026-12-01", "input": 4, "cache_read": 0.4,
+                                                     "cache_write": 4, "output": 24}])
+        self.assertNotIn("later", dated["default"])
+        with self.assertRaises(prices.Refused):
+            prices.made(self.LISTED, self.FAMILIES, {"grok": (("2026-12-01", made["gemini"]),)})
         for families in ((("default", "google", "unpriced"),), (("default", "google", "no-such-model"),),
                          (("default", "no-such-provider", "x"),), (("gemini", "google", "gemini-pro"),)):
             with self.assertRaises(prices.Refused):
-                prices.made(self.LISTED, families)
+                prices.made(self.LISTED, families, {})
         self.assertEqual(len({key for key, _, _ in prices.FAMILIES}), len(prices.FAMILIES))
-        self.assertLessEqual(len(prices.FAMILIES) + 1, 50)
+        self.assertLessEqual(len(prices.FAMILIES) + 1, lifecycle.PRICE_KEYS)
+        self.assertLessEqual(set(prices.LATER), {key for key, _, _ in prices.FAMILIES})
 
 
 if __name__ == "__main__":

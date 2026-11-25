@@ -10,6 +10,7 @@ works: the vendor's own update, a check of the new version, and the previous ver
 (update_runtimes).
 """
 import contextlib
+import datetime
 import fcntl
 import glob
 import hashlib
@@ -582,8 +583,9 @@ def web_hosts(value):
 #   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
 #                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10); on a
 #                     subscription account they are weights, not money spent. A session's model takes the entry
-#                     whose key is the longest part of its name, else "default". The owner's own prices are in
-#                     team.json runtime_facts (facts_now); None for no prices
+#                     whose key is the longest part of its name, else "default". An entry may add "later": the
+#                     prices that a provider announced, each with the day "from" which it holds (token_price). The
+#                     owner's own prices are in team.json runtime_facts (facts_now); None for no prices
 #
 # The facts of a runtime of driver "acp", and of how its program comes to a machine (the AI providers build spec,
 # section 3.4). For a terminal runtime each is None, `pinned` is False, and `continues` is its `manager` value.
@@ -1036,19 +1038,38 @@ def whole_or_none(low, high):
     return check
 
 
+PRICE_KEYS, LATER_PRICES = 64, 4
+PRICE_DAY = re.compile(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}")
+
+
 def weights_check(value):
     if value is None:
         return None
-    if not isinstance(value, dict) or not value or len(value) > 50:
-        raise ValueError('must map at most 50 model names, or "default", to their prices')
+    if not isinstance(value, dict) or not value or len(value) > PRICE_KEYS:
+        raise ValueError(f'must map at most {PRICE_KEYS} model names, or "default", to their prices')
+    four = lambda price, more=(): isinstance(price, dict) and set(price) - set(more) == set(TOKEN_KINDS) and not any(
+        isinstance(price[k], bool) or not isinstance(price[k], (int, float)) or not 0 <= price[k] <= 10000
+        for k in TOKEN_KINDS)
     for key, price in value.items():
         if not isinstance(key, str) or not (key == "default" or MODEL_KEY.fullmatch(key)):
             raise ValueError(f"names no model: {str(key)[:60]!r}")
-        if not isinstance(price, dict) or set(price) != set(TOKEN_KINDS) or any(
-                isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 10000 for p in price.values()):
+        later = price.get("later", []) if isinstance(price, dict) else None
+        if not four(price, ("later",)) or not isinstance(later, list) or len(later) > LATER_PRICES or any(
+                not four(step, ("from",)) or not isinstance(step.get("from"), str) or
+                not PRICE_DAY.fullmatch(step["from"]) or not price_day(step["from"]) for step in later) or \
+                [step["from"] for step in later] != sorted({step["from"] for step in later}):
             raise ValueError(f"{key} must give input, cache_read, cache_write and output in dollars per million "
-                             f"tokens, each from 0 to 10000")
+                             f"tokens, each from 0 to 10000, and may give later: up to {LATER_PRICES} more of them, "
+                             f"each with from, the day YYYY-MM-DD in UTC since which it holds, in the order of those "
+                             f"days")
     return value
+
+
+def price_day(text):
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def routine_check(value):
@@ -1087,9 +1108,11 @@ def facts_now(team, runtime):
     return out
 
 
-def token_price(weights, model):
+def token_price(weights, model, day=None):
     """One model's prices from a runtime's token_weights: the entry whose key is the longest part of the model's
-    name, case aside, else "default"; None for a runtime with no prices. A key that ends in "/" matches only the start
+    name, case aside, else "default"; None for a runtime with no prices. An entry's "later" prices hold each from its
+    own day, in UTC (day: "YYYY-MM-DD", default today): a provider's announced price takes its place on that day by
+    itself, with no new file (price_on). A key that ends in "/" matches only the start
     of a model's name, and such a key wins over each other key: it names where a model runs, as "own/" names the
     owner's own model server, whose models cost nothing whatever their names hold (own/deepseek-r1 is no model of a
     key "deepseek"). own/ costs nothing on every runtime, also on one with no prices (the lane "Tokens by day and
@@ -1101,9 +1124,21 @@ def token_price(weights, model):
         return None
     placed = [k for k in weights if k.endswith("/") and name.startswith(k.lower())]
     if placed:
-        return weights[max(placed, key=len)]
+        return price_on(weights[max(placed, key=len)], day)
     named = [k for k in weights if k != "default" and not k.endswith("/") and k.lower() in name]
-    return weights[max(named, key=len)] if named else weights.get("default")
+    return price_on(weights[max(named, key=len)] if named else weights.get("default"), day)
+
+
+def price_on(price, day=None):
+    """One entry of token_weights on one day: its newest "later" price from that day or before, else its own. An
+    entry with no "later" is itself."""
+    if not isinstance(price, dict) or "later" not in price:
+        return price
+    day, now = day or time.strftime("%Y-%m-%d", time.gmtime(time.time())), {k: price[k] for k in TOKEN_KINDS}
+    for step in price["later"]:
+        if step["from"] <= day:
+            now = {k: step[k] for k in TOKEN_KINDS}
+    return now
 
 
 # The list prices of the models that an ACP program runs, in one file of this checkout (prices.py makes it from a

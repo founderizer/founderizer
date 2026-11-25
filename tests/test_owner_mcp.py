@@ -3960,7 +3960,9 @@ class ShareStanding(SecretGive):
         self.routes.clear()
         self.pages.clear()
         self.assertTrue(self.share(client, most=None)["changed"])
-        self.assertEqual((self.routes, self.pages, self.standing()), (self.UNJUDGED, [], {}))
+        # null: only the owner gives it again, which the hub keeps as their "Only you" under the default (pool_default)
+        self.assertEqual((self.routes, self.pages, self.standing()),
+                         (self.UNJUDGED, [], {"secret:" + self.REF: {"owner": True}}))
 
     def test_a_standing_for_a_repository_a_tool_and_a_google_service_reads_no_page_of_the_vault(self):
         self.central()                      # the state that refuses a standing for a secret

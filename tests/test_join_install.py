@@ -587,15 +587,42 @@ class MacVault(unittest.TestCase):
         self.ran = self.tmp / "ran"
         self.config = self.tmp / "config.json"          # never this Mac's own: the owner's Mac has a vault
 
-    def step(self, build=0, sudo=0, name="mini", fleet="0123456789abcdef", track="approved"):
+    ON, OFF = "Firewall is enabled. (State = 1)", "Firewall is disabled. (State = 0)"
+    BLOCK_OFF = "Firewall has block all state set to disabled."
+    BLOCK_ON = "Firewall is blocking all non-essential incoming connections."
+    SIGNED_ON = ("Automatically allow built-in signed software ENABLED.\n"
+                 "Automatically allow downloaded signed software ENABLED.")
+    SIGNED_OFF = "Automatically allow built-in signed software DISABLED."
+    MANAGED = "Firewall settings cannot be modified from command line on managed Mac computers."
+
+    def step(self, build=0, sudo=0, name="mini", fleet="0123456789abcdef", track="approved", firewall=ON,
+             block=BLOCK_OFF, signed=SIGNED_ON, turns=True):
+        """mac_vault with stubs; socketfilterfw is a stand-in that answers with macOS's own words (`firewall`, `block`
+        and `signed`, as macOS 27 says them), and a root step that gets the firewall's text and is not refused turns
+        the firewall on, unless `turns` is False: a Mac whose firewall a profile keeps off, where socketfilterfw says
+        so in its own words."""
+        fw = self.tmp / "fw"
+        fw.mkdir(exist_ok=True)
+        for part, said in (("global", firewall), ("block", block), ("signed", signed)):
+            (fw / part).write_text(said + "\n")
+        program = fw / "socketfilterfw"
+        program.write_text(f'#!/bin/sh\ncase "$1" in --getglobalstate) cat {fw}/global ;; '
+                           f'--getblockall) cat {fw}/block ;; --getallowsigned) cat {fw}/signed ;; esac\n')
+        program.chmod(0o755)
         stubs = (f'VAULT_CONFIG="{self.config}"\nVAULT_APP="build/Fleet Vault.app"\nVAULT_ROOT_STEP="the root step"\n'
-                 'VAULT_REQUIREMENT="the requirement"\n'
+                 'VAULT_REQUIREMENT="the requirement"\nFIREWALL_ROOT_STEP="the firewall step"\n'
+                 f'FIREWALL_STATE={program}\n'
                  f'HUB=http://100.64.0.2:8765\nFLEET={fleet}\nCHANNEL=https://founderizer.test\nTRACK={track}\n'
                  f'RAN={self.ran}\n'
                  f'MAC_USER=$(id -un)\npython3() {{ printf "%s\\n" "{name}"; }}\n'
                  f'vault_build() {{ printf "build %s\\n" "$1" >> "$RAN"; return {build}; }}\n'
-                 f'sudo() {{ printf "sudo %s\\n" "$*" >> "$RAN"; return {sudo}; }}\n')
-        return run_step("mac_vault", 'mac_vault\necho "ready=$ready"\n', stubs)
+                 f'sudo() {{ printf "sudo %s" "$*" | tr "\\n" " " >> "$RAN"; echo >> "$RAN"; '
+                 f'case "$*" in *"the firewall step"*) [ {sudo} -ne 0 ] || {{ [ {int(not turns)} -ne 0 ] && '
+                 f'echo "{self.MANAGED}"; }} || echo "{self.ON}" > {fw}/global ;; esac; '
+                 f'return {sudo}; }}\n'
+                 + "".join(shell_function(SCRIPT, f) + "\n"
+                           for f in ("firewall_state", "firewall_safe", "mac_firewall")))
+        return run_step("mac_vault", f'mac_vault\necho "ready=$ready"\necho "firewall=$(cat {fw}/global)"\n', stubs)
 
     def test_a_mac_without_a_vault_gets_the_checked_one_with_one_password_prompt(self):
         for track in ("approved", "early"):         # the root step gets the fleet's track last
@@ -605,7 +632,7 @@ class MacVault(unittest.TestCase):
                 self.assertEqual(code, 0, out)
                 ran = self.ran.read_text().splitlines()
                 self.assertEqual(len(ran), 2, ran)
-                self.assertTrue(ran[1].startswith("sudo /bin/sh -c the root step sh "), ran)
+                self.assertTrue(ran[1].startswith("sudo /bin/sh -c the root step sh "), ran)   # its firewall is on
                 self.assertTrue(ran[1].endswith(
                     '/build/Fleet Vault.app ' + __import__("getpass").getuser() + ' mini http://100.64.0.2:8765 '
                     '0123456789abcdef https://founderizer.test the requirement ' + track), ran[1])
@@ -618,6 +645,108 @@ class MacVault(unittest.TestCase):
         code, out = self.step()
         self.assertEqual((code, self.ran.exists()), (0, False), out)
         self.assertIn("installed already", out)
+
+    def test_a_mac_that_the_line_joins_ends_with_its_firewall_on(self):
+        """The plain join line turned no Mac's firewall on: only the installer's root step did (app/Installer/setup.sh,
+        settings), and the owner's Mac Studio read "Firewall is disabled" (25 November 2026). The line now turns it on
+        by default in the one root step that it asks for, the vault's (the firewall first, so a vault that fails
+        leaves it on), and says it. A run that installs no vault asks for no root step and leaves the firewall as it
+        is: an off firewall on a Mac is no fault, and its owner may have turned it off on purpose (his answer of 25
+        November 2026, "All Macs: no fault")."""
+        code, out = self.step(firewall=self.OFF)
+        self.assertEqual(code, 0, out)
+        self.assertIn("firewall=" + self.ON, out)
+        self.assertIn("this Mac's firewall: on", out)
+        self.assertIn("ready=yes", out)
+        sudo = [line for line in self.ran.read_text().splitlines() if line.startswith("sudo ")]
+        self.assertEqual(len(sudo), 1, sudo)                        # one password, never a second one
+        self.assertTrue(sudo[0].startswith("sudo /bin/sh -c the firewall step the root step sh "), sudo)
+        for older in ({"block": "Block all DISABLED! "},
+                      {"signed": "Automatically allow signed built-in software ENABLED "}):
+            with self.subTest(older=older):                     # the forms of older macOS that the program carries
+                self.ran.unlink(missing_ok=True)
+                code, out = self.step(firewall=self.OFF, **older)
+                self.assertIn("firewall=" + self.ON, out)
+        self.ran.unlink(missing_ok=True)
+        code, out = self.step(firewall=self.OFF, turns=False)    # the root step ran, and a profile keeps it off
+        self.assertEqual(code, 0, out)
+        self.assertIn(self.MANAGED, out)                        # socketfilterfw's own line shows
+        self.assertIn("this Mac's firewall stays off: macOS kept it off, and the line of socketfilterfw above", out)
+        self.assertIn("ready=yes", out)                         # no fault: the join does not fail for it
+        self.ran.unlink(missing_ok=True)
+        code, out = self.step(firewall=self.OFF, sudo=1)         # the password was refused: no step ran
+        self.assertIn("this Mac's firewall: off", out)
+        self.assertNotIn("macOS kept it off", out)
+        for case, kwargs in (("a vault there", {"config": True}), ("no signed vault", {"build": 1}),
+                             ("no name", {"name": ""})):
+            with self.subTest(case):
+                self.ran.unlink(missing_ok=True)
+                if kwargs.pop("config", False):
+                    self.config.write_text("{}")
+                code, out = self.step(firewall=self.OFF, **kwargs)
+                self.config.unlink(missing_ok=True)
+                self.assertEqual(code, 0, out)
+                self.assertIn("firewall=" + self.OFF, out)
+                self.assertNotIn("sudo", self.ran.read_text() if self.ran.exists() else "")
+                self.assertNotIn("this Mac's firewall", out)
+
+    def test_a_firewall_whose_options_would_cut_off_ssh_stays_off_and_says_why(self):
+        """The reads of the Door and Vault areas of 25 November 2026: macOS lets its own SSH and Screen Sharing answer
+        through the firewall only while Block all is off and built-in software is allowed. A Block all that a person
+        set stays stored while the firewall is off and holds the moment it goes on, and the owner often reaches a
+        Mac, or runs the line, over SSH. So the join reads both options by their exact words first; when one of them
+        would cut SSH off, or when an answer is not one that it knows, its root step installs the vault alone, the
+        firewall stays off, the join says why and where the owner sets it, and it does not fail. An unknown reading of
+        the firewall itself changes nothing and says so."""
+        for case, kwargs, words in (
+                ("Block all on", {"block": self.BLOCK_ON}, 'its option "Block all incoming connections" is on'),
+                ("Block all on, in older words",
+                 {"block": "Firewall is set to block all non-essential incoming connections "},
+                 'its option "Block all incoming connections" is on'),
+                ("built-in software not allowed", {"signed": self.SIGNED_OFF},
+                 'its option "Automatically allow built-in software to receive incoming connections" is off'),
+                ("an unknown answer for Block all", {"block": "Block all: maybe"},
+                 "socketfilterfw gave no known answer for its option Block all"),
+                ("an unknown answer for built-in software", {"signed": ""},
+                 "socketfilterfw gave no known answer for its option of built-in software")):
+            with self.subTest(case):
+                self.ran.unlink(missing_ok=True)
+                code, out = self.step(firewall=self.OFF, **kwargs)
+                self.assertEqual(code, 0, out)
+                self.assertNotIn("the firewall step", self.ran.read_text())
+                self.assertIn("firewall=" + self.OFF, out)
+                self.assertIn("this Mac's firewall stays off: " + words, out)
+                self.assertIn("System Settings, Network, Firewall, Options", out)
+                self.assertIn("ready=yes", out)
+        self.ran.unlink(missing_ok=True)
+        code, out = self.step(firewall="")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("the firewall step", self.ran.read_text())
+        self.assertIn("this Mac's firewall could not be read: socketfilterfw gave no known answer", out)
+        self.assertIn("ready=yes", out)
+
+    @unittest.skipUnless((KIT / "app").is_dir(), "the apps' folder app/ is not in this tree (the published repository has none)")
+    def test_the_installer_turns_the_firewall_on_with_the_join_steps_command(self):
+        """The Mac installer and the join line turn the firewall on with one command: if one of them changes alone,
+        a Mac that joins by the line and a Mac that installs the app end with different firewalls."""
+        command = shell_value("FIREWALL_ROOT_STEP").split("=", 1)[1][1:-1]
+        self.assertIn(command + " ", (KIT / "app/Installer/setup.sh").read_text())
+
+    def test_the_firewall_step_is_the_installers_own_command(self):
+        """The join's root step turns the firewall on with the installer's own command, and the join reads it with
+        the same program: a wrong path or word would leave every Mac that joins by the line with its firewall off."""
+        step = shell_value("FIREWALL_ROOT_STEP").split("=", 1)[1][1:-1]
+        command = "/usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+        self.assertEqual(step, command)                         # its own words show: a managed Mac says why
+        self.assertIn("FIREWALL_STATE=" + command.split(" ", 1)[0] + " ", TEXT)
+        program = self.tmp / "socketfilterfw"
+        for said, state in (("Firewall is enabled. (State = 1)", "on"), ("Firewall is enabled. (State = 2)", "on"),
+                            ("Firewall is disabled. (State = 0)", "off"), ("", "unknown")):
+            with self.subTest(said=said):
+                program.write_text(f'#!/bin/sh\n[ "$1" = --getglobalstate ] && echo "{said}"\n')
+                program.chmod(0o755)
+                code, out = run_step("firewall_state", "firewall_state", f"FIREWALL_STATE={program}\n")
+                self.assertEqual((code, out.strip()), (0, state), out)
 
     def test_no_signed_vault_no_name_or_no_fleet_asks_for_nothing_and_says_so(self):
         for kwargs, words in (({"build": 1}, "gave no signed vault"), ({"name": ""}, "no name or no release channel"),

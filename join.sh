@@ -317,12 +317,57 @@ early=""
 /usr/bin/python3 "$installer" --app "$stage/Fleet Vault.app" --user "$2" --agent "$3" --hub "$4" --store \
     --fleet "$5" --channel "$6" ${early:+--track early} >/dev/null'
 
+# The root half of this Mac's firewall step: the application firewall on, as the installer's root step turns it on
+# (app/Installer/setup.sh, settings). A Mac that joined by the line alone kept it off (the owner's Mac Studio, 25
+# November 2026: "Firewall is disabled"). Fleet's own listeners take 127.0.0.1 only, and macOS lets its own signed
+# services (Remote Login, Screen Sharing) answer as before, but only while two of its options allow it: firewall_safe
+# reads them first. It runs in mac_vault's one root step, before the vault, and only in a run that installs the vault.
+FIREWALL_ROOT_STEP='/usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on'   # its own words show
+FIREWALL_STATE=/usr/libexec/ApplicationFirewall/socketfilterfw     # its readings need no root
+
+firewall_state() {  # on, off or unknown: this Mac's firewall by socketfilterfw's own words
+    case "$("$FIREWALL_STATE" --getglobalstate 2>/dev/null)" in
+        *"Firewall is enabled"*) echo on ;;
+        *"Firewall is disabled"*) echo off ;;
+        *) echo unknown ;;
+    esac
+}
+
+firewall_safe() {   # Nothing when the firewall can go on and SSH and Screen Sharing still answer, else why not (the
+                    # Door area's read of 25 November 2026). A Block all that a person set stays stored while the
+                    # firewall is off and holds the moment it goes on, and built-in software answers only while
+                    # macOS lets it. Each option by the exact words of the program (macOS 27, and the older forms that
+                    # it still carries); any other answer changes nothing.
+    case "$("$FIREWALL_STATE" --getblockall 2>/dev/null)" in
+        *"has block all state set to disabled"*|*"Block all DISABLED"*) ;;
+        *"is blocking all non-essential incoming connections"*|*"is set to block all non-essential incoming"*)
+            echo "its option \"Block all incoming connections\" is on, and with the firewall on no new SSH or Screen \
+Sharing connection would reach this Mac"; return 0 ;;
+        *) echo "socketfilterfw gave no known answer for its option Block all, so the join changed nothing there"
+           return 0 ;;
+    esac
+    case "$("$FIREWALL_STATE" --getallowsigned 2>/dev/null)" in
+        *"Automatically allow built-in signed software ENABLED"*|\
+        *"Automatically allow signed built-in software ENABLED"*) ;;
+        *"Automatically allow built-in signed software DISABLED"*|\
+        *"Automatically allow signed built-in software DISABLED"*)
+            echo "its option \"Automatically allow built-in software to receive incoming connections\" is off, and \
+with the firewall on SSH and Screen Sharing could not answer"; return 0 ;;
+        *) echo "socketfilterfw gave no known answer for its option of built-in software, so the join changed \
+nothing there" ;;
+    esac
+}
+
 mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 28 October 2026: "it is essential that
                 # they all have access to secrets"): the signed Fleet Vault that the release channel's newest Mac build
                 # carries, put in place by the install.py inside it. It opens the fleet's own store, so it needs no
                 # account and no token of the owner's, and it is named after this Mac, because each request of an
                 # agent names that agent and carries its key. It is the one step of a Mac's join that needs root, so
-                # macOS asks for this user's password here and nowhere else. A Mac whose vault is there keeps it.
+                # macOS asks for this user's password here and nowhere else. A Mac whose vault is there keeps it. The
+                # same root step turns this Mac's firewall on by default, as the installer does (FIREWALL_ROOT_STEP),
+                # so the join asks for no second password. A run that installs no vault leaves the firewall as it is:
+                # an off firewall on a Mac is allowed and no fault, and its owner may have turned it off on purpose
+                # (the owner, 25 November 2026: "All Macs: no fault").
     if [ -e "$VAULT_CONFIG" ]; then
         say "this Mac's vault: installed already"
         return 0
@@ -339,16 +384,47 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
         ready=no
         say "this Mac's vault was not installed: $CHANNEL gave no signed vault. Run the line again."
     else
-        say "this Mac's vault: macOS asks once for the password of $MAC_USER, because only root installs it"
-        if sudo /bin/sh -c "$VAULT_ROOT_STEP" sh "$work/$VAULT_APP" "$MAC_USER" "$name" "$HUB" "$FLEET" "$CHANNEL" \
+        fw="" fw_why="" also="" rooted=no
+        if [ "$(firewall_state)" = off ]; then
+            fw_why=$(firewall_safe)
+            [ -n "$fw_why" ] || fw=$FIREWALL_ROOT_STEP
+        fi
+        [ -z "$fw" ] || also=" and turns the firewall on"
+        say "this Mac's vault: macOS asks once for the password of $MAC_USER, because only root installs it$also"
+        step=$VAULT_ROOT_STEP
+        [ -z "$fw" ] || step="$fw
+$VAULT_ROOT_STEP"
+        if sudo /bin/sh -c "$step" sh "$work/$VAULT_APP" "$MAC_USER" "$name" "$HUB" "$FLEET" "$CHANNEL" \
                 "$VAULT_REQUIREMENT" "$TRACK" </dev/null; then
+            rooted=yes
             say "this Mac's vault: installed, with the fleet's own store; it updates itself every hour"
         else
             ready=no
             say "this Mac's vault was not installed: the lines above say why. Run the line again."
         fi
+        mac_firewall
     fi
     rm -rf "$work"
+}
+
+mac_firewall() {    # After the vault's root step: this Mac's firewall as it reads now, with fw_why when the join left
+                    # it off for its options, and fw and rooted when that step ran its line. An off firewall on a Mac is
+                    # no fault, so it never fails the join.
+    case "$(firewall_state)" in
+        on) say "this Mac's firewall: on" ;;
+        off)
+            if [ -n "$fw_why" ]; then
+                say "this Mac's firewall stays off: $fw_why. An off firewall on a Mac is no fault; its options are \
+in System Settings, Network, Firewall, Options."
+            elif [ -n "$fw" ] && [ "$rooted" = yes ]; then  # the root step ran it, and macOS kept it off
+                say "this Mac's firewall stays off: macOS kept it off, and the line of socketfilterfw above says why \
+(a Mac whose firewall a management profile sets keeps it so). An off firewall on a Mac is no fault."
+            else
+                say "this Mac's firewall: off"
+            fi ;;
+        *) say "this Mac's firewall could not be read: socketfilterfw gave no known answer, so the join changed \
+nothing there." ;;
+    esac
 }
 
 vault_build() { # $1: an empty folder. The release channel's newest Mac build, as the vault's own updater takes it: this

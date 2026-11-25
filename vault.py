@@ -164,8 +164,8 @@ NO_BITWARDEN = ("Founderizer has no Bitwarden backend any more, so this vault br
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
-CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
-                      "export", "remove", "key_addresses", "hub_key", "client-add", "client-end")
+CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "default_pool",
+                      "seal", "inventory", "export", "remove", "key_addresses", "hub_key", "client-add", "client-end")
 # The hub's own files whose key the central vault keeps for it (hub_key; UI-API.md 1.202): its Google file, which the
 # hub seals so that a copy of the hub user's files does not open it.
 HUB_KEYS = ("google",)
@@ -260,7 +260,10 @@ STATE = 1                                           # the format of the central 
 # The fields of each statement that the owner signs: all of them, and no other.
 # grant: the owner gives this secret to this agent, whose vault is on this machine, so the vault may seal it to that
 # machine's pin; ungrant takes that back. pool: the owner lets the manager hand this secret out (team.json
-# "resources"), so the vault may seal it to any pinned machine; unpool takes that back.
+# "resources"), so the vault may seal it to any pinned machine; unpool takes that back. default_pool: the same, signed by
+# the owner's app under the hood for the hub's default (owner feature pool_default), which no record of an unpool takes
+# back: only the owner's own pool puts a secret that they took out back into the pool (the Door area's read of 24
+# November 2026), so a hub that is broken into cannot undo their "Only you".
 STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
               "unpin": {"v", "kind", "fleet", "machine", "at"},
               "recovery": {"v", "kind", "fleet", "recipient", "at"},
@@ -268,6 +271,7 @@ STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
               "ungrant": {"v", "kind", "fleet", "login", "agent", "at"},
               "pool": {"v", "kind", "fleet", "login", "at"},
               "unpool": {"v", "kind", "fleet", "login", "at"},
+              "default_pool": {"v", "kind", "fleet", "login", "at"},
               # replace: the owner puts a new value under a reference that the vault holds. sha256 is of the sealed
               # copy that his app made, so the statement is about that one copy and no other (intake).
               "replace": {"v", "kind", "fleet", "login", "sha256", "at"},
@@ -291,6 +295,13 @@ KEY_HASH = re.compile(r"[0-9a-f]{64}")              # the SHA-256 of the 65 byte
 ENDED_KEYS = 1024                                   # the most keys of the ended set (1.2 rule 4)
 UNKNOWN_ENDED = 16                                  # of them, for one signer, the most that this vault never held
 END_KEYS = 16                                       # the most keys that one client-end names
+# A key that moves money stays the owner's to give (the supervisor's decision of 24 November 2026 on the pool default:
+# RULES.md keeps money with the owner): its value is read here, where it is, never by a name that the hub gives.
+# Stripe's unrestricted secret keys, live and test; a restricted key (rk_) and a webhook secret (whsec_) stay in the
+# default. Stripe is the one payment provider whose keys the fleet's secrets held on that day (by their names); the key
+# of another provider joins this list with its own shape.
+MONEY_KEYS = re.compile(r"sk_(?:live|test)_[0-9A-Za-z]{16,}")
+DOOR_MACHINE = "door"       # the name under which the owner pins the door's key and signs its grants (hub.py DOOR_PIN)
 COPY_MAX = 16384            # characters of one sealed copy that the owner gives, as the hub's DEPOSIT_COPY_MAX
 CENTRAL_LINE = 65536        # bytes of one request line to the central vault: an intake carries a sealed copy
 # The central vault's own user. Not a fleet-* name: the hub's user may put any fleet-* user into the agents' group
@@ -2995,9 +3006,11 @@ def new_file(path, text):
 #
 # The state keeps what the owner signed and the statement's own time, and no signer. So this vault keeps, in a file of
 # its own, who signed each record that is in force and when it took the statement, by its own clock: after the end of a
-# device, the app shows what that device gave. The kinds that have it: pin, unpin, grant, ungrant, pool, unpool and
-# replace; client-add and client-end keep the same two in the list itself. `recovery` has none: a vault with a list takes
-# none and makes no backup (central_signed, export).
+# device, the app shows what that device gave. The kinds that have it: pin, unpin, grant, ungrant, pool, unpool,
+# default_pool and replace; client-add and client-end keep the same two in the list itself. `recovery` has none: a vault
+# with a list takes none and makes no backup (central_signed, export). A pool record that this vault ended itself (a key
+# that moves money came into a pooled secret, intake) keeps the signer of the pool statement before it: that record
+# then names who pooled the secret, not who ended it, and only this vault's log says that it left the pool.
 
 def beside(conf, name):
     """A file of the central vault's own folder, which its state is in."""
@@ -3041,7 +3054,7 @@ def keep_signer(conf, kind, said, by):
     record = {"at": said["at"], "by": by, "when": int(time.time())}
     if kind in ("grant", "ungrant"):
         signers["grants"].setdefault(said["login"], {})[said["agent"]] = record
-    elif kind in ("pool", "unpool"):
+    elif kind in ("pool", "unpool", "default_pool"):
         signers["pool"][said["login"]] = record
     elif kind == "replace":
         signers["values"][said["login"]] = record
@@ -3272,10 +3285,20 @@ def central_status(conf):
     """What the hub reads of the central vault: its keys, the owner's records and how many items it holds. Never a
     value and never a title."""
     state, store, clients = central_state(conf), LocalStore(conf), held_clients(conf)
+    items = store.opened()
     return {"ok": True, "v": PROTOCOL, "central": True, "recipient": public_key(conf["age_key"], "key"),
             "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(decision_keys(conf)),
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
-            "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
+            "grants": granted(state), "pool": pooled(state), "items": len(items),
+            # each secret whose value moves money (MONEY_KEYS): the hub keeps it with the owner, and no default_pool
+            # puts it into the pool; the reference only, never a value
+            "money": sorted("bws://" + sid for sid, item in items.items() if moves_money(item)),
+            # each reference that the store holds a value of: the hub owes no default_pool of any other, which this
+            # program refuses (central_signed), so one name with no value never holds the app's round
+            "stored": sorted("bws://" + sid for sid in items),
+            # each secret that a signed unpool took out, which no default_pool puts back, and that this program serves
+            # default_pool: the hub owes the owner's app no default_pool of these, and none to an older program
+            "unpooled": sorted(ref for ref, x in state["pool"].items() if not x["in"]), "default_pools": True,
             "removes": True, "replaces": True,      # this program serves remove, and replace in intake (the hub asks)
             "key_addresses": True,                  # and key_addresses: the hub asks it only when this says so
             "hub_keys": True,                       # and hub_key, the key of the hub's Google file: the same rule
@@ -3357,6 +3380,14 @@ def intake(conf, req):
             state["values"][ref.lower()] = record   # first: from here no older statement of this login is taken
             keep_state(conf, state)
     saved = store.put(m.group(1).lower(), title, canonical(value), TAKEN, replace=said is not None)
+    pool = state["pool"].get(ref.lower())
+    if pool and pool["in"] and moves_money({"value": canonical(value)}):
+        # a key that moves money came into a secret of the pool (a replace): out of the pool, which only the owner's own
+        # pool statement ends, so no seal reaches it by a pool from before (the Door area's read of the pool default).
+        # The signers file keeps the signer of that earlier pool (keep_signer): no key of the owner's signed this end
+        state["pool"][ref.lower()] = {"in": False, "at": pool["at"]}
+        keep_state(conf, state)
+        log(f"intake: {ref.lower()} moves money, so it left the pool")
     log(f"intake: {ref.lower()} {saved}" + (", with the owner's replace statement" if said is not None else ""))
     return {"ok": True, "login": ref.lower(), "saved": saved,
             "fingerprints": [{"kind": k, "hash": h, "len": n} for k, h, n in sorted(mine)]}
@@ -3402,9 +3433,22 @@ def central_signed(conf, req, kind):
         held = state["grants"].setdefault(said["login"], {})
         new, old = {"machine": said.get("machine"), "at": said["at"]}, held.get(said["agent"])
         was = old is not None and old["machine"] is not None
-    elif kind in ("pool", "unpool"):
-        new, old = {"in": kind == "pool", "at": said["at"]}, state["pool"].get(said["login"])
+    elif kind in ("pool", "unpool", "default_pool"):
+        new, old = {"in": kind != "unpool", "at": said["at"]}, state["pool"].get(said["login"])
         was = old is not None and old["in"]
+        if kind == "default_pool" and old is not None and not old["in"]:
+            raise Refused("the owner took this secret out of the pool, so only their own pool statement puts it back")
+        if kind == "default_pool":
+            held = LocalStore(conf).opened().get(SECRET_REF.fullmatch(said["login"]).group(1).lower())
+            if held is None:        # else a later intake could put a key that moves money under a pooled name
+                raise Refused("this vault holds no value of this secret yet, so no default_pool is kept for it")
+            if moves_money(held):
+                raise Refused("this secret moves money, so only the owner's own pool statement puts it into the pool")
+            if any(x.get("machine") == DOOR_MACHINE for x in state["grants"].get(said["login"], {}).values()):
+                # a key that the owner gave the door (its providers, a production app's settings): no agent's box
+                # gets its value, so no default pools it, also when a hub that is broken into says otherwise
+                raise Refused("the owner gave this secret to the door, so only their own pool statement puts it into "
+                              "the pool")
     else:
         new = {"recipient": said.get("recipient"), "at": said["at"]}       # an unpin keeps its time, with no recipient
         old = state["recovery"] if kind == "recovery" else state["pins"].get(said["machine"])
@@ -3421,7 +3465,7 @@ def central_signed(conf, req, kind):
             state["recovery"] = new
         elif kind in ("grant", "ungrant"):
             state["grants"][said["login"]][said["agent"]] = new
-        elif kind in ("pool", "unpool"):
+        elif kind in ("pool", "unpool", "default_pool"):
             state["pool"][said["login"]] = new
         else:
             state["pins"][said["machine"]] = new
@@ -3430,6 +3474,16 @@ def central_signed(conf, req, kind):
     answer = {"ok": True, "kind": kind, "saved": saved}
     answer.update({k: said[k] for k in ("machine", "recipient", "login", "agent") if k in said})
     return answer
+
+
+def moves_money(item):
+    """True when this item of the store holds a key that moves money (MONEY_KEYS): its key, as the value's password."""
+    try:
+        value = json.loads(item.get("value") or "")
+    except (ValueError, TypeError, AttributeError):
+        return False
+    secret = value.get("password") if isinstance(value, dict) else None
+    return isinstance(secret, str) and MONEY_KEYS.fullmatch(secret.strip()) is not None
 
 
 def granted(state):
@@ -3445,8 +3499,13 @@ def pooled(state):
 
 def sealable(state, ref, machine):
     """True when the owner signed that this secret may reach this machine: a grant of it to an agent there, or the
-    secret in the grantable pool, which the manager may hand to an agent on any machine."""
-    return any(g["login"] == ref and g["machine"] == machine for g in granted(state)) or ref in pooled(state)
+    secret in the grantable pool, which the manager may hand to an agent on any machine. A secret that they gave the
+    door goes only by a grant, never by the pool, whichever came first: no agent's box gets a key of the door's
+    (the Door area's read of the pool default, 24 November 2026)."""
+    grants = granted(state)
+    if any(g["login"] == ref and g["machine"] == DOOR_MACHINE for g in grants):
+        return any(g["login"] == ref and g["machine"] == machine for g in grants)
+    return any(g["login"] == ref and g["machine"] == machine for g in grants) or ref in pooled(state)
 
 
 def seal(conf, req):
@@ -3635,7 +3694,7 @@ def central(conf, req):
         return central_status(conf)
     if op == "intake":
         return intake(conf, req)
-    if op in ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool"):
+    if op in ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "default_pool"):
         return central_signed(conf, req, op)
     if op == "client-add":
         return client_add(conf, req)

@@ -144,7 +144,7 @@ class Resources(OwnerAPI):
         repo = self.entry("repo:acme/web")
         self.assertEqual((repo["kind"], repo["credential"], repo["uses"]), ("repo", "github_app", []))
         self.assertEqual(repo["holders"], [{"agent": "shopper", "level": "read"}])
-        self.assertIsNone(repo["grant"])                        # nothing is grantable until the owner says so
+        self.assertEqual(repo["grant"], {"max": "write", "to": "workers", "by": "default"})     # the default (1.328)
         self.assertEqual(repo["history"], [])                   # nothing has been given through this feature yet
         # An MCP server says which secret of the catalog it needs, and Fleet's own tool needs none of the owner's.
         self.assertEqual(self.entry("tool:jobs")["uses"], [KEY])
@@ -160,49 +160,215 @@ class Resources(OwnerAPI):
 
     # ---- the owner sets the standing, and nothing is grantable before that
 
-    def test_nothing_is_grantable_until_the_owner_opens_the_pool(self):
+    def test_each_resource_that_the_fleet_holds_is_grantable_by_default(self):
+        """Owner feature pool_default (the owner, 24 November 2026: "I think the manager should be able to do that!",
+        "the goal is to minimize Needs you cards"): the manager gives each resource that the fleet holds, up to its
+        kind's top level, and the owner's standing only narrows it. Bugs: a give of a held secret or repository comes
+        to the owner as a card again; the default reaches a repository that no record of the fleet names; or the
+        owner's "Only you" no longer narrows it."""
+        self.assertIn("pool_default", self.request()[1]["ui_features"])
+        self.assertEqual(self.entry("repo:acme/web")["grant"], {"max": "write", "to": "workers", "by": "default"})
+        self.assertEqual(self.entry("gmail:support@shop.test")["grant"], {"max": "write", "to": "workers", "by": "default"})
+        # the two outward tops come only with their own level (the supervisor's (B), after the Door area's read): a
+        # deploy token reaches the CI keys and the runners, and send mails as the owner to anyone
+        self.assertIn("The default gives at most write", self.refused("dev", "repo:acme/web", "deploy"))
+        self.assertIn("The default gives at most write", self.refused("dev", "gmail:support@shop.test", "send"))
+        self.assertEqual(self.entry(f"secret:{LOGIN}")["grant"], {"max": "read", "to": "workers", "by": "default"})
+        self.granted("dev", "repo:acme/web", "write")           # shopper holds it, so the fleet holds it
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})
+        self.assertFalse(self.committed().get("resources"))     # no entry of the owner's was needed
+        self.assertIn("not in the grantable pool", self.refused("dev", "repo:acme/other", "read"))   # no record names it
+        # the owner narrows it: their own level, then "Only you", then the default again
+        code, receipt = self.stand("repo:acme/web", {"max": "deploy", "to": "workers"})
+        self.assertEqual((code, receipt["policy"]), (200, {"max": "deploy", "to": "workers", "by": "owner"}), receipt)
+        self.granted("lead", "repo:acme/web", "deploy")         # their own level opens deploy
+        code, receipt = self.stand("repo:acme/web", None)
+        self.assertEqual((code, receipt["changed"], receipt["policy"]), (200, True, None), receipt)
+        self.assertEqual(self.committed()["resources"], {"repo:acme/web": {"owner": True}})
+        self.assertEqual((self.entry("repo:acme/web")["grant"], self.entry("repo:acme/web")["kept"]), (None, "owner"))
+        self.assertIn("dev, shopper hold it: give that part of the work to dev", self.refused("lead", "repo:acme/web", "read"))
+        code, receipt = self.stand("repo:acme/web", "default")
+        self.assertEqual((code, receipt["policy"]["by"]), (200, "default"), receipt)
+        self.assertNotIn("resources", self.committed())
+        self.assertEqual(self.entry("repo:acme/web")["holders"], [{"agent": "dev", "level": "write"},
+                                                                  {"agent": "lead", "level": "deploy"},
+                                                                  {"agent": "shopper", "level": "read"}])
+
+    def test_what_the_fleet_runs_on_stays_the_owners_by_a_list_in_the_code(self):
+        """pool_default's list (resource_kept): a secret whose variable is one of Fleet's own keys and a secret that an
+        account names stay the owner's to give, and see_capacity says why. Bugs: the default gives the fleet's own
+        GitHub token or an AI account's key to any worker."""
+        import lifecycle
+        token = "bws://41111111-2222-4333-8444-55555555555b"
+        hub.TEAM["logins"][token] = {"title": "GH_TOKEN", "kind": "api_key", "env": "GH_TOKEN"}
+        hub.TEAM["accounts"] = {"team-claude": {"kind": lifecycle.ACCOUNT_KINDS[0], "secret": SPEND}}
+        for ref in (token, SPEND):
+            with self.subTest(ref=ref):
+                self.assertIsNone(hub.resource_standing(f"secret:{ref}"))
+                self.assertIn("the fleet runs on it, so only the owner gives it",
+                              self.refused("dev", f"secret:{ref}", "use"))
+        kept = {k["resource"]: k["kept"] for k in hub.capacity_view()["resource_default"]["kept"]}
+        self.assertEqual(kept, {f"secret:{token}": "fleet", f"secret:{SPEND}": "fleet", "tool:crm": "owner"})
+        text, _ = self.call("manager", "see_capacity", {})
+        self.assertIn(f"secret:{token} (GH_TOKEN): the fleet runs on it, so only the owner gives it. Give the work to "
+                      f"an agent that holds it, else ask with raise_needs_you", text)
+        self.assertIn("By default: each resource that the fleet holds, to any worker or lead", text)
+        self.assertIsNone(hub.resource_kept(f"secret:{LOGIN}"))
+        # a key of the door's (its providers, a production app's settings) and a GitHub App's key: no agent's box
+        hub.TEAM["door"] = {"secrets": [LOGIN]}
+        self.assertEqual(hub.resource_kept(f"secret:{LOGIN}"), "fleet")
+        hub.TEAM.pop("door")
+        hub.TEAM["logins"][token]["env"] = "GITHUB_APP_ACME_KEY"
+        self.assertEqual(hub.resource_kept(f"secret:{token}"), "fleet")
+        # a secret that the vault holds out of its pool, with no level of theirs: theirs, so no give waits with no word
+        self.addCleanup(hub.CENTRAL.update, status=hub.CENTRAL.get("status"))
+        hub.CENTRAL["status"] = {"ok": True, "unpooled": [LOGIN]}
+        self.assertEqual((hub.resource_kept(f"secret:{LOGIN}"), self.entry(f"secret:{LOGIN}")["kept"]),
+                         ("owner", "owner"))
+
+    def test_a_key_that_moves_money_stays_the_owners_until_his_own_level_opens_it(self):
+        """The supervisor's decision of 24 November 2026: a secret whose value the central vault reads as a key that
+        moves money (its status's "money") is kept as the owner's, with the reason, and their own level on its row opens
+        it. Bugs: the default lets the manager give a key that charges and refunds; or the mark outlives their level."""
+        self.addCleanup(hub.CENTRAL.update, status=hub.CENTRAL.get("status"))
+        hub.CENTRAL["status"] = {"ok": True, "money": [KEY.upper().replace("BWS", "bws")]}
+        self.assertEqual((self.entry(f"secret:{KEY}")["grant"], self.entry(f"secret:{KEY}")["kept"]), (None, "owner"))
+        self.assertIn("it moves money, so only the owner gives it", self.refused("dev", f"secret:{KEY}", "read"))
+        text, _ = self.call("manager", "see_capacity", {})
+        self.assertIn(f"secret:{KEY} (DEPLOY_KEY): it moves money, so only the owner gives it", text)
+        self.stand(f"secret:{KEY}", {"max": "use"})
+        self.assertEqual(self.entry(f"secret:{KEY}")["grant"], {"max": "use", "to": "workers", "by": "owner"})
+        self.assertIsNone(self.entry(f"secret:{KEY}")["kept"])
+        # their replace of that value with such a key took it out of the vault's pool: kept until they set its level again
+        hub.CENTRAL["status"] = dict(hub.CENTRAL["status"], unpooled=[KEY])
+        self.assertEqual(self.entry(f"secret:{KEY}")["kept"], "owner")
+        self.assertEqual(self.entry(f"secret:{LOGIN}")["grant"]["by"], "default")      # another secret: the default
+
+    def test_the_defaults_words_and_reach_stay_inside_what_the_work_asked(self):
+        """The Door area's read of the pool default, 24 November 2026: the words name the level that the work asked
+        for, else the lowest, never the top by itself; the door's GitOps repository stays the owner's (a direct token
+        would go around the door's rules); and a session that reads strangers' text loads no MCP server that the
+        manager gave by the default alone. Bugs: a worker that asked to read is told grant_access(..., level="deploy");
+        the default gives a GitOps repository; a manager's grant reaches a closed session with no duty that names it."""
+        # the fleet's GitHub App reaches acme's repositories: with none, a repository's card is the owner's step
+        reached = patch.object(hub, "team_repo_owner_step", lambda what: False)
+        reached.start()
+        self.addCleanup(reached.stop)
+        said = hub.need_is_yours("manager", "dev needs repo:acme/web for its work")
+        self.assertIn('resource="repo:acme/web", level="read")', said)
+        self.assertIn('level="write")', hub.need_is_yours("manager", "dev needs repo:acme/web", level="write"))
+        # a level above the default is the owner's own, so the card for it is raised, not refused as the manager's
+        self.assertIsNone(hub.need_is_yours("manager", "dev needs repo:acme/web", level="deploy"))
+        hub.TEAM["door"] = {"gitops": {"acme/web": {"sync": "argocd", "agents": ["shopper"]}}}
+        self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
+        hub.TEAM.pop("door")
+        # and an Operator's repository, a commit target of the door, whose commits it checks (NEVER_PATHS)
+        hub.TEAM["agents"]["shopper"]["servers"] = {"web-1": "fix"}
+        self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
+        self.refused("dev", "repo:acme/web", "read")       # its words send the work to shopper, which holds it
+        hub.TEAM["agents"]["shopper"].pop("servers")
+        self.assertTrue(hub.owner_gave("dev", "jobs"))                  # a hold from before the records
+        self.granted("dev", "tool:jobs", "use")
+        self.assertFalse(hub.owner_gave("dev", "jobs"))                 # the manager's, by the default alone
+        # and a session that reads strangers' text gets an explicit list without it: a helper with no list loads each
+        # server that needs no session token (fleet.py), so null would load the manager's grant after all
+        hub.TEAM["agents"]["dev"]["can"] = []                           # its Shell box off
+        servers = hub.closed_extra("dev")["shell_off"]["servers"]
+        self.assertIsInstance(servers, list)
+        self.assertNotIn("jobs", servers)
+        self.stand("tool:jobs", {"max": "use"})
+        self.assertTrue(hub.owner_gave("dev", "jobs"))                  # the owner set its level themselves
+        hub.TEAM["agents"]["dev"]["can"] = []                           # the stand read the team file again
+        self.assertIn("jobs", hub.closed_extra("dev")["shell_off"]["servers"])
+        # an MCP server with an OAuth sign-in acts as an account of the owner's: theirs to give
+        self.assertEqual((hub.resource_kept("tool:crm"), self.entry("tool:crm")["kept"]), ("account", "owner"))
+
+    def test_the_vault_is_owed_a_pool_statement_for_each_secret_of_the_default(self):
+        """GET /ui/vault's standing.due (pool_default): the owner's app signs a default_pool for each secret of the
+        default that the vault's pool lacks, and an unpool for each pooled one that is the owner's now, an end first;
+        none for a secret that the owner took out ("unpooled"), and no pool at all for a vault that does not serve
+        default_pool. Bugs: the app pools the owner's "Only you" again under the hood, or sends a statement that an
+        older vault refuses at each round."""
+        import lifecycle
+        hub.TEAM["accounts"] = {"team-claude": {"kind": lifecycle.ACCOUNT_KINDS[0], "secret": SPEND}}
+        status = {"pool": [SPEND], "unpooled": [KEY], "default_pools": True}
+        self.assertEqual(hub.central_pool_due(status), [{"login": SPEND, "in": False}, {"login": LOGIN, "in": True}])
+        self.assertEqual(hub.central_pool_due(dict(status, default_pools=None)), [{"login": SPEND, "in": False}])
+        # a name with no value in the vault is owed no pool (the vault refuses it, and it would hold the round), and its
+        # unpool is reckoned from the whole wish
+        self.assertEqual(hub.central_pool_due(dict(status, stored=[KEY, SPEND])), [{"login": SPEND, "in": False}])
+        self.assertEqual(hub.central_pool_due(dict(status, stored=[LOGIN, KEY, SPEND])),
+                         [{"login": SPEND, "in": False}, {"login": LOGIN, "in": True}])
+        # a pooled secret that is out of the catalog (their removal) is unpooled, so that the vault can remove its value
+        gone = "bws://51111111-2222-4333-8444-55555555555b"
+        self.assertEqual(hub.central_pool_due(dict(status, pool=[SPEND, gone])),
+                         [{"login": SPEND, "in": False}, {"login": gone, "in": False}, {"login": LOGIN, "in": True}])
+        # but not while the hub runs on a team.json that breaks its own rules: it can lack secrets never removed
+        self.addCleanup(hub.CFG.pop, "team_problem", None)
+        hub.CFG["team_problem"] = "agents.x: a rule that this file breaks"
+        self.assertEqual(hub.central_pool_due(dict(status, pool=[SPEND, gone])), [{"login": SPEND, "in": False}])
+        self.assertEqual(hub.central_removals({gone}, (set(), [])), [])
+
+    def test_the_owners_only_you_from_before_the_default_stays_his(self):
+        """The coordinator's validator, 24 November 2026: before 1.328 their "Only you" took the entry out, because no
+        entry meant theirs; under the default no entry means the manager's. At the first start, each resource whose
+        standing they changed and that has no entry now gets {"owner": true}, once. Bug: the release gives the manager
+        every repository, mailbox and server that they had kept."""
+        def old_standing(entry, rid="repo:acme/web"):
+            def change(team):
+                pool = dict(team.get("resources") or {})
+                if entry is None:
+                    pool.pop(rid, None)
+                else:
+                    pool[rid] = entry
+                team["resources"] = pool
+                return True
+            hub.save_integration(None, change, f"Owner changed the standing of {rid}")
+        old_standing({"max": "write", "to": "workers"})
+        old_standing(None)                                      # their "Only you" of before
+        old_standing({"max": "read", "to": "workers"}, "repo:acme/other")
+        old_standing(None, "repo:acme/other")                   # no agent holds it: no default, so no row comes back
+        self.assertEqual(self.entry("repo:acme/web")["grant"]["by"], "default")
+        self.addCleanup(hub.POOL_KEPT_TRIED.update, start=hub.POOL_KEPT_TRIED["start"])
+        hub.POOL_KEPT_TRIED["start"] = False
+        hub.pool_default_keep_seed(hub.now())
+        self.assertEqual(self.committed()["resources"], {"repo:acme/web": {"owner": True}})
+        self.assertEqual(self.entry("repo:acme/web")["kept"], "owner")
         before = self.commits()
-        text = self.refused("dev", "repo:acme/web", "write")
-        self.assertIn("not in the grantable pool", text)
-        self.assertIn("raise_needs_you", text)
+        hub.POOL_KEPT_TRIED["start"] = False
+        hub.pool_default_keep_seed(hub.now())                   # once for each database
         self.assertEqual(self.commits(), before)
-        self.assertNotIn("repos", self.committed()["agents"]["dev"])
-        code, receipt = self.stand("repo:acme/web", {"max": "write", "to": "workers"})
-        self.assertEqual((code, receipt["changed"], receipt["policy"]),
-                         (200, True, {"max": "write", "to": "workers"}), receipt)
-        self.assertEqual(self.committed()["resources"], {"repo:acme/web": {"max": "write", "to": "workers"}})
-        self.assertEqual(self.entry("repo:acme/web")["grant"], {"max": "write", "to": "workers"})
-        self.assertEqual(self.stand("repo:acme/web", {"max": "write", "to": "workers"})[1]["changed"], False)
-        # An entry of the pool grants nothing by itself: no agent has the repository yet.
-        self.assertEqual(self.entry("repo:acme/web")["holders"], [{"agent": "shopper", "level": "read"}])
 
     def test_the_owner_takes_the_standing_back_and_the_grant_that_was_made_stays(self):
         self.stand("repo:acme/web", {"max": "write"})
         self.granted("dev", "repo:acme/web", "write")
         code, receipt = self.stand("repo:acme/web", None)
         self.assertEqual((code, receipt["changed"], receipt["policy"]), (200, True, None), receipt)
-        self.assertNotIn("resources", self.committed())
+        self.assertEqual(self.committed()["resources"], {"repo:acme/web": {"owner": True}})     # "Only you" keeps it
         self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})   # the owner removes it
-        self.assertIn("not in the grantable pool", self.refused("lead", "repo:acme/web", "write"))
+        self.assertIn("dev holds it: give that part of the work to dev", self.refused("lead", "repo:acme/web", "write"))
+        self.assertIn("the owner keeps it, so only the owner gives it", self.refused("lead", "repo:acme/web", "deploy"))
         self.assertEqual(self.stand("repo:acme/web", None)[1]["changed"], False)
 
     # ---- the whole loop
 
     def test_the_whole_loop_from_the_owners_standing_to_the_agents_next_task_session(self):
-        """What the owner's side of the pool is for, from end to end. Before he opens anything the manager has
-        nothing to give and the refusal sends it to him; after he opens it, the manager grants, the agent reads the
-        resource in the task session that starts next, and he ends the hold in one step. shopper is alone on its
-        machine, so its own helper asks the hub for that session as a real one does."""
+        """What the owner's side of the pool is for, from end to end. With their "Only you" the manager has nothing to
+        give and the refusal says why; after they open it, the manager grants, the agent reads the resource in the task
+        session that starts next, and they end the hold in one step. shopper is alone on its machine, so its own helper
+        asks the hub for that session as a real one does."""
         def session():
             """What the helper gives this agent's next task session (POST /helper/integrations)."""
             code, data = self.request("/helper/integrations/shopper", {}, source="127.0.0.4")
             self.assertEqual(code, 200, data)
             return data
 
-        # The refusal names the resource as the owner's page names it: only its first letter is made a capital.
-        self.assertIn("The MCP server Failed jobs is not in the grantable pool",
+        # The refusal names the resource as the owner's page names it, and says why it is theirs.
+        self.stand("tool:jobs", None)
+        self.stand(f"secret:{KEY}", None)
+        self.assertIn("You cannot give the MCP server Failed jobs: the owner keeps it, so only the owner gives it",
                       self.refused("shopper", "tool:jobs", "use"))
-        self.assertIn("The secret DEPLOY_KEY is not in the grantable pool",
+        self.assertIn("You cannot give the secret DEPLOY_KEY: the owner keeps it, so only the owner gives it",
                       self.refused("shopper", f"secret:{KEY}", "read"))
         self.assertEqual(session()["tools"], [])
         self.assertEqual(hub.read_secrets("shopper"), [])
@@ -340,7 +506,7 @@ class Resources(OwnerAPI):
         """The owner, 17 October 2026: no preapproval of sending email or deploying to production. A level that a
         credential has is part of what the owner grants, so the manager may give it when the policy allows it."""
         self.stand("gmail:support@shop.test", {"max": "send"})
-        self.assertEqual(self.entry("gmail:support@shop.test")["grant"], {"max": "send", "to": "workers"})
+        self.assertEqual(self.entry("gmail:support@shop.test")["grant"], {"max": "send", "to": "workers", "by": "owner"})
         self.assertIn("dev now has Gmail of support@shop.test at level send",
                       self.granted("dev", "gmail:support@shop.test", "send"))
         self.assertEqual(self.committed()["agents"]["dev"]["google"],
@@ -424,10 +590,13 @@ class Resources(OwnerAPI):
         # What the manager reads. Each eligible agent's own line says what it may be given, with what it has.
         text, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, text)
-        self.assertIn("GRANTABLE POOL (what you may give with grant_access", text)
-        self.assertIn("repo:acme/web (acme/web): up to write, to any worker or lead. Held by shopper read. "
+        self.assertIn("GRANTABLE POOL (what you may give with grant_access: each thing that the fleet holds, by the "
+                      "owner's default; their own level on a row only widens or narrows it)", text)
+        self.assertIn("repo:acme/web (acme/web): the owner's own level, up to write, to any worker or lead. Held by "
+                      "shopper read. "
                       "You may give it to: lead, dev, shopper.", text)
-        self.assertIn(f"secret:{LOGIN} (shop.test · admin): up to use, to any worker or lead", text)
+        self.assertIn(f"secret:{LOGIN} (shop.test · admin): the owner's own level, up to use, to any worker or lead",
+                      text)
         self.assertIn("you may give it: repo:acme/web up to write (has read)", text)       # shopper's own line
         self.assertIn("you may give it: repo:acme/web up to write", text)                  # dev's, with nothing yet
         # Nothing left to give is not offered: the agent that holds the level the owner allows drops off that line.
@@ -445,7 +614,7 @@ class Resources(OwnerAPI):
     def test_an_empty_pool_says_so_and_a_lead_reads_no_pool_at_all(self):
         text, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, text)
-        self.assertIn("none. Every resource is the owner's to give until it makes one grantable", text)
+        self.assertIn("By default: each resource that the fleet holds, to any worker or lead", text)
         self.assertNotIn("you may give it:", text)
         self.assertEqual(hub.capacity_view()["resources"], [])
         # A lead has no grant_access, so its own reading names no pool and no grant.
@@ -470,12 +639,11 @@ class Resources(OwnerAPI):
         before = [t["name"] for t in hub.tools_for("manager")]
         first, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, first)
-        self.assertIn("none. Every resource is the owner's to give", first)
+        self.assertNotIn("repo:acme/web (acme/web): the owner's own level", first)
         self.stand("repo:acme/web", {"max": "write"})            # the owner, while that session is open
         again, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, again)
-        self.assertIn("repo:acme/web (acme/web): up to write", again)
-        self.assertNotIn("none. Every resource is the owner's to give", again)
+        self.assertIn("repo:acme/web (acme/web): the owner's own level, up to write", again)
         # The tool list did not change, which is why no new session is needed: the same tool, a new answer.
         self.assertEqual([t["name"] for t in hub.tools_for("manager")], before)
         self.assertIn("grant_access", before)
@@ -502,7 +670,7 @@ class Resources(OwnerAPI):
         self.assertIn("needs max", bad({"repo:acme/web": {}}))
         self.assertIn("needs max", bad({"repo:acme/web": {"max": "read", "extra": 1}}))
         self.assertIn("needs max", bad({"repo:acme/web": {"guard": "money"}}))     # no mark: the grant authorizes
-        self.assertIn("up to 256", bad({f"tool:crm{i}": {"max": "use"} for i in range(257)}))
+        self.assertIn("up to 1024", bad({f"tool:crm{i}": {"max": "use"} for i in range(1025)}))
         # The good ones, including a resource that no agent holds yet.
         for pool in ({}, {"repo:acme/other": {"max": "write"}}, {f"secret:{KEY}": {"max": "read", "to": "workers"}},
                      {"drive:a@b.test": {"max": "write_shared"}}, {"tool:github": {"max": "use"}},
@@ -591,7 +759,7 @@ class Resources(OwnerAPI):
             self.assertEqual(repos(repo="acme/web", access={"shopper": "read"})[0], 200)
             self.assertEqual(repos(repo="acme/web", agent="shopper", level=None)[0], 200)
             self.assertEqual(repos(repo="acme/storefront", agent="lead", level=None)[0], 200)
-            self.assertEqual(self.stand("repo:acme/web", None)[0], 200)
+            self.assertEqual(self.stand("repo:acme/web", "default")[0], 200)
             self.assertEqual([a.get("repos") for a in self.committed()["agents"].values()], [None] * 4)
             self.assertNotIn("resources", self.committed())
             # with no standing and no holder, still no route to the owner for it
@@ -616,12 +784,22 @@ class Resources(OwnerAPI):
 
     # ---- Give on a card (the lane "Give on a card", 19 November 2026): an item for access carries its grant
 
+    def keep(self, rid):
+        """The owner's "Only you" on one resource, which keeps it theirs under the default (pool_default)."""
+        code, receipt = self.stand(rid, None)
+        self.assertEqual(code, 200, receipt)
+
     def give_card(self, **fields):
-        """The manager's item for access that names the agent that needs it: its id, or the refusal's words."""
-        said, error = hub.call_tool("manager", "raise_needs_you", dict(
-            {"title": "Let Dev write to acme/web", "why": "Its fix needs a push to acme/web.", "reason": "access",
-             "needs_access": "repo:acme/web", "needs_level": "write", "needs_agent": "dev",
-             "options": ["No: keep it read-only"]}, **fields))
+        """The manager's item for access that names the agent that needs it: its id, or the refusal's words. Under the
+        default a card is raised only for what stays the owner's (need_is_yours), so each named resource that the
+        default gives the manager is first kept as the owner's ("Only you")."""
+        fields = dict({"title": "Let Dev write to acme/web", "why": "Its fix needs a push to acme/web.",
+                       "reason": "access", "needs_access": "repo:acme/web", "needs_level": "write",
+                       "needs_agent": "dev", "options": ["No: keep it read-only"]}, **fields)
+        for rid in (r.strip() for r in str(fields["needs_access"]).split(",")):
+            if (hub.resource_standing(rid) or {}).get("by") == "default":
+                self.keep(rid)
+        said, error = hub.call_tool("manager", "raise_needs_you", fields)
         return said if error else int(said.split("N-")[1].split(".")[0])
 
     def test_give_on_a_card_gives_its_repository_at_the_press_and_never_lowers_a_level(self):
@@ -727,9 +905,10 @@ class Resources(OwnerAPI):
     def test_only_a_press_of_give_on_the_mac_or_a_pc_gives(self):
         """A phone shows no Details, so its press gives nothing and answers nothing; Give's words typed give nothing
         either; and a card whose agent left the fleet closes, at a press and by itself."""
-        nid, before = self.give_card(), self.commits()
+        nid = self.give_card()
         mail = self.give_card(title="Let Lead answer support@shop.test", why="It answers that mail.", options=None,
                               needs_access="gmail:support@shop.test", needs_level="send", needs_agent="lead")
+        before = self.commits()
         with patch.object(hub, "owner_device_at", lambda address: "phone" if address == "100.64.0.9" else None), \
                 patch.object(hub, "owner_device_class", lambda device: "iPhone" if device == "phone" else None):
             for card in (nid, mail):        # a repository, and a mailbox (F6 piece 2)
@@ -781,7 +960,10 @@ class Resources(OwnerAPI):
                       f"support@shop.test (gmail:support@shop.test) now",
                       hub.q1("SELECT text FROM events WHERE agent='manager' AND text LIKE '[hub] The owner pressed%' "
                              "ORDER BY id DESC LIMIT 1")["text"])
-        # what one press cannot give makes no item, and no refusal sends the manager to write the owner's steps
+        # what one press cannot give makes no item, and no refusal sends the manager to write the owner's steps; the
+        # owner keeps what the default gives first (give_card), since that write reads the team file again
+        for rid in ("tool:jobs", "drive:support@shop.test"):
+            self.keep(rid)
         hub.TEAM["agents"]["shopper"]["google"] = {"drive": {"account": "old@shop.test", "level": "read"}}
         rows = hub.q1("SELECT COUNT(*) n FROM needs")["n"]
         for fields, words in (
@@ -826,6 +1008,7 @@ class Resources(OwnerAPI):
         # an MCP server with no key, at its one level
         tool = self.give_card(**dict(mail, needs_agent="lead", needs_access="tool:github", needs_level=None,
                                      title="Let Lead use GitHub's MCP server"))
+        before = self.commits()                 # give_card kept it as the owner's first, a commit of its own
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (tool,)))
         self.assertEqual((need["options"][0], need["todo"]), ("Give Lead use of the MCP server GitHub",
                                                               "Press Give: it gives Lead use of the MCP server "

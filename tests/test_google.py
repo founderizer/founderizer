@@ -314,6 +314,10 @@ class FakeGoogle:
     def gmail_trash(self, access, message_id, trash=True):
         self.note("gmail_trash", access, message_id, trash)
 
+    def gmail_system_labels(self, access, message_id):
+        self.note("gmail_system_labels", access, message_id)
+        return {"SENT"} if message_id.startswith("sent") else {"DRAFT"} if message_id.startswith("draft") else {"INBOX"}
+
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite([case(name) for case in (GoogleHub, DriveFolders, ConnectThroughTheStandIn, SealAtStart)
@@ -2841,6 +2845,13 @@ class GoogleHub(OwnerAPI):
                                  ("gmail_trash", (ACCESS + "1", "m1", True)), ("gmail_trash", (ACCESS + "1", "m2", True))])
         self.assertIn("taken out of the trash", self.ok("gmail_label", {"request_id": str(uuid.uuid4()),
                                                                         "message_ids": ["m1"], "trash": False}))
+        # What the account sent or drafted stays where the owner reads it (the Door area's read of the pool default):
+        # bug, an agent with gmail write hides a mail that it sent
+        before = len([c for c in self.fake.calls if c[0] == "gmail_trash"])
+        said = self.refused("gmail_label", {"request_id": str(uuid.uuid4()), "message_ids": ["m1", "sent-9", "draft-2"],
+                                            "trash": True})
+        self.assertIn("sent-9, draft-2: a message that the account sent, or a draft, does not go to the trash", said)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "gmail_trash"]), before)
 
     def test_the_title_of_a_send_whose_outcome_is_not_known_keeps_no_part_of_a_login(self):
         """The task keeps an unknown send's title, with its subject cut at 120 characters where no login can be cut in
@@ -3310,16 +3321,19 @@ class DriveFolders(GoogleHub):
         return json.loads((self.root / "kit" / "team.json").read_text())
 
     def test_the_manager_gives_a_folder_only_of_an_account_of_its_pool(self):
-        """Bug: a folder is given although its account has no standing in the pool, or the hub asks Google about a
-        folder of an account that the manager may not give."""
+        """Bug: a folder is given although the owner keeps its account, or the hub asks Google about a folder of an
+        account that the manager may not give."""
+        for account in (EMAIL, EMAIL2):     # their "Only you": under the default (1.328) a connected Drive is the manager's
+            code, data = self.owner("/ui/resources", base_sha256=self.sha(), resource=f"drive:{account}", policy=None)
+            self.assertEqual(code, 200, data)
         said, refused = self.grant(folder=REPLIES, level="read")
         self.assertTrue(refused, said)
-        self.assertIn("is not in the grantable pool", said)
+        self.assertIn("only the owner gives it", said)
         self.assertNotIn("drive_file", self.fake.names())           # no read of Google for it
         self.pool()
         self.connected(email=EMAIL2, refresh=REFRESH2)
         said, refused = self.grant(account=EMAIL2, folder=REPLIES, level="read")
-        self.assertIn("is not in the grantable pool", said)
+        self.assertIn("only the owner gives it", said)
         said, refused = self.grant(account="", folder=REPLIES, level="read")
         self.assertTrue(refused, said)
         self.assertNotIn("drive_file", self.fake.names())

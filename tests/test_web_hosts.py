@@ -289,7 +289,7 @@ class Hub(test_shell_box.Fleet):
     def test_the_owner_gives_an_agent_whose_shell_box_is_off_a_host_list(self):
         before, text = self.started()
         self.assertEqual(before, {"runtime": "claude", "version": hub.CLOSED_TESTED, "built_ins": ["WebSearch"],
-                                  "servers": None})
+                                  "servers": []})
         self.assertNotIn("host list", text)
         self.assertFalse(any("web pages" in fact for fact in hub.colleague_facts("desk")))
         # a conversation of such an agent is always closed: it has no web tool, so no start of one names a list
@@ -312,7 +312,7 @@ class Hub(test_shell_box.Fleet):
         hub.TEAM["settings"]["conversations.closed_version"] = outside
         shell_off, text = self.started()
         self.assertEqual(shell_off, {"runtime": "claude", "version": PROVED, "built_ins": ["WebSearch", "WebFetch"],
-                                     "servers": None, "web_hosts": HOSTS})
+                                     "servers": [], "web_hosts": HOSTS})
         self.assertIn(f" Your page reads (WebFetch) open only on the hosts of your host list: {WORDS}. A page on "
                       f"another host does not open, also when a web search names it or a listed page sends you to it "
                       f"(only a listed host's own www. name opens that way): do not try another address for it. Web "
@@ -334,7 +334,7 @@ class Hub(test_shell_box.Fleet):
         hub.TEAM["settings"]["conversations.closed_version"] = outside
         review = self.duty(watch=[{"kind": "clock", "schedule": test_shell_box.EVERY}], tools=["remember"])
         shell_off, text = self.started(responsibility=review["id"])
-        self.assertEqual(shell_off, {"runtime": "claude", "version": outside, "built_ins": [], "servers": None})
+        self.assertEqual(shell_off, {"runtime": "claude", "version": outside, "built_ins": [], "servers": []})
         self.assertNotIn("host list", text)
         ticket = self.duty(watch=[{"kind": "clock", "schedule": test_shell_box.EVERY}], tools=["WebSearch"])
         self.assertEqual(self.started(responsibility=ticket["id"])[0]["built_ins"], ["WebSearch", "WebFetch"])
@@ -344,7 +344,7 @@ class Hub(test_shell_box.Fleet):
         self.assertEqual((code, data["changed"]), (200, [{"field": "web_hosts", "before": HOSTS, "after": []}]))
         self.assertNotIn("web_hosts", self.stored())
         self.assertEqual(self.started()[0], {"runtime": "claude", "version": hub.CLOSED_TESTED,     # as before
-                                             "built_ins": ["WebSearch"], "servers": None})
+                                             "built_ins": ["WebSearch"], "servers": []})
         self.assertFalse(any("web pages" in fact for fact in hub.colleague_facts("desk")))
 
     def test_a_host_list_is_refused_where_no_session_can_be_held_to_it(self):

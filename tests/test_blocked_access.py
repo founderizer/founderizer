@@ -243,6 +243,7 @@ class BlockedAccess(OwnerAPI):
     # ---- the three routes, read at the moment the requester sees them
 
     def test_the_manager_reads_which_of_the_three_it_is(self):
+        self.stand(WEB, None)       # the owner's "Only you": ops holds it, so the default would give it (pool_default)
         tid = self.task_for("dev")
         self.ask("dev", tid, needs_access=WEB)
         told = self.said_to("manager")
@@ -251,12 +252,13 @@ class BlockedAccess(OwnerAPI):
         self.assertIn("Held now by ops (write): ops can do this part of the work, or answer the question from it: "
                       "give that part to ops with create_task.", told)      # ask the one that holds it
         self.assertNotIn("Needs-you", told)     # the owner, 29 October 2026: an agent holds it, so he is not asked
+        self.assertNotIn("grant_access(", told)     # the owner keeps it: no grant for the manager to make
         self.assertIn("ACCESS NEEDED: dev needs the GitHub repository acme/web", self.ok("manager", "see_team", {}))
 
         self.stand(WEB, {"max": "write"})                   # the owner makes it grantable, and only that changes
-        self.assertIn('grant_access(agent="dev", resource="repo:acme/web", level="write") settles it. The grant '
-                      'reaches its next session, so restart_task then starts this task again in a session that has it.',
-                      self.ok("manager", "see_team", {}))
+        self.assertIn('grant_access(agent="dev", resource="repo:acme/web", level="read") settles it, or the level '
+                      'that the work needs, up to write. The grant reaches its next session, so restart_task then '
+                      'starts this task again in a session that has it.', self.ok("manager", "see_team", {}))
 
         # A standing whose thing left team.json: the manager is told so, never sent to a tool that would refuse it.
         hub.TEAM["resources"] = {GONE: {"max": "use"}}
@@ -268,7 +270,7 @@ class BlockedAccess(OwnerAPI):
         tid = self.task_for("dev")
         self.ask("dev", tid, needs_access=BILLING)
         told = self.said_to("manager")
-        self.assertIn("The owner set no standing for it and no agent holds it, so the manager cannot give it: raise a "
+        self.assertIn("It stays the owner's to give and no agent holds it, so the manager cannot give it: raise a "
                       "Needs-you item and say what the work needs it for.", told)
         self.assertNotIn("Held now by", told)
         self.assertNotIn("grant_access", told)
@@ -337,9 +339,9 @@ class BlockedAccess(OwnerAPI):
         self.ok("dev", "report_progress", {"note": "I read the shop's pages."}, tid)
         self.ask("dev", tid, "The fix is written. May I push it?", needs_access=WEB)
         qid = hub.q1("SELECT id FROM questions ORDER BY id DESC LIMIT 1")["id"]
-        self.assertIn('grant_access(agent="dev", resource="repo:acme/web", level="write") settles it. The grant '
-                      'reaches its next session, so restart_task then starts this task again in a session that has '
-                      'it.', self.said_to("manager"))
+        self.assertIn('grant_access(agent="dev", resource="repo:acme/web", level="read") settles it, or the level '
+                      'that the work needs, up to write. The grant reaches its next session, so restart_task then '
+                      'starts this task again in a session that has it.', self.said_to("manager"))
         # The access comes first: a restart before the grant is refused, and it names the thing that is missing.
         self.assertEqual(self.restart(tid)[0],
                          f"T-{tid} waits at Q-{qid} for the GitHub repository acme/web (repo:acme/web), and dev does "

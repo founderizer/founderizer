@@ -794,13 +794,13 @@ class ModelAccounts(OwnerAPI):
         team["logins"][other] = {"title": "Pooled key", "kind": "api_key", "env": "POOLED_API_KEY"}
         hub.commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(), "Owner added a key")
         hub.apply_team(team)
+        # a key that only the vault's pool holds is no refusal: the default pools each secret (pool_default), and once
+        # an account names it, it is the fleet's alone, so the owner's Mac unpools it at its next round
         hub.CENTRAL["status"] = {"pool": [other]}
-        code, said = self.account("box", provider="own", title="Box", kind="server",
-                                  address="https://models.example.com", secret=other)
-        self.assertEqual((code, said["error"]), (409, hub.ACCOUNT_WORDS["pooled"]))
-        hub.CENTRAL["status"] = {"pool": []}
         self.assertEqual(self.account("box", provider="own", title="Box", kind="server",
                                       address="https://models.example.com", secret=other)[0], 200)
+        self.assertEqual(hub.resource_kept(f"secret:{other}"), "fleet")
+        hub.CENTRAL["status"] = {"pool": []}
         # 2. validate_team refuses a resources entry for a secret that an account names.
         self.assertEqual(self.refused(lambda t: t.update(resources={f"secret:{GEMINI_KEY}": {"max": "use"}})),
                          hub.ACCOUNT_WORDS["resource"].format(rid=f"secret:{GEMINI_KEY}", aid="gemini"))

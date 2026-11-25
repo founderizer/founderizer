@@ -2030,6 +2030,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mcp_find",          # the same answers: Find a server, POST /ui/mcp/find over the official MCP Registry
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
+               # owner API 1.328: the manager gives each resource that the fleet holds by default (resource_standing),
+               # and GET /ui/vault's standing.due names the pool statements that the owner's app signs for it
+               "pool_default",
                "steer_files",       # the owner, 19 November 2026 ("Yes, build it" to the pictures of the file "+" on a
                                     # task's guidance box): POST /ui/tasks/<id>/steer takes `attachments` (owner API
                                     # 1.223), and each task of GET /ui/state says from_conversation (UI-API.md 1.231)
@@ -14535,9 +14538,11 @@ def access_route(asker, rid, requester, want=None, restarts=None):
     mine = next((h["level"] for h in held if h["agent"] == asker), None)
     enough = level_at_least(kind, mine, want)
     others = [h for h in held if h["agent"] != asker]
-    top = (resource_pool().get(rid) or {}).get("max")
+    top = resource_top(rid)
     # What the grant would have to give: the level the task named, else as much as the owner allows.
-    level = want or top
+    # the level that the task named, else the kind's lowest: never the top by itself (the Door area's read of the pool
+    # default, 24 November 2026: a worker that asked for gmail to read was told send)
+    level = want or (RESOURCE_LEVELS[kind][0] if top else None)
     refused = grant_check(asker, rid, level) if level else None
     manager = role_of(requester) == "manager"
     own = restarts in (None, requester)
@@ -14621,8 +14626,11 @@ def access_route(asker, rid, requester, want=None, restarts=None):
             out.append(moved.strip())
         return " ".join(out)
     if not enough and level and not refused:
+        # a level that the ask did not name is the kind's lowest, which may not be the work's (a push needs write): the
+        # words say so (the coordinator's validator's N4 on the pool default)
+        needs = "" if want else f", or the level that the work needs, up to {top}"
         out.append((f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
-                    f'level="{level}") settles it. The grant reaches its next session, so ' +
+                    f'level="{level}") settles it{needs}. The grant reaches its next session, so ' +
                     ("restart_task then starts this task again in a session that has it." if own else
                      f"{restarts}, its requester, then starts it again with restart_task.")) if manager else
                    f"It is in the grantable pool, up to {top}, and only the manager gives it.")
@@ -14634,7 +14642,7 @@ def access_route(asker, rid, requester, want=None, restarts=None):
             out.append(f'One more folder of it is yours to give, up to {top}: grant_access(agent="{asker}", '
                        f'resource="{rid}", level="{level}", folder="<the folder\'s link>"), and then {restart}.')
     elif not enough and not others:
-        out.append("The owner set no standing for it and no agent holds it, so the manager cannot give it" +
+        out.append("It stays the owner's to give and no agent holds it, so the manager cannot give it" +
                    (": raise a Needs-you item and say what the work needs it for." if manager else "."))
     if not enough and not manager and not in_team:
         out.append(f"Pass the question up with answer(..., pass_up=true): once it is settled, {restart}.")
@@ -17157,7 +17165,7 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
     # owner feature resource_grants: beside what each agent holds, what the manager may give it. Access is part of
     # suitability, so the choice of an agent and the grant that would make it suitable are read in one place.
     return {"time": t0, "stale_after": USAGE_STALE, "accounts": accounts_out, "agents": out,
-            "resources": grant_pool([a["agent"] for a in out])}
+            "resources": grant_pool([a["agent"] for a in out]), "resource_default": grant_default()}
 
 
 def gb(size):
@@ -17303,17 +17311,29 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
         out.append(f"  {machine} ({names_here or 'no agent'}): " + (", ".join(parts) or "no reading") + "." +
                    (f" Read {span(t0 - load['at'])} ago." if parts and t0 - load["at"] >= 60 else ""))
     if not restricted:          # grant_access is the manager's; a lead reads capacity to choose, not to grant
-        pool = view.get("resources") or []
-        out.append("GRANTABLE POOL (what you may give with grant_access; the owner sets each standing in the app)")
+        pool, default = view.get("resources") or [], view.get("resource_default")
+        # the same plain sentence as rules/manager.md (the coordinator's point of 25 November 2026): a profile from
+        # before the default says "only what the owner has put in the pool", and this heading must not say so too
+        out.append("GRANTABLE POOL (what you may give with grant_access: each thing that the fleet holds, by the owner's "
+                   "default; their own level on a row only widens or narrows it)")
+        if default:         # owner feature pool_default: every resource that the fleet holds, as one rule
+            top = ", ".join(f"{RESOURCE_WORDS[k]} {lvl}" for k, lvl in default["top"].items())
+            out.append(f"  By default: each resource that the fleet holds, to any worker or lead, up to {top}. Give it "
+                       f"yourself: the owner is asked only for what stays the owner's below, and for deploy of a "
+                       f"repository or send of a Gmail, which come only with their own level on its row.")
         for p in pool:
             held = ", ".join(f"{n} {lvl}" for n, lvl in p["held_by"].items()) or "no agent"
-            out.append(f"  {p['resource']} ({p['title']}): up to {p['max']}, to " +
+            out.append(f"  {p['resource']} ({p['title']}): the owner's own level, up to {p['max']}, to " +
                        "any worker or lead" +
                        f". Held by {held}. You may give it to: {', '.join(p['eligible']) or 'nobody here'}.")
-        if not pool:
+        for k in (default or {}).get("kept") or []:
+            out.append(f"  {k['resource']} ({k['title']}): {k['why']}. Give the work to an agent that holds it, else "
+                       f"ask with raise_needs_you and say what the work needs it for.")
+        if not pool and not default:
             out.append("  none. Every resource is the owner's to give until it makes one grantable: ask with "
-                       "raise_needs_you, and say what the work needs it for. A key or a login the fleet does not "
-                       "hold at all: request_secret, and the owner types it into the vault.")
+                       "raise_needs_you, and say what the work needs it for.")
+        out.append("  A key or a login the fleet does not hold at all: request_secret, and the owner types it into the "
+                   "vault.")
     # The caller's own account is in none of the blocks above: it reads the capacity of the agents it may give work
     # to, and it is not one of them. Its own allowance is what every one of those placements costs a turn of, so it
     # belongs in the tool it calls before each one -- said as its own spending and not as a fact about an agent.
@@ -18635,20 +18655,34 @@ def t_hand_over(agent, a):
     return helper_job(agent, tid, "handover", a.get("login"), to)
 
 
-def need_is_yours(agent, *texts):
+def need_is_yours(agent, *texts, level=None):
     """The refusal of a Needs-you item that asks the owner for something this manager may already give, or None. The
     owner's own rule is that a grant is the authorization and the manager answers for giving it; that rule only works
     if the owner is never asked for what he has already delegated."""
     import door_targets
+    if level in ("value", "placeholder"):
+        return None         # a new value of a key, or its placeholder: no grant gives it (card_access routes it)
     blob = " ".join(t for t in texts if t).lower()
     words, services = re.sub(r"\S+@\S+", " ", blob), None      # its words without addresses: x@gmail.com is no Gmail
-    for rid, entry in sorted(resource_pool().items()):
+    # its words without the resource ids that it names: drive:a@b.test names no Gmail of a@b.test, so a short name
+    # counts only where it stands alone (the default makes each held resource the manager's, pool_default)
+    loose = re.sub(rf"\b(?:{'|'.join(sorted(RESOURCE_LEVELS))}):\S+", " ", blob)
+    # each resource that the owner's page shows (resource_ids), with the standing that counts (pool_default)
+    for rid in resource_ids(TEAM, google_services_now()[0]):
         kind, what = resource_parts(rid)
-        if not kind or not entry.get("max") or not resource_known(kind, what, TEAM):
+        if not kind or rid not in blob and not (len(what) >= 4 and what in loose):
             continue
+        entry = resource_standing(rid) or {}
+        if not entry.get("max") or not resource_known(kind, what, TEAM):
+            continue
+        levels = RESOURCE_LEVELS[kind]
+        if level in levels and levels.index(level) > levels.index(entry["max"]):
+            continue        # deploy or send above the default: the owner's own level, so the card is theirs
         if kind == "repo" and door_targets.vendor(what):
             continue        # a standing from before: grant_check refuses each grant of it (vendor_repo_check)
-        if rid not in blob and not (len(what) >= 4 and what in blob):
+        if kind == "repo" and team_repo_owner_step(what):
+            # no GitHub App reaches it: a grant gives no token, and the owner connects GitHub or adds it to the App, as
+            # card_access lets such a card up (the coordinator's validator on the pool default, 25 November 2026)
             continue
         if kind in ("drive", "gmail"):
             # The owner's Connect of a service that the account does not allow is what such an item asks for, and no
@@ -18665,9 +18699,11 @@ def need_is_yours(agent, *texts):
         who = [n for n in agents() if grant_fits(n, entry) and agent_active(n)]
         if not who:
             continue
+        give = level if level in RESOURCE_LEVELS[kind] and grant_check(who[0], rid, level) is None else \
+            RESOURCE_LEVELS[kind][0]       # the level that the item asked for, else the lowest: never the top by itself
         return (f"That is yours to give; use grant_access. This item names {resource_phrase(kind, what)} ({rid}), "
-                f"which the owner made grantable up to {entry['max']}: "
-                f'grant_access(agent="{who[0]}", resource="{rid}", level="{entry["max"]}") settles it for '
+                f"which you may give up to {entry['max']}: "
+                f'grant_access(agent="{who[0]}", resource="{rid}", level="{give}") settles it for '
                 f"{', '.join(who)}. The owner is asked only for what the fleet does not hold at all. If this item is "
                 f"not about who may use it, raise it again without naming {rid}.")
     return None
@@ -19354,13 +19390,13 @@ def card_access(words, level):
         return (f"Not raised: {', '.join(h['agent'] + ' (' + h['level'] + ')' for h in held)} holds "
                 f"{resource_phrase(kind, what)} ({rid}) already. Give that part of the work to it with create_task: "
                 f"the owner is not needed. If the work needs more than that level, give needs_level.{value}")
-    top = (resource_pool().get(rid) or {}).get("max")
+    top = resource_top(rid)
     if kind == "drive" and drive_folders_held(what, active=True):
         return None         # the item can be about an agent that holds folders of it: only the owner widens them
     for name in sorted(agents()):
         if not (agent_active(name) and role_of(name) in ("worker", "lead")):
             continue
-        for lv in [want] if want else [top] if top else list(RESOURCE_LEVELS[kind]):
+        for lv in [want] if want else [RESOURCE_LEVELS[kind][0]] if top else list(RESOURCE_LEVELS[kind]):
             try:
                 if grant_check(name, rid, lv) is None:
                     return (f'Not raised: {resource_phrase(kind, what)} ({rid}) is yours to give: grant_access('
@@ -20541,9 +20577,14 @@ def t_raise_needs_you(agent, a):
         raise ToolError(secret)
     # The item about a server's key swap names that server, which a manager may give to an agent: it asks for the
     # owner's word on the vault there, and for no access. So does the hub's step of a runtime's sign-in.
-    mine = None if key_swap_server is not None or sign_in else need_is_yours(agent, title, why, todo)
-    if mine:
-        raise ToolError(mine)
+    # Only an item about who may use a resource: since the default pools each resource that the fleet holds, a door
+    # card, or a decision or a person's step whose words only name a held repository, would be refused as a grant (the
+    # Needs-you area's survey of 24 November 2026: N-202 named a held argocd repository).
+    about_access = str(a.get("reason") or "").strip().lower() == "access" or a.get("needs_access") not in (None, "")
+    # An item that names its thing in needs_access is about that thing alone: its other words are its reasons, and a
+    # held resource that they name by its short name ("the GitHub App" beside the GitHub MCP server) is no grant that
+    # it asks for (the pool default's test run of 25 November 2026)
+    asked = str(a.get("needs_access") or "").strip()
     guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
     # A card is the manager's last step: the hub's own kinds (the door's, an App's, a phone's, an App key's and a key
     # swap's) carry their reason, and every other item names its own, which the hub checks.
@@ -20559,6 +20600,13 @@ def t_raise_needs_you(agent, a):
         raise ToolError(CARD_ROUTE_REFUSAL)     # the door's card shows the call that the owner's yes lets through
     # a runtime's sign-in is a person's step, in the hub's own words, which card_reason would read as the manager's
     reason = "person" if sign_in else None if fixed else card_reason(a, title, why, todo, listed)
+    # after card_reason's own access check (card_access), whose words come first: an agent that holds it does that
+    # part, and the door's refusal of the product's own repositories stands, also where the default gives the rest
+    mine = None if key_swap_server is not None or sign_in or not about_access else \
+        need_is_yours(agent, *((asked,) if asked else (title, why, todo)),
+                      level=str(a.get("needs_level") or "").strip().lower() or None)
+    if mine:
+        raise ToolError(mine)
     ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
     recommended = need_recommended(a.get("recommended"), listed, give=give is not None)
     if recommended and not listed:          # the free words get every check that an option gets
@@ -21265,7 +21313,7 @@ def need_look_hints(r):
                      if e.get("kind") == "api_key" and spec.get("env") and e.get("env") == spec["env"]), None) \
             if spec.get("kind") == "api_key" and not spec.get("failed") else None
         # a grant releases no task that waits on the card: only the owner's answer, or the task's end, does
-        top = (resource_pool().get(f"secret:{have}") or {}).get("max") \
+        top = resource_top(f"secret:{have}") \
             if have and not spec.get("door") and not waiters else None
         if have and top:
             hints.append(f"the fleet's list holds {spec['env']} already, as {have}, in the grantable pool: "
@@ -22069,9 +22117,10 @@ def secret_route(ref, holders):
     """How the manager gives a secret of the catalog to the agent that needs it, in words: grant_access from the
     grantable pool, or the agent that holds it does that part of the work, or the owner gives it on the Secrets page."""
     rid = f"secret:{ref}"
-    top = (resource_pool().get(rid) or {}).get("max")
+    top = resource_top(rid)
     if top:
-        return f'grant_access(agent=..., resource="{rid}", level="{top}") gives it to an agent'
+        return (f'grant_access(agent=..., resource="{rid}", level="use") gives it to an agent ("read" where the work '
+                f'reads the value, up to {top})')
     if holders:
         return (f"it is not in the grantable pool, and {', '.join(holders)} {'holds' if len(holders) == 1 else 'hold'} "
                 f"it: give that part of the work to {holders[0]} with create_task")
@@ -22104,7 +22153,7 @@ def login_known(agent, site, account, worker, chat, tid):
             return (f"You hold a login for {host} already, as {own}: "
                     + ("open the work that needs it with start_task." if chat else "sign in with it.") + fails(own)
                     + other)
-    pool = {ref: (resource_pool().get(f"secret:{ref}") or {}).get("max") for ref, _ in found}
+    pool = {ref: resource_top(f"secret:{ref}") for ref, _ in found}
     holders = {} if chat else login_holders([ref for ref, _ in found if not pool[ref]])
     given = [(ref, user) for ref, user in found if pool[ref] or holders.get(ref)][:3]
     if not given:
@@ -22963,7 +23012,7 @@ def secret_answer_text(ref, entry, spec, worker=False, task=False):
     api = entry.get("kind") == "api_key"
     name = entry.get("env") or entry.get("title") or ref
     held = resource_holders("secret", ref)
-    top = (resource_pool().get(f"secret:{ref}") or {}).get("max")
+    top = resource_top(f"secret:{ref}")
     words = [f"Replaced the value of the API key {name} in the vault, under the same reference, {ref}."
              if api and spec.get("failed") == ref else
              f"Saved {'the API key' if api else 'the login'} {name} in the vault, as {ref}."]
@@ -23757,10 +23806,11 @@ def central_signatures(status):
     """({(reference, machine)}, {reference}) of a status answer: what the owner signed may reach a machine, by a grant
     to an agent there or by the secret's place in the grantable pool (vault.py sealable). The well-formed ones only;
     the central vault checks each seal itself, so this only spares it the asks it would refuse."""
-    granted = {(str(g["login"]).lower(), g["machine"]) for g in (status or {}).get("grants") or []
+    grants, pool = (status or {}).get("grants"), (status or {}).get("pool")
+    granted = {(str(g["login"]).lower(), g["machine"]) for g in (grants if isinstance(grants, list) else [])
                if isinstance(g, dict) and isinstance(g.get("login"), str) and BWS_REF.fullmatch(g["login"])
                and isinstance(g.get("machine"), str)}
-    pooled = {str(ref).lower() for ref in (status or {}).get("pool") or []
+    pooled = {str(ref).lower() for ref in (pool if isinstance(pool, list) else [])
               if isinstance(ref, str) and BWS_REF.fullmatch(ref)}
     return granted, pooled
 
@@ -23776,8 +23826,8 @@ def central_standing(status):
     (machine_secrets, central_plan), so held does not say that a copy goes there. A grant for the machine DOOR_PIN,
     the door's name in the central vault, is held while the door holds the secret (team.json door.secrets,
     save_door_grant), as the door's own delivery reads it (door_reconcile); the hub delivers to no server of that
-    name. A pooled secret is held while the hub's grantable pool has it (resource_pool), the owner's standing for the
-    manager to hand it out. So a rename on the same machine keeps a grant held, and a delete, a move or a take-back
+    name. A pooled secret is held while the standing that counts lets the manager hand it out (resource_top: the
+    owner's own level, else the default of pool_default), and not after their "Only you". So a rename on the same machine keeps a grant held, and a delete, a move or a take-back
     does not, unless another agent on that machine holds the secret. The hub signs nothing. Called with LOCK held."""
     if not isinstance(status, dict):
         return None
@@ -23786,7 +23836,6 @@ def central_standing(status):
         if isinstance(a.get("machine"), str):
             on.setdefault(a["machine"], set()).update(str(ref).lower() for ref in secret_grants(name))
     door = {str(ref).lower() for ref in ((TEAM.get("door") or {}).get("secrets") or [])}
-    pool = resource_pool()
     signed = status.get("grants") if isinstance(status.get("grants"), list) else []
     pooled = status.get("pool") if isinstance(status.get("pool"), list) else []
     grants = []
@@ -23797,8 +23846,43 @@ def central_standing(status):
         ref = g["login"].lower()
         held = ref in door if g["machine"] == DOOR_PIN else ref in on.get(g["machine"], ())
         grants.append({"login": ref, "agent": g["agent"], "machine": g["machine"], "held": held})
-    return {"grants": grants, "pool": [{"login": ref.lower(), "held": f"secret:{ref.lower()}" in pool}
-                                       for ref in pooled if isinstance(ref, str) and BWS_REF.fullmatch(ref)]}
+    return {"grants": grants, "pool": [{"login": ref.lower(), "held": resource_top(f"secret:{ref.lower()}") is not None}
+                                       for ref in pooled if isinstance(ref, str) and BWS_REF.fullmatch(ref)],
+            "due": central_pool_due(status)}
+
+
+def central_pool_due(status):
+    """The pool statements that the owner's app owes the central vault (owner feature pool_default, owner API 1.328):
+    {"login", "in": true} for each secret of the catalog that the standing that counts lets the manager give
+    (resource_top) and that the vault's signed pool lacks, and {"login", "in": false} for each secret of that pool that
+    is the owner's alone now. An end first, since it only narrows; then by reference. The app signs them under the hood
+    with the owner key, a few at each round, so a give of a secret of the default reaches its agent once the vault holds
+    that secret's pool statement. Called with LOCK held."""
+    _, pooled = central_signatures(status)
+    logins = TEAM.get("logins") or {}
+    wanted = {str(ref).lower() for ref in logins if BWS_REF.fullmatch(str(ref)) and resource_top(f"secret:{ref}")}
+    # a pool only for a vault that serves default_pool, and never over a signed unpool, which only the owner's own
+    # pool ends (vault.py refuses it as well)
+    unpooled = {str(ref).lower() for ref in status.get("unpooled") or [] if isinstance(ref, str)} \
+        if isinstance(status, dict) and status.get("default_pools") is True and \
+        isinstance(status.get("unpooled") or [], list) else None
+    # a name with no value in the vault: the vault refuses its default_pool, so it is owed none (it would come first in
+    # each round and hold the rest; the Door area's read); its unpool is reckoned with the whole wish, never this cut
+    stored = {str(ref).lower() for ref in status.get("stored") or [] if isinstance(ref, str)} \
+        if unpooled is not None and isinstance(status.get("stored"), list) else None
+    owed = (wanted if stored is None else wanted & stored) - pooled - (unpooled or set())
+    # an unpool also for a secret that is out of the catalog: the hub reads that as their removal (central_removals), and
+    # the vault removes no value that a pool names, so without it the value would stay sealable for good (the Door
+    # area's read); a removed name takes no value again, so that unpool costs nothing. Not while the hub runs on a
+    # team.json that breaks its own rules (team_problem): such a file can lack secrets that were never removed, and
+    # that unpool would last (the coordinator's validator)
+    out = pooled - wanted
+    if CFG.get("team_problem"):
+        catalog = {str(ref).lower() for ref in logins}
+        out &= catalog
+        owed = set()        # and no new pool from that file either: fail closed both ways (the Door area's read)
+    return ([{"login": ref, "in": False} for ref in sorted(out)] +
+            ([{"login": ref, "in": True} for ref in sorted(owed)] if unpooled is not None else []))
 
 
 def central_read(t0=None):
@@ -24170,6 +24254,8 @@ def central_removals(inventory, signed):
     only after its last copy left the machines. A machine whose vault cannot give a copy back keeps the secret in the
     central vault until it can. Called with LOCK held."""
     granted, pooled = signed
+    if CFG.get("team_problem"):
+        return []           # a team.json that breaks its own rules can lack secrets that were never removed
     left = inventory - set(logins()) - {ref for ref, _machine in granted} - set(pooled)
     for (_machine, ref), (d, w) in central_holdings().items():
         if ref in left and any(vault_holds(d, w)):
@@ -24417,7 +24503,8 @@ CENTRAL_SIGNATURE = re.compile(r"[A-Za-z0-9+/]{8,200}={0,2}")      # base64 of a
 
 
 CENTRAL_KINDS = ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool",     # the owner's signed statements
-                 "client-add", "client-end")            # and those of the list of their devices (F17, P1)
+                 "client-add", "client-end",            # and those of the list of their devices (F17, P1)
+                 "default_pool")        # owner feature pool_default: the app's pool for the default (vault.py)
 
 
 def statement_kind(statement):
@@ -24451,7 +24538,7 @@ def central_statement(body):
     hub's time when its call ended stays (signed_at), also for a call that failed: vault_view gives no `standing` of
     a status that the timers read before that time, because such a status can miss the statement (choice C50)."""
     kind = statement_kind(body["statement"])
-    grants = kind in ("grant", "ungrant", "pool", "unpool")
+    grants = kind in ("grant", "ungrant", "pool", "unpool", "default_pool")
     if grants:
         with CENTRAL_LOCK:
             CENTRAL["signing"] += 1
@@ -35324,6 +35411,55 @@ def profile_long_after(agent, sections, ask):
     return profile_long_words(agent, n)
 
 
+POOL_KEPT_SEEDED = "pool_default_kept"      # kv: the owner's "Only you" from before 1.328 is kept, once a database
+POOL_KEPT_TRIED = {"start": False}
+STANDING_SUBJECT = "Owner changed the standing of "     # save_resource's commit, by which the history names each rid
+
+
+def pool_default_keep_seed(t0):
+    """At the first pass of the timers of the release that brought the pool default (owner feature pool_default), one
+    time for each database: each resource whose standing the owner changed before (a commit "Owner changed the standing
+    of <rid>") and that has no entry now was their "Only you" then, when no entry meant that only they gave it. Under the
+    default no entry means the manager's, so it gets {"owner": true} (the coordinator's validator, 24 November 2026).
+    Outside LOCK (timers): its one git read, at most 30 seconds, holds nothing; a read that git does not answer now, or
+    a write that the configuration refuses, leaves it for the next start."""
+    if POOL_KEPT_TRIED["start"]:
+        return
+    POOL_KEPT_TRIED["start"] = True
+    rev = kit_revision(fresh=True) if not kv_get(POOL_KEPT_SEEDED) else None
+    if not rev:
+        return
+    try:
+        out = subprocess.run(["git", "-C", kit_dir(), "log", "--format=%s", rev, "--", "team.json"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if out.returncode != 0:
+        return
+    said = {line[len(STANDING_SUBJECT):].strip() for line in out.stdout.splitlines()
+            if line.startswith(STANDING_SUBJECT)}
+
+    def change(team):
+        pool, kept = dict(team.get("resources") or {}), False
+        for rid in sorted(said):
+            kind, what = resource_parts(rid)
+            if rid in pool or kind in (None, "server") or not resource_held(kind, what, team):
+                continue        # one that the fleet does not hold has no default to narrow: no row for it comes back
+            try:
+                pool[rid] = resource_entry(rid, {"owner": True}, team)
+            except ValueError:
+                continue            # a resource that the team no longer has
+            kept = True
+        if kept:
+            team["resources"] = dict(sorted(pool.items()))
+        return kept
+    try:
+        save_integration(None, change, 'The owner\'s "Only you" from before the default stays theirs (owner API 1.328)')
+    except Refusal:
+        return
+    kv_set(POOL_KEPT_SEEDED, str(int(t0)))
+
+
 def long_texts_seed(t0):
     """At the first pass of the timers of the release that brought a mark, one time for each database and each mark:
     one message to the manager that names each profile above PROFILE_LONG_MARK with its number (each one recorded,
@@ -37681,6 +37817,15 @@ def t_gmail_label(agent, a):
     if old:
         return google_receipt(agent, "gmail_label", a, old, t)
     access = google_access(email, "gmail")
+    if trash:
+        # what an agent sent or drafted stays where the owner reads it (the Door area's read of the pool default)
+        try:
+            own = [i for i in ids if google.gmail_system_labels(access, i) & {"SENT", "DRAFT"}]
+        except google.GoogleError as e:
+            raise ToolError(f"Gmail did not say what those messages are ({e}), so nothing went to the trash.") from None
+        if own:
+            raise ToolError(f"{', '.join(own)}: a message that the account sent, or a draft, does not go to the trash, "
+                            f"so that what was sent stays where the owner reads it. Leave them out.")
     command, old = google_begin(agent, "gmail_label", a, fields)
     if old:
         return google_receipt(agent, "gmail_label", a, old, t)
@@ -48405,15 +48550,163 @@ RESOURCE_NEEDS = {"secret": "a data source or a deploy route", "repo": "a reposi
                   "drive": "files", "gmail": "a mail account", "tool": "an MCP server",
                   "server": "a server to read or fix through the door"}
 RESOURCE_AUDIENCE = "workers"       # a policy's "to": its one audience, any worker or lead
-RESOURCE_LIMIT = 256                # entries of team.json "resources"
+RESOURCE_LIMIT = 1024               # entries of team.json "resources", their {"owner": true} ones included (pool_default)
 RESOURCE_HISTORY = 10               # grants of one resource that GET /ui/resources carries
 
 
 def resource_pool():
     """team.json "resources" (owner feature resource_grants): what the owner says about each thing it already holds, by
-    id. {"max", "to"}: the manager may hand it out, up to that level, to any worker or lead. An id without an entry is the
-    owner's to give, which is the default of every resource."""
+    id. {"max", "to"}: the manager may hand it out, up to that level, to any worker or lead; {"owner": true}: only the
+    owner gives it. What counts for an id is resource_standing, whose default covers an id with no entry."""
     return TEAM.get("resources") or {}
+
+
+# The default of every resource (owner feature pool_default; the owner, 24 November 2026: "I think the manager should be
+# able to do that!" and "yes, the goal is to minimize Needs you cards!"): the manager may give each resource that the
+# fleet holds, up to the default's top (DEFAULT_TOP), to any worker or lead, and the owner's entry only narrows it. What the fleet
+# itself runs on stays the owner's by this list, never by a guess (resource_kept): a secret whose variable is one of
+# Fleet's own keys (lifecycle.FLEET_KEYS: GH_TOKEN and the catalog tools' own keys), a secret that an account names
+# (account_secrets), one of the product's own repositories (door_targets.VENDOR_REPOS), and a server, which the owner's
+# app gives by its Tailscale tag. The vault's own keys, the release and tester signers and the owner's access keys are
+# files and Keychain items, never secrets of the catalog, so no grant reaches them.
+RESOURCE_KEPT = {"fleet": "the fleet runs on it, so only the owner gives it",
+                 "owner": "the owner keeps it, so only the owner gives it",
+                 # a key whose value moves money, as the central vault reads it (vault.py MONEY_KEYS; the supervisor's
+                 # decision of 24 November 2026: RULES.md keeps money with the owner): kept like their "Only you", which
+                 # their own level on its row opens
+                 "money": "it moves money, so only the owner gives it",
+                 # an MCP server with an OAuth sign-in acts as one of the owner's own accounts, and can send as it
+                 # (a mail or an automation server), which the default's Gmail write keeps from the manager
+                 "account": "it acts as an account of the owner's, so only the owner gives it"}
+
+
+# The default's top of the two kinds that act outward, one level below their own top (the supervisor's choice (B) of
+# 24 November 2026, after the Door area's read): a repository up to write, whose token has no workflows or actions
+# right, so GitHub refuses a change of .github/workflows; a Gmail up to write, drafts and labels, no send. The owner's
+# own level on a row opens deploy or send. A write still changes, and starts, what the repository's existing jobs run
+# (a push to their branch, a tag, a pull request or a comment that a job takes): VAULT.md limit 32.
+DEFAULT_TOP = {"repo": "write", "gmail": "write"}
+
+
+def default_top(kind):
+    """The default's top level of a kind (DEFAULT_TOP, else the kind's own top)."""
+    return DEFAULT_TOP.get(kind) or RESOURCE_LEVELS[kind][-1]
+
+
+def kept_word(why):
+    """The `kept` that the owner's page and the manager read: a key that moves money and an OAuth server are kept as
+    the owner's."""
+    return "owner" if why in ("money", "account") else why
+
+
+def vault_unpooled():
+    """The references that the central vault's last ok status names as taken out of its pool (an unpool, or a key that
+    moves money that came into a pooled value), in lower case: empty while the hub has read no such status."""
+    with CENTRAL_LOCK:
+        status = CENTRAL.get("status")
+    refs = status.get("unpooled") if isinstance(status, dict) else None
+    return {ref.lower() for ref in refs or [] if isinstance(ref, str)}
+
+
+def money_secrets():
+    """The references whose value moves money, in lower case, as the central vault's last ok status says (vault.py
+    MONEY_KEYS): empty while the hub has read no such status. The vault refuses a default_pool of each of them itself,
+    so a hub that is broken into and hides this list gets no such key pooled."""
+    with CENTRAL_LOCK:
+        status = CENTRAL.get("status")
+    refs = status.get("money") if isinstance(status, dict) else None
+    return {ref.lower() for ref in refs or [] if isinstance(ref, str)}
+
+
+def resource_kept(rid, team=None):
+    """Why this resource is the owner's alone to give, as a key of RESOURCE_KEPT: "fleet" by the list above, "owner"
+    by their own entry ({"owner": true}), "money" for a key whose value moves money (money_secrets) that their own level
+    has not opened, or None."""
+    import door_targets
+    from lifecycle import FLEET_KEYS
+    team = TEAM if team is None else team
+    kind, what = resource_parts(rid)
+    if kind == "server":
+        return "fleet"
+    if kind == "secret":
+        login = (team.get("logins") or {}).get(what) or {}
+        door = team.get("door") if isinstance(team.get("door"), dict) else {}
+        if login.get("env") in FLEET_KEYS or what.lower() in {str(ref).lower() for ref in account_secrets(team)} or \
+                what.lower() in {str(ref).lower() for ref in door.get("secrets") or []} or \
+                GITHUB_APP_KEY_NAME.fullmatch(str(login.get("env") or "")):
+            # Fleet's own keys, an account's key, a key of the door's (its providers and production settings: no
+            # agent's box gets its value, save_door_grant) and a GitHub App's key (the coordinator's validator)
+            return "fleet"
+    if kind == "repo" and door_targets.vendor(what):
+        return "fleet"
+    door = team.get("door") if isinstance(team.get("door"), dict) else {}
+    if kind == "repo" and what.lower() in {str(r).lower() for r in door.get("gitops") or {}}:
+        return "fleet"      # the door syncs it to a server (door_gitops): a direct token would go around its rules
+    if kind == "repo" and not door_made(what) and any(
+            a.get("servers") and what.lower() in {str(r).lower() for r in a.get("repos") or {}}
+            for a in (team.get("agents") or {}).values() if isinstance(a, dict)):
+        # a commit target of the door: a repository that an Operator (an agent that holds servers through the door)
+        # holds is a target of kind app or devops in the door's file (DoorAccess.operatorGitHub), whose commits the
+        # door checks (NEVER_PATHS: policy.hujson, .github/**, AGENTS.md); a direct write token would go around that
+        # (the Door area's read of the pool default). One that the door made stays as N3 gives it.
+        return "fleet"
+    entry = (team.get("resources") or {}).get(rid)
+    if isinstance(entry, dict) and entry.get("owner") is True:
+        return "owner"
+    if isinstance(entry, dict) and entry.get("max"):
+        # the owner's own level, which also opens a key that moves money or an OAuth server; but a key that moves money
+        # that came into the value that they pooled took it out of the vault's pool (vault.py intake): kept until they set
+        # its level again, which signs their pool
+        if kind == "secret" and what.lower() in money_secrets() and what.lower() in vault_unpooled():
+            return "money"
+        return None
+    if kind == "tool" and (tool_catalog(team).get(what) or {}).get("auth") == "oauth":
+        return "account"
+    if kind == "secret" and what.lower() in money_secrets():
+        return "money"
+    if kind == "secret" and what.lower() in vault_unpooled():
+        return "owner"      # the vault holds it out of its pool (their "Only you", a round's unpool): a give would wait
+    return None
+
+
+def resource_held(kind, what, team=None):
+    """True when the hub's own record shows that the fleet holds this resource, so the default can cover it: a secret
+    or an MCP server of the catalog, a repository that an agent holds or that the door made, a Google account that is
+    connected. An id that no record names stays the owner's to give, as before."""
+    team = TEAM if team is None else team
+    if kind == "secret":
+        return what in (team.get("logins") or {})
+    if kind == "tool":
+        servers = team.get("mcp") if isinstance(team.get("mcp"), dict) else {}
+        return what in tool_catalog(team) or what in servers
+    if kind == "repo":
+        return any(what.lower() == str(repo).lower() for a in (team.get("agents") or {}).values()
+                   for repo in (a.get("repos") or {})) or door_made(what)
+    if kind in ("drive", "gmail"):
+        return what in google_services_now()[0]
+    return False
+
+
+def resource_standing(rid, team=None):
+    """The standing that counts for one resource (owner feature pool_default): None where it is the owner's alone to
+    give (resource_kept); the owner's own entry {"max", "to", "by": "owner"}; else, for a resource that the fleet holds
+    (resource_held), the default {"max": default_top(kind), "to", "by": "default"}: a repository and a Gmail up to
+    write, each other kind up to its own top level."""
+    team = TEAM if team is None else team
+    kind, what = resource_parts(rid)
+    if not kind or resource_kept(rid, team):
+        return None
+    entry = (team.get("resources") or {}).get(rid)
+    if isinstance(entry, dict) and entry.get("max"):
+        return {"max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE), "by": "owner"}
+    if not resource_held(kind, what, team):
+        return None
+    return {"max": default_top(kind), "to": RESOURCE_AUDIENCE, "by": "default"}
+
+
+def resource_top(rid, team=None):
+    """The highest level of this resource that the manager may give now, or None (resource_standing)."""
+    return (resource_standing(rid, team) or {}).get("max")
 
 
 def resource_parts(rid):
@@ -48452,8 +48745,10 @@ def resource_entry(rid, entry, team, carried=()):
         raise ValueError(f"resource {rid!r}: a server is the owner's alone to give: their app gives each server to the "
                          f"DevOps agent of the business whose Tailscale tag it carries, or to the manager while the "
                          f"business has none, and no pool holds it")
+    if entry == {"owner": True}:
+        return {"owner": True}      # only the owner gives it (pool_default: their narrowing of the default)
     if not isinstance(entry, dict) or not entry or set(entry) - {"max", "to"}:
-        raise ValueError(f"resource {rid!r} needs max, with an optional to")
+        raise ValueError(f'resource {rid!r} needs max, with an optional to, or is {{"owner": true}}')
     levels = RESOURCE_LEVELS[kind]
     if entry.get("max") not in levels:
         raise ValueError(f"resource {rid!r}: max must be one of {', '.join(levels)}")
@@ -48566,13 +48861,14 @@ def resource_view(rid, team, accounts):
     that each Google account allows now (google_services), so a Drive or Gmail service is connected only when its
     account allows it."""
     kind, what = resource_parts(rid)
-    entry = (team.get("resources") or {}).get(rid) or {}
+    standing = resource_standing(rid, team)     # the owner's own, or the default (owner feature pool_default)
     uses, credential = resource_uses(kind, what, team)
     ready = True if kind not in ("drive", "gmail") else kind in accounts.get(what, ())
     return dict({"id": rid, "kind": kind, "what": what, "title": resource_title(kind, what, team),
                  "needs": RESOURCE_NEEDS[kind], "levels": list(RESOURCE_LEVELS[kind]), "uses": uses,
                  "credential": credential, "connected": ready,
-                 "grant": {"max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE)} if entry.get("max") else None,
+                 "grant": standing and {"max": standing["max"], "to": standing["to"], "by": standing["by"]},
+                 "kept": kept_word(resource_kept(rid, team)),
                  "holders": resource_holders(kind, what, team), "history": resource_history(rid)},
                 **({"folders": drive_folders_view(what, team, ready)} if kind == "drive" else {}))
 
@@ -48671,10 +48967,11 @@ def resources_view(team):
 
 
 def save_resource(body):
-    """One owner change of team.json "resources": the standing of one resource, or None, which takes the entry out.
-    The owner's own grants do not change with it; only who may hand this resource out. A new standing of one of the
-    product's own repositories is refused, as grant_check would refuse each grant from it; one from before can be
-    taken out, and validate_team keeps it."""
+    """One owner change of team.json "resources": the standing of one resource. None ("Only you" on the owner's page)
+    keeps it for the owner as {"owner": true}, so that it stays theirs under the default (owner feature pool_default);
+    "default" takes the entry out, so the default counts again. The owner's own grants do not change with it; only who
+    may hand this resource out. A new standing of one of the product's own repositories is refused, as grant_check would
+    refuse each grant from it; one from before can be taken out, and validate_team keeps it."""
     import door_targets
     rid, policy = body["resource"], body["policy"]
     kind, what = resource_parts(rid)
@@ -48682,13 +48979,16 @@ def save_resource(body):
     def change(team):
         pool = dict(team.get("resources") or {})
         try:
-            entry = resource_entry(rid, policy, team) if policy is not None else None
+            entry = None if policy == "default" else resource_entry(rid, {"owner": True} if policy is None else policy,
+                                                                    team)
         except ValueError as e:
             raise Refusal(400, str(e)) from None
         if pool.get(rid) == entry or (entry is None and rid not in pool):
             return False
-        if entry is not None and kind == "repo" and door_targets.vendor(what):
+        if entry is not None and entry.get("max") and kind == "repo" and door_targets.vendor(what):
             raise Refusal(400, code="repo_vendor", names={"repo": what})
+        if entry is not None and entry.get("max") and resource_kept(rid, team) == "fleet":
+            raise Refusal(400, f"{resource_phrase(kind, what)}: {RESOURCE_KEPT['fleet']}")
         if entry is None:
             pool.pop(rid, None)
         else:
@@ -48699,7 +48999,7 @@ def save_resource(body):
             team.pop("resources", None)
         return True
     result = save_integration(body["base_sha256"], change, f"Owner changed the standing of {rid}")
-    entry = resource_pool().get(rid)
+    entry = resource_standing(rid)
     if result["changed"]:
         said = f"you may give it to {entry['to']}, at most {entry['max']}" if (entry or {}).get("max") else \
             "only the owner gives it now"
@@ -48758,13 +49058,34 @@ def grant_pool(names, team=None):
             services = google_services_now()[0] if services is None else services      # one read for the pool
             if kind not in services.get(what, ()):
                 continue        # grant_check refuses it: the account does not allow that service now
+        if resource_kept(rid, team):
+            continue        # the fleet runs on it: its entry from before gives nothing (resource_kept)
         pool.append({"resource": rid, "kind": kind, "title": resource_title(kind, what, team),
-                     "max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE),
+                     "max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE), "by": "owner",
                      "levels": list(RESOURCE_LEVELS[kind]),
                      "eligible": [n for n in names if grant_fits(n, entry, team) and
                                   not (kind == "drive" and drive_grant(n, team)[2])],
                      "held_by": {h["agent"]: h["level"] for h in resource_holders(kind, what, team)}})
     return pool
+
+
+def grant_default(team=None):
+    """see_capacity's resource_default (owner feature pool_default): the default of each resource that the fleet holds
+    and that has no entry of the owner's, as one rule and not one row each (a fleet holds hundreds), and each resource
+    that stays the owner's alone, with why (resource_kept)."""
+    team = TEAM if team is None else team
+    kept = []
+    for rid in resource_ids(team, google_services_now()[0]):
+        why = resource_kept(rid, team)
+        if why:
+            kind, what = resource_parts(rid)
+            kept.append({"resource": rid, "title": resource_title(kind, what, team), "kept": kept_word(why),
+                         "why": RESOURCE_KEPT[why]})
+    return {"to": RESOURCE_AUDIENCE, "top": {kind: default_top(kind) for kind in RESOURCE_LEVELS if kind != "server"},
+            "words": "You may give each resource that the fleet holds to a worker or a lead with grant_access, up to "
+                     "the default's top of its kind (top), unless resources gives the owner's own level for it or kept "
+                     "names it. Deploy of a repository and send of a Gmail come only with the owner's own level.",
+            "kept": kept}
 
 
 def grant_check(agent, rid, level, folder=False):
@@ -48802,8 +49123,8 @@ def grant_check(agent, rid, level, folder=False):
                 f"tag to that business's DevOps agent, by itself. Give the work on {what} to the agent that holds it, "
                 f"which does it through the door, and raise no Needs-you item that asks the owner to do the step by "
                 f"hand.")
-    entry = resource_pool().get(rid) or {}
-    if not entry.get("max") and kind == "repo" and door_made(what):
+    entry = resource_standing(rid) or {}
+    if entry.get("by") != "owner" and not resource_kept(rid) and kind == "repo" and door_made(what):
         # new-projects plan N3: a repository that the door made is the manager's to give, up to write, to an agent that
         # holds no server through the door; its workflow files go through the door, and nobody gets deploy there
         if a.get("servers"):
@@ -48826,6 +49147,10 @@ def grant_check(agent, rid, level, folder=False):
             return (f"{phrase[0].upper() + phrase[1:]} is not in the grantable pool, so you cannot give it, and "
                     f"{', '.join(held)} {'holds' if len(held) == 1 else 'hold'} it: give that part of the work to "
                     f"{held[0]} with create_task. The owner is asked only for what no agent holds.")
+        kept = resource_kept(rid)
+        if kept:
+            return (f"You cannot give {phrase}: {RESOURCE_KEPT[kept]}. Ask the owner with raise_needs_you to grant it "
+                    f"once, and say what the work needs it for.")
         return (f"{phrase[0].upper() + phrase[1:]} is not in the grantable pool, so you cannot give it. Ask "
                 f"the owner with raise_needs_you to make it grantable, or to grant it once.")
     if not resource_known(kind, what, TEAM):
@@ -48846,7 +49171,8 @@ def grant_check(agent, rid, level, folder=False):
     if level not in levels:
         raise ToolError(f"level must be one of {', '.join(levels)} for a {RESOURCE_WORDS[kind]}.")
     if levels.index(level) > levels.index(entry["max"]):
-        return (f"The owner allows at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for {level}. "
+        return (f"{'The owner allows' if entry.get('by') == 'owner' else 'The default gives'} at most {entry['max']} of "
+                f"{resource_phrase(kind, what)}, and you asked for {level}. "
                 f"Give {entry['max']}, or ask the owner for {level}.")
     account, whole, _ = drive_grant(agent) if folder else (None, -1, {})
     if folder and account == what and whole >= levels.index(level):
@@ -56925,15 +57251,14 @@ TOOLS = [
                       "typed report to (report_defect). Each one's holder must have its Shell box on."},
         "task_id": TASK_ID}, ["request_id"])),
     ("manager", "grant_access", t_grant_access,
-     "Give one agent one thing that the owner already brought into the fleet: a repository, a secret (a data source "
-     "or a deploy route), a Google service or an MCP server. It works only inside the grantable pool that the owner "
-     "set, never above the level the owner allows, and never for a resource that the owner keeps (money, a production "
-     "deployment, customer mail). The grant is a commit of team.json, so the owner sees it and can take it back. "
-     "Bringing a new credential into the fleet stays the owner's: for a key or a login the fleet does not hold, "
-     "request_secret; for anything else, raise_needs_you. A Drive account of the pool also gives one folder of it "
-     "alone (folder), up to the account's level. The agent gets it in its "
-     "next task session. Each grant is written into the owner's chat with you, with your own why, because you answer "
-     "for giving it.",
+     "Give one agent one thing that the owner already brought into the fleet: a repository, a secret, a Google "
+     "service or an MCP server. By default each resource that the fleet holds, up to write for a repository or a "
+     "Gmail; the owner's own level on a row is its ceiling, and only it gives deploy or send. Never what "
+     "see_capacity lists as kept. Give the level that the work needs: a key of a sending service (SMTP, Twilio) "
+     "sends. The grant is a commit of team.json, so the owner sees it and can take it back. A credential that the "
+     "fleet does not hold is the owner's to bring: request_secret for a key or a login, else raise_needs_you. A "
+     "Drive account also gives one folder alone (folder), up to its level. The agent gets it in its next task "
+     "session. Each grant is written into the owner's chat with you, with your why, because you answer for it.",
      S({"request_id": REQUEST_ID,
         "agent": {"type": "string", "description": "The worker or lead that gets the access"},
         "resource": {"type": "string", "description": "The resource, <kind>:<what>: repo:acme/web, "
@@ -57622,13 +57947,31 @@ def closed_extra(owner, responsibility=None, record=None):
         else None
     named = duty_tools(row["tools"]) if row else None
     allowed = SHELL_OFF_BUILT_INS if "web" in (agents()[owner].get("can") or []) else ()
+    listed = duty_tools(row["servers"]) if row else (question_servers(owner) if record else None)
+    if listed is None:
+        # No duty list: an explicit one, each of the agent's servers that needs no session token and that the owner
+        # gave or set the level of (owner_gave), because a helper with no list loads each such server, and one that
+        # the manager gave by the default alone must not reach a session that reads strangers' text (the Door area's
+        # read of the pool default, 24 November 2026)
+        catalog = tool_catalog(TEAM)
+        listed = [t for t in agents()[owner].get("tools") or [] if isinstance(t, str) and t in catalog
+                  and not catalog[t].get("mint") and owner_gave(owner, t)]
     out = {"runtime": setting("conversations.closed_runtime"), "version": setting("conversations.closed_version"),
-           "built_ins": [n for n in allowed if named is None or n in named],
-           "servers": duty_tools(row["servers"]) if row else (question_servers(owner) if record else None)}
+           "built_ins": [n for n in allowed if named is None or n in named], "servers": listed}
     hosts = agents()[owner].get("web_hosts")
     if hosts and WEB_SEARCH in out["built_ins"]:        # the host list: page reads go with web search, on its hosts
         out.update(built_ins=out["built_ins"] + [WEB_PAGES], web_hosts=list(hosts), version=host_list_version())
     return {"shell_off": out}
+
+
+def owner_gave(agent, tool):
+    """True when a session that reads strangers' text may load this MCP server of the agent's with no duty that names
+    it (owner feature pool_default; the Door area's read of 24 November 2026): the owner gave it, the newest record of
+    that hold is from before the records, or the owner set the server's level themselves. A server that the manager gave
+    by the default alone is loaded only where a duty names it."""
+    rid = f"tool:{tool}"
+    row = read_row("SELECT by FROM resource_grants WHERE resource=? AND agent=? ORDER BY id DESC LIMIT 1", (rid, agent))
+    return row is None or row["by"] == "owner" or (resource_standing(rid) or {}).get("by") == "owner"
 
 
 def closed_servers(owner, start):
@@ -57643,7 +57986,7 @@ def closed_servers(owner, start):
     for t in conf.get("tools") or []:
         tool = catalog.get(t) if isinstance(t, str) else None       # a name of a newer catalog is no server here
         if not tool or conf.get("runtime") not in tool["runtimes"] or \
-                not (t in named if isinstance(named, list) else not tool.get("mint")):
+                not (t in named if isinstance(named, list) else not tool.get("mint") and owner_gave(owner, t)):
             continue
         if [v for v in tool_needs(tool) if v != mcp_variable(t)] or \
                 lifecycle.mcp_left_out(tool, conf.get("runtime")):     # a text that the session would replace
@@ -61528,6 +61871,7 @@ def timers():
                 DESKTOP.prune(now())
             tick()
             long_texts_seed(now())          # long profiles and items at a first start: its git read outside LOCK
+            pool_default_keep_seed(now())   # their "Only you" from before the default, once: its git read outside LOCK
         except Exception:
             print_fault()
 
@@ -72259,10 +72603,10 @@ def account_resources_rule(team):
     """ValueError when team.json "resources" holds a secret that an account names: the pool that the manager gives
     from never holds an account's key (spec 3.1, the second of its three refusals)."""
     held = account_secrets(team)
-    for rid in team.get("resources") or {}:
+    for rid, entry in (team.get("resources") or {}).items():
         kind, what = resource_parts(rid)
-        if kind == "secret" and what in held:
-            raise AccountRuleError("resource", rid=rid, aid=held[what])
+        if kind == "secret" and what in held and isinstance(entry, dict) and entry.get("max"):     # {"owner": true}
+            raise AccountRuleError("resource", rid=rid, aid=held[what])                         # is no pool
 
 
 def account_fields(data):
@@ -72334,7 +72678,9 @@ def account_entry(body):
         if secret:
             with CENTRAL_LOCK:
                 status = CENTRAL["status"]
-            if f"secret:{secret}" in (team.get("resources") or {}) or secret in central_signatures(status)[1]:
+            if ((team.get("resources") or {}).get(f"secret:{secret}") or {}).get("max"):
+                # a key that only the default pools is no refusal: once an account names it, it is kept, and the
+                # owner's Mac unpools it at its next round (pool_default)
                 raise account_refusal(409, "pooled")
         # the account's own rules before the write, so that a refusal's answer has its code and names (D7);
         # validate_team holds the same rules at the write
@@ -72352,7 +72698,7 @@ def pool_statement_refusal(data):
         said = json.loads(data.get("statement")) if isinstance(data.get("statement"), str) else None
     except ValueError:
         return None
-    login = said.get("login") if isinstance(said, dict) and said.get("kind") == "pool" else None
+    login = said.get("login") if isinstance(said, dict) and said.get("kind") in ("pool", "default_pool") else None
     return account_refusal(409, "pool_statement") if isinstance(login, str) and \
         login.lower() in account_secrets(team_read()) else None
 
@@ -75408,7 +75754,7 @@ def door_key_kept(team, ref, rev):
     if users:
         return (f"held {', '.join(users)}",
                 f"{', '.join(users)} still {'holds' if len(users) == 1 else 'hold'} it, by a grant or a profile")
-    if f"secret:{ref}" in (team.get("resources") or {}):
+    if ((team.get("resources") or {}).get(f"secret:{ref}") or {}).get("max"):
         return "pool", "the owner's standing lets the manager give it (the grantable pool names it)"
     door = team.get("door") if isinstance(team.get("door"), dict) else {}
     named = sorted(n for n, c in (door.get("credentials") or {}).items()
@@ -87706,7 +88052,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"unknown field {extra[0]}")
             if pool_statement_refusal(data):        # the AI providers build: an account's key goes into no pool
                 raise pool_statement_refusal(data)
-            return self.signed_statement(data, ("grant", "ungrant", "pool", "unpool"))
+            return self.signed_statement(data, ("grant", "ungrant", "pool", "unpool", "default_pool"))
         return self.ui_command("vault/grant", read, self.signed_receipt, outside=central_statement)
 
     def ui_vault_recovery(self):
@@ -87838,17 +88184,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_resource(self):
         """POST /ui/resources (owner feature resource_grants): the standing of one resource. policy {"max", "to"} lets
-        the manager hand it out up to that level, to any worker or lead ("workers");
-        null takes the entry out, so the owner alone gives it. It changes no grant of its own: only who may give this
-        resource. There is no second kind of entry: the grant is the authorization."""
+        the manager hand it out up to that level, to any worker or lead ("workers"); null keeps it for the owner alone
+        ({"owner": true}); "default" takes the entry out, so the default counts (owner feature pool_default, owner API
+        1.328). It changes no grant of its own: only who may give this resource."""
         def read(data):
             base = self.integration_base(data, ("resource", "policy"))
             rid, policy = data.get("resource"), data.get("policy")
             if not isinstance(rid, str) or not resource_parts(rid.strip().lower())[0]:
                 raise ValueError(f"resource must be <kind>:<what>, with a kind of "
                                  f"{', '.join(sorted(RESOURCE_LEVELS))}")
-            if policy is not None and not isinstance(policy, dict):
-                raise ValueError('policy must be {"max", "to"}, or null, which takes the entry out')
+            if policy is not None and policy != "default" and not isinstance(policy, dict):
+                raise ValueError('policy must be {"max", "to"}; null, which keeps it for the owner; or "default", '
+                                 'which takes the entry out')
             return {"base_sha256": base, "resource": rid.strip().lower(), "policy": policy}
         return self.ui_command("resources", read, save_resource, kit=True)
 

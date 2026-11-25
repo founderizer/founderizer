@@ -567,6 +567,18 @@ class Reasons(OwnerAPI):
                 "an agent's sign-in to its runtime", reason="person", options=["Done", "Not now"],
                 title="Sign Customer Support in", what_to_do="Press Sign in on its row."))
 
+    def test_a_card_for_a_held_repository_that_no_github_app_reaches_goes_to_the_owner(self):
+        """The coordinator's validator on the pool default, 25 November 2026: the default makes each held repository the
+        manager's to give, but a grant of one that no GitHub App reaches gives no token, so its card is the owner's
+        step (connect GitHub, or add it to the App). Bug: the card is refused as "yours to give", the manager grants a
+        hold that GitHub gives no token for, the worker fails again, and the owner is never asked."""
+        self.assertEqual(hub.resource_standing("repo:acme/web")["by"], "default")      # dev holds it
+        with patch.object(hub, "team_repo_owner_step", lambda what: what == "acme/web"):
+            nid = self.card(reason="access", needs_access="repo:acme/web", needs_level="write",
+                            title="Let Dev push to acme/web", why="No GitHub App of the fleet reaches acme/web.",
+                            what_to_do="Add acme/web to the GitHub App.")
+        self.assertIsInstance(nid, int, nid)
+
     def test_access_that_an_agent_holds_or_the_manager_can_grant_never_reaches_the_owner(self):
         # the fleet's GitHub App reaches acme's repositories, so dev can use acme/web: with no App, a repository's
         # card goes to the owner, who connects GitHub first (team_repo_owner_step)
@@ -591,7 +603,9 @@ class Reasons(OwnerAPI):
             "is yours to give", reason="access", needs_access="repo:acme/docs"))
         self.refused("names the thing in needs_access", reason="access")
         # the hub's own words send no manager to a card that this check refuses: a repository that an agent holds
-        # goes to that agent, and one that no agent holds goes to the owner
+        # goes to that agent, and one that no agent holds goes to the owner (of one that the owner keeps: under the
+        # default the manager gives a held one itself, pool_default)
+        hub.TEAM["resources"]["repo:acme/web"] = {"owner": True}
         said, error = hub.call_tool("manager", "grant_access", {"agent": "ivy", "resource": "repo:acme/web",
                                                                 "level": "write"})
         self.assertTrue(error)

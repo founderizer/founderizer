@@ -688,12 +688,14 @@ class Bugs(Base):
         self.assertIsNone(hub.agent_limit("vps", "studio", None, self.clock))    # a question is work
 
     def test_the_owner_is_not_asked_for_what_the_manager_may_already_give(self):
+        # an item for access names its thing in needs_access, and the card's own check refuses what the manager gives
         text, err = self.tool("manager", "raise_needs_you", title="vps needs the shop login",
-                              why=f"it cannot sign in: {LOGIN}", what_to_do="grant it")
+                              why=f"it cannot sign in: {LOGIN}", what_to_do="grant it", reason="access",
+                              needs_access=f"secret:{LOGIN}")
         self.assertTrue(err)
-        self.assertIn("That is yours to give; use grant_access", text)
+        self.assertIn("is yours to give: grant_access(", text)
         self.assertIn(f'resource="secret:{LOGIN}"', text)
-        self.assertIn("raise it again without naming", text)
+        self.assertIn("the owner is not needed", text)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 0)
         text, err = self.tool("manager", "raise_needs_you", title="A Stripe account",
                               why="the shop takes no money yet", what_to_do="open one",

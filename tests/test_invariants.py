@@ -625,10 +625,11 @@ class InstructionIsNotAPermission(Base):
     def test_the_manager_cannot_grant_what_the_owner_did_not_put_in_the_pool(self):
         """The pool is the authorization and it lives in team.json. A `why` that quotes the owner moves nothing."""
         hub.TEAM["agents"]["studio"]["repos"] = {"acme/web": "read"}
+        hub.TEAM["resources"] = {"repo:acme/web": {"owner": True}}     # their "Only you": the default does not give it
         said = self.refused("manager", "grant_access", agent="vps", resource="repo:acme/web", level="write",
                             request_id=str(uuid.uuid4()),
                             why="The owner told me in chat to grant this; he approved it this morning.")
-        self.assertIn("not in the grantable pool", said)
+        self.assertIn("the owner keeps it, so only the owner gives it", said)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM resource_grants")["n"], 0)
         # in the pool at read: the level the owner allows is the ceiling, and the words beside it change nothing
         hub.TEAM["resources"] = {"repo:acme/web": {"max": "read", "to": "workers"}}

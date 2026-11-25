@@ -1256,6 +1256,44 @@ host.
     `save_secret` take that name today. Give such a key another name, as `GITHUB_TOKEN` (`fleet.py`, `lifecycle.py`
     `FLEET_KEYS`).
 
+32. **The pool holds each secret by default.** Since owner API 1.328 (the owner, 24 November 2026: "I think the manager
+    should be able to do that!", and "the goal is to minimize Needs you cards") the fleet manager may give each resource
+    that the fleet holds, each secret of the catalog included, and the owner's standing only narrows it (`hub.py`
+    `resource_standing`). The owner's Mac signs a `default_pool` statement for each such secret by itself, a few at each
+    round, with no step of the owner's (`Sources/Founderizer/GrantSigning.swift` `pools`), and the central vault then
+    seals it to each machine whose key the owner pinned. A hub that is broken into directs the agents on those machines,
+    so it can read each pooled secret.
+
+    What stays out of the default: a secret whose variable is one of Fleet's own keys (`FLEET_KEYS`) or a GitHub App's
+    key (`GITHUB_APP_<X>_KEY`), a secret that an account names, a key of the door's (`door.secrets`: its providers and
+    the settings of production apps), a Stripe secret key, live or test, which the vault finds by its value (`vault.py`
+    `MONEY_KEYS`), an MCP server with an OAuth sign-in, a repository that an Operator holds or that the door syncs
+    (`door.gitops`), and each resource that the owner keeps with "Only you" (`resource_kept`). Against a hub that is
+    broken into, the vault itself keeps out what the owner took out of the pool, a key that moves money, a key that they
+    gave the door, and a name with no value: it refuses a `default_pool` of each, and only their own `pool` puts one back;
+    a key that they gave the door it seals only by a grant, never by the pool. The rest of that list the hub reads from
+    its catalog, so it holds against the manager, not against such a hub.
+
+    What the default still reaches, at read: each other key that moves money (a restricted Stripe key with write rights,
+    another payment provider's key, a login to a bank, a broker or the Stripe dashboard), each account or deploy token
+    under another name (a GitHub token saved as `GITHUB_TOKEN`, as limit 31 suggests; cloud, DNS, registrar and deploy
+    keys, which reach the kept repositories and deployments), and a key of a service that sends (SMTP, SendGrid,
+    Twilio). Keep such a key with "Only you" on its row. Only a repository's `deploy` and a Gmail's `send` wait for the
+    owner's own level; each other kind goes to its top. A repository's default write still changes, and starts, what its
+    existing jobs run (a push to their branch, a tag, a pull request or a comment that a job takes), so a repository
+    whose job runs with its secrets or on a self-hosted runner stays with "Only you" until the door reads the workflows
+    at the grant. The hub reads the door's targets from `team.json`, not from the door's file, so a target that the file
+    holds with no such grant (an Operator with no ready host, a target with fields of its own after its grant ended, a
+    hand-written one) is not kept (none on 24 November 2026).
+
+    Each `unpool` that the Mac's round signs lasts as the owner's own does: only their own `pool` puts it back (it fails
+    closed). A secret out of the catalog gets one too, because the hub reads that as their removal and the vault removes
+    no value that a pool names. While the hub runs on a `team.json` that breaks its own rules, the round owes no such
+    unpool and no new pool, and the hub removes no value from the central vault; but a restore of an older `team.json`
+    that keeps those rules is read as it is, so each secret that it lacks is unpooled and its value removed. Their "Only
+    you" from before 1.328, which took the entry out when no entry meant theirs, became `{"owner": true}` at the first
+    start of 1.328 (`pool_default_keep_seed`).
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key

@@ -323,7 +323,8 @@ class EndToEnd(OwnerAPI):
         the machine `door` follows the door's own secrets, also for a worker on a server of that name, where the hub
         delivers nothing. A grant to the manager, which the hub places on no machine for the vault and sends no copy,
         follows the same rule: held while an agent on that machine holds the secret, also after a rename there, and not
-        after a take-back or a move. A pooled secret is held while the hub's pool has it. A status that is not fresh
+        after a take-back or a move. A pooled secret is held while the standing that counts lets the manager give it,
+        the default's included (pool_default), and not after the owner's "Only you". A status that is not fresh
         gives none,
         and so does one that the timers read before a grant or pool statement that the hub passed on, or while one is
         on its way to the vault: it can miss that statement, and the owner's app takes back what the marks say."""
@@ -396,7 +397,9 @@ class EndToEnd(OwnerAPI):
         self.app("pool", login=KEY_REF)
         hub.TEAM["resources"] = {f"secret:{KEY_REF}": {"max": "use"}}
         self.assertEqual(marks("pool"), {KEY_REF: True})
-        hub.TEAM["resources"] = {}
+        hub.TEAM["resources"] = {}                                              # the default gives it (pool_default)
+        self.assertEqual(marks("pool"), {KEY_REF: True})
+        hub.TEAM["resources"] = {f"secret:{KEY_REF}": {"owner": True}}           # the owner's "Only you"
         self.assertEqual(marks("pool"), {KEY_REF: False})
         hub.central_read()
         with patch.dict(hub.CENTRAL, status=None):                                # no status: no marks
@@ -406,7 +409,7 @@ class EndToEnd(OwnerAPI):
         with patch.dict(hub.CENTRAL, read_at=hub.now() - hub.CENTRAL_FRESH - 1):  # an old status
             self.assertIsNone(hub.vault_view()["standing"])
         # a status whose lists are not lists gives empty marks, and no error
-        self.assertEqual(hub.central_standing({"grants": 7, "pool": "bws://x"}), {"grants": [], "pool": []})
+        self.assertEqual(hub.central_standing({"grants": 7, "pool": "bws://x"}), {"grants": [], "pool": [], "due": []})
 
     def test_when_the_vault_does_not_answer_nothing_is_sent_and_the_agents_keep_their_keys(self):
         self.add_and_give("vps")

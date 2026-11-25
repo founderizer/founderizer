@@ -575,6 +575,12 @@ def gmail_message(access, message_id):
     return found
 
 
+def gmail_system_labels(access, message_id):
+    """The label ids of one message, read in Gmail's smallest form (SENT, DRAFT, INBOX and the rest): no part of it."""
+    found = _gmail(access, "GET", "/messages/" + _q(message_id), {"format": "minimal"})
+    return {str(x) for x in found.get("labelIds") or []}
+
+
 def gmail_attachment(access, message_id, attachment_id):
     found = _gmail(access, "GET", f"/messages/{_q(message_id)}/attachments/{_q(attachment_id)}")
     return _b64(str(found.get("data") or ""))
