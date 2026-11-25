@@ -27535,7 +27535,9 @@ AGENT_TEXT_MAX = 8000
 # caught as surely as a loop of answers.
 TALK_GUARD = 20
 AM_REF = re.compile(r"(?i)^\s*AM-?([1-9][0-9]{0,17})\s*$")
-DISCORD_TOKEN = re.compile(r"[A-Za-z0-9._-]{50,100}")
+# A Slack token (`xoxb-`, `xoxp-`, ..., `xapp-`) has the same characters, so the form refuses its prefixes: no Discord bot
+# token starts with them (its first part is a base64 user id, M, N or O). Owner API 1.338.
+DISCORD_TOKEN = re.compile(r"(?!xox|xapp-)[A-Za-z0-9._-]{50,100}")
 WHATSAPP_NUMBER_JID = "@s.whatsapp.net"     # the phone-number form of a WhatsApp JID; "@lid" is the hidden ID
 
 
@@ -88898,8 +88900,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"account": aid, "delete": True}
             token = data.get("token")
             if not isinstance(token, str) or not (DISCORD_TOKEN.fullmatch(token) or TELEGRAM_TOKEN.fullmatch(token)):
-                raise ValueError("token must be a Discord bot token (50 to 100 characters of A-Z a-z 0-9 . _ -) or a "
-                                 "Telegram bot token (the bot's number, a colon and its key)")
+                raise ValueError("token must be a Discord bot token (50 to 100 characters of A-Z a-z 0-9 . _ -, not a Slack "
+                                 "token) or a Telegram bot token (the bot's number, a colon and its key)")
             made["token"] = token
             return {"account": aid, "sha256": hashlib.sha256(json.dumps({"account": aid, "token": token},
                                                                         sort_keys=True).encode()).hexdigest()}
