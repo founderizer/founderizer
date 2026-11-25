@@ -124,7 +124,8 @@ def load_tests(loader, _tests, _pattern):
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
                                                     SecretReferences, SecretReferencePath, StoreFacts, RepoReach, LongLines,
-                                                    ErrorLines, YamlTags, RenderBoxUnit, RenderBoxLive)
+                                                    ErrorLines, YamlTags, RenderBoxUnit, RenderBoxLive, FolderWrites,
+                                                    GitHubTree)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -1085,7 +1086,8 @@ class Refusals(DoorCase):
     """Test 3: every refusal of the plan's list, and a package install that works as the agent's own form."""
 
     def decide(self, target, op, *args, content=None, lookups=None, agent="ops-one"):
-        return door_targets.decide(ACCESS, agent, target, op, list(args), content, lookups or {})
+        return door_targets.decide(ACCESS, agent, target, op, list(args), content,
+                                   dict({"head_tree": lambda: head_of(content)}, **(lookups or {})))
 
     def commit(self, *files, message="change"):
         return json.dumps({"message": message, "files": [
@@ -2149,6 +2151,71 @@ class OwnCalls(DoorCase):
                 self.assertNotIn("call", got)       # nothing for the owner to say yes to: code refused it
         self.assertEqual((self.stubs.ssh_calls, self.stubs.model_calls()), ([], []))
 
+    def test_a_protected_file_under_a_folder_cannot_go_through_a_write_at_the_folder_s_path(self):
+        """Reader A of 24 November 2026: GitHub's tree API replaces a folder with a file written at its path, so a commit
+        that writes scripts/security in the devops repository removed scripts/security/check-tailnet-policy.mjs, which
+        no commit may touch (never_path), as the agent's own call under scripts/. The door reads what the path is at
+        the head (GitHub.path_kind: the contents API gives a folder as a list) and refuses it. Bug: a file at a
+        folder's path passes the rules of its own path and takes the protected files under it."""
+        api, calls = "https://api.github.com/repos/one-org/ops", []
+        answers = {("GET", f"{api}/installation"): (200, {"id": 9}),
+                   ("POST", "https://api.github.com/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
+                   ("GET", api): (200, {"default_branch": "main"}),
+                   ("GET", f"{api}/git/ref/heads/main"): (200, {"object": {"sha": HEAD_SHA}}),
+                   ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1"): (200, git_tree(
+                       ["scripts/security/check-tailnet-policy.mjs", "scripts/deploy.sh"]))}
+
+        def http(method, url, headers, data, **more):
+            calls.append((method, url))
+            return answers.get((method, url), (404, {"message": "not stubbed"}))
+        self.door.http = http
+        door.GitHub.TOKENS.clear()
+        door.GitHub.BRANCHES.clear()
+        self.addCleanup(door.GitHub.TOKENS.clear)
+        self.addCleanup(door.GitHub.BRANCHES.clear)
+        content = json.dumps({"message": "m", "files": [{"path": "scripts/security", "content": "eA=="}]}).encode()
+        with patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt"):
+            got = self.call(ONE, "commit:one-org/ops", "push", content=content)
+        self.assertEqual((got["ok"], got["kind"], got["route"]), (False, "refused", "none"), got)
+        self.assertIn("scripts/security is a folder at the head of the branch, and a file written at its path would "
+                      "replace the whole folder", got["why"])
+        self.assertFalse([u for _m, u in calls if u.endswith(("/git/trees", "/git/commits"))])
+
+    def test_a_commit_is_made_only_on_the_head_that_its_decision_read(self):
+        """Reader A of 24 November 2026: a commit: target's decision reads the head once, and the door makes the commit
+        on it; when the branch moved before the door moves it, nothing changes. Bug: the commit goes on a head that the
+        checks never read."""
+        api, calls = "https://api.github.com/repos/one-org/ops", []
+        refs = iter([(200, {"object": {"sha": HEAD_SHA}}), (200, {"object": {"sha": "f" * 40}})])
+        answers = {("GET", f"{api}/installation"): (200, {"id": 9}),
+                   ("POST", "https://api.github.com/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
+                   ("GET", api): (200, {"default_branch": "main"}),
+                   ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1"): (200, git_tree(["scripts/deploy.sh"])),
+                   ("GET", f"{api}/git/commits/{HEAD_SHA}"): (200, {"tree": {"sha": "t1"}}),
+                   ("POST", f"{api}/git/blobs"): (201, {"sha": "b1"}),
+                   ("POST", f"{api}/git/trees"): (201, {"sha": "t2"}),
+                   ("POST", f"{api}/git/commits"): (201, {"sha": "c2"}),
+                   ("PATCH", f"{api}/git/refs/heads/main"): (200, {})}
+
+        def http(method, url, headers, data, **more):
+            calls.append((method, url, None if data is None else json.loads(data)))
+            if (method, url) == ("GET", f"{api}/git/ref/heads/main"):
+                return next(refs)
+            return answers.get((method, url), (404, {"message": "not stubbed"}))
+        self.door.http = http
+        door.GitHub.TOKENS.clear()
+        door.GitHub.BRANCHES.clear()
+        self.addCleanup(door.GitHub.TOKENS.clear)
+        self.addCleanup(door.GitHub.BRANCHES.clear)
+        content = json.dumps({"message": "m", "files": [{"path": "scripts/new.sh", "content": "eA=="}]}).encode()
+        with patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt"):
+            got = self.call(ONE, "commit:one-org/ops", "push", content=content)
+        self.assertEqual(got["ok"], False, got)
+        self.assertIn("main moved after the door read it for this commit: nothing changed", got["why"])
+        made = next(body for method, url, body in calls if (method, url) == ("POST", f"{api}/git/commits"))
+        self.assertEqual(made["parents"], [HEAD_SHA])
+        self.assertFalse([c for c in calls if c[0] == "PATCH"])
+
     def test_a_gitops_commit_that_deletes_files_runs_as_the_agent_s_own_call(self):
         """The first live call of this kind: an Operator's commit in the GitOps repository that deletes the files of
         idle copies. Code passes no deleted file as a rule, and nothing in it is a refusal of code, so it runs."""
@@ -2156,13 +2223,15 @@ class OwnCalls(DoorCase):
         answers = {("GET", f"{api}/installation"): (200, {"id": 9}),
                    ("POST", "https://api.github.com/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
                    ("GET", api): (200, {"default_branch": "main"}),
-                   ("GET", f"{api}/git/ref/heads/main"): (200, {"object": {"sha": "h1"}}),
-                   ("GET", f"{api}/git/commits/h1"): (200, {"tree": {"sha": "t1"}}),
+                   ("GET", f"{api}/git/ref/heads/main"): (200, {"object": {"sha": HEAD_SHA}}),
+                   ("GET", f"{api}/git/commits/{HEAD_SHA}"): (200, {"tree": {"sha": "t1"}}),
+                   ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1"): (200, git_tree(
+                       ["apps/shop-canary/deployment.yaml", "apps/shop-test/values.yaml"])),
                    ("POST", f"{api}/git/trees"): (201, {"sha": "t2"}),
                    ("POST", f"{api}/git/commits"): (201, {"sha": "c2"}),
                    ("PATCH", f"{api}/git/refs/heads/main"): (200, {})}
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             calls.append((method, url, None if data is None else json.loads(data)))
             return answers.get((method, url), (404, {"message": "not stubbed"}))
         self.door.http = http
@@ -2387,7 +2456,7 @@ class HubRights(Served):
         self.secrets = json.loads(out.getvalue())
         self.github = []
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             self.github.append((method, url, data))
             if url.endswith("/installation"):
                 return 200, {"id": 77}
@@ -2558,7 +2627,7 @@ class HubRights(Served):
         of the app's "What the App reaches". The pages are built from the account and the installation id."""
         stubbed = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if url == "https://api.github.com/app":
                 return 200, {"slug": "fleet-app", "owner": {"login": "One-Org"}}
             if url.startswith("https://api.github.com/app/installations?"):
@@ -2591,7 +2660,7 @@ class HubRights(Served):
         installations and names of another account. A page that GitHub does not give is an error, not a short list."""
         stubbed = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if url.startswith("https://api.github.com/app/installations?"):
                 return 200, [{"id": 77, "account": {"login": "One-Org", "type": "Organization"},
                               "repository_selection": "all"},
@@ -2629,7 +2698,7 @@ class HubRights(Served):
         answers = {"status": 200}
         stubbed = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if url == "https://api.github.com/app":
                 return answers["status"], {"slug": "fleet-app", "owner": {"login": "One-Org", "type": "Organization"}}
             return stubbed(method, url, headers, data)
@@ -2790,8 +2859,8 @@ def github_stubs(self):
         ("GET", f"{api}/repos/one-org/cluster"): (200, {"default_branch": "master"}),
         ("GET", f"{api}/repos/one-org/cluster/contents/apps/shop/deployment.yaml?ref=master"):
             (200, {"encoding": "base64", "content": deployment}),
-        ("GET", f"{api}/repos/one-org/cluster/git/ref/heads/master"): (200, {"object": {"sha": "h1"}}),
-        ("GET", f"{api}/repos/one-org/cluster/git/commits/h1"): (200, {"tree": {"sha": "t1"}}),
+        ("GET", f"{api}/repos/one-org/cluster/git/ref/heads/master"): (200, {"object": {"sha": HEAD_SHA}}),
+        ("GET", f"{api}/repos/one-org/cluster/git/commits/{HEAD_SHA}"): (200, {"tree": {"sha": "t1"}}),
         ("POST", f"{api}/repos/one-org/cluster/git/blobs"): (201, {"sha": "b1"}),
         ("POST", f"{api}/repos/one-org/cluster/git/trees"): (201, {"sha": "t2"}),
         ("POST", f"{api}/repos/one-org/cluster/git/commits"): (201, {"sha": "c2"}),
@@ -2811,10 +2880,55 @@ def github_stubs(self):
             (200, {"workflow_runs": [{"head_sha": "3333333abcdef"}]}),
     })
 
-    def http(method, url, headers, data):
+    def http(method, url, headers, data, **more):
         self.calls.append((method, url, None if data is None else json.loads(data)))
-        return self.answers.get((method, url), (404, {"message": "not stubbed"}))
+        return self.answers.get((method, url)) or at_head(self, method, url) or (404, {"message": "not stubbed"})
     self.door.http = http
+
+
+def at_head(self, method, url):
+    """GitHub's answer at the head commit (HEAD_SHA), which a decision reads once (door.Door.lookups): the whole tree of
+    the repository (GitHub.head_tree), made of self.tree and the files that the test stubs, and a file that the test
+    stubs at the branch's name (the branch's head is that commit). None for any other request."""
+    if method != "GET":
+        return None
+    if "/git/trees/" in url:
+        repo = url.split("/repos/", 1)[1].split("/git/trees/", 1)[0]
+        stubbed = [u.split(f"/repos/{repo}/contents/", 1)[1].split("?", 1)[0] for m, u in self.answers
+                   if m == "GET" and f"/repos/{repo}/contents/" in u]
+        return 200, git_tree(stubbed + list(getattr(self, "tree", None) or {} if repo == "one-org/cluster" else {}))
+    if f"?ref={HEAD_SHA}" in url:
+        return next((self.answers[("GET", url.replace(f"?ref={HEAD_SHA}", f"?ref={branch}"))]
+                     for branch in ("master", "main")
+                     if ("GET", url.replace(f"?ref={HEAD_SHA}", f"?ref={branch}")) in self.answers), None)
+    return None
+
+
+def head_of(content, files=()):
+    """The tree at the head for a decision in a test that has no door (door_targets.head_refused fails closed with
+    none): these files, and each file that the commit deletes, with the folders above them."""
+    try:
+        deleted = [f["path"] for f in json.loads(content or b"{}").get("files") or []
+                   if isinstance(f, dict) and f.get("delete") is True and isinstance(f.get("path"), str)]
+    except (ValueError, AttributeError, TypeError, RecursionError):
+        deleted = []
+    kinds = {}
+    for path in [*files, *deleted]:
+        parts = path.split("/")
+        kinds.update({"/".join(parts[:n]): "folder" for n in range(1, len(parts))})
+    kinds.update({path: "file" for path in [*files, *deleted]})
+    return kinds
+
+
+def git_tree(files, links=(), modules=()):
+    """GitHub's answer to a read of a whole tree (GitHub.head_tree): an entry for each file, link and submodule, and one
+    for each folder above them."""
+    folders = {"/".join(path.split("/")[:n]) for path in [*files, *links, *modules] for n in range(1, path.count("/") + 1)}
+    entries = [{"path": f, "type": "tree", "mode": "040000", "sha": "0" * 40} for f in sorted(folders)]
+    entries += [{"path": p, "type": "blob", "mode": "100644", "sha": "0" * 40} for p in sorted(set(files))]
+    entries += [{"path": p, "type": "blob", "mode": "120000", "sha": "0" * 40} for p in links]
+    entries += [{"path": p, "type": "commit", "mode": "160000", "sha": "0" * 40} for p in modules]
+    return {"sha": HEAD_SHA, "tree": entries, "truncated": False}
 
 
 class SyncRuns(DoorCase):
@@ -2837,7 +2951,7 @@ class SyncRuns(DoorCase):
     def sync(self):
         stub = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if method == "GET" and url == self.RUN and self.runs:
                 self.calls.append((method, url, None))
                 return self.runs.pop(0) if len(self.runs) > 1 else self.runs[0]
@@ -2992,7 +3106,7 @@ class CommitChecks(DoorCase):
         self.reads = []         # the answers that the runs of the commit give, one for each read, the last one again
         stub = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if method == "GET" and url == self.CHECKS and self.reads:
                 self.calls.append((method, url, None))
                 return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
@@ -3619,8 +3733,27 @@ class OwnerYes(DoorCase):
     def test_a_yes_never_opens_a_call_that_code_refuses(self):
         content = json.dumps({"message": "change", "files": [
             {"path": "apps/x.yaml", "content": base64.b64encode(b"kind: Secret\ndata:\n  x: eA==\n").decode()}]}).encode()
+        # GitHub answers the head and its tree, so that the call reaches the rule that refuses it, not a GitHub that
+        # does not answer
+        api, approvals = "https://api.github.com/repos/one-org/cluster", self.door.http
+        github = {("GET", f"{api}/installation"): (200, {"id": 9}),
+                  ("POST", "https://api.github.com/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
+                  ("GET", api): (200, {"default_branch": "master"}),
+                  ("GET", f"{api}/git/ref/heads/master"): (200, {"object": {"sha": HEAD_SHA}}),
+                  ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1"): (200, git_tree(["apps/shop/web.yaml"]))}
+        self.door.http = lambda method, url, headers, body, **more: github.get((method, url)) or \
+            approvals(method, url, headers, body)
+        jwt = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt")
+        jwt.start()
+        self.addCleanup(jwt.stop)
+        door.GitHub.TOKENS.clear()
+        door.GitHub.BRANCHES.clear()
+        self.addCleanup(door.GitHub.TOKENS.clear)
+        self.addCleanup(door.GitHub.BRANCHES.clear)
         got = self.call(ONE, "gitops:one-org/cluster", "push", content=content)
         self.assertEqual(got["kind"], "refused")
+        self.assertIn("Secret", got["why"])
+        self.assertNotIn("could not check", got["why"])
         self.assertNotIn("call", got)
         sha = hashlib.sha256(json.dumps(["gitops:one-org/cluster", "push", []], sort_keys=True).encode() +
                              content).hexdigest()
@@ -3752,7 +3885,7 @@ class Signed:
         data.update(owner_keys=[OWNER_C], fleet="fleet-1")
         self.write_access(data)
         self.answers = []
-        self.door.http = lambda method, url, headers, body: (200, {"approvals": self.answers, "devices": []}) \
+        self.door.http = lambda method, url, headers, body, **more: (200, {"approvals": self.answers, "devices": []}) \
             if url.endswith("/door/approvals") else (404, {})
 
     def yes(self, call, need=9):
@@ -3773,7 +3906,7 @@ class Prunes(Signed, DoorCase):
         self.signed_setup()             # the owner's keys in the door's file
         github_stubs(self)              # self.answers: GitHub's answers by method and address
         github, self.yeses = self.door.http, []
-        self.door.http = lambda method, url, headers, body: (200, {"approvals": self.yeses, "devices": []}) \
+        self.door.http = lambda method, url, headers, body, **more: (200, {"approvals": self.yeses, "devices": []}) \
             if url.endswith("/door/approvals") else github(method, url, headers, body)
         listing_stubs(self)
 
@@ -4014,7 +4147,7 @@ class FullAccess(Signed, DoorCase):
         super().setUp()
         self.signed_setup()
         self.modes = []
-        self.door.http = lambda method, url, headers, body: \
+        self.door.http = lambda method, url, headers, body, **more: \
             (200, {"approvals": self.answers, "devices": [], "modes": self.modes}) \
             if url.endswith("/door/approvals") else (404, {})
         patcher = patch.object(door, "TIMER_PAUSE", 0)
@@ -4256,7 +4389,7 @@ class FullAccess(Signed, DoorCase):
         phone = 0x0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
         cert = vault.canonical({"v": 1, "kind": "owner-device", "fleet": "fleet-1", "device": "iphone",
                                 "key": owner_point(phone), "at": t})
-        self.door.http = lambda method, url, headers, body: \
+        self.door.http = lambda method, url, headers, body, **more: \
             (200, {"approvals": [], "devices": [{"device": "iphone", "statement": cert, "signature": self.sign(cert)}],
                    "modes": self.modes}) if url.endswith("/door/approvals") else (404, {})
         auto = self.statement("web-1", "auto", at=t - 50)
@@ -4320,7 +4453,7 @@ class FullAccess(Signed, DoorCase):
         cert = vault.canonical({"v": 1, "kind": "owner-device", "fleet": "fleet-1", "device": "iphone",
                                 "key": owner_point(phone), "at": round(time.time())})
         devices = [{"device": "iphone", "statement": cert, "signature": self.sign(cert)}]
-        self.door.http = lambda method, url, headers, body: \
+        self.door.http = lambda method, url, headers, body, **more: \
             (200, {"approvals": [], "devices": devices, "modes": self.modes}) if url.endswith("/door/approvals") \
             else (404, {})
         said = self.statement("web-1")
@@ -4672,7 +4805,7 @@ PROVIDERS_ANSWER = [
 
 def provider_http(stubs):
     """The stubbed providers of PROVIDERS_ANSWER, recorded as the door sent them; the model as Stubs answers it."""
-    def http(method, url, headers, data):
+    def http(method, url, headers, data, **more):
         for (m, start), answer in PROVIDERS_ANSWER:
             if m == method and url.startswith(start):
                 stubs.http_calls.append((method, url, headers, data))
@@ -4757,7 +4890,7 @@ class MadeDeletes(DoorCase):
         self.assertTrue(self.door.minted("k-minted"))
         stubbed = self.door.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if method == "POST" and url == B2 + "b2_delete_key":
                 return 200, {"applicationKeyId": "k-minted", "keyName": "web-1"}
             return stubbed(method, url, headers, data)
@@ -4872,7 +5005,7 @@ class AppSettingsPath(HostPath):
     def sweep(self, *copies, keep=None):
         """One pass of the vault sweep: the hub's copies, each (reference, value), and its keep list."""
         answer = {"copies": [{"id": n, "login": r, "sealed": v} for n, (r, v) in enumerate(copies, 1)], "keep": keep}
-        with patch.object(self.door, "http", lambda method, url, headers, data: (200, answer)), \
+        with patch.object(self.door, "http", lambda method, url, headers, data, **more: (200, answer)), \
                 patch.object(door, "run_program", lambda argv, stdin, env: (0, stdin.decode())):
             return door.fetch_sealed(self.door)
 
@@ -4889,7 +5022,7 @@ class AppSettingsPath(HostPath):
     def provider_sends(self):
         """The authorization of each request of one call of hetzner:one."""
         asked = []
-        with patch.object(self.door, "http", lambda method, url, headers, data: (
+        with patch.object(self.door, "http", lambda method, url, headers, data, **more: (
                 asked.append(headers["Authorization"]), (200, {"servers": []}))[1]):
             got = self.call(ONE, "hetzner:one", "servers")
         self.assertTrue(got["ok"], got)
@@ -5652,7 +5785,7 @@ class WorkKeys(DoorCase):
     def test_two_calls_at_once_make_one_key(self):
         slow = self.cloud.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             if method == "POST":
                 time.sleep(0.2)
             return slow(method, url, headers, data)
@@ -5928,7 +6061,7 @@ class WorkKeys(DoorCase):
         self.t += 23 * 3600 + 60                # less than an hour is left, and the new key does not sign in
         slept, real = [], self.cloud.http
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             status, answer = real(method, url, headers, data)
             if url.endswith("/tokens/verify") and self.cloud.calls[-1][2] not in ("work1", "maker"):
                 return 401, {"success": False}
@@ -6212,7 +6345,7 @@ class Vault(DoorCase):
     def test_a_sealed_copy_is_opened_kept_at_600_and_confirmed(self):
         calls = []
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             calls.append((method, url, data))
             if url.endswith("/door/sealed"):
                 return 200, {"copies": [{"id": 5, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"},
@@ -6236,7 +6369,7 @@ class Vault(DoorCase):
         the old value or the new one, never a part: the new file is written beside the old one and then put in its
         place, so a write that stops leaves the old value."""
         values = iter(["the-old-value\n", "the-new-value\n", "the-new-value\n", "the-third-value\n"])
-        self.door.http = lambda method, url, headers, data: (200, {"copies": [
+        self.door.http = lambda method, url, headers, data, **more: (200, {"copies": [
             {"id": 8, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}) \
             if url.endswith("/door/sealed") else (200, {})
         folder = self.root + door.SECRETS_DIR
@@ -6264,7 +6397,7 @@ class Vault(DoorCase):
         door's providers need the key alone, a PEM file's lines included."""
         pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"
         item = json.dumps({"password": pem, "username": ""}, sort_keys=True)
-        self.door.http = lambda method, url, headers, data: (200, {"copies": [
+        self.door.http = lambda method, url, headers, data, **more: (200, {"copies": [
             {"id": 7, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}) \
             if url.endswith("/door/sealed") else (200, {})
         with patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, item + "\n")):
@@ -6278,12 +6411,12 @@ class Vault(DoorCase):
         minted = os.path.join(folder, "minted-" + "a" * 64)
         with open(minted, "w") as f:
             f.write("k:v")
-        self.door.http = lambda method, url, headers, data: (200, {"copies": [], "keep": [ref(1), ref(9)]})
+        self.door.http = lambda method, url, headers, data, **more: (200, {"copies": [], "keep": [ref(1), ref(9)]})
         door.fetch_sealed(self.door)
         left = sorted(os.listdir(folder))
         self.assertEqual(left, sorted([hashlib.sha256(ref(1).encode()).hexdigest(),
                                        hashlib.sha256(ref(9).encode()).hexdigest(), os.path.basename(minted)]))
-        self.door.http = lambda method, url, headers, data: (200, {"copies": [], "keep": None})   # the vault is down
+        self.door.http = lambda method, url, headers, data, **more: (200, {"copies": [], "keep": None})   # the vault is down
         door.fetch_sealed(self.door)
         self.assertEqual(sorted(os.listdir(folder)), left)
 
@@ -6299,10 +6432,10 @@ class Vault(DoorCase):
         data.update(hub={"address": "fd7a:115c:a1e0::2", "port": 8765}, owner_keys=[OWNER_C], fleet="fleet-1")
         self.write_access(door.validate_access(data))
         asked = []
-        self.door.http = lambda method, url, headers, body: (asked.append(url), (404, {}))[1]
+        self.door.http = lambda method, url, headers, body, **more: (asked.append(url), (404, {}))[1]
         door.fetch_sealed(self.door)
         door.fetch_approvals(self.door)
-        with patch.object(door.door_providers, "http", lambda method, url, headers, body: self.door.http(
+        with patch.object(door.door_providers, "http", lambda method, url, headers, body, **more: self.door.http(
                 method, url, headers, body)), self.assertRaises(SystemExit), \
                 patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, "")), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -6417,13 +6550,15 @@ class AuditReplay(unittest.TestCase):
         self.assertGreaterEqual(len(EVENTS), 30)
         for what, target, op, args, content, kind in EVENTS:
             with self.subTest(what):
-                d = door_targets.decide(ACCESS, "ops-one", target, op, args, content, LOOKUPS)
+                d = door_targets.decide(ACCESS, "ops-one", target, op, args, content,
+                                        dict(LOOKUPS, head_tree=lambda: head_of(content)))
                 self.assertEqual(d.kind, kind, f"{what}: {d.why}")
 
     def test_the_other_business_reaches_none_of_them(self):
         for what, target, op, args, content, kind in EVENTS:
             with self.subTest(what):
-                self.assertEqual(door_targets.decide(ACCESS, "ops-two", target, op, args, content, LOOKUPS).kind,
+                self.assertEqual(door_targets.decide(ACCESS, "ops-two", target, op, args, content,
+                                                     dict(LOOKUPS, head_tree=lambda: head_of(content))).kind,
                                  "refused")
 
 
@@ -6463,14 +6598,15 @@ class Workflows(DoorCase):
         answers = {("GET", f"https://api.github.com/repos/{self.REPO}/installation"): (200, {"id": 9}),
                    ("POST", "https://api.github.com/app/installations/9/access_tokens"): (201, {"token": "ghs_door"}),
                    ("GET", api): (200, {"default_branch": "main"}),
-                   ("GET", f"{api}/git/ref/heads/main"): (200, {"object": {"sha": "h1"}}),
-                   ("GET", f"{api}/git/commits/h1"): (200, {"tree": {"sha": "t1"}}),
+                   ("GET", f"{api}/git/ref/heads/main"): (200, {"object": {"sha": HEAD_SHA}}),
+                   ("GET", f"{api}/git/commits/{HEAD_SHA}"): (200, {"tree": {"sha": "t1"}}),
+                   ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1"): (200, git_tree(["README.md"])),
                    ("POST", f"{api}/git/blobs"): (201, {"sha": "b1"}),
                    ("POST", f"{api}/git/trees"): (201, {"sha": "t2"}),
                    ("POST", f"{api}/git/commits"): (201, {"sha": "c2"}),
                    ("PATCH", f"{api}/git/refs/heads/main"): (200, {})}
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             self.calls.append((method, url, None if data is None else json.loads(data)))
             return answers.get((method, url), (404, {"message": "not stubbed"}))
         self.door.http = http
@@ -6483,7 +6619,7 @@ class Workflows(DoorCase):
     def decide(self, *files, agent="ops-one"):
         made = lambda name: self.door.repo_record("made", name)        # noqa: E731
         return door_targets.decide(door.read_json(door.ACCESS_FILE, {}), agent, f"commit:{self.REPO}", "push", [],
-                                   change(*files), {"made_repo": made})
+                                   change(*files), {"made_repo": made, "head_tree": lambda: {}})
 
     def test_the_operator_that_made_the_repository_commits_its_workflows(self):
         deploy = self.template()
@@ -7072,6 +7208,7 @@ class RenderCase(unittest.TestCase):
         lookups = {"render": self.lookup(tree, links)} if render else \
             {"base_file": lambda p: tree[p].encode() if isinstance(tree.get(p), str) else tree.get(p),
              "declared": lambda: door_targets.DOOR_DECLARATION in tree}
+        lookups["head_tree"] = lambda: head_of(content, [p for p, t in tree.items() if isinstance(t, (str, bytes))])
         return door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content,
                                    dict(dict(lookups, default_branch=lambda repo: "master"), **(more or {})))
 
@@ -7341,10 +7478,19 @@ class Rendered(RenderCase):
         d = self.push(files, tree)
         self.assertEqual(d.kind, "refused", d)
         self.assertIn("touches more than 16 charts and Kustomize folders", d.why)
-        d = self.push({"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true"),
-                       "knative": "a file where a folder is\n"})
+        files = {"monitoring/stack/values.yaml": STACK_VALUES.replace("debug: false", "debug: true"),
+                 "knative": "a file where a folder is\n"}
+        d = self.push(files)
         self.assertEqual(d.kind, "refused", d)
-        self.assertIn("knative is a folder at HEAD", d.why)
+        # (since Reader A of 24 November 2026 the door's own read of the head refuses it first: head_refused)
+        self.assertIn("knative is a folder at the head of the branch", d.why)
+        # and the render box refuses the same commit by itself (door_render.put)
+        scratch = tempfile.mkdtemp(prefix="door-render-test-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        header = {"v": 1, "op": "render", "exposure": ACCESS["exposure"],
+                  "files": [{"path": path, "size": len(text), "mode": "100644"} for path, text in files.items()]}
+        report = door_render.answer(header, self.packed, [text.encode() for text in files.values()], self.tools, scratch)
+        self.assertEqual(report, {"v": 1, "ok": False, "why": "knative is a folder at HEAD"})
 
     def test_a_file_of_no_unit_keeps_its_rules_and_the_real_parser_reads_flow_style(self):
         d = self.push({"apps/core/app/flow.yaml": '{apiVersion: v1, kind: ConfigMap, metadata: {name: f}, data: {}}\n'})
@@ -7501,7 +7647,8 @@ class Rendered(RenderCase):
         # a report that is no object is no report to fall back from
         content = json.dumps({"message": "m", "files": [{"path": "README.md", "content": "eA=="}]}).encode()
         for report in (["ok"], "ok", 1):
-            d = door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content, {"render": lambda files: report})
+            d = door_targets.decide(ACCESS, "ops-one", GITOPS, "push", [], content,
+                                    {"render": lambda files: report, "head_tree": lambda: {}})
             self.assertEqual((d.kind, d.route), ("refused", "again"), d)
 
     def test_what_a_program_says_reaches_the_agent_only_as_fixed_words(self):
@@ -7566,8 +7713,17 @@ class Rendered(RenderCase):
         tree = dict(CLUSTER, **{"a/b/S/keep.txt": "x", "a/b/c/keep.txt": "x", "r/keep.txt": "x"})
         links = {"p/q/D": "../../a/b/c", "p/q/S": "../../r", "p/q/L1": "D/../S/../.."}
         d = self.push({"p/q/D": None, "p/q/D/f": "x\n"}, tree, links)
-        self.assertEqual(d.kind, "refused", (d, self.last))
-        self.assertIn("after this commit a link of the repository ends outside it", d.why)
+        self.assertEqual(d.kind, "refused", d)
+        # (since Reader A of 24 November 2026 no commit holds a path and a path under it: paths_clash refuses it first)
+        self.assertIn("a path of the commit comes twice, or is a folder of another of its paths", d.why)
+        # and the render box refuses the same commit by itself, so that a door with no such check upstream still keeps
+        # each link of the repository inside it (door_render.stray_links)
+        scratch = tempfile.mkdtemp(prefix="door-render-test-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        header = {"v": 1, "op": "render", "exposure": ACCESS["exposure"], "files": [
+            {"path": "p/q/D", "size": None, "mode": "100644"}, {"path": "p/q/D/f", "size": 2, "mode": "100644"}]}
+        report = door_render.answer(header, tarball(tree, links), [None, b"x\n"], self.tools, scratch)
+        self.assertEqual(report, {"v": 1, "ok": False, "why": "after this commit a link of the repository ends outside it"})
 
 
 # A cluster repository with references to Secrets at HEAD, for the door's rule of 21 November 2026: a workload that
@@ -8998,15 +9154,15 @@ class RenderPath(RenderDoor):
         reads = iter([(200, {"object": {"sha": HEAD_SHA}}), (200, {"object": {"sha": "f" * 40}})])
         answers, moves = dict(self.answers), len([c for c in self.calls if c[0] == "PATCH"])
 
-        def http(method, url, headers, data):
+        def http(method, url, headers, data, **more):
             self.calls.append((method, url, None if data is None else json.loads(data)))
             if (method, url) == ("GET", f"{api}/git/ref/heads/master"):
                 return next(reads)
-            return answers.get((method, url), (404, {}))
+            return answers.get((method, url)) or at_head(self, method, url) or (404, {})
         self.door.http = http
         got = self.call(ONE, GITOPS, "push", content=change((path, STACK_DEPLOYMENT + "# another comment\n")))
         self.assertEqual(got["ok"], False, got)
-        self.assertIn("moved while the door rendered the commit", got["why"])
+        self.assertIn("moved after the door read it for this commit", got["why"])
         self.assertEqual(len([c for c in self.calls if c[0] == "PATCH"]), moves)
         github_stubs(self)
         self.answers[("GET", f"{api}/git/ref/heads/master")] = (200, {"object": {"sha": HEAD_SHA}})
@@ -9232,7 +9388,7 @@ class SignedRenderDoor(RenderDoor):
         data.update(owner_keys=[OWNER_C], fleet="fleet-1")
         self.write_access(data)
         github, self.yeses = self.door.http, []
-        self.door.http = lambda method, url, headers, body: (200, {"approvals": self.yeses, "devices": []}) \
+        self.door.http = lambda method, url, headers, body, **more: (200, {"approvals": self.yeses, "devices": []}) \
             if url.endswith("/door/approvals") else github(method, url, headers, body)
 
     def yes(self, call, need=9):
@@ -10595,7 +10751,7 @@ class LongLines(unittest.TestCase):
         with patch.object(door_targets, "head_key", lambda o: calls.append(1) or key(o)):
             started = time.thread_time()
             d = door_targets.decide(ACCESS, "ops-one", "gitops:one-org/cluster", "push", [], content,
-                                    {"base_file": lambda p: reads.append(p) or heads.get(p)})
+                                    {"base_file": lambda p: reads.append(p) or heads.get(p), "head_tree": lambda: {}})
             spent = time.thread_time() - started
         self.assertEqual(d.kind, "own", d)
         self.assertLess(len(calls), 10 * 200 * 26)
@@ -11022,3 +11178,165 @@ class RenderBoxLive(unittest.TestCase):
                 self.assertRaises(SystemExit) as ended:
             door.main(["render-check"])
         self.assertEqual((ended.exception.code, json.loads(out.getvalue())["boxed"]), (0, True))
+
+
+class FolderWrites(unittest.TestCase):
+    """What a commit's paths are at the head of the branch (door_targets.head_refused, Reader A of 24 November 2026):
+    a file at a folder's path replaces the whole folder, a file under a file replaces it, and a delete takes only a
+    file. The tree comes whole from one read of GitHub (GitHub.head_tree, GitHubTree below)."""
+
+    TREE = {"scripts": "folder", "scripts/security": "folder", "scripts/security/check-tailnet-policy.mjs": "file",
+            "scripts/deploy.sh": "file", "CLAUDE.md": "file", "apps": "folder", "apps/shop": "folder",
+            "apps/shop/web.yaml": "file", "apps/shop/current": "link", "apps/vendor": "link"}
+
+    def decide(self, target, files, tree=None, more=None):
+        content = json.dumps({"message": "m", "files": [{"path": p, "delete": True} if t is None else
+                                                        {"path": p, "content": base64.b64encode(t).decode()}
+                                                        for p, t in files]}).encode()
+        kinds = self.TREE if tree is None else tree
+        return door_targets.decide(ACCESS, "ops-one", target, "push", [], content,
+                                   dict({"head_tree": lambda: kinds, "default_branch": lambda repo: "master"},
+                                        **(more or {})))
+
+    def test_a_file_written_at_a_folder_s_path_is_refused_in_each_kind_of_commit(self):
+        """Bug: a commit of a devops repository, of a GitOps repository or of a made repository's workflows writes a
+        file at a folder's path, and the folder goes with everything in it."""
+        d = self.decide("commit:one-org/ops", [("scripts/security", b"x\n")])
+        self.assertEqual((d.kind, d.why), ("refused", "scripts/security is a folder at the head of the branch, and a "
+                                                      "file written at its path would replace the whole folder"))
+        self.assertEqual(self.decide("commit:one-org/ops", [("scripts/new.sh", b"x\n")]).kind, "own")
+        d = self.decide("gitops:one-org/cluster", [("apps/shop", b"x: 1\n")])
+        self.assertIn("apps/shop is a folder at the head of the branch", d.why)
+        made = {"made_repo": lambda name: {"agent": "ops-one", "app": "shop"}, "branch": lambda: "release"}
+        d = self.decide("commit:one-org/new-app", [(".github/workflows/ci.yml", b"{}")],
+                        {".github": "folder", ".github/workflows": "folder", ".github/workflows/ci.yml": "folder"}, made)
+        self.assertIn(".github/workflows/ci.yml is a folder at the head of the branch", d.why)
+
+    def test_a_file_under_a_file_or_a_link_and_a_write_at_a_link_are_refused(self):
+        """Bug: only the nearest parent is read, so a/b/c under the file a goes through; or the devops route reads
+        none; or a write at a link's or a submodule's own path replaces it."""
+        for target, path, under in (("gitops:one-org/cluster", "apps/shop/web.yaml/x.yaml", "apps/shop/web.yaml"),
+                                    ("gitops:one-org/cluster", "apps/shop/web.yaml/a/b.yaml", "apps/shop/web.yaml"),
+                                    ("commit:one-org/ops", "scripts/deploy.sh/x.sh", "scripts/deploy.sh"),
+                                    ("gitops:one-org/cluster", "apps/vendor/x.yaml", "apps/vendor")):
+            d = self.decide(target, [(path, b"x: 1\n")])
+            self.assertEqual((d.kind, d.why), ("refused", f"{under} is a file or a link at the head of the branch, and "
+                                                          f"a file written under it would replace it"), path)
+        for path in ("apps/shop/current", "apps/vendor"):
+            d = self.decide("gitops:one-org/cluster", [(path, b"x: 1\n")])
+            self.assertEqual(d.why, f"{path} is a link or a submodule at the head of the branch, which the door does "
+                                    f"not replace", path)
+
+    def test_a_delete_takes_only_a_file_at_the_head(self):
+        """Bug: a delete of a folder's path (a null sha at it) or of a link goes through: an own call under scripts/
+        took scripts/security, and in GitOps a bare .founderizer or apps/Secrets."""
+        for path in ("scripts/security", "apps/shop/current", "scripts/gone.sh"):
+            target = "commit:one-org/ops" if path.startswith("scripts/") else "gitops:one-org/cluster"
+            d = self.decide(target, [(path, None)])
+            self.assertEqual((d.kind, d.why), ("refused", f"{path} is no file at the head of the branch (a folder, a "
+                                                          f"link, or no file), so the commit deletes nothing there"))
+        self.assertEqual(self.decide("commit:one-org/ops", [("scripts/deploy.sh", None)]).kind, "own")
+
+    def test_a_path_that_differs_from_one_at_the_head_only_in_case_is_refused(self):
+        """Bug: never_path reads names in any case and the head check does not, so claude.md/x beside the file
+        CLAUDE.md, or scripts/Security, goes through on a checkout that reads them as one name."""
+        for path, here, other in (("claude.md/x", "claude.md", "CLAUDE.md"),
+                                  ("scripts/Security/check.mjs", "scripts/Security", "scripts/security")):
+            d = self.decide("commit:one-org/ops", [(path, b"x\n")])
+            self.assertEqual((d.kind, d.why), ("refused", f"{here} differs only in case from {other} at the head of the "
+                                                          f"branch, which some checkouts read as one name; a rename by "
+                                                          f"case only is made outside the door"), path)
+
+    def test_paths_and_modes_that_the_door_does_not_commit(self):
+        """Bug: never_path misses scripts/./security/x or scripts//security/x; a tree entry (040000) is written at a
+        file's path; or x and x/y in one commit, of which GitHub keeps one."""
+        for path in ("scripts/./security/x.mjs", "scripts//security/x.mjs", "scripts/new/", "./scripts/x.sh"):
+            self.assertEqual(door_targets.commit_files(json.dumps({"message": "m", "files": [
+                {"path": path, "content": "eA=="}]}).encode())[0], None, path)
+        content = json.dumps({"message": "m", "files": [{"path": "apps/shop/x.yaml", "content": "eA==",
+                                                         "mode": "040000"}]}).encode()
+        d = door_targets.decide(ACCESS, "ops-one", "gitops:one-org/cluster", "push", [], content, {})
+        self.assertEqual((d.kind, d.why), ("refused", "apps/shop/x.yaml has the mode 040000"))
+        d = self.decide("commit:one-org/ops", [("scripts/new", b"x\n"), ("scripts/new/x.sh", b"x\n")], {})
+        self.assertEqual(d.why, "a path of the commit comes twice, or is a folder of another of its paths")
+
+    def test_a_new_file_under_a_folder_that_exists_goes_and_a_decision_with_no_head_goes_nowhere(self):
+        """Bug: the head check refuses a new file in a folder that is there, the common commit; or a decision that has
+        no head to read (no lookup) commits with no check at all."""
+        manifest = b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new\n  namespace: shop\ndata:\n  a: b\n"
+        d = self.decide("gitops:one-org/cluster", [("apps/shop/new.yaml", manifest)])
+        self.assertNotIn("at the head of the branch", d.why or "", d)
+        self.assertEqual(self.decide("commit:one-org/ops", [("scripts/security/new.mjs", b"x\n")]).kind, "own")
+        content = json.dumps({"message": "m", "files": [{"path": "scripts/new.sh", "content": "eA=="}]}).encode()
+        for target in ("commit:one-org/ops", "gitops:one-org/cluster"):
+            d = door_targets.decide(ACCESS, "ops-one", target, "push", [], content, {})
+            self.assertEqual((d.kind, d.why), ("refused", "the door cannot read what the commit's paths are at the head "
+                                                          "of the branch, so it commits nothing"), target)
+        d = door_targets.decide(ACCESS, "ops-one", "commit:one-org/ops/x", "push", [], content, {})
+        self.assertEqual(d.why, "one-org/ops/x is no repository's name, owner/repository")
+
+    def test_two_paths_that_differ_only_in_case_are_refused(self):
+        """Bug: a commit holds a.txt and A.txt, or Foo/x and foo, which a checkout that reads names in any case reads
+        as one, as never_path does."""
+        for paths in (["scripts/a.txt", "scripts/A.txt"], ["scripts/Foo/x.sh", "scripts/foo"]):
+            d = self.decide("commit:one-org/ops", [(p, b"x\n") for p in paths], {})
+            self.assertEqual(d.why, "two paths of the commit differ only in case, which some checkouts read as one name; "
+                                    "a rename by case only (README to Readme) is made outside the door")
+
+    def test_the_files_that_the_door_writes_again_are_checked_with_the_commit_s(self):
+        """Bug: only the agent's files are checked, so a file that the door writes again under a file of the commit
+        (x and x/y) goes in the final tree, of which GitHub keeps one."""
+        def generated(d, report, lookups, files, plan, target):
+            plan["files"] = list(files) + [("apps/shop/gen.yaml/hosts.yaml", b"x: 1\n", "100644")]
+            return d
+        manifest = b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: gen\n  namespace: shop\ndata:\n  a: b\n"
+        with patch.object(door_targets, "with_generated", generated):
+            d = self.decide("gitops:one-org/cluster", [("apps/shop/gen.yaml", manifest)])
+        self.assertEqual((d.kind, d.why), ("refused", "a path of the commit comes twice, or is a folder of another of "
+                                                      "its paths"))
+
+    def test_the_commit_goes_on_the_head_that_the_decision_read(self):
+        """Bug: the decision reads one head and the commit is made on another (a made repository's workflows took
+        the default branch, and its lookups another)."""
+        made = {"made_repo": lambda name: {"agent": "ops-one", "app": "shop"}, "branch": lambda: "release",
+                "head_sha": lambda: HEAD_SHA}
+        d = self.decide("commit:one-org/new-app", [(".github/workflows/ci.yml", json.dumps(CI).encode())], {}, made)
+        self.assertEqual((d.kind, d.plan["branch"], d.plan["parent"]), ("rule", "release", HEAD_SHA), d)
+        d = self.decide("commit:one-org/ops", [("scripts/new.sh", b"x\n")], None, {"head_sha": lambda: HEAD_SHA})
+        self.assertEqual(d.plan["parent"], HEAD_SHA)
+
+
+class GitHubTree(DoorCase):
+    """The door's one read of a whole tree at the head (GitHub.head_tree): its answer, or Stop for anything else."""
+
+    def tree(self, *answers):
+        """head_tree of one-org/cluster with GitHub's answers in turn, as the door reads it."""
+        replies = list(answers)
+        patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: "jwt")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        door.GitHub.TOKENS.clear()
+        self.addCleanup(door.GitHub.TOKENS.clear)
+        api = "https://api.github.com"
+
+        def http(method, url, headers, data, **more):
+            if url.endswith("/installation"):
+                return 200, {"id": 9}
+            if url.endswith("/access_tokens"):
+                return 201, {"token": "ghs_door"}
+            return replies.pop(0)
+        self.door.http = http
+        return door.GitHub(self.door, ACCESS, "one-org/cluster").head_tree(HEAD_SHA)
+
+    def test_only_a_whole_tree_of_known_entries_is_read_and_every_other_answer_stops_the_call(self):
+        """Bug: an error of GitHub (a token refused, a limit, a fault), a tree that GitHub cut, or an entry of no known
+        type reads as a tree with no such path, and a write at a folder's path goes through."""
+        self.assertEqual(self.tree((200, git_tree(["apps/a.yaml"], ["apps/l"], ["vendor/m"]))),
+                         {"apps": "folder", "apps/a.yaml": "file", "apps/l": "link", "vendor": "folder",
+                          "vendor/m": "link"})
+        for answer in ((403, {"message": "denied"}), (429, {}), (500, {}), (599, {}), (404, {}), (200, {}),
+                       (200, dict(git_tree(["a"]), truncated=True)), (200, {"tree": [{"path": "a"}], "truncated": False}),
+                       (200, {"tree": [{"path": "a", "type": "blob", "mode": "100600"}], "truncated": False}),
+                       (200, {"tree": [{"type": "blob", "mode": "100644"}], "truncated": False}), (200, [])):
+            with self.subTest(answer=answer), self.assertRaises(door_providers.Stop):
+                self.tree(answer)

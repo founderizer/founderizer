@@ -1737,19 +1737,39 @@ class Door:
         hub = GitHub(self, access, repo)
         entry = (((access.get("agents") or {}).get(agent) or {}).get("repos") or {}).get(repo)
         branch = entry.get("branch") if isinstance(entry, dict) else None
-        facts.update(base_file=lambda path: hub.file_at_head(path, branch), image_made=hub.image_made,
+        # One head for the whole decision (Reader A of 24 November 2026): the commit at the head of the branch, read
+        # once; every file read, the tree, the render and the commit's parent are of it, and the commit's last read of
+        # the branch, before it moves it, refuses a branch that moved meanwhile (GitHub.commit)
+        once = {}
+
+        def branch_name():      # the branch of the decision and of the commit (a made repository's workflows too)
+            if "branch" not in once:
+                once["branch"] = branch or hub.branch()
+            return once["branch"]
+
+        def head_sha():
+            if "sha" not in once:
+                once["sha"] = hub.head(branch_name())
+            return once["sha"]
+
+        def head_tree():
+            if "tree" not in once:
+                once["tree"] = hub.head_tree(head_sha())
+            return once["tree"]
+        facts.update(base_file=lambda path: hub.file_at_head(path, head_sha()), image_made=hub.image_made,
+                     head_sha=head_sha, head_tree=head_tree, branch=branch_name,
                      deploy_facts=hub.deploy_facts, npm=self.npm, schema_ok=lambda path, data: True)
         if kind == "gitops":    # a sync with prune (DevOps plan X3): the listing, and the door's own record
             facts.update(prune_listing=listing, removed_object=lambda key: self.removed_object(repo, key),
                          made_object=lambda key: self.made(target, "object:" + key),
                          # a repository that generates files, for a commit that no render writes them for (X3)
-                         declared=lambda: hub.file_at_head(door_targets.DOOR_DECLARATION, branch) is not None)
+                         declared=lambda: hub.file_at_head(door_targets.DOOR_DECLARATION, head_sha()) is not None)
         box = self.box or (box_call if os.path.exists(P(RENDER_SOCKET)) else None)
         # A door with no render box gives no render, and the rules that need none stay. But only for a repository that
         # this door never rendered: where it did, templates changed under the render, and the rules that read lines
         # no longer say what a commit does.
         if kind == "gitops" and (box or self.rendered(repo)):
-            facts["render"] = lambda files: self.render(hub, branch, files, box or box_call)
+            facts["render"] = lambda files: self.render(hub, head_sha(), files, box or box_call)
         return facts
 
     def rendered(self, repo, keep=False):
@@ -1761,18 +1781,13 @@ class Door:
                 write_json(RENDERED_FILE, dict(known, **{repo.lower(): round(now())}))
             return repo.lower() in known
 
-    def render(self, hub, branch, files, box):
-        """The render of one GitOps commit (door_render.answer). The door reads the commit id of the branch, gets the
-        tarball of that one commit, and gives it to the box with the commit's files. The report names that commit
-        (head): each file at HEAD comes from it, and the door makes its commit on it, so what the door rendered is
-        what the commit changes. A report with `skip` says that this repository cannot be rendered here (no programs
-        yet, a tarball over the cap), and its commits keep the rules that need no render: but not once the door has
-        rendered the repository, because an agent can make a repository grow. Then it is a refusal."""
-        name = branch or hub.branch()
-        status, ref = hub.call("GET", f"/repos/{hub.repo}/git/ref/heads/{name}")
-        head = (ref.get("object") or {}).get("sha") if status == 200 and isinstance(ref, dict) else None
-        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", head):
-            raise door_providers.Stop(f"GitHub answered {status} for {name}")
+    def render(self, hub, head, files, box):
+        """The render of one GitOps commit (door_render.answer). The door gets the tarball of the commit at the head of
+        the branch that the decision read (head), and gives it to the box with the commit's files. The report names
+        that commit (head): each file at HEAD comes from it, and the door makes its commit on it, so what the door
+        rendered is what the commit changes. A report with `skip` says that this repository cannot be rendered here (no
+        programs yet, a tarball over the cap), and its commits keep the rules that need no render: but not once the door
+        has rendered the repository, because an agent can make a repository grow. Then it is a refusal."""
         status, tar = self.raw("GET", f"{GitHub.API}/repos/{hub.repo}/tarball/{head}", {
             "Authorization": "Bearer " + hub.token(), "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"}, door_render.TAR_MAX + 1)
@@ -2399,6 +2414,12 @@ class Door:
                 "owners": sorted(owners)}
 
 
+
+# The bytes of GitHub's answer to a read of a whole tree (GitHub.head_tree): its trees API lists 100,000 entries and
+# 7 MB at most, which its JSON gives in about 32 MiB; door_providers.http reads 4 MiB of other answers, and cut a tree
+# of over about 15,000 entries, so that a commit of a medium monorepo was refused
+TREE_MOST = 40 * 1024 * 1024
+
 class GitHub:
     """One repository through the door's App of its owner: the commits the door makes, the filtered read of the
     GitOps repository, workflow runs, and the facts of the checks. A token of the App lasts an hour and stays here."""
@@ -2437,11 +2458,13 @@ class GitHub:
         self.BRANCHES[self.repo.lower()] = (name, now() + 3600)
         return name
 
-    def call(self, method, path, body=None):
+    def call(self, method, path, body=None, most=None):
+        """One request of GitHub's API. most: the bytes of an answer that the door reads, where it is not the 4 MiB of
+        door_providers.http (a whole tree, TREE_MOST)."""
         status, answer = self.door.http(method, self.API + path, {
             "Authorization": "Bearer " + self.token(), "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
-            None if body is None else json.dumps(body).encode())
+            None if body is None else json.dumps(body).encode(), **({"most": most} if most else {}))
         return status, answer
 
     def file_at_head(self, path, branch=None, sure=False):
@@ -2457,6 +2480,29 @@ class GitHub:
         if status != 200 or not isinstance(answer, dict) or answer.get("encoding") != "base64":
             return None
         return base64.b64decode(answer["content"])
+
+    def head_tree(self, ref):
+        """{path: "file" | "folder" | "link"} of each entry of the tree at ref (a commit), in one read of GitHub's trees
+        API, which lists the whole tree: a submodule and a symlink are links. door_targets.head_refused reads what each
+        path of a commit is there, since a file written at a folder's path replaces the whole folder. One read for the
+        whole decision, so a commit of many files in many folders costs one call of the App's hourly allowance, which
+        all of the owner's agents share. Each answer that is not this tree whole is Stop: a status other than 200, a
+        tree that GitHub cut ("truncated"), and an entry with no path or a type or mode that the door does not know."""
+        status, got = self.call("GET", f"/repos/{self.repo}/git/trees/{urllib.parse.quote(ref, safe='')}?recursive=1",
+                                most=TREE_MOST)
+        entries = got.get("tree") if status == 200 and isinstance(got, dict) else None
+        if not isinstance(entries, list) or got.get("truncated") is not False:
+            raise door_providers.Stop(f"GitHub gave no whole tree of {self.repo} ({status}): send the commit again later, "
+                                      f"or in a repository that the door can read whole")
+        kinds, known = {}, {("tree", "040000"): "folder", ("blob", "100644"): "file", ("blob", "100755"): "file",
+                            ("blob", "120000"): "link", ("commit", "160000"): "link"}
+        for entry in entries:
+            kind = known.get((entry.get("type"), entry.get("mode"))) if isinstance(entry, dict) else None
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if kind is None or not isinstance(path, str) or not path:
+                raise door_providers.Stop(f"GitHub gave a tree of {self.repo} with an entry that the door does not read")
+            kinds[path] = kind
+        return kinds
 
     def head(self, branch):
         """The commit at the head of a branch. A branch that GitHub does not give (none of that name, or a repository
@@ -2550,7 +2596,7 @@ class GitHub:
             # branch that somebody set back). So the door reads the branch once more, just before it moves it.
             status, ref = self.call("GET", f"/repos/{self.repo}/git/ref/heads/{branch}")
             if status != 200 or ((ref or {}).get("object") or {}).get("sha") != head:
-                raise door_providers.Stop(f"{branch} moved while the door rendered the commit: nothing changed")
+                raise door_providers.Stop(f"{branch} moved after the door read it for this commit: nothing changed")
         status, moved = self.call("PATCH", f"/repos/{self.repo}/git/refs/heads/{branch}",
                                   {"sha": made["sha"], "force": False})
         if status != 200:

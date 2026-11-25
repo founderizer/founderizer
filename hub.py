@@ -229,7 +229,7 @@ CREATE INDEX IF NOT EXISTS standing_of ON standing(agent, ended, id);
 CREATE TABLE IF NOT EXISTS kpi_points(item INTEGER NOT NULL, day TEXT NOT NULL, value REAL NOT NULL, at REAL NOT NULL,
   source TEXT NOT NULL, backfill INTEGER NOT NULL DEFAULT 0, recorded REAL, PRIMARY KEY(item, day));
 CREATE TABLE IF NOT EXISTS kpi_changes(id INTEGER PRIMARY KEY, item INTEGER NOT NULL, at REAL NOT NULL, by TEXT NOT NULL,
-  words TEXT NOT NULL, outside_reads INTEGER);
+  words TEXT NOT NULL, outside_reads INTEGER, fields TEXT, asked_by TEXT);
 CREATE INDEX IF NOT EXISTS kpi_changes_of ON kpi_changes(item, at);
 CREATE TABLE IF NOT EXISTS prompts(id INTEGER PRIMARY KEY, task INTEGER, agent TEXT, tool TEXT, input TEXT,
   key TEXT, created REAL, decision TEXT, reason TEXT, decided REAL, by TEXT);
@@ -6763,17 +6763,31 @@ def waiting_say_rows(agent, task_id):
     and a notice whose task ended before its read waits again. Its words are the duty's as it stands now, and a duty
     that this agent no longer holds, or that was retired, needs no notice at all.
 
-    Only a duty's notice: any other message written under no task was written for nobody's task, and a task session
-    must not read it -- the board's answer to a person's question was one."""
+    Only a duty's notice, and a KPI's change that an agent above its parent made (KPIs version 2, 4.4; kpi_change_row),
+    as written, while the agent is still that KPI's parent: any other message written under no task was written for
+    nobody's task, and a task session must not read it -- the board's answer to a person's question was one."""
     in_transaction("waiting_say_rows")
     if role_of(agent) not in ("worker", "lead"):
         return
-    t0 = now()
+    t0, personal = now(), None
     # Under no task only: a task that ends before its session read the notice gives it back (unfile_notices), so
     # this is one read of the event_task index and not a look at every ended task's messages at each session start.
     for e in read_rows("SELECT id, extra FROM events WHERE task IS NULL AND kind='say' AND agent=? AND "
-                       "read_at IS NULL AND json_extract(extra, '$.duty') IS NOT NULL", (agent,)):
+                       "read_at IS NULL AND (json_extract(extra, '$.duty') IS NOT NULL OR "
+                       "json_extract(extra, '$.kpi_note') IS NOT NULL)", (agent,)):
         x = json.loads(e["extra"])
+        if "kpi_note" in x:         # KPIs version 2 (4.4): a change from above, as written, while it is the parent
+            if personal is None:    # spec 7.4: no KPI where a person's words drive: it waits for another task
+                personal = conversation_opened(task_id, lambda tid: read_row(
+                    "SELECT source_conversation, parent FROM tasks WHERE id=?", (tid,))) or task_scope(read_row(
+                        "SELECT id, owner, scope_person, source_conversation FROM tasks WHERE id=?", (task_id,))) \
+                    is not None
+            k = read_row("SELECT agent FROM standing WHERE id=?", (x["kpi_note"],))
+            if not (k and k["agent"] in agents() and kpi_parent(k["agent"]) == agent):
+                DB.execute("UPDATE events SET read_at=? WHERE id=?", (t0, e["id"]))
+            elif not personal:
+                DB.execute("UPDATE events SET task=? WHERE id=?", (task_id, e["id"]))
+            continue
         r = read_row("SELECT * FROM responsibilities WHERE id=?", (x["duty"],))
         if not r or r["agent"] != agent or r["state"] == "retired":
             DB.execute("UPDATE events SET read_at=? WHERE id=?", (t0, e["id"]))       # nothing to tell any more
@@ -9295,6 +9309,8 @@ def migrate():
                      "link_digest": "TEXT", "source": "TEXT"},
         # KPIs version 2 (4.2): a past value that a check printed after its link, and when the hub recorded a value
         "kpi_points": {"backfill": "INTEGER NOT NULL DEFAULT 0", "recorded": "REAL"},
+        # KPIs version 2 (4.4): the fields that a change named (a JSON list), and the owner's message that asked for it
+        "kpi_changes": {"fields": "TEXT", "asked_by": "TEXT"},
         # agent_remove: when the agent whose row keeps its name left team.json (forget_removed_agents), which the costs
         # reading of the whole fleet says (costs_deleted)
         "agents": {"deleted": "REAL"},
@@ -15721,14 +15737,17 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     in_transaction("admit_task")
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
+    # source_conversation with the row itself: its start text and its waiting notes read it (start_text,
+    # waiting_say_rows), and a task that a conversation opened reads no KPI (lanes/agent-kpis.md, spec 7.4)
     tid = DB.execute("INSERT INTO tasks(id,title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,"
                      "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case,"
-                     "ask,job,job_name,peer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     "ask,job,job_name,peer,source_conversation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                     "?,?)",
                      (unused_id("tasks"), f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"],
                       f["parent"], f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0,
                       f["case_id"], trigger_id, trigger_run, f.get("why"), f.get("responsibility"),
                       f.get("duty_case"), f.get("ask"), f.get("job"), f.get("job_name"),
-                      1 if f.get("peer") else None)).lastrowid
+                      1 if f.get("peer") else None, f.get("source_conversation"))).lastrowid
     if f.get("ask") and f.get("asked"):         # owner feature asks: the first task of a message names the ask
         ask_name_row(f["ask"], f["asked"])
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
@@ -31734,8 +31753,8 @@ def conversation_line_task(agent, conv, person, title, details, record, why, fol
             common["parent"] = lead_batch_rows(route["requester"], t0)
         tid = admit_task(route["requester"], dict(common, owner=agent, title=title, details=details,
                                                   done_when="The work is done and its result says what came of it.",
-                                                  why=why, question_record=(question or {}).get("record")))
-        DB.execute("UPDATE tasks SET source_conversation=? WHERE id=?", (conv["id"], tid))
+                                                  why=why, question_record=(question or {}).get("record"),
+                                                  source_conversation=conv["id"]))
         if question:        # a colleague's question about one record (question_record)
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (f"question_record:{tid}", json.dumps(question)))
@@ -45129,6 +45148,9 @@ def memory_shown_rows(agent, task_id, attempt, t0):
     reads these rows as where a lesson was used. A restart builds its text just before its transaction, so a lesson
     written in between can be missed here: it is shown by the next start."""
     in_transaction("memory_shown_rows")
+    if task_scope(read_row("SELECT id, owner, scope_person, source_conversation FROM tasks WHERE id=?", (task_id,))) \
+            is not None:            # start_text: a narrowed task reads no lesson (person access plan, section 5)
+        return
     for mid in memory_start_fit(agent, task_id)[3]:
         DB.execute("INSERT OR IGNORE INTO memory_shown(memory,task,attempt,at) VALUES(?,?,?,?)",
                    (mid, task_id, attempt, t0))
@@ -51114,7 +51136,7 @@ def standing_line(r, reader, t0):
     words are masked on their own: start_text masks the whole per-task block once more, and one login that the mask
     could not place in one item, as JSON writes one with a quote, made every start text of the agent MASK, and the
     brief of each window."""
-    if r["kind"] == "kpi":         # its words and its part, never a number (lanes/agent-kpis.md, spec 7.4)
+    if r["kind"] == "kpi":         # its words, its part and its level, and its value for a reader with a shell (4.5)
         return kpi_line(r, reader)
     scope = "" if r["scope"] != "team" else " for your team" if r["agent"] == reader else f" for {r['agent']}'s team"
     source = item_source(r)
@@ -51551,20 +51573,217 @@ def kpi_parent(agent):
     return None if role_of(agent) == "manager" else task_giver(agent)
 
 
+def kpi_setters(target):
+    """The agents that set `target`'s KPIs, nearest first (KPIs version 2, 4.4): its parent (task_giver), the agent
+    that gives the parent its tasks, and so on up to the fleet manager. A lead that cannot act is not in it, as
+    task_giver skips it. [] for the fleet manager, which has no KPIs. team.json only."""
+    out, at = [], target
+    if role_of(target) == "manager":
+        return out
+    while True:
+        up = task_giver(at)
+        if not up or up == target or up in out:
+            return out
+        out.append(up)
+        at = up
+
+
+def kpi_rank(actor, target):
+    """`actor`'s rank over `target`'s KPIs (4.4): 1 for the parent, 2 for the agent above it, and so on; None when it
+    is no agent of kpi_setters."""
+    setters = kpi_setters(target)
+    return setters.index(actor) + 1 if actor in setters else None
+
+
 def kpi_may_set(actor, target):
-    """None, or a ToolError's words: may `actor` set, change, link or end `target`'s KPIs? Only its parent may (spec
-    R3): a higher level asks the parent, and the measured agent proposes."""
+    """None, or a ToolError's words: may `actor` set, change, link or end `target`'s KPIs? Its parent may, and each
+    agent above the parent (KPIs version 2, 4.4: a lead for its whole subtree, the fleet manager for every agent),
+    inside the locks of kpi_locked. The measured agent proposes."""
     if target not in agents():
         return f"There is no agent {target} in the team."
     if role_of(target) == "manager":
         return f"{target} is the fleet manager, which has no KPIs."
-    parent = kpi_parent(target)
-    if actor == parent:
+    if kpi_rank(actor, target) is not None:
         return None
+    parent = kpi_parent(target)
     if actor == target:
         return f"{name_and_role(parent)} sets your KPIs: propose a change with message_agent."
-    return f"{name_and_role(parent)} sets {target}'s KPIs, as it gives {target} its tasks: ask it with " \
-           f"message_agent."
+    return f"{name_and_role(parent)} sets {target}'s KPIs, as it gives {target} its tasks, and so does each agent " \
+           f"above it: ask it with message_agent."
+
+
+# KPIs version 2 (4.4): a KPI's fields, as its changes name them for the locks; "check" is its link (a check or a hub
+# measure, with how and the agent's part)
+KPI_LOCK_FIELDS = ("name", "words", "direction", "number", "unit", "window_days", "metric", "measured_by", "check")
+
+
+def kpi_changes_named(r):
+    """(fields, by, rank, asked_by, at) of each change of KPI row r that named its fields (4.4), newest first: who
+    made it, that changer's rank over the agent now (kpi_rank: None when it is no longer above it, so it locks
+    nothing), the owner's message that asked for it or None, and when. A change of before version 2 names none. A
+    read."""
+    return [(json.loads(c["fields"]), c["by"], kpi_rank(c["by"], r["agent"]), c["asked_by"], c["at"]) for c in
+            read_rows("SELECT by, fields, asked_by, at FROM kpi_changes WHERE item=? AND fields IS NOT NULL ORDER BY "
+                      "id DESC", (r["id"],))]
+
+
+def kpi_step_open(r, actor):
+    """The time of the hub's step "Name who measures" of KPI row r (kpi_name_who_rows) while it waits for `actor`, the
+    KPI's parent: the owner of its open task, or, for an inbox message of the fleet manager's (no task), the parent
+    until a new link, a new setup or a new value (kpi_step_over_rows). None otherwise. A read."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"kpi_name_who:{r['id']}",))
+    if not row or actor != kpi_parent(r["agent"]):
+        return None
+    step = json.loads(row["v"])
+    if step["task"] is None and role_of(actor) != "manager":   # an inbox step went to the fleet manager alone
+        return None
+    if step["task"] is not None and not read_row(f"SELECT 1 FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}",
+                                                 (step["task"], actor)):
+        return None
+    return step["at"]
+
+
+def kpi_locks(r, actor):
+    """[(field, by, rank, asked_by, at)] that a change by `actor` of KPI row r must pass (4.4): for each field, the
+    newest change that named it. The hub's step "Name who measures" asks the parent to restore the measurement, so
+    while it waits for that parent (kpi_step_open) no change of the measurer or the link from before the step locks
+    them for it, the owner's choice included: he asked for a measurement, and the step is how it comes back. A change
+    after the step is a choice made since, and locks as ever. A read."""
+    step = kpi_step_open(r, actor)
+    locks = {}
+    for fields, by, rank, asked, at in kpi_changes_named(r):
+        for f in fields:
+            if not (step is not None and f in ("measured_by", "check") and at <= step):
+                locks.setdefault(f, (f, by, rank, asked, at))
+    return list(locks.values())
+
+
+def kpi_said_at(ref):
+    """(event id, time) of the owner's message `ref` (M-<n>): its ui_requests or steers row. A read."""
+    n = int(SOURCE_REF.match(str(ref)).group(2))
+    row = read_row("SELECT created FROM ui_requests WHERE event_id=?", (n,)) or \
+        read_row("SELECT created FROM steers WHERE event_id=?", (n,))
+    return n, row["created"] if row else None
+
+
+def kpi_locked(actor, r, fields, owner, same=True):
+    """None, or a ToolError's words: may `actor` change `fields` of KPI row r, or end it (fields None)? owner: the
+    owner's own message M-<n> that the call names (kpi_asked), or None (4.4). same: False when the number is locked
+    only for what a change of direction or unit does to it.
+
+    A field that his message set changes only on a later message of his (a higher M number: he may send two before
+    the first is applied, and his later word passes whoever applied his earlier one), or the number on the same one
+    again, to another figure that it holds; one that a higher rank set on its own word changes only from that rank or
+    above, while that changer is still above the agent, or on a message of his sent after that change. Two fields lock nothing while the hub asks the parent to set them again: the link (check) while the KPI
+    has none, and measured_by while its measurer is no agent of the parent's; and the step "Name who measures" frees
+    both for its parent (kpi_locks). An end passes every change that the KPI ever had, with no such exception: the
+    highest rank and the owner's latest ask, whatever changed after them."""
+    rank = kpi_rank(actor, r["agent"])
+    n, said = kpi_said_at(owner) if owner else (None, None)
+    if fields is None:
+        locks = [(f, by, theirs, asked, at) for names, by, theirs, asked, at in kpi_changes_named(r) for f in names]
+    else:
+        locks = [lock for lock in kpi_locks(r, actor) if lock[0] in fields and not (
+            (lock[0] == "check" and not (r["check"] or r["source"])) or
+            (lock[0] == "measured_by" and not kpi_measurer_ok(r)))]
+    for f, by, theirs, asked, at in locks:
+        if asked:                   # his own ask: his later word passes it, whoever applied it
+            again = same and fields is not None and f == "number"
+            if owner is None or not (n > int(asked[2:]) or again and n == int(asked[2:])):
+                return (f"The owner asked for {iref(r['id'])}'s {f} in {asked}: it changes, and the KPI ends, only on "
+                        f"a later message of theirs, named in asked_by, that holds any new number"
+                        + (f" (the number also on {asked} again, to another figure in it)." if again else ".")
+                        + (f" {owner} is not later than {asked}." if owner else ""))
+            continue
+        after = owner is not None and said is not None and said > at
+        if not after and theirs is not None and rank is not None and theirs > rank:
+            return (f"{name_and_role(by)} set {iref(r['id'])}'s {f}, above you: ask it with message_agent."
+                    + (f" {owner} was sent before that change." if owner else ""))
+    return None
+
+
+def kpi_owner_said(agent, target, ref):
+    """The text of the owner's own message `ref` (M-<n>) that asks for a set, change or end of a KPI of `target` (4.4):
+    his own hand (not an AI session's or a program's), sent to `target` or to an agent above it up to the caller
+    `agent`, which passed his words up (kpi_rule_sentence, chat_kpi_text); a message to an agent above the caller is
+    that agent's to act on, and naming it would carry his lock past the agents above. In an owner chat, a message of
+    his to that chat, as standing_chat takes one. A ToolError otherwise."""
+    m = SOURCE_REF.match(str(ref or ""))
+    if not m or m.group(1).upper() != "M":
+        raise ToolError("asked_by names the owner's own message that asks for it: M-<n>, as read_messages gives it.")
+    n = int(m.group(2))
+    if chat_context(agent) and not read_row("SELECT 1 FROM ui_requests WHERE event_id=? AND recipient=? AND "
+                                            "kind='message'", (n, agent)):
+        raise ToolError(f"In your owner chat, asked_by names the owner's message to you that asks for it, and M-{n} "
+                        f"is none.")
+    said = read_row("SELECT text, recipient, hand, connection FROM ui_requests WHERE event_id=? AND kind='message'",
+                    (n,)) or \
+        read_row("SELECT s.text, t.owner recipient, s.hand, s.connection FROM steers s JOIN tasks t ON t.id=s.task "
+                 "WHERE s.event_id=?", (n,))
+    above = line_above(target)
+    if not said or said["recipient"] not in [target] + above:
+        raise ToolError(f"M-{n} is no message of the owner's to {target} or to an agent above it.")
+    if said["recipient"] not in [target] + above[:above.index(agent) + 1 if agent in above else 0]:
+        raise ToolError(f"M-{n} went to {name_and_role(said['recipient'])}, above you: it acts on that message itself.")
+    if not owner_force(said["hand"]) or said["connection"] is not None:
+        raise ToolError(f"M-{n} came through an AI session or a program, not from the owner's own hand, so it asks "
+                        f"for no KPI.")
+    return said["text"] or ""
+
+
+KPI_FIGURE = re.compile(r"(?:(?<![^\s(\[=<>:\"'\u2264\u2265\u201c\u2018])([-\u2212]))?(?<![A-Za-z0-9_.,])(?<![A-Za-z][-\u2212])([0-9]+(?:[.,][0-9]+)*|[.,][0-9]+)"
+                        r"([kK](?![A-Za-z]))?")
+
+
+def kpi_figure_readings(x):
+    """The values that the digits and marks `x` can mean: "4.5" and "4,5" a decimal; "1,000" and "2.500" a thousands
+    group in one writing and a decimal in another, so both, but "0.500" only a decimal; "1.000.000" groups of three;
+    "1.234,5" and "1,234.5" the last mark the decimal one, after groups of three. [] for a form that no writing has
+    ("1,2.5")."""
+    seps = [c for c in x if c in ".,"]
+    if not seps:
+        return [float(x)]
+    if x[0] in ".,":
+        return [float("0." + x[1:])] if len(seps) == 1 else []
+    if len(set(seps)) == 2:
+        dec = seps[-1]
+        head, tail = x.rsplit(dec, 1)
+        group = "," if dec == "." else "."
+        ok = x.count(dec) == 1 and all(len(g) == 3 for g in head.split(group)[1:])
+        return [float(head.replace(group, "") + "." + tail)] if ok else []
+    if len(seps) == 1:
+        whole, part = x.split(seps[0])
+        return [float(f"{whole}.{part}")] + ([float(whole + part)] if len(part) == 3 and whole[0] != "0" else [])
+    return [float(x.replace(seps[0], ""))] if all(len(g) == 3 for g in x.split(seps[0])[1:]) else []
+
+
+def kpi_figures(text):
+    """The numbers that `text` writes, each read every way that a writer may mean it (kpi_figure_readings), so that a
+    level that the owner wrote in either way of writing numbers is his (kpi_asked): "80", "80%", "-5" and "=-5", ".5",
+    "16.1k" (16,100), "2.500" (2.5 and 2500). A ref such as M-12 or I-116 is no number, a minus after anything but a
+    space, a bracket, a sign of comparison or a quote is a dash ("28-30", "20%-30%"), and digits after a letter are
+    part of a word ("x5", "v1.2")."""
+    out = []
+    for m in KPI_FIGURE.finditer(text or ""):
+        scale = (-1 if m.group(1) else 1) * (1000 if m.group(3) else 1)
+        out += [round(v * scale, 9) if m.group(3) else v * scale for v in kpi_figure_readings(m.group(2))]
+    return out
+
+
+def kpi_asked(agent, target, a):
+    """(asked_by, note) of a set_kpi call (4.4): the owner's message M-<n> that it names, checked (kpi_owner_said), or
+    None; and the reply's sentence when a new number is not in his message, which makes the call the caller's own, at
+    its rank, with no lock of his ("make the fix time one day" for a level of 24 h)."""
+    if a.get("asked_by") in (None, ""):
+        return None, ""
+    text = kpi_owner_said(agent, target, a["asked_by"])
+    ref = f"M-{SOURCE_REF.match(str(a['asked_by'])).group(2)}"
+    if a.get("number") not in (None, ""):
+        number = item_value(a["number"], "number")      # as kpi_fields reads it, also from words such as "70"
+        if number not in kpi_figures(text):
+            return None, (f" {ref} does not hold the number {item_number(number)}, so this is your own change, at "
+                          f"your rank, with no lock of the owner's.")
+    return ref, ""
 
 
 def kpi_route(owner):
@@ -51578,21 +51797,31 @@ def kpi_route(owner):
     return route
 
 
-def kpi_measuring(parent, target, value):
+def kpi_giver_words(actor, r):
+    """"you give" for the parent of KPI row r, and "<parent> gives" for an agent above it (4.4)."""
+    parent = kpi_parent(r["agent"])
+    return "you give" if actor == parent else f"{parent} gives"
+
+
+def kpi_measuring(actor, target, value):
     """The agent that measures `target`'s KPI (spec 5.1): the measured agent by default; else an agent whose tasks the
-    parent gives, or the parent itself when it is a lead. Never the fleet manager, which holds no task."""
+    parent gives, or the parent itself when it is a lead. Never the fleet manager, which holds no task. The parent is
+    the KPI's, also when `actor` is an agent above it (KPIs version 2, 4.4)."""
+    parent = kpi_parent(target)
+    whose = "you" if actor == parent else parent
+    them = "yourself when you are a lead" if actor == parent else f"{parent} itself when it is a lead"
     name = str(value or "").strip() or target
     if name not in agents():
         raise ToolError(f"measured_by: there is no agent {name} in the team.")
     if role_of(name) == "manager":
-        raise ToolError("measured_by is never the fleet manager, which holds no task: name an agent whose tasks you "
-                        "give, or yourself when you are a lead.")
+        raise ToolError(f"measured_by is never the fleet manager, which holds no task: name an agent whose tasks "
+                        f"{whose} give{'' if whose == 'you' else 's'}, or {them}.")
     if name != target and not (name == parent and role_of(parent) == "lead") and task_giver(name) != parent:
-        raise ToolError(f"measured_by is {target}, an agent whose tasks you give, or yourself when you are a lead: an "
-                        f"agent that already holds the source, as a KPI gives no access.")
+        raise ToolError(f"measured_by is {target}, an agent whose tasks {whose} give{'' if whose == 'you' else 's'}, "
+                        f"or {them}: an agent that already holds the source, as a KPI gives no access.")
     if shell_off(name):
-        raise ToolError(f"{name}'s Shell box is off, so it writes no check: name measured_by, an agent whose tasks you "
-                        f"give that holds the source, or yourself when you are a lead.")
+        raise ToolError(f"{name}'s Shell box is off, so it writes no check: name measured_by, an agent whose tasks "
+                        f"{whose} give{'' if whose == 'you' else 's'} that holds the source, or {them}.")
     return name
 
 
@@ -51675,12 +51904,27 @@ def kpi_level(r):
     return f"{'at least' if r['direction'] == 'at_least' else 'at most'} {kpi_value_text(r, r['number'])}"
 
 
-def kpi_change_row(item, by, words, t0, reads=None):
+def kpi_change_row(item, by, words, t0, reads=None, fields=None, asked_by=None, opened=None):
     """Inside a transaction: one line of a KPI's own history (spec 7.5): who changed it, when, what, and after how many
-    outside texts that session had read (save_provenance)."""
+    outside texts that session had read (save_provenance); with KPIs version 2 (4.4) the fields that it named, for
+    the locks (kpi_locks), and the owner's message that asked for it. When an agent above the KPI's parent made it,
+    the parent reads who and what in its next task session (waiting_say_rows); opened: the setup task that this same
+    change opened, whose details say all of it."""
     in_transaction("kpi_change_row")
-    DB.execute("INSERT INTO kpi_changes(item,at,by,words,outside_reads) VALUES(?,?,?,?,?)",
-               (item, t0, by, words[:500], reads))
+    DB.execute("INSERT INTO kpi_changes(item,at,by,words,outside_reads,fields,asked_by) VALUES(?,?,?,?,?,?,?)",
+               (item, t0, by, words[:500], reads, json.dumps(list(fields)) if fields is not None else None, asked_by))
+    r = DB.execute("SELECT agent, name, setup_task FROM standing WHERE id=?", (item,)).fetchone()
+    parent = kpi_parent(r["agent"]) if r and r["agent"] in agents() else None
+    if parent and by != parent and role_of(parent) != "manager" and (kpi_rank(by, r["agent"]) or 0) > 1:
+        # under the parent's own open setup task of this KPI when it measures it itself: that session reads it now
+        setup = DB.execute(f"SELECT id FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}",
+                           (r["setup_task"], parent)).fetchone() if r["setup_task"] else None
+        if setup and setup["id"] == opened:
+            return
+        DB.execute(EVENT, (parent, "say", setup["id"] if setup else None, mask_secrets(
+            f"[hub] {name_and_role(by)}, above you, made a change to the KPI {iref(item)} of {r['agent']} "
+            f"({r['name']})" + (f", as the owner asked in {asked_by}" if asked_by else "") + f": {words[:500]}"),
+            t0, json.dumps({"kpi_note": item})))
 
 
 def kpi_step_rows(owner, task, t0, job=None):
@@ -51700,11 +51944,13 @@ def kpi_step_rows(owner, task, t0, job=None):
     return {"task": admit_task(route["requester"], dict(common, owner=owner, job=job, **task))}
 
 
-def kpi_setup_fields(r, measuring):
-    """The setup task of KPI row r for its measuring agent (spec 7.1)."""
-    parent, measured = shown_role(kpi_parent(r["agent"])), shown_role(r["agent"])
-    return {"title": f"Measure {r['name']}",
-            "details": (f"{parent} set a KPI on {name_and_role(r['agent'])}, {iref(r['id'])}: {full_stop(r['words'])} "
+def kpi_setup_fields(r, measuring, by=None):
+    """The setup task of KPI row r for its measuring agent (spec 7.1); by: the agent whose change opened it, when it
+    is not the KPI's author."""
+    parent, measured, setter = shown_role(kpi_parent(r["agent"])), shown_role(r["agent"]), shown_role(by or r["author"])
+    return {"title": f"Measure {r['name']}",      # its setter may be above the parent (KPIs version 2, 4.4)
+            "details": (f"{setter} {'changed' if by else 'set'} a KPI on {name_and_role(r['agent'])}, {iref(r['id'])}: "
+                        f"{full_stop(r['words'])} "
                         f"Its level: {kpi_level(r)}, over {r['window_days']} days. Its metric: {r['metric']}. "
                         + (f"It is {measured}'s department's KPI: the results of its whole team's work. "
                            if role_of(r["agent"]) == "lead" else
@@ -51715,8 +51961,8 @@ def kpi_setup_fields(r, measuring):
                         f"\"kpi {r['metric']} <value>\", the value of the last {r['window_days']} days as one number. "
                         f"After it, each past day may follow as \"kpi {r['metric']} <value> <unix-seconds>\" (the end "
                         f"of that day's window: the midnight after it, in the time zone {goal_settings()[2].key}), up "
-                        f"to {KPI_BACKFILL_DAYS} days back: the hub takes them in the first run after {parent} links "
-                        f"the check and drops them with no words in later runs, and its value shows at once. Save the "
+                        f"to {KPI_BACKFILL_DAYS} days back: the hub takes them in the first run after the check's "
+                        f"link and drops them with no words in later runs, and its value shows at once. Save the "
                         f"check in this task, also an existing one (as an edit, also with no change), so that {parent} "
                         f"can read it.\n\n{KPI_DATA_RULE}\n\nWhen the source does not hold the data, say what "
                         f"{measured}'s "
@@ -51726,16 +51972,39 @@ def kpi_setup_fields(r, measuring):
                           f"check, the metric, the query and the count behind the value, every input that the code "
                           f"reads and who can write each, whether the source keeps the history that the rule needs, "
                           f"and what {measured}'s work must do for the data to exist."),
-            "why": f"{parent} set the KPI {r['name']} on {measured}, and {measuring} measures it."}
+            "why": f"{setter} {'changed' if by else 'set'} the KPI {r['name']} on {measured}, and {measuring} measures "
+                   f"it."}
+
+
+def kpi_days_words(start, end):
+    """The days of a window in the fleet's time zone, as a KPI line names them: "15-22 Nov", "28 Oct-4 Nov"."""
+    import datetime
+    tz = goal_settings()[2]
+    a, b = (datetime.datetime.fromtimestamp(x, tz) for x in (start, end))
+    if a.year != b.year:
+        return f"{a.day} {a:%b %Y}-{b.day} {b:%b %Y}"
+    return f"{a.day}-{b.day} {b:%b}" if a.month == b.month else f"{a.day} {a:%b}-{b.day} {b:%b}"
 
 
 def kpi_line(r, reader):
-    """One KPI in a standing block (spec 7.4): its words and its part, never a number. An agent told in every session
-    that a number is low drifts toward work that moves the number."""
+    """One KPI in a standing block: its name, its level, its words and its part (spec 7.4), and for a reader with a
+    shell its newest judged value with the days that it measures, and whether that value is on target (KPIs version 2,
+    4.5: the owner asks for awareness, and his first proposal, "the value, the target and the trend" in each session,
+    is what he praised on 20 November 2026). A reader whose Shell box is off gets no value: it cannot act on a number,
+    and a number in each ticket session could only bend its ticket work. A new value is never news. A read."""
     whose = "" if reader == r["agent"] else f" of {r['agent']}"
     part = f" [{'your' if reader == r['agent'] else 'its'} part: {mask_secrets(r['agent_part'])}]" \
         if r["agent_part"] else ""
-    return f"{iref(r['id'])} KPI{whose} from {shown_role(r['author'])}: {mask_secrets(r['words'])}{part}"
+    head = f"{iref(r['id'])} KPI{whose} from {shown_role(r['author'])}: {r['name']}, {kpi_level(r)}"
+    if not shell_off(reader):
+        row = kpi_judged_newest(r["id"], r)
+        days = kpi_days_words(row["at"] - r["window_days"] * KPI_DAY, row["at"]) if row else ""
+        head += ("; no judged value yet" if not row else
+                 f"; {kpi_value_text(r, row['value'])} for {days}, its newest judged value, and none since"
+                 if r["kpi_state"] == "no_data" else      # its state: no value in its last window
+                 f"; {kpi_value_text(r, row['value'])} for {days}, "
+                 f"{'on' if kpi_shown_state(r, row['value']) == 'on' else 'off'} target")
+    return f"{head}. {mask_secrets(r['words'])}{part}"
 
 
 def kpi_rule_sentence(agent):
@@ -51744,7 +52013,25 @@ def kpi_rule_sentence(agent):
     return ("A KPI measures your work and never limits it: never skip a correct step, hide a fault or choose easier "
             "work to keep a number good, and never change a check or its query to move a number. Do your part of each "
             f"KPI. When you find a fault in a check that measures you, tell {parent} with message_agent. You never "
-            f"change or end a KPI: propose a change to {parent} with message_agent.")
+            f"change or end a KPI: propose a change to {parent} with message_agent, naming the owner's message "
+            f"(M-<n>) when they asked for it.")
+
+
+def chat_kpi_text(agent):
+    """The owner chat's words about KPIs while the setting kpis is on (KPIs version 2, 4.4): the owner's words about
+    the agent's own KPIs go to the agent that sets them, and a lead's chat sets its team's on his message, or passes
+    his words on when its Shell box is off. A chat reads no KPI line (chat_recap_text)."""
+    if not setting("kpis") or role_of(agent) not in ("worker", "lead"):
+        return ""
+    parent = kpi_parent(agent)
+    text = (f" When the owner asks you to change one of your own KPIs, pass their words to {parent} with message_agent, "
+            f"naming their message (M-<n>), and tell them that you did." if parent else "")
+    if role_of(agent) == "lead" and not shell_off(agent):
+        text += (" When the owner asks you to set, change or end a KPI of your team, do it here with set_kpi or "
+                 "end_standing and their message in asked_by; see_history reads your team's KPIs.")
+    elif role_of(agent) == "lead" and parent:
+        text += f" The owner's words about a KPI of your team go the same way to {parent}."
+    return text
 
 
 def kpi_parent_text(agent):
@@ -51764,11 +52051,12 @@ def kpi_parent_text(agent):
 
 def kpi_readable(caller):
     """The ids of the rules that a lead may read beside its own (spec 5.1): a rule that the measuring agent saved in the
-    setup task of a KPI of the lead's team, and a rule that such a KPI links. Read only: may_control still refuses."""
+    setup task of a KPI that the lead sets, and a rule that such a KPI links: of its own team, and of its whole subtree
+    (KPIs version 2, 4.4: every level above the parent sets and links). Read only: may_control still refuses."""
     if role_of(caller) != "lead":
         return set()
     mine = [r for r in read_rows('SELECT agent, "check", setup_task FROM standing WHERE kind=\'kpi\' AND ended IS '
-                                 'NULL') if kpi_parent(r["agent"]) == caller]
+                                 'NULL') if kpi_rank(caller, r["agent"]) is not None]
     ids = {r["check"] for r in mine if r["check"]}
     setups = [r["setup_task"] for r in mine if r["setup_task"]]
     if setups:
@@ -51777,9 +52065,9 @@ def kpi_readable(caller):
             tuple(setups))}
     if not ids:
         return set()
-    # and only while the rule's agent is one whose tasks the lead gives: a measurer that moved away takes its rules
+    # and only while the rule's agent is in the lead's subtree: a measurer that moved away takes its rules
     return {t["id"] for t in read_rows(f"SELECT id, agent FROM triggers WHERE id IN ({','.join('?' * len(ids))})",
-                                       tuple(ids)) if t["agent"] == caller or task_giver(t["agent"]) == caller}
+                                       tuple(ids)) if t["agent"] == caller or kpi_rank(caller, t["agent"]) is not None}
 
 
 def t_set_kpi(agent, a):
@@ -51787,7 +52075,11 @@ def t_set_kpi(agent, a):
         raise ToolError(KPIS_OFF)
     if shell_off(agent) or contact_session(agent):
         raise ToolError("set_kpi is for a session of your own work, never one that a person's message drives.")
-    task = session_task(agent, a)
+    chat = chat_context(agent)      # a lead's owner chat sets a KPI on the owner's word alone (4.4)
+    if chat and a.get("asked_by") in (None, ""):
+        raise ToolError("In your owner chat, set_kpi takes the owner's message to you that asks for it, in asked_by: "
+                        "M-<n>, as read_messages gives it.")
+    task = None if chat else session_task(agent, a)
     guard(agent, *(str(a.get(k) or "") for k in ("name", "words", "how", "agent_part", "unit")))
     if a.get("id") in (None, ""):
         return kpi_new(agent, a, task)
@@ -51798,14 +52090,15 @@ def t_set_kpi(agent, a):
     if a.get("agent") not in (None, "", r["agent"]):
         raise ToolError(f"{iref(r['id'])} measures {r['agent']}: a KPI stays with its agent. Set a new one on "
                         f"{a['agent']}.")
+    asked = kpi_asked(agent, r["agent"], a)
     if a.get("check") not in (None, ""):
         mixed = [k for k in ("name", "words", "direction", "number", "unit", "window_days", "measured_by")
                  if a.get(k) not in (None, "")]
         if mixed:
             raise ToolError(f"A link takes id, check, how, agent_part and metric. Change {', '.join(mixed)} in a call "
                             f"of its own.")
-        return kpi_link(agent, r, a, task)
-    return kpi_change(agent, r, a, task)
+        return kpi_link(agent, r, a, task, asked)
+    return kpi_change(agent, r, a, task, asked)
 
 
 def kpi_news_rows(item, t0, by_agent, by_task, new=False):
@@ -51822,6 +52115,7 @@ def kpi_new(agent, a, task):
     if refused:
         raise ToolError(refused)
     kpi_route(target)               # an agent that no hub task reaches gets no KPI (spec 7), in the route's words
+    owner, note = kpi_asked(agent, target, a)
     f = kpi_fields(a)
     same = read_row("SELECT id FROM standing WHERE agent=? AND kind='kpi' AND ended IS NULL AND name=?",
                     (target, f["name"]))
@@ -51844,20 +52138,26 @@ def kpi_new(agent, a, task):
         DB.execute("UPDATE standing SET setup_task=? WHERE id=?", (setup, item))
         kpi_change_row(item, agent, f"set: {f['name']}: {f['words']} ({kpi_level(r)} over {f['window_days']} days, "
                                     f"metric {f['metric']}"
-                                    + (f", measured by {measuring}" if measuring != target else "") + ")", t0, reads)
+                                    + (f", measured by {measuring}" if measuring != target else "") + ")", t0, reads,
+                       [k for k in KPI_LOCK_FIELDS if k != "check" and (k != "measured_by" or a.get("measured_by"))],
+                       owner, setup)
         kpi_news_rows(item, t0, agent, task, new=True)
         log_row(agent, f"set the KPI {iref(item)} on {target}")
+    reader = read_row("SELECT requester FROM tasks WHERE id=?", (setup,))["requester"] if setup else None
     return (f"Set {iref(item)} on {target}: {f['name']}, {kpi_level(r)} over {f['window_days']} days. "
             + (f"{tref(setup)} asks {measuring} to build its check. When its result comes, read the check, its "
                f"inputs and who can write each, and link it with set_kpi(id=\"{iref(item)}\", check, how, "
-               f"agent_part), or send it back." if setup else
+               f"agent_part), or send it back." if setup and reader == agent else
+               f"{tref(setup)} asks {measuring} to build its check, and {name_and_role(reader)} reads its result and "
+               f"links it." if setup else
                f"You measure it yourself: write a line check of your own that prints \"kpi {f['metric']} <value>\", "
                f"then link it with set_kpi(id=\"{iref(item)}\", check, how, agent_part).")
             + f" {target}'s sessions start with its words. Each value shows at once; its steps judge values from the "
-              f"link, or from one window after it when {target} has a part.")
+              f"link, or from one window after it when {target} has a part." + note)
 
 
-def kpi_change(agent, r, a, task):
+def kpi_change(agent, r, a, task, asked=(None, "")):
+    owner, note = asked
     f = {k: v for k, v in kpi_fields(a, r).items() if v != r[k]}
     if f.get("name") and read_row("SELECT id FROM standing WHERE agent=? AND kind='kpi' AND ended IS NULL AND name=? "
                                   "AND id<>?", (r["agent"], f["name"], r["id"])):
@@ -51871,9 +52171,20 @@ def kpi_change(agent, r, a, task):
         wrong = hub_measure_wrong(kpi_measure(r), f.get("unit", r["unit"]), f.get("direction", r["direction"]))
         if wrong:
             raise ToolError(f"{wrong} {iref(r['id'])} is linked to it, so nothing changed.")
-    if again and not by and not kpi_measurer_ok(r):
-        raise ToolError(f"{measuring}, which measured {r['name']}, is no agent whose tasks you give now: name who "
+    # a change that clears a link needs the link's rank too, and records no choice of a link ("check")
+    names = set(f) | ({"measured_by"} if by else set()) | ({"check"} if again and (r["check"] or r["source"])
+                                                             else set())
+    # direction and unit say what the number means: a change of them needs the number's lock too
+    refused = kpi_locked(agent, r, names, owner) or (kpi_locked(agent, r, {"number"}, owner, same=False)
+                                                     if {"direction", "unit"} & set(f) else None)
+    if refused:
+        raise ToolError(refused + note)
+    if again and not by and shell_off(measuring):
+        raise ToolError(f"{measuring}, which measured {r['name']}, has its Shell box off and writes no check: name who "
                         f"measures it with measured_by in the same call.")
+    if again and not by and not kpi_measurer_ok(r):
+        raise ToolError(f"{measuring}, which measured {r['name']}, is no agent whose tasks "
+                        f"{kpi_giver_words(agent, r)} now: name who measures it with measured_by in the same call.")
     if again and measuring != agent:
         kpi_route(measuring)
     t0, reads = now(), save_provenance(agent)[1]
@@ -51893,22 +52204,23 @@ def kpi_change(agent, r, a, task):
         setup = None
         if again:
             now_r = DB.execute("SELECT * FROM standing WHERE id=?", (r["id"],)).fetchone()
-            setup = kpi_step_rows(measuring, kpi_setup_fields(now_r, measuring), t0).get("task") \
+            setup = kpi_step_rows(measuring, kpi_setup_fields(now_r, measuring, agent), t0).get("task") \
                 if measuring != agent else None
             DB.execute("UPDATE standing SET setup_task=? WHERE id=?", (setup, r["id"]))
             kpi_setup_done_rows(r, f"{agent} changed the KPI {iref(r['id'])}", t0, setup)   # the old one is replaced
+            kpi_step_over_rows(r["id"])
         elif "direction" in f or "number" in f:
             kpi_state_rows(r["id"], t0, steps=False)    # the state from the newest counting value, at the new level
         kpi_change_row(r["id"], agent, "changed: " + "; ".join(
             [f"{k} to {item_number(v) if isinstance(v, float) else v}" for k, v in f.items()]
-            + ([f"measured by {measuring}"] if by else [])), t0, reads)
+            + ([f"measured by {measuring}"] if by else [])), t0, reads, sorted(names - {"check"}), owner, setup)
         kpi_news_rows(r["id"], t0, agent, task)
         log_row(agent, f"changed the KPI {iref(r['id'])} of {r['agent']}")
     if not again:
-        return f"Changed {iref(r['id'])}. Its link and its values stay."
+        return f"Changed {iref(r['id'])}. Its link and its values stay." + note
     return (f"Changed {iref(r['id'])}. Its link cleared: its steps judge values again from the next link. " +
             (f"{tref(setup)} asks {measuring} to build its check." if setup else
-             "You measure it yourself: link a line check of your own with set_kpi."))
+             "You measure it yourself: link a line check of your own with set_kpi.") + note)
 
 
 def kpi_code_read(rule, setup):
@@ -51936,13 +52248,18 @@ def kpi_setup_done_rows(r, why, t0, setup=None):
                            "have, and change nothing more for it.", t0, "{}"))
 
 
-def kpi_link(agent, r, a, task):
+def kpi_link(agent, r, a, task, asked=(None, "")):
+    new_measure = str(a.get("check") or "").startswith("hub:") and r["source"] != str(a["check"]).strip()
+    refused = kpi_locked(agent, r, {"check", "measured_by"} if new_measure else {"check"}, asked[0])  # 4.4: it
+    if refused:                     # measures in place of the measurer
+        raise ToolError(refused + asked[1])
     if str(a.get("check") or "").startswith("hub:"):        # KPIs version 2 (4.3): a hub measure, with no check
-        return kpi_link_measure(agent, r, a, task, str(a["check"])[4:])
+        return kpi_link_measure(agent, r, a, task, str(a["check"])[4:], asked)
     measuring = kpi_measuring_agent(r)
     if not kpi_measurer_ok(r):
-        raise ToolError(f"{measuring}, which was to measure {r['name']}, is no agent whose tasks you give now: name who "
-                        f"measures it with set_kpi(id=\"{iref(r['id'])}\", measured_by).")
+        raise ToolError(f"{measuring}, which was to measure {r['name']}, is no agent whose tasks "
+                        f"{kpi_giver_words(agent, r)} now: name who measures it with set_kpi(id=\"{iref(r['id'])}\", "
+                        f"measured_by).")
     if not setting("checks.lines"):
         raise ToolError("This fleet takes no check that prints lines yet (the setting checks.lines), so no check can "
                         "measure a KPI.")
@@ -51966,7 +52283,9 @@ def kpi_link(agent, r, a, task):
         raise ToolError(f"Wake-up rule {rule}'s code now was not saved in {r['name']}'s setup task"
                         + (f" {tref(r['setup_task'])}" if r["setup_task"] else "") + f", so you have not read it: ask "
                         f"{measuring} to save it there (an edit of an existing check counts), then read it and link "
-                        f"it. A setup task that ended gives no new read: set_kpi(id, measured_by) opens a new one.")
+                        f"it. A setup task that ended gives no new read: set_kpi(id, measured_by) opens a new one."
+                        + (f" That call is not yours now: {locked}" if (locked := kpi_locked(
+                            agent, r, {"measured_by", "check"}, asked[0])) else ""))
     if "reports" in (spec.get("inputs") or []) and measuring != r["agent"]:
         raise ToolError(f"Wake-up rule {rule} reads the input reports, which gives the typed reports to {measuring}'s "
                         f"own duties, not to {r['agent']}'s: only a check of {r['agent']}'s own can read them for it.")
@@ -51984,9 +52303,10 @@ def kpi_link(agent, r, a, task):
     if same:                        # new words of how or of the agent's part: the link stays
         with transaction():
             DB.execute("UPDATE standing SET how=?, agent_part=? WHERE id=?", (how, part or None, r["id"]))
-            kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads)
+            kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads,
+                           ["check"], asked[0])
             kpi_news_rows(r["id"], t0, agent, task)
-        return f"Changed how {iref(r['id'])} is measured and the agent's part. Its link and its values stay."
+        return f"Changed how {iref(r['id'])} is measured and the agent's part. Its link and its values stay." + asked[1]
     with transaction():
         # the markers of steps that have ended clear (spec 6); an episode that is still marked is judged one window
         # after the new link
@@ -52000,15 +52320,17 @@ def kpi_link(agent, r, a, task):
                    (rule, t0, digest, how, part or None, t0 + r["window_days"] * KPI_DAY if marked else None,
                     "no_data", t0, kept["off_task"], kept["parent_task"], r["id"]))
         quicker = kpi_check_often_rows(t, t0)
+        kpi_step_over_rows(r["id"])
         kpi_change_row(r["id"], agent, f"linked to wake-up rule {rule}; how: {how}"
-                                       + (f"; the agent's part: {part}" if part else ""), t0, reads)
+                                       + (f"; the agent's part: {part}" if part else ""), t0, reads, ["check"],
+                       asked[0])
         kpi_news_rows(r["id"], t0, agent, task)
         log_row(agent, f"linked the KPI {iref(r['id'])} of {r['agent']} to wake-up rule {rule}")
     return (f"Linked {iref(r['id'])} to wake-up rule {rule}. {kpi_runs_text(t, quicker)}; each value shows at once, "
             f"and its first run may also print the {KPI_BACKFILL_DAYS} days before the "
             f"link, as \"kpi {r['metric']} <value> <unix-seconds>\". " +
             (f"Its steps judge values from one window after now ({r['window_days']} days), because {r['agent']} has a "
-             f"part." if part else "Its steps judge values from now."))
+             f"part." if part else "Its steps judge values from now.") + asked[1])
 
 
 def kpi_runs_text(t, quicker):
@@ -52048,7 +52370,7 @@ def kpi_check_often_rows(t, t0):
     return True
 
 
-def kpi_link_measure(agent, r, a, task, name):
+def kpi_link_measure(agent, r, a, task, name, asked=(None, "")):
     """set_kpi's link of a hub measure (KPIs version 2, 4.3): the hub counts it from its own records, with no check
     and no measuring agent, and fills its past at once."""
     if name not in HUB_MEASURES:
@@ -52071,9 +52393,10 @@ def kpi_link_measure(agent, r, a, task, name):
             return f"{iref(r['id'])} is the hub measure {name} already. Nothing changed."
         with transaction():
             DB.execute("UPDATE standing SET how=?, agent_part=? WHERE id=?", (how, part or None, r["id"]))
-            kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads)
+            kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads,
+                           ["check"], asked[0])
             kpi_news_rows(r["id"], t0, agent, task)
-        return f"Changed how {iref(r['id'])} is measured and the agent's part. Its link and its values stay."
+        return f"Changed how {iref(r['id'])} is measured and the agent's part. Its link and its values stay." + asked[1]
     with transaction():
         # as kpi_link: the markers of steps that have ended clear (spec 6), and an episode that is still marked is
         # judged one window after the new link
@@ -52087,15 +52410,17 @@ def kpi_link_measure(agent, r, a, task, name):
                     "no_data", t0, kept["off_task"], kept["parent_task"], r["id"]))
         kpi_setup_done_rows(r, f"{agent} linked the KPI {iref(r['id'])} to the hub's own measure {name}", t0)
         kpi_measure_rows(DB.execute("SELECT * FROM standing WHERE id=?", (r["id"],)).fetchone(), t0, past=True)
+        kpi_step_over_rows(r["id"])
         kpi_change_row(r["id"], agent, f"linked to the hub measure {name}; how: {how}"
-                                       + (f"; the agent's part: {part}" if part else ""), t0, reads)
+                                       + (f"; the agent's part: {part}" if part else ""), t0, reads, ["check"],
+                       asked[0])
         kpi_news_rows(r["id"], t0, agent, task)
         log_row(agent, f"linked the KPI {iref(r['id'])} of {r['agent']} to the hub measure {name}")
     lag = HUB_MEASURE_LAGS.get(name, 0)
     return (f"Linked {iref(r['id'])} to the hub measure {name}: the hub counts it from its own records at each event, "
             f"and its past {KPI_BACKFILL_DAYS} days show at once." +
             (f" A value is final {lag // KPI_DAY} days after its window ends; until then it shows the count so far, "
-             f"and only final values are judged." if lag else ""))
+             f"and only final values are judged." if lag else "") + asked[1])
 
 
 # ---- values, state and steps (spec 5.2, 5.3, 6)
@@ -52298,6 +52623,8 @@ def kpi_state_rows(item, t0, steps=True):
     on = value >= r["number"] if r["direction"] == "at_least" else value <= r["number"]
     state = "on" if on else "off"
     sets = {} if r["kpi_state"] == state else {"kpi_state": state, "state_since": at}
+    if steps:                       # a value from after the step: the measurement is back
+        kpi_step_over_rows(item, at)
     if steps:
         m = dict(r)
         if m["parent_task"] and m["judge_after"] is None and not m["off_task"] and not m["parent_event"] and \
@@ -52484,16 +52811,38 @@ def kpi_still_off_rows(r, value, t0):
 def kpi_name_who_rows(r, why, t0):
     """Inside a transaction: the parent's step "Name who measures <name>" (spec 5.1, 6), a task for a lead and an inbox
     message for the fleet manager, when the link broke or nobody measures the KPI any more. Returns kpi_step_rows'
-    answer: {} when no route reaches the parent now."""
-    return kpi_step_rows(kpi_parent(r["agent"]), {
+    answer: {} when no route reaches the parent now. Once the step is made, no change of the measurer or the link from
+    before it locks them (kpi_locks): the parent can do what it asks, also when an agent above it, or the owner, set
+    them."""
+    in_transaction("kpi_name_who_rows")
+    ends = kpi_locked(kpi_parent(r["agent"]), r, None, None) is None
+    step = kpi_step_rows(kpi_parent(r["agent"]), {
         "title": f"Name who measures {r['name']}",
         "details": (f"{why} The KPI {iref(r['id'])} of {name_and_role(r['agent'])}: "
                     f"{full_stop(r['words'])} Its level: {kpi_level(r)} over {r['window_days']} days."),
         "done_when": (f"You named who measures it with set_kpi(id=\"{iref(r['id'])}\", measured_by), which opens its "
                       f"setup" + ("" if role_of(kpi_parent(r["agent"])) == "manager" else
                                   "; or you named yourself there and linked a line check of your own") +
-                      "; or you ended the KPI and said why."),
+                      "; or its check gives values again" +
+                      ("; or you ended the KPI and said why." if ends else ".")),
         "why": f"Nobody measures the KPI {r['name']} of {shown_role(r['agent'])} now."}, t0)
+    if step:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (f"kpi_name_who:{r['id']}", json.dumps({"at": t0, "task": step.get("task")})))
+    return step
+
+
+def kpi_step_over_rows(item, value_at=None):
+    """Inside a transaction: the hub's step "Name who measures" of KPI I-<item> has done its work (kpi_locks): a new
+    link, a change that opens a new setup, or a value judged at value_at, when that is after the step (a new spell of
+    the daily pass needs one of them first)."""
+    in_transaction("kpi_step_over_rows")
+    key = f"kpi_name_who:{item}"
+    if value_at is not None:
+        row = DB.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        if not row or value_at <= json.loads(row["v"])["at"]:
+            return
+    DB.execute("DELETE FROM kv WHERE k=?", (key,))
 
 
 def kpi_unlink_rows(rule, why, t0, only=None):
@@ -52599,7 +52948,8 @@ def kpi_sweep(t0):
 def kpi_daily_rows(t0):
     """Inside the hub's daily pass: each linked KPI with no value for two windows since its link or its newest value
     (spec 6) turns no_data, and its measuring agent gets one task "Measure <name> again" for that spell; when that
-    agent is gone, in setup or the parent itself, the parent gets the step "Name who measures <name>". One step for
+    agent is gone, in setup, has its Shell box off or is the parent itself, the parent gets the step "Name who
+    measures <name>". One step for
     each spell, also for a KPI that never had a value that counts: kv kpi_spell:<id> holds the start of the last spell
     that had its step. A new value ends the spell."""
     in_transaction("kpi_daily_rows")
@@ -52618,7 +52968,8 @@ def kpi_daily_rows(t0):
         measuring = kpi_measuring_agent(r) if kpi_measurer_ok(r) else None
         why = (f"The check of wake-up rule {r['check']} gave it no value for {2 * r['window_days']} days: it prints no "
                f"line \"kpi {r['metric']} <value>\", or prints it after another line.")
-        if measuring not in agents() or not agent_active(measuring) or measuring == kpi_parent(r["agent"]):
+        if measuring not in agents() or not agent_active(measuring) or measuring == kpi_parent(r["agent"]) or \
+                shell_off(measuring):           # one whose Shell box is off writes no check
             step = kpi_name_who_rows(r, why, t0)
         else:
             step = kpi_step_rows(measuring, {
@@ -52875,7 +53226,8 @@ def t_end_standing(agent, a):
         raise ToolError(f"There is no standing item {iref(item)}.")
     if r["kind"] == "kpi" and not r["ended"] and contact_session(agent):     # spec 7.4: no person's word ends one
         raise ToolError(f"{iref(item)} is a KPI: a session that a person's message drives does not end it.")
-    if r["kind"] == "kpi" and not r["ended"] and agent != kpi_parent(r["agent"]):    # spec R3, 10: its parent ends it
+    # spec R3, 10, and KPIs version 2 (4.4): its parent ends it, and each agent above the parent
+    if r["kind"] == "kpi" and not r["ended"] and kpi_rank(agent, r["agent"]) is None:
         parent = kpi_parent(r["agent"])
         raise ToolError(f"{name_and_role(parent)} ends your KPIs: propose it with message_agent."
                         if agent == r["agent"] else
@@ -52887,8 +53239,16 @@ def t_end_standing(agent, a):
     if r["ended"]:
         return (f"{iref(item)} already ended {ago(r['ended'])} ago, as {standing_who(r['ended_by'], agent)} asked. "
                 f"Nothing changed.")
-    chat = chat_context(agent)
-    if chat:                        # on the owner's own word alone, before the branch of a colleague's question task
+    chat, kpi = chat_context(agent), r["kind"] == "kpi"
+    said = None
+    if kpi:                         # 4.4: the owner's own message to the agent or above it (in a chat: to the chat)
+        if chat or a.get("asked_by") not in (None, ""):
+            kpi_owner_said(agent, r["agent"], a.get("asked_by"))
+            said = f"M-{SOURCE_REF.match(str(a['asked_by'])).group(2)}"
+        refused = kpi_locked(agent, r, None, said)      # an end takes the highest rank of its fields
+        if refused:
+            raise ToolError(refused)
+    elif chat:                      # on the owner's own word alone, before the branch of a colleague's question task
         standing_chat(agent, a, "asked_by")
     elif shell_off(agent):          # a colleague's question task alone has the tool (shell_tools)
         person = standing_asked(agent, a, "asked_by")[1]
@@ -52896,13 +53256,13 @@ def t_end_standing(agent, a):
             raise ToolError(f"{iref(item)} is not a wish of {person['name']}'s: this task ends only theirs.")
     guard(agent, why)
     task = None if chat else session_task(agent, a)
-    asked_by = standing_source(agent, a.get("asked_by"), ending=True)[1] if a.get("asked_by") not in (None, "") \
-        else agent
-    t0, reads = now(), save_provenance(agent)[1] if r["kind"] == "kpi" else None    # it commits: before
+    asked_by = ("owner" if said else agent) if kpi else \
+        standing_source(agent, a.get("asked_by"), ending=True)[1] if a.get("asked_by") not in (None, "") else agent
+    t0, reads = now(), save_provenance(agent)[1] if kpi else None    # it commits: before
     with transaction():
         standing_end_rows(r, agent, asked_by, why, t0, task)
-        if r["kind"] == "kpi":
-            kpi_change_row(item, agent, f"ended: {why}", t0, reads)
+        if kpi:
+            kpi_change_row(item, agent, f"ended: {why}", t0, reads, None, said)
     standing_seen_here(agent, task, item)
     return (f"{iref(item)} ended" + (f", as {standing_who(asked_by, agent)} asked" if asked_by != agent else "")
             + ". New sessions no longer start with it, and every other running session it steered is told"
@@ -52917,8 +53277,8 @@ def t_see_standing(agent, a):
                 if not (person and r["kind"] == "kpi")]
         out.append(f"EVERY ACTIVE STANDING ITEM OF THE FLEET ({len(rows)}):")
         out += [f"  {r['agent']}: {standing_line(r, agent, t0)}" for r in rows] or ["  none"]
-        out.append("You end any of them but a KPI of a lead's team with end_standing when the owner asks "
-                   "(asked_by=\"M-<n>\"); its agent ends its "
+        out.append("You end any of them with end_standing when the owner asks (asked_by=\"M-<n>\"), and a KPI also "
+                   "on your own word when the owner set none of its fields; its agent ends its "
                    "own. An item of an agent whose Shell box is off you end in its place when its author, a person whose "
                    "role allows it or the owner asks, or when you wrote it whole into the place that its work reads, "
                    "with that place in why: that agent ends only a colleague's own wish, when that colleague "
@@ -54277,9 +54637,10 @@ def t_see_history(agent, a):
     """One reader with modes, so the manager asks for the measure it needs and carries nothing else in its session.
     A worker or a lead reads one mode, its costs: its own, and a lead its team's as well (AUTONOMY.md P8)."""
     manager = role_of(agent) == "manager"
-    # a lead reviews its team's KPIs too (lanes/agent-kpis.md, spec 7.6); a worker's number reaches it in its task
-    modes = HISTORY_MODES if manager else ("costs", "kpis") if role_of(agent) == "lead" and setting("kpis") else \
-        ("costs",)
+    # a lead reviews its team's KPIs too (lanes/agent-kpis.md, spec 7.6); a worker's number reaches it in its task. A
+    # lead's owner chat reads its team's KPIs alone (KPIs version 2, 4.4)
+    modes = ("kpis",) if chat_context(agent) else HISTORY_MODES if manager else ("costs", "kpis") \
+        if role_of(agent) == "lead" and setting("kpis") else ("costs",)
     what = str(a.get("what") or modes[0]).strip().lower()
     if what not in modes:
         raise ToolError("what must be one of " + ", ".join(modes) + ".")
@@ -56233,14 +56594,14 @@ TOOLS = [
         "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
         "task_id": TASK_ID})),
     ("all", "set_kpi", t_set_kpi,
-     "Set, change or link a KPI of an agent whose tasks you give: one to three each, a number that a worker's own "
-     "work on its tasks and duties moves, or a lead's whole team's results. Pair a speed or volume KPI with a quality "
-     "one, counting all work that arrived. No KPI counts asking, reporting, cost, or what the agent records itself: a "
-     "value comes from a hub measure or a check of what others write in a business system. New: agent, name, "
-     "words, direction, number, unit, window_days, metric, measured_by (who writes the check; default the agent), and "
-     "that agent gets a setup task. Link: id, check, how, agent_part, once you read the check and who can write its "
-     "inputs. Change: id and its fields; new words, window_days, metric or measured_by clear the link. Never lower a "
-     "level only because it is not met. The agent reads the words and its part, never the number.",
+     "Set, change or link a KPI of an agent below you: one to three each, a number "
+     "that a worker's own work moves, or a lead's whole team's results. Pair a speed or volume "
+     "KPI with a quality one, counting all work that arrived. No KPI counts asking, reporting, cost, or what the agent "
+     "records itself: a value comes from a hub measure or a check of what others write in a business system. New: "
+     "agent, name, words, direction, number, unit, window_days, metric; measured_by (default the agent) gets a setup "
+     "task. Link: id, check, how, agent_part, once you read the check and who can write its inputs. Change: id and its "
+     "fields; new words, window_days, metric or measured_by clear the link. Fields set from above or by the owner "
+     "change only by them. Never lower a level only because it is not met.",
      S({"id": {"type": "string", "description": "The KPI, I-12; none for a new one"},
         "agent": {"type": "string", "description": "New: the agent it measures"},
         "name": {"type": "string", "description": "Its title, at most 40 characters"},
@@ -56254,6 +56615,7 @@ TOOLS = [
         "check": {"type": "string", "description": "Link: its wake-up rule, or hub:reports_came_back"},
         "how": {"type": "string", "description": "Link: the query, its inputs, who writes each"},
         "agent_part": {"type": "string", "description": "Link: what its work must do for the data"},
+        "asked_by": {"type": "string", "description": "The owner's message, M-12"},
         "task_id": TASK_ID})),
     ("all", "end_standing", t_end_standing,
      "End one of your standing items when its author, a person whose role allows it or the owner asks, when a "
@@ -56492,6 +56854,10 @@ TOOLS = [
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
               "start_task", "request_secret", "search_history", "read_history", "read_attachment",
               "keep_instruction", "end_standing")
+# KPIs version 2 (4.4): a lead's owner chat, while the setting kpis is on and its Shell box is on, also sets a KPI of
+# its team on the owner's message (asked_by) and reads its team's KPIs (see_history, what="kpis" alone). A worker's
+# chat gets neither. Release A gave fleet.CHAT_TOOLS the two names first, so that no helper refuses them.
+CHAT_KPI_TOOLS = ("set_kpi", "see_history")
 
 
 # ---------------------------------------------------------------- the Shell box (support plan F1, H1, H7, H8)
@@ -57224,7 +57590,8 @@ def tools_for(agent, context=None):
             (name != "ask_reporter" or (closed is None and not narrowed and conversation is None and
                                         not contact_session(agent, context) and report_reader(agent))) and
             (name in conversation if conversation is not None else
-             name in CHAT_TOOLS if chat else
+             (name in CHAT_TOOLS or name in CHAT_KPI_TOOLS and role == "lead" and closed is None and setting("kpis"))
+             if chat else
              not (role in ("worker", "lead") and name in WORKER_CHAT_ONLY) and name not in CONVERSATION_ONLY + CHAT_ONLY) and
             # lanes/agent-kpis.md: while kpis is on, a lead takes its own see_history, with kpis (spec 7.6)
             not (name == "see_history" and role == "lead" and r == ("worker" if setting("kpis") else "lead")) and
@@ -61762,10 +62129,10 @@ def passed_above(p, lead):
 
 
 def unfile_notices(task_id):
-    """A task that ended gives back the duty notice its session never read, so the next task session reads it
-    (waiting_say_rows). Committing: its callers end a task with q()."""
+    """A task that ended gives back the duty notice or the KPI note that its session never read, so the next task
+    session reads it (waiting_say_rows). Committing: its callers end a task with q()."""
     q("UPDATE events SET task=NULL WHERE task=? AND kind='say' AND read_at IS NULL AND "
-      "json_extract(extra, '$.duty') IS NOT NULL", (task_id,))
+      "(json_extract(extra, '$.duty') IS NOT NULL OR json_extract(extra, '$.kpi_note') IS NOT NULL)", (task_id,))
 
 
 def liveness(t0):
@@ -91810,7 +92177,7 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        "its own task session; its result comes back here by itself, and you tell "
                                        "them with message_owner. A key or a login that the owner wants you to use and "
                                        "the fleet does not hold: ask them with request_secret, in reply to their "
-                                       "message, never in words."
+                                       "message, never in words." + chat_kpi_text(agent)
                                        if chat_context(agent, context) else
                                        f"Team tools of Founderizer. You are '{agent}'. Execution work is a task; follow RULES.md.")}
         elif method == "ping":

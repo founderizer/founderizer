@@ -6,6 +6,7 @@ hub, a temporary database and a set clock; no helper, no fleet and no AI call.
 """
 import json
 import unittest
+import uuid
 from unittest.mock import patch
 
 import hub
@@ -90,9 +91,12 @@ class Kpis(test_standing.Base):
 
 
 class Parents(Kpis):
-    def test_only_the_parent_sets_changes_links_and_ends_a_kpi(self):
-        """Spec R3: the agent that gives an agent its tasks (task_giver) is the one changer of its KPIs. Protects
-        against an agent that lowers its own level, and a higher level that skips the parent."""
+    def test_each_level_above_sets_a_kpi_and_a_field_keeps_the_rank_that_set_it(self):
+        """KPIs version 2, 4.4: the parent and each agent above it set, change, link and end an agent's KPIs; a field
+        changes only from the rank of the newest change that named it, or above, while that changer is still above the
+        agent; an end needs the highest rank of the KPI's fields; and the parent reads each change from above in its
+        next task session. Protects against a lead that undoes the fleet manager's level, an agent that changes its
+        own KPI, and a parent that never learns what changed above it."""
         r, _ = self.set_kpi("lead", "hand")
         ref = hub.iref(r["id"])
         self.assertIn("no tool named set_kpi", self.kpi_refused("hand", id=ref, number=10))     # a worker has none
@@ -100,21 +104,249 @@ class Parents(Kpis):
         hub.TEAM["agents"]["lead"]["title"] = "Team Lead"   # an agent reads the parent as the team list: name (role)
         self.assertIn("lead (Team Lead) sets your KPIs", self.kpi_refused("sublead", id=hub.iref(sub["id"]), number=10))
         self.assertIn("ends your KPIs", self.refused("hand", "end_standing", id=ref, why="Too hard."))
-        self.assertIn("ask it with message_agent", self.kpi_refused("manager", id=ref, number=10))
-        self.assertIn("ends this KPI", self.refused("manager", "end_standing", id=ref, why="Not needed."))
-        self.kpi_refused("manager", **dict(KPI, agent="hand", name="Other"))
-        self.kpi_refused("lead", **dict(KPI, agent="deep"))         # sublead gives deep its tasks
+        self.assertIn("sets hand's KPIs", self.kpi_refused("sublead", id=ref, number=10))       # not above hand
+        self.assertIn("sets solo's KPIs", self.kpi_refused("lead", **dict(KPI, agent="solo")))
         self.assertIn("has no KPIs", self.kpi_refused("manager", **dict(KPI, agent="manager")))
         self.assertIn("Shell box is off", self.kpi_refused("lead", **dict(KPI, agent="closed")))
-        self.kpi_ok("sublead", **dict(KPI, agent="deep"))
-        self.kpi_ok("manager", **dict(KPI, agent="solo"))
-        self.assertEqual(self.item(r["id"])["number"], 80)
-        self.kpi_ok("lead", id=ref, number=85)
-        self.assertEqual(self.item(r["id"])["number"], 85)
-        self.ok("lead", "end_standing", id=ref, why="The help desk changed.")
+        # the fleet manager, above the lead, changes the level: the lead keeps its other fields, and not that one
+        self.kpi_ok("manager", id=ref, number=85)
+        note = hub.q1("SELECT * FROM events WHERE agent='lead' AND task IS NULL AND kind='say'")
+        self.assertIn(f"above you, made a change to the KPI {ref} of hand", note["text"])
+        self.assertIn("number to 85", note["text"])
+        self.assertIn("above you: ask it", self.kpi_refused("lead", id=ref, number=70))
+        self.kpi_ok("lead", id=ref, name="Drafts as written")
+        self.assertIn("set " + ref + "'s number, above you", self.refused("lead", "end_standing", id=ref, why="No."))
+        later = self.new_task("lead", title="The next task")     # its next task session reads the note, as written
+        with hub.transaction():
+            hub.waiting_say_rows("lead", later)
+        self.assertEqual(hub.q1("SELECT task FROM events WHERE id=?", (note["id"],))["task"], later)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='lead' AND "
+                                "json_extract(extra, '$.kpi_note') IS NOT NULL")["n"], 1)      # its own change: none
+        # a link from above locks the link; a change from above that clears it leaves the next link to the parent
+        self.link("manager", r, self.rule("hand", saved_in=r["setup_task"]))
+        self.assertIn("above you", self.kpi_refused("lead", id=ref, check=self.rule("hand")["id"], how="x"))
+        self.kpi_ok("manager", id=ref, words="Most tickets got a draft that staff sent as written.")
+        self.link("lead", r, self.rule("hand", saved_in=self.kpi(r)["setup_task"]))
+        # a lead sets a KPI anywhere in its subtree, reads the check that measures it, and the parent below it keeps
+        # out of the lead's fields
+        deep, _ = self.set_kpi("lead", "deep")
+        rule = self.rule("deep", saved_in=deep["setup_task"])
+        self.assertTrue(hub.wakeups.may_read(hub.wake_org(), "lead", hub.trigger_view(rule, hub.now())))
+        self.assertIn("above you", self.kpi_refused("sublead", id=hub.iref(deep["id"]), number=70))
+        team = json.loads(json.dumps(hub.TEAM))     # a changer that is no longer above the agent locks nothing
+        team["agents"]["sublead"]["reports_to"] = "manager"
+        hub.apply_team(team)
+        self.kpi_ok("sublead", id=hub.iref(deep["id"]), number=70)
+        self.ok("manager", "end_standing", id=ref, why="The help desk changed.")
         self.assertIsNotNone(self.item(r["id"])["ended"])
-        self.assertEqual([c["by"] for c in hub.q("SELECT by FROM kpi_changes WHERE item=? ORDER BY id", (r["id"],))],
-                         ["lead", "lead", "lead"])
+        self.assertEqual([(c["by"], c["fields"] and json.loads(c["fields"])) for c in hub.q(
+            "SELECT by, fields FROM kpi_changes WHERE item=? ORDER BY id", (r["id"],))],
+            [("lead", [k for k in hub.KPI_LOCK_FIELDS[:-1] if k != "measured_by"]), ("manager", ["number"]), ("lead", ["name"]),
+             ("manager", ["check"]), ("manager", ["words"]), ("lead", ["check"]), ("manager", None)])
+        # the hub's "Name who measures" step reaches a parent below the setter of measured_by: the parent can do it
+        named, _ = self.set_kpi("manager", "hand", name="Drafts read", measured_by="lead")
+        notes = "SELECT task FROM events WHERE agent='lead' AND json_extract(extra, '$.kpi_note')=?"
+        self.assertEqual(hub.q(notes, (named["id"],)), [])     # its setup task, which that change opened, says it all
+        self.assertIn(f"{hub.shown_role('manager')} set the KPI Drafts read", hub.q1(
+            "SELECT why FROM tasks WHERE id=?", (named["setup_task"],))["why"])
+        self.kpi_ok("manager", id=hub.iref(named["id"]), number=75)       # its session there reads the next one now
+        self.assertEqual([e["task"] for e in hub.q(notes, (named["id"],))], [named["setup_task"]])
+        self.kpi_ok("manager", id=hub.iref(named["id"]), words="Most tickets got a draft that a person read.")
+        self.assertEqual(len(hub.q(notes, (named["id"],))), 1)      # the new setup task that it opened says it all
+        team = json.loads(json.dumps(hub.TEAM))
+        team["agents"]["hand"]["reports_to"] = "sublead"        # lead measures it, and leads hand no more
+        hub.apply_team(team)
+        self.kpi_ok("sublead", id=hub.iref(named["id"]), measured_by="hand")
+        # also when the measurer stays (its rule deleted, or no value for two windows): the step frees the measurer
+        # and the link that an agent above set, and offers no end that the parent cannot make
+        kept, said = self.set_kpi("manager", "hand", name="Drafts kept", measured_by="hand")
+        self.assertIn(f"{hub.name_and_role('sublead')} reads its result and links it", said)
+        kref = hub.iref(kept["id"])
+        first = self.rule("hand", saved_in=kept["setup_task"])
+        self.link("manager", kept, first)
+        newer = self.rule("hand", saved_in=kept["setup_task"])
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, check=newer["id"], how="x"))
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, measured_by="hand"))
+
+        def name_who(r):
+            row = self.kpi(r)
+            with hub.transaction():
+                return hub.kpi_name_who_rows(row, "No value for two windows.", hub.now())
+        step = name_who(kept)
+        self.assertIsNone(hub.kpi_locked("sublead", self.kpi(kept), {"measured_by", "check"}, None))
+        self.end(step["task"])                      # its task ended with nothing done: the locks are back
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, check=newer["id"], how="x"))
+        name_who(kept)
+        self.value(first, 90, self.clock + 8 * DAY)     # a value came: the step is over
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, check=newer["id"], how="x"))
+        hub.q("UPDATE standing SET kpi_state='no_data' WHERE id=?", (kept["id"],))      # as the daily pass does
+        self.clock += 60
+        name_who(kept)
+        with hub.transaction():         # a run with no new value: its old one moves the state, and ends no step
+            hub.kpi_state_rows(kept["id"], hub.now())
+        self.link("sublead", kept, newer)           # the parent restores the measurement, and the step is done
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, measured_by="hand"))
+        self.clock += 60
+        name_who(kept)
+        self.clock += 60
+        self.kpi_ok("manager", id=kref, check=newer["id"], how="Drafts that staff sent as written.")   # made since
+        self.assertIn("above you", self.kpi_refused("sublead", id=kref, check=first["id"], how="x"))
+        # the step frees no end: an end passes every change that the KPI ever had, also one that the step freed
+        mine, _ = self.set_kpi("sublead", "hand", name="Drafts mine")
+        mref = hub.iref(mine["id"])
+        self.kpi_ok("manager", id=mref, measured_by="hand")
+        self.link("manager", mine, self.rule("hand", saved_in=self.kpi(mine)["setup_task"]))
+        step = name_who(mine)
+        self.assertNotIn("ended the KPI", hub.q1("SELECT done_when FROM tasks WHERE id=?", (step["task"],))["done_when"])
+        self.assertIn("above you", self.refused("sublead", "end_standing", id=mref, why="No."))
+        self.kpi_ok("sublead", id=mref, measured_by="hand")         # the parent names the measurer, as the step asks
+        self.link("sublead", mine, self.rule("hand", saved_in=self.kpi(mine)["setup_task"]))       # and links its check
+        self.assertIn("above you", self.refused("sublead", "end_standing", id=mref, why="No."))
+        self.kpi_ok("manager", id=mref, measured_by="hand")
+        name_who(mine)
+        self.kpi_ok("manager", id=mref, words="Drafts that staff kept.")      # a new setup: the step is over
+        self.assertIn("above you", self.kpi_refused("sublead", id=mref, measured_by="hand"))
+        # a step in the fleet manager's inbox frees nothing for a lead that the agent moved under since
+        top, _ = self.set_kpi("manager", "solo", name="Solo drafts")
+        sref = hub.iref(top["id"])
+        self.kpi_ok("manager", id=sref, measured_by="solo")
+        self.assertIsNone(name_who(top).get("task"))
+        team = json.loads(json.dumps(hub.TEAM))
+        team["agents"]["solo"]["reports_to"] = "lead"
+        hub.apply_team(team)
+        self.assertIn("above you", self.kpi_refused("lead", id=sref, measured_by="solo"))
+
+    def test_the_owners_message_sets_a_field_that_only_his_next_message_changes(self):
+        """KPIs version 2, 4.4: a field set with asked_by, the owner's own message to the agent or to an agent above it
+        up to the caller, with the new number in it, changes, and the KPI ends, only on a later message of his; a
+        number that is not in his message makes the change the setter's own; a message that an AI session sent, one to
+        another line or one to an agent above the caller, and his answer to a Needs-you item, ask for nothing; his
+        message passes a rank's own change only when sent after it, and his later word passes his earlier ask
+        whoever applied it. Protects against an agent above that overrules the owner's level, a level that a session's
+        words lock, and his later word refused because his first one was applied late."""
+        r, _ = self.set_kpi("lead", "hand")
+        ref = hub.iref(r["id"])
+        newest = "SELECT asked_by FROM kpi_changes WHERE item=? ORDER BY id DESC LIMIT 1"
+
+        def says(recipient, text):          # a message of his, a minute after the last change
+            self.clock += 60
+            return f"M-{self.owner_says(recipient, text)}"
+        loose = says("hand", "Make it a bit higher.")
+        self.assertIn("is your own change", self.kpi_ok("lead", id=ref, number=85, asked_by=loose))
+        self.assertIsNone(hub.q1(newest, (r["id"],))["asked_by"])
+        asked = says("hand", "Make the drafts KPI 90%, please.")
+        self.assertNotIn("your own change", self.kpi_ok("lead", id=ref, number=90, asked_by=asked))
+        self.assertEqual(hub.q1(newest, (r["id"],))["asked_by"], asked)
+        self.assertIn(f"The owner asked for {ref}'s number in {asked}", self.kpi_refused("manager", id=ref, number=95))
+        self.assertIn("only on a later message", self.refused("manager", "end_standing", id=ref, why="Not needed."))
+        higher = says("hand", "Raise it more.")       # no number: the manager's own, which his lock refuses
+        self.assertIn("The owner asked", self.kpi_refused("manager", id=ref, number=96, asked_by=higher))
+        again = says("lead", "Now 95 for the drafts.")      # a newer word of his, to an agent above it, passes a rank
+        self.kpi_ok("manager", id=ref, number=95, asked_by=again)
+        steady = says("hand", "Hold it steady.")        # a number in words is checked too
+        self.assertIn("The owner asked", self.kpi_refused("lead", id=ref, number="70", asked_by=steady))
+        self.assertIn("The owner asked", self.kpi_refused("lead", id=ref, direction="at_most"))   # what 95 means
+        self.assertIn(f"{again} is not later than {again}", self.refused("lead", "end_standing", id=ref, why="Done.",
+                                                                         asked_by=again))     # the one that locked it
+        with hub.transaction():
+            tool = hub.owner_message_rows(str(uuid.uuid4()), "message", None, "Set it to 50.", "founderizer-cli/1/test",
+                                          "hand", None, hub.now(), session="claude-code/0d8aa41c")
+        self.assertIn("AI session", self.kpi_refused("manager", id=ref, number=50, asked_by=f"M-{tool}"))
+        other = says("solo", "Set it to 50.")
+        self.assertIn("no message of the owner's to hand", self.kpi_refused("manager", id=ref, number=50,
+                                                                            asked_by=other))
+        top = says("manager", "Make the drafts KPI 99%.")      # the manager's to act on, not the lead's
+        self.assertIn("went to manager", self.kpi_refused("lead", id=ref, number=99, asked_by=top))
+        self.assertEqual(self.item(r["id"])["number"], 95)
+        # he wrote twice before his first word was applied: his later word goes through
+        first, second = says("lead", "Make it 97."), says("lead", "No, 98.")
+        last = says("hand", "Make it 96 after all.")
+        self.clock += 60
+        self.kpi_ok("manager", id=ref, number=97, asked_by=first)
+        self.kpi_ok("manager", id=ref, number=98, asked_by=second)
+        self.assertEqual(self.item(r["id"])["number"], 98)
+        self.kpi_ok("lead", id=ref, number=96, asked_by=last)     # his latest word, whoever applied the ones before
+        self.assertEqual(self.item(r["id"])["number"], 96)
+        answer = says("hand", "Set it to 60.")            # his answer to a Needs-you item is no message of his
+        hub.q("UPDATE ui_requests SET kind='answer' WHERE event_id=?", (int(answer[2:]),))
+        self.assertIn("no message of the owner's", self.kpi_refused("manager", id=ref, number=60, asked_by=answer))
+        pair = says("lead", "Raise it from 91 to 92.")     # one message of his sets a field again, never ends it
+        self.kpi_ok("manager", id=ref, number=91, asked_by=pair)
+        self.kpi_ok("manager", id=ref, number=92, asked_by=pair)
+        self.assertIn(f"{pair} is not later", self.refused("manager", "end_standing", id=ref, why="No.", asked_by=pair))
+        self.assertIn("The owner asked", self.kpi_refused("manager", id=ref, direction="at_most", asked_by=pair))
+        # a message of his from before an agent above changed a field does not pass that agent's rank
+        before = says("lead", "Call it Drafts kept.")
+        self.clock += 60
+        self.kpi_ok("manager", id=ref, name="Drafts kept")
+        self.assertIn("above you", self.kpi_refused("lead", id=ref, name="Drafts as sent", asked_by=before))
+        self.kpi_ok("lead", id=ref, name="Drafts as sent", asked_by=says("lead", "Call it Drafts as sent."))
+        named = says("lead", "Call it Drafts read, at 93.")     # the same message again: the number alone
+        self.kpi_ok("manager", id=ref, name="Drafts read", number=93, asked_by=named)
+        self.assertIn(f"{named} is not later", self.kpi_refused("manager", id=ref, name="Drafts kept", asked_by=named))
+        # the step "Name who measures" frees his choice of the measurer for the parent that it went to, and no other
+        self.kpi_ok("lead", id=ref, measured_by="lead", asked_by=says("lead", "Measure it yourself."))
+        row = self.item(r["id"])
+        with hub.transaction():
+            hub.kpi_name_who_rows(row, "Its rule was deleted.", hub.now())
+        self.assertIn("The owner asked", self.kpi_refused("manager", id=ref, measured_by="hand"))
+        self.assertIsNotNone(hub.kpi_step_open(self.item(r["id"]), "lead"))
+        team = json.loads(json.dumps(hub.TEAM))     # nor for its task's owner once that is no longer the parent
+        team["agents"]["hand"]["reports_to"] = "sublead"
+        hub.apply_team(team)
+        self.assertIsNone(hub.kpi_step_open(self.item(r["id"]), "lead"))
+        team = json.loads(json.dumps(hub.TEAM))
+        team["agents"]["hand"]["reports_to"] = "lead"
+        hub.apply_team(team)
+        self.kpi_ok("lead", id=ref, measured_by="hand")
+        self.ok("lead", "end_standing", id=ref, why="The owner asked.", asked_by=says("hand", "End the drafts KPI."))
+        self.assertEqual(self.item(r["id"])["ended_by"], "owner")
+        # his figures, read every way that a writer may mean them, and no ref or digit inside a word
+        self.assertEqual(hub.kpi_figures("1,000 tickets in 4,5 h or 4.5 h, 80%, 1.000.000, 2.500, .5, -5 or 28-30, "
+                                         "5k, I-116, x5, 1,2.5, 16.1k, 0.500, =-5, 20%-30%, \u22125, I\u2212116"),
+                         [1.0, 1000.0, 4.5, 4.5, 80.0, 1000000.0, 2.5, 2500.0, 0.5, -5.0, 28.0, 30.0, 5000.0,
+                          16100.0, 0.5, -5.0, 20.0, 30.0, -5.0])
+
+    def test_a_leads_owner_chat_sets_its_teams_kpi_on_his_message_and_a_workers_chat_has_none(self):
+        """KPIs version 2, 4.4: a lead's owner chat gets set_kpi, only with the owner's message to that chat as
+        asked_by, and see_history for KPIs alone, while the setting kpis is on; a worker's chat and a Shell-off lead's
+        get neither, and a worker's chat is told where the owner's words about its own KPIs go. Protects against a chat
+        that sets a KPI on its own words, and a worker that changes its own."""
+        names = lambda who: {t["name"] for t in hub.tools_for(who, test_standing.CHAT)}
+        chat = lambda name, **args: hub.call_tool("lead", name, args, test_standing.CHAT)
+        self.assertLessEqual({"set_kpi", "see_history"}, names("lead"))
+        self.assertFalse({"set_kpi", "see_history"} & names("hand"))
+        r, _ = self.set_kpi("lead", "hand")
+        ref = hub.iref(r["id"])
+        text, err = chat("set_kpi", id=ref, number=85)
+        self.assertTrue(err and "asked_by" in text, text)
+        to_hand = self.owner_says("hand", "Make it 85.")
+        text, err = chat("set_kpi", id=ref, number=85, asked_by=f"M-{to_hand}")       # not a message to this chat
+        self.assertTrue(err, text)
+        said = self.owner_says("lead", "Make hand's drafts KPI 85%.")
+        text, err = chat("set_kpi", id=ref, number=85, asked_by=f"M-{said}")
+        self.assertFalse(err, text)
+        self.assertEqual(self.item(r["id"])["number"], 85)
+        self.assertIn("what must be one of kpis.", chat("see_history", what="costs")[0])
+        self.assertTrue(chat("end_standing", id=ref, why="He asked.", asked_by=f"M-{said}")[1])    # its own lock
+        self.clock += 60
+        text, err = chat("end_standing", id=ref, why="He asked.",
+                         asked_by=f"M-{self.owner_says('lead', 'End the drafts KPI of hand.')}")
+        self.assertFalse(err, text)
+        r, _ = self.set_kpi("lead", "hand")
+        ref = hub.iref(r["id"])
+        text, err = chat("end_standing", id=ref, why="He asked.")      # an end in a chat needs his message too
+        self.assertTrue(err and "asked_by" in text, text)
+        self.assertIn(ref, chat("see_history")[0])
+        words = lambda who: hub.rpc(who, {"id": 1, "method": "initialize", "params": {}}, {},
+                                    test_standing.CHAT)["result"]["instructions"]
+        self.assertIn("pass their words to lead with message_agent", words("hand"))
+        self.assertIn("do it here with set_kpi or end_standing", words("lead"))
+        hub.TEAM["agents"]["sublead"]["can"] = []           # a lead whose Shell box is off
+        self.assertFalse({"set_kpi", "see_history"} & names("sublead"))
+        hub.TEAM["settings"]["kpis"] = False
+        self.assertFalse({"set_kpi", "see_history"} & names("lead"))
+        self.assertNotIn("KPI", words("hand"))
 
     def test_a_lead_that_cannot_act_passes_its_kpis_up(self):
         """Spec R3, v10: a lead in setup or with its Shell box off cannot act, so the nearest agent above that can is
@@ -316,7 +548,9 @@ class Steps(Kpis):
     def test_the_daily_pass_and_a_deleted_rule_name_who_measures(self):
         """Spec 5.1, 6: no value for two windows asks the measuring agent to measure again, once for each spell, also
         for a check that never gave a value; a deleted linked rule clears the link and asks the parent who measures.
-        Protects against a KPI that waits for ever on a check that prints the wrong metric, and a task each day."""
+        A measurer whose Shell box is off writes no check, so the parent names who measures. Protects against a KPI
+        that waits for ever on a check that prints the wrong metric, or on an agent that cannot write one, and a task
+        each day."""
         r, rule = self.linked("hand")
         again = lambda: hub.q1("SELECT COUNT(*) n FROM tasks WHERE owner='hand' AND title=?",
                                ("Measure Drafts sent as written again",))["n"]
@@ -331,31 +565,93 @@ class Steps(Kpis):
                 hub.kpi_daily_rows(r["linked_at"] + days * DAY)
             self.assertEqual(again(), count, days)
         self.assertEqual(self.kpi(r)["kpi_state"], "no_data")
+        named = lambda: hub.q1("SELECT COUNT(*) n FROM tasks WHERE owner='lead' AND title=?",
+                               ("Name who measures Drafts sent as written",))["n"]
+        self.value(rule, 90, r["linked_at"] + 32 * DAY)
+        can = hub.TEAM["agents"]["hand"].get("can")
+        hub.TEAM["agents"]["hand"]["can"] = []         # its Shell box is off: it writes no check any more
+        with hub.transaction():
+            hub.kpi_daily_rows(r["linked_at"] + 46 * DAY)
+        self.assertEqual((again(), named()), (2, 1))
+        self.assertIn("has its Shell box off", self.kpi_refused("lead", id=hub.iref(r["id"]), words="All drafts sent."))
+        if can is None:
+            hub.TEAM["agents"]["hand"].pop("can")
+        else:
+            hub.TEAM["agents"]["hand"]["can"] = can
         revision = hub.trigger_row(rule["id"])["revision"]          # the link changed its schedule, so its revision
         with hub.transaction():
             hub.trigger_state_rows(rule["id"], revision, "delete", "hand", hub.now())
         self.assertIsNone(self.kpi(r)["check"])
-        self.assertIsNotNone(hub.q1("SELECT id FROM tasks WHERE owner='lead' AND title=?",
-                                    ("Name who measures Drafts sent as written",)))
+        self.assertEqual(named(), 2)
 
 
 class StartText(Kpis):
-    def test_the_agent_reads_the_words_and_its_part_and_never_the_number(self):
-        """Spec 7.4: one line for each KPI with its words and part, the hub's sentence once, and no end sentence for a
-        KPI. Protects against a number that steers every session, and an agent told to end its own KPI."""
+    def test_an_agent_with_a_shell_reads_its_judged_value_and_one_without_reads_its_level_alone(self):
+        """KPIs version 2, 4.5: a KPI line holds its name, level, words and part, and in a session of an agent with a
+        shell its newest judged value with its days and whether that value is on target; never a value for a Shell-off
+        agent; the hub's sentence once, and no end sentence for a KPI. Protects against an agent that does not know
+        where its KPI stands, and a number in each session of a ticket agent."""
         r, _ = self.set_kpi("lead", "hand", words="Most tickets that arrived got a draft that staff sent as written.")
-        hub.q("UPDATE standing SET agent_part='Mark each ticket that you answer with a draft.' WHERE id=?",
-              (r["id"],))
-        hub.q("UPDATE standing SET progress=41.5 WHERE id=?", (r["id"],))
+        ref = hub.iref(r["id"])
+        rule = self.rule("hand", saved_in=r["setup_task"])
+        self.link("lead", r, rule)
+        self.assertIn(f"{ref} KPI from Lead: Drafts sent as written, at least 80%; no judged value yet. Most tickets "
+                      f"that arrived got a draft that staff sent as written. [your part: Mark each ticket that you "
+                      f"answer with a draft.]", hub.standing_start_text("hand"))
+        linked = self.kpi(r)["linked_at"]
+        self.value(rule, 41.5, linked + DAY)            # shown, not judged: its part gives one window first
+        self.assertIn("no judged value yet", hub.standing_start_text("hand"))
+        self.value(rule, 85, linked + 8 * DAY)
+        self.assertIn("at least 80%; 85% for 28 Oct-4 Nov, on target. Most tickets", hub.standing_start_text("hand"))
+        hub.q("UPDATE standing SET kpi_state='no_data' WHERE id=?", (r["id"],))     # no value in its last window
+        self.assertIn("85% for 28 Oct-4 Nov, its newest judged value, and none since.", hub.standing_start_text("hand"))
+        self.value(rule, 60, linked + 9 * DAY)
         text = hub.standing_start_text("hand")
-        self.assertIn(f"{hub.iref(r['id'])} KPI from Lead: Most tickets that arrived got a draft that staff sent as "
-                      f"written. [your part: Mark each ticket that you answer with a draft.]", text)
-        self.assertNotIn("80", text)
-        self.assertNotIn("41.5", text)
+        self.assertIn("at least 80%; 60% for", text)
+        self.assertIn(", off target. Most tickets", text)
         self.assertEqual(text.count("A KPI measures your work and never limits it"), 1)
         self.assertNotIn("end_standing", text)
         self.ok("lead", "keep_instruction", words="Answer in Spanish.", scope="team")
         self.assertIn("end_standing, never a KPI", hub.standing_start_text("hand"))
+        closed, _ = self.set_kpi("lead", "closed", measured_by="lead")
+        own = self.rule("lead")
+        self.link("lead", closed, own)
+        self.value(own, 85, self.kpi(closed)["linked_at"] + 8 * DAY)
+        line = hub.standing_start_text("closed")
+        self.assertIn(f"{hub.iref(closed['id'])} KPI from Lead: Drafts sent as written, at least 80%. Of all", line)
+        self.assertNotIn("85", line)
+
+    def test_a_note_from_above_waits_for_a_task_of_the_parents_own_work(self):
+        """KPIs version 2, 4.4 and spec 7.4: the parent's note of a change from above waits under no task for its next
+        task session, never one that a conversation opened, whose start holds no KPI either; a task that ends unread
+        gives it back; it is dropped once the agent is no longer the parent. Protects against a person's session that
+        reads the owner's KPI words, and a note that a short task swallows."""
+        r, _ = self.set_kpi("lead", "hand")
+        own, _ = self.set_kpi("manager", "lead", name="Team drafts")
+        self.kpi_ok("manager", id=hub.iref(r["id"]), number=85)
+        note = hub.q1("SELECT id FROM events WHERE agent='lead' AND "
+                      "json_extract(extra, '$.kpi_note') IS NOT NULL")["id"]
+        filed = lambda: hub.q1("SELECT task, read_at FROM events WHERE id=?", (note,))
+        pid = self.person(agents=("lead",))
+        conv = hub.q1("SELECT * FROM conversations WHERE id=?", (self.conversation(pid, agent="lead"),))
+        opened, _ = hub.conversation_line_task("lead", conv, hub.q1("SELECT * FROM people WHERE id=?", (pid,)),
+                                               "Look at the drafts", "", "Asked the team", "A person asked.")
+        self.assertIsNone(filed()["task"])
+        start = hub.q1("SELECT text FROM events WHERE task=? AND kind='task'", (opened,))["text"]
+        self.assertNotIn(hub.iref(own["id"]), start)
+        later = self.new_task("lead", title="The next task")
+        with hub.transaction():
+            hub.waiting_say_rows("lead", later)
+        self.assertEqual(filed()["task"], later)
+        hub.unfile_notices(later)                # it ended before its session read the note
+        self.assertIsNone(filed()["task"])
+        team = json.loads(json.dumps(hub.TEAM))
+        team["agents"]["hand"]["reports_to"] = "sublead"
+        hub.apply_team(team)
+        another = self.new_task("lead", title="Another task")
+        with hub.transaction():
+            hub.waiting_say_rows("lead", another)
+        self.assertEqual((filed()["task"], filed()["read_at"] is not None), (None, True))
 
     def test_no_kpi_where_a_persons_words_drive_or_read(self):
         """Spec 7.4: a window's brief, a task that a conversation opened, and its news read no KPI. Protects against

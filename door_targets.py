@@ -225,6 +225,8 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     if kind in ("commit", "deploy", "gitops"):
         if vendor(name) or name.lower() in {r.lower() for r in never.get("repos") or []}:
             return refused(f"{name} is never a target of the door")
+        if not REPO.fullmatch(name):        # the door reads the head of no other name (door.Door.lookups)
+            return refused(f"{name} is no repository's name, owner/repository")
         if kind == "commit":
             return decide_commit(access, agent, me, name, op, args, content, lookups or {})
         if kind == "deploy":
@@ -594,8 +596,9 @@ def workflow_problem(path, workflow, app):
     return None
 
 
-def decide_workflows(repo, made, files, message):
-    """A commit of workflow files only, for the Operator that made the repository through the door."""
+def decide_workflows(repo, made, files, message, branch=None):
+    """A commit of workflow files only, for the Operator that made the repository through the door, on the branch that
+    the decision read (branch)."""
     app, target, out = made.get("app") or repo.split("/", 1)[1], f"commit:{repo}", []
     for path, data, mode in files:
         if data is None:
@@ -611,7 +614,7 @@ def decide_workflows(repo, made, files, message):
             return refused(why, target=target)
         out.append((path, canonical(workflow), "100644"))
     return Decision("rule", "workflow files of a repository that the door made, checked by code", target=target,
-                    plan={"repo": repo, "files": out, "message": message, "branch": None})
+                    plan={"repo": repo, "files": out, "message": message, "branch": branch})
 
 
 def decide_template(repo, made, args):
@@ -646,7 +649,8 @@ def commit_files(content):
                 return None, f"a path of the commit has more than {PATH_MOST} characters"
             if isinstance(path, str) and path.count("/") > FOLDERS_MOST:
                 return None, f"a path of the commit has more than {FOLDERS_MOST} folders"
-            if not isinstance(path, str) or path.startswith("/") or ".." in path.split("/") or not path or \
+            # no empty part, ".", ".." (a leading or trailing "/", "//"): never_path reads each path as it is written
+            if not isinstance(path, str) or any(part in ("", ".", "..") for part in path.split("/")) or \
                     "\\" in path or "\0" in path:
                 raise ValueError
             data = None if f.get("delete") is True else base64.b64decode(f["content"], validate=True)
@@ -654,6 +658,77 @@ def commit_files(content):
         return out, message
     except (ValueError, KeyError, TypeError):
         return None, "the content of a commit is {message, files: [{path, content (base64)} or {path, delete}]}"
+
+
+def paths_clash(files):
+    """Why a commit's paths are refused among themselves, or None: a path twice, or a path and a path under it (x and
+    x/y), of which GitHub's tree keeps one; and two that differ only in case (a.txt and A.txt, Foo/x and foo), which a
+    checkout that reads names in any case reads as one, as never_path does. No lookup."""
+    paths = [path for path, _data, _mode in files]
+    if len(set(paths)) != len(paths) or any(a.startswith(b + "/") for a in paths for b in paths):
+        return "a path of the commit comes twice, or is a folder of another of its paths"
+    folded = [path.casefold() for path in paths]
+    if len(set(folded)) != len(folded) or any(a.startswith(b + "/") for a in folded for b in folded):
+        return "two paths of the commit differ only in case, which some checkouts read as one name; a rename by case " \
+               "only (README to Readme) is made outside the door"
+    return None
+
+
+def head_refused(files, lookups):
+    """Why a commit is refused by what its paths are at the head of the branch (head_tree: {path: "file" | "folder" |
+    "link"} of the whole tree there, one read of GitHub), or None (Reader A of 24 November 2026). A file written at a
+    path that is a folder there replaces the whole folder (GitHub's tree API: "Entries defined in the tree parameter
+    will overwrite items from base_tree with the same path"), and the rules of the paths under it (never_path) never
+    see them go, as scripts/security in a devops repository; a file written at a link's path, or under a file or a link,
+    replaces it. A delete of a path that is no file there (a folder, a link, or nothing) is refused: GitHub takes a
+    null sha at a folder's path too. A path that differs from one there only in case is refused, as never_path reads
+    names in any case (claude.md/x beside CLAUDE.md, scripts/Security). Without the lookup, every commit is refused."""
+    tree = lookups.get("head_tree")
+    if not tree:                # fail closed: a decision that cannot read the head commits nothing
+        return "the door cannot read what the commit's paths are at the head of the branch, so it commits nothing"
+    kinds = tree()
+    folded = {}
+    for known in kinds:
+        folded.setdefault(known.casefold(), known)
+    for path, data, _mode in files:
+        parts = path.split("/")
+        at = None
+        for n in range(1, len(parts) + 1):
+            here = "/".join(parts[:n])
+            at = kinds.get(here)
+            if at is None:
+                other = folded.get(here.casefold())
+                if other is not None:
+                    return f"{here} differs only in case from {other} at the head of the branch, which some checkouts " \
+                           f"read as one name; a rename by case only is made outside the door"
+                break                   # nothing there: the rest of the path is new
+            if n < len(parts) and at != "folder":
+                return f"{here} is a file or a link at the head of the branch, and a file written under it would " \
+                       f"replace it"
+        if data is None and at != "file":
+            return f"{path} is no file at the head of the branch (a folder, a link, or no file), so the commit deletes " \
+                   f"nothing there"
+        if data is not None and at == "folder":
+            return f"{path} is a folder at the head of the branch, and a file written at its path would replace the " \
+                   f"whole folder"
+        if data is not None and at == "link":
+            return f"{path} is a link or a submodule at the head of the branch, which the door does not replace"
+    return None
+
+
+def set_parent(plan, lookups):
+    """The commit at the head that the decision read (head_sha) as its commit's one parent: GitHub.commit makes the
+    commit on it, and reads the branch again before it moves it, so a branch that moved meanwhile is no commit."""
+    sha = lookups.get("head_sha")
+    if sha and not plan.get("parent"):
+        plan["parent"] = sha()
+
+
+def with_parent(d, lookups):
+    """The decision with its commit's parent (set_parent)."""
+    if d.kind != "refused" and isinstance(d.plan, dict):
+        set_parent(d.plan, lookups)
+    return d
 
 
 def decide_commit(access, agent, me, repo, op, args, content, lookups):
@@ -674,7 +749,11 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
             if not all(WORKFLOW.fullmatch(p) and m == "100644" for p, _, m in files):
                 return refused("a commit of workflow files holds only workflow files (.github/workflows/<name>.yml, "
                                "mode 100644), with no other file", target=f"commit:{repo}")
-            return decide_workflows(repo, made, files, message)
+            why = paths_clash(files) or head_refused(files, lookups)
+            if why:
+                return refused(why, target=f"commit:{repo}")
+            d = decide_workflows(repo, made, files, message, (lookups.get("branch") or (lambda: None))())
+            return with_parent(d, lookups)
     entry = repo_entry(me, repo, ("devops", "app"))
     if entry is None:
         return refused(f"the door commits nothing on {repo} for this agent", route="holder")
@@ -689,7 +768,11 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
         hit = never_path(path)
         if hit:
             return refused(f"{path} is under the commit rules ({hit}), which no commit passes")
+    why = paths_clash(files) or head_refused(files, lookups)
+    if why:
+        return refused(why, target=f"commit:{repo}")
     plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch")}
+    set_parent(plan, lookups)
     if entry["kind"] == "devops":
         if any(p == "scripts" or p.startswith("scripts/") for p, _, _ in files):
             return Decision("own", "a commit under scripts/", target=f"commit:{repo}", plan=plan)
@@ -1997,15 +2080,18 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     for path, data, mode in files:
         if mode in ("120000", "160000") or never_path(path):
             return refused(f"{path} is under the commit rules", target=target)
+        if mode not in ("100644", "100755"):        # 040000 too: a tree entry at a file's path
+            return refused(f"{path} has the mode {mode}", target=target)
         if path.casefold() == DOOR_DECLARATION:
             return refused(f"{path} names the files that the door writes itself: a person changes it, outside the "
                            f"door", target=target)
         why = gitops_path_refused(path, access)
         if why:
             return refused(why, target=target)
-    why = tag_text_refusal(files)              # before the box: no generator there reads such a file
+    why = paths_clash(files) or head_refused(files, lookups) or tag_text_refusal(files)   # before the box
     if why:
         return refused(why, target=target)
+    set_parent(plan, lookups)
     # What the commit makes a cluster apply (door_render.py): the door gives the lookup only where its render box is.
     # With no report, every file keeps the rules that need no render, as before the box.
     report = (lookups.get("render") or (lambda files: None))(files)
@@ -2024,7 +2110,11 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         if d.kind != "refused":
             plan["objects"] = commit_objects(files, report, lookups)     # door.py keeps them once the commit is made
             d = with_owner(d, report, files, plan, target)
-        return with_generated(d, report, lookups, files, plan, target)
+        d = with_generated(d, report, lookups, files, plan, target)
+        # the files that the commit holds in the end, with those that the door writes again (with_generated)
+        why = (paths_clash(d.plan["files"]) or head_refused(d.plan["files"], lookups)) \
+            if d.kind != "refused" and isinstance(d.plan, dict) and d.plan.get("files") else None
+        return refused(why, target=target) if why else d
     except (KeyError, TypeError, AttributeError, ValueError, RecursionError):
         return refused("the door could not read the render of this commit", target=target, route="again")
 

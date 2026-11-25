@@ -1998,12 +1998,13 @@ def aws_call(s, conf, ctx, now=None):
     return status, text
 
 
-def http(method, url, headers, data, timeout=30):
-    """The door's own HTTPS call: (status, the answer as JSON, or text when it is not JSON)."""
+def http(method, url, headers, data, timeout=30, most=4 * 1024 * 1024):
+    """The door's own HTTPS call: (status, the answer as JSON, or text when it is not JSON). most: the bytes of an
+    answer that it reads; a longer one is cut, and is no JSON then."""
     req = urllib.request.Request(url, data=data, method=method, headers=dict(headers, **{"User-Agent": "fleet-door"}))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw, status = r.read(4 * 1024 * 1024), r.status
+            raw, status = r.read(most), r.status
     except urllib.error.HTTPError as e:
         raw, status = e.read(64 * 1024), e.code
     except (urllib.error.URLError, OSError) as e:

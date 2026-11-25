@@ -494,6 +494,7 @@ class Columns(unittest.TestCase):
         ("door_record", "caller"): "the door's own record of who called it, kept as the door keeps it (plan C4)",
         ("needs", "replaced_by"): "the id of the item that took its place (owner API 1.274)",
         ("standing", "name"): "a KPI's title (lanes/agent-kpis.md)",
+        ("kpi_changes", "asked_by"): "the owner's message (M-n) that asked for a KPI change (lanes/agent-kpis.md)",
         ("capp_clients", "name"): "a connected app's own name", ("capp_connections", "name"): "a connected app",
         ("capp_grants", "name"): "the connected app of an authorization code",
         ("capp_connections", "ended_by"): "what ended a connected app: owner, reuse, code_reuse, off, client or "
@@ -532,6 +533,7 @@ class Columns(unittest.TestCase):
         "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
         "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task", "no_tools:": "a task",
         "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
+        "kpi_name_who:": "a KPI's standing item (lanes/agent-kpis.md)",
         "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):

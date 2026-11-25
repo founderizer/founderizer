@@ -341,6 +341,10 @@ class Linked(Records):
         # a new measuring agent: the hub's values measured something else
         self.kpi_ok("lead", id=hub.iref(r["id"]), measured_by="hand")
         self.assertEqual((self.points(r), self.kpi(r)["source"]), ([], None))
+        # a hub measure measures in place of the measurer: a measurer that an agent above named holds it off (4.4)
+        self.kpi_ok("manager", id=hub.iref(r["id"]), measured_by="hand")
+        self.assertIn("above you", self.kpi_refused("lead", id=hub.iref(r["id"]), check="hub:reports_came_back",
+                                                    how="The hub's typed reports to the duties of hand."))
 
 if __name__ == "__main__":
     unittest.main()

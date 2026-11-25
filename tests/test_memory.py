@@ -1972,6 +1972,8 @@ class Shown(Base):
                 hub.q("SELECT memory, attempt FROM memory_shown WHERE task=? ORDER BY attempt, memory", (task,))]
 
     def test_a_start_records_the_lessons_it_showed_and_a_new_attempt_records_its_own(self):
+        """And a narrowed pair's start, which shows no lesson (start_text), records none: a later review would read a
+        lesson as used where no session had it."""
         self.remember()                                                         # M-1: the task names acme/web
         self.remember(about="billing", text="Invoices go out on the first.", prevents="A late invoice")    # M-2
         tid = self.admit()
@@ -1981,6 +1983,12 @@ class Shown(Base):
         self.assertNotIn("- M-2 [", start)
         t = hub.q1("SELECT * FROM tasks WHERE id=?", (tid,))
         event = hub.attempt_event(t)                    # built before the transaction, as every caller does
+        with hub.LOCK, hub.transaction():
+            hub.attempt_rows(t, "restart", event, self.clock)
+        self.assertEqual(self.rows(tid), [(1, 1), (1, 2)])
+        hub.q("UPDATE tasks SET scope_person=1 WHERE id=?", (tid,))    # a narrowed pair's task: its start reads none
+        t = hub.q1("SELECT * FROM tasks WHERE id=?", (tid,))
+        event = hub.attempt_event(t)
         with hub.LOCK, hub.transaction():
             hub.attempt_rows(t, "restart", event, self.clock)
         self.assertEqual(self.rows(tid), [(1, 1), (1, 2)])
