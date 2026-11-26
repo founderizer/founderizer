@@ -9968,7 +9968,8 @@ def migrate():
         "egress_servers": {"down": "INTEGER NOT NULL DEFAULT 0", "unloaded": "INTEGER NOT NULL DEFAULT 0"},
         # the reliability plan of 21 November 2026, W11: the cause of a run that did not end done, one code of
         # releases.CAUSES or null (finish_release), which the automatic sweep acts on (release_again)
-        "releases": {"cause": "TEXT"},
+        # the audit of 24 November 2026, finding 4: the pushes of a release whose end no run saw (release_attempts)
+        "releases": {"cause": "TEXT", "attempted": "TEXT"},
         # Founderizer for Teams: the signed word that the licence ended, and whether it renews (teams_on, teams_state)
         "entitlement": {"ended": "REAL", "ended_word": "TEXT", "renews": "INTEGER"},
         # the owner, 23 November 2026, of the cards "Outcome not known: check it" ("this sohuld be automatically
@@ -10110,6 +10111,8 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS question_task ON questions(task)",
         # (and the questions that wait for an answer, which the manager's read_messages joins to their open tasks)
         "CREATE INDEX IF NOT EXISTS question_open ON questions(id) WHERE answer IS NULL",
+        # the releases whose push no run saw the end of, at each pass (release_look_sweep): almost always none
+        "CREATE INDEX IF NOT EXISTS release_attempted ON releases(id) WHERE attempted IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS agent_limit_agent ON agent_limits(agent)",
         # ... the check runs that wait and those that a helper holds (trigger_sweep, and checks_in_flight at each
         # send), the messages whose sender waits (wait_sweep) and the reminders that are not done (reminder_sweep):
@@ -36088,6 +36091,12 @@ KIT_BUSY_RESTORE = ("A copy of this fleet is being put back now, which can take 
                     "try again when it is done.")
 
 
+# A write while an update run goes on and the ref holds the release that it sent, before its own follow. The run waits
+# for nothing (it starts when no turn runs), and its checks take minutes.
+RELEASE_LANDS = ("An update of this fleet is being put in place now, which takes some minutes. Nothing was written: "
+                 "try again when it is done.")
+
+
 @contextlib.contextmanager
 def kit_lock():
     """KIT, then LOCK: for a writer of the hub's files that holds neither, so that it waits for a write in its turn
@@ -36314,9 +36323,25 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     the write. So the checkout still moves only under LOCK, and while the stretches run, a writer that holds LOCK
     without a turn is refused (kit_flying) and nothing takes the pushed commit back (undo_kit_push).
 
+    **A release that a run of this hub sent, and whose end nobody saw yet** (release_attempts), can be what the ref
+    holds and the checkout does not. Its commit is taken in as other commits are (release_sent_here), and the write
+    goes on top of it, also while tasks run: the run's own checks passed on that code, and move_kit checks its
+    signature and its tree as for every move (may_take). So an agent's delivery keeps its files on the ref, and the
+    owner's saves go through. From the take-in no new task session starts (release_holds_starts), except a duty's
+    case and a start that its helper took already, as before any release; a conversation's messages wait only during
+    an update run; and the hold ends after RELEASE_POLL, as any release's wait for the running turns does, so a turn
+    that runs longer than that lets new sessions start on the old process. The look of the next tick puts the release
+    in place at the first moment no turn runs (release_lands: the machines' update requests and the hub's restart), as
+    after a reload onto such a tip. Until then the hub's process runs its old code beside the new files, as every
+    helper does between its sync and its restart, and a module that it imports late meanwhile (door_targets,
+    thread_door, teamspack, door_providers) comes from the new files: an accepted risk, for the files that a delivery
+    and the owner's saves keep. During an update run, whose push
+    may be on the ref before its own follow, the write is a KitFault (RELEASE_LANDS). Until 25 November 2026 every
+    write was refused here, as final, until a later run of the release.
+
     A refusal whose cause can pass by itself is a KitFault: the fetch or the push failed, another write's push came
     first, git did not answer in time, the take-back of a write of the hub's own failed, the checkout did not take in
-    a push that landed, or KIT_BUSY. A write whose bytes the ref holds already (a push of before that landed with no
+    a push that landed, RELEASE_LANDS, or KIT_BUSY. A write whose bytes the ref holds already (a push of before that landed with no
     answer) makes no commit and returns the revision."""
     import shutil
     import tempfile
@@ -36365,15 +36390,24 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
                     raise Refusal(409, f"origin has no {branch} ref: the hub's configuration ref is missing")
         if remote != rev:
             ahead = git_kit("merge-base", "--is-ancestor", rev, remote)[0] == 0
+            sent = False
             if not (ahead and same_code(rev, remote)):
-                raise Refusal(409, f"origin/{branch} " + ("carries changes that the hub does not run" if ahead else
-                                                          "lacks commits that the hub has"))
+                sent = ahead and release_sent_here(rev, remote)
+                if not sent:
+                    raise Refusal(409, f"origin/{branch} " + ("carries changes that the hub does not run" if ahead else
+                                                              "lacks commits that the hub has"))
+                if release_applying():
+                    raise KitFault(409, RELEASE_LANDS)
             problem = move_kit(remote)
             if problem:
                 raise Refusal(409, f"the hub could not take in origin/{branch}: {problem}")
             rev = kit_revision(fresh=True)
             if rev != remote:
                 raise Refusal(409, f"the hub checkout did not reach origin/{branch}")
+            if sent:
+                # The hub's process still runs the code before it: new sessions wait from here, as for a release that
+                # a look found (release_holds_starts), and the look puts it in place at the first tick that no turn runs
+                _release.update(look=True, found=_release["found"] or now())
         if check:
             check(rev)
         with out:
@@ -81011,7 +81045,10 @@ BRIDGE_RESTART = ["systemctl", "--user", "try-restart", "fleet-channels"]     # 
 # runs all the same, because a later release holds it (pass_held_releases).
 PASSED = "passed"
 RELEASE_STATES = ("verified", "held", "updating", PASSED) + releases.STATES
-_release = {"thread": None, "applying": False}      # the one check or update that may run at a time
+# the one check or update that may run at a time; and of the looks for a sent release (release_look_sweep): that one is
+# due now, when the last one began, and since when a release that a look found waits for the turns that run
+_release = {"thread": None, "applying": False, "look": False, "looked": 0.0, "found": None}
+RELEASE_SENT_MOST = 8           # the pushes of one release that are kept (release_attempts): the newest
 _release_lock = threading.Lock()
 
 
@@ -81653,8 +81690,9 @@ def release_running():
 
 
 def release_applying():
-    """True for the whole length of an update run: the poll, the merge, the checks, the push, and the hub's own
-    restart at the end.
+    """True for the whole length of an update run after its look for a release that a run sent before
+    (release_finds), which reads this fleet's own ref and holds nothing: the poll, the merge, the checks, the push, and
+    the hub's own restart at the end; and for a look, from the moment it puts a release in place (release_lands).
 
     No session of a task starts while this is true (`Handler.events`), because the restart would drop it. The run
     begins only when no task is open, so with this gate nothing of the fleet's is live when the hub restarts: a
@@ -81906,7 +81944,8 @@ def release_holds_starts():
     if release_applying():
         return True
     waits = release_waiting()
-    return bool(waits) and 0 <= now() - waits["since"] < RELEASE_POLL
+    return any(since is not None and 0 <= now() - since < RELEASE_POLL
+               for since in (waits and waits["since"], _release["found"]))
 
 
 def release_row_view(row):
@@ -82025,9 +82064,12 @@ def poll_release(fetch=None):
     return answer, row
 
 
-def start_release_work(applying, automatic=False, fetch=None, take=False):
+def start_release_work(applying, automatic=False, fetch=None, take=False, look=False):
     """Start the poll — and, when `applying`, the update that follows it — in a thread of its own. `take`: a check
-    whose release the automatic sweep takes at its next tick (release_work, POST /ui/releases/check).
+    whose release the automatic sweep takes at its next tick (release_work, POST /ui/releases/check). `look`: no poll
+    and no update, only the look for a release that a run sent (release_finds). No run holds a session start while that
+    look reads the ref, which can take minutes on a network that does not answer: a look holds them from the moment it
+    lands a release (release_lands), and an update run from the end of its look (release_work).
 
     Called under LOCK, so it only checks what is cheap and starts the thread: an update takes a minute or more,
     because `selftest.py` and `fleet.py verify` run on the released code before anything is published."""
@@ -82043,8 +82085,9 @@ def start_release_work(applying, automatic=False, fetch=None, take=False):
             if going:
                 raise Refusal(409, code="update_waits_for_copy", names={"copy": ", ".join(going)})
         thread = threading.Thread(target=release_work, name="release-update", daemon=True,
-                                  args=(applying, automatic, fetch, take))
-        _release["thread"], _release["applying"] = thread, bool(applying)       # before start: see release_applying
+                                  args=(applying, automatic, fetch, take, look))
+        # before start: see release_applying. An update run holds every start only after its look (release_work)
+        _release["thread"], _release["applying"] = thread, False
         thread.start()
     changed()                   # a run that goes on is on the owner's Updates page at once (live_changes)
     return {"started": True, "applying": bool(applying), "automatic": bool(automatic),
@@ -82077,9 +82120,19 @@ def records_copy(path):
     q("VACUUM INTO ?", (path,))
 
 
-def release_work(applying, automatic=False, fetch=None, take=False):
-    """The thread. Nothing in it holds LOCK while it waits for the network, for git, or for a check."""
+def release_work(applying, automatic=False, fetch=None, take=False, look=False):
+    """The thread. Nothing in it holds LOCK while it waits for the network, for git, or for a check. An update run marks
+    itself (release_applying) under LOCK after its look for a release that a run sent before (release_finds), and
+    before it checks the turns under LOCK, so that no session start goes out that its check did not see, and its look,
+    which reads this fleet's own repository, holds nothing. `sent`: the pushes of this run (release_pushing); `run`:
+    the id of the row that it marked updating."""
+    sent, run = [], None
     try:
+        if applying and release_finds() or look:
+            return              # a release that a run sent before is on the ref: it ended now, or waits for the turns
+        if applying:
+            with LOCK:
+                _release["applying"] = True
         answer, row = poll_release(fetch)
         if take and not applying and row is not None and row["state"] == "verified" and releases_automatic():
             with LOCK:
@@ -82097,6 +82150,9 @@ def release_work(applying, automatic=False, fetch=None, take=False):
         with LOCK:
             if row["state"] in (releases.DONE, PASSED):
                 return                                  # this fleet runs this release already, or one that holds it
+            if automatic and release_unconfirmed(row):
+                kv_set("release_waits", None)
+                return                                  # its push may have landed: the look comes first, not a run
             again = release_again(row, room) if automatic else False
             if again in ("probe", "rests"):
                 kv_set("release_waits", None)
@@ -82135,6 +82191,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                 q("UPDATE releases SET state='updating', step=NULL, says=NULL, pinned=?, reached=NULL, started=?, "
                   "finished=NULL, automatic=?, cause=NULL WHERE id=?",
                   (pinned, now(), 1 if automatic else 0, row["id"]))
+                run = row["id"]
             origin = git_kit("remote", "get-url", "origin")[1] or None
         if not idle:
             # plan P0: a release that no run has tried yet waits for the turns that run now, and no new session starts
@@ -82153,9 +82210,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
         teams_sweep_ends()      # Founderizer for Teams: a run that starts waits for the check of a package, if one runs
         waits = teams_package_for(manifest, origin, bundled)    # Founderizer for Teams: the release's package first
         if waits:
-            with LOCK:
-                release_count_unreached(probed, finish_release(row["id"], waits["state"], waits["step"],
-                                                               waits["says"], automatic, waits))
+            release_ends(row["id"], waits, automatic, probed, pushed=False)
             return
         import shutil
         import tempfile
@@ -82172,10 +82227,9 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             except sqlite3.Error as e:
                 # No copy, no schema check, and the one thing worse than an unchecked release is an unchecked
                 # release on a hub that cannot even read its own records. The fleet keeps what it runs.
-                with LOCK:
-                    finish_release(row["id"], releases.KEPT, "schema", f"this fleet's records could not be copied "
-                                   f"for the schema check, so no release is taken: {e}", automatic,
-                                   cause=releases.room_cause(None, str(e)))
+                release_ends(row["id"], {"state": releases.KEPT, "step": "schema", "says": f"this fleet's records "
+                             f"could not be copied for the schema check, so no release is taken: {e}",
+                             "cause": releases.room_cause(None, str(e))}, automatic, pushed=False)
                 return
             # W2: the checks run at the lowest priority and, where systemd gives it, in a scope with a memory limit
             # and no swap. A machine that gives no scope says so in the hub's log once, and the run goes on.
@@ -82184,22 +82238,42 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                 _release["said_scope"] = True
                 with LOCK:
                     log("hub", plain)
+            before = release_attempts(row)
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
                                      database=path, floor=kit_floor(),
+                                     pushing=lambda attempt: sent.append(attempt) or
+                                     release_pushing(row["id"], before, attempt),
                                      pushed=lambda merged: release_pushed(row["id"], merged),
                                      own=kit_own, limit=limit, bundled=bundled).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
-        with LOCK:
-            release_count_unreached(probed, finish_release(row["id"], result["state"], result["step"], result["says"],
-                                                           automatic, result))
+        release_ends(row["id"], result, automatic, probed, pushed=bool(sent))
     except Exception:
         print_fault()
+        # This process runs the code it started with, so a run whose push had landed ends as each found release does:
+        # the machines are asked and the hub restarts (release_finds). Any other run that the error cut off ends failed,
+        # also one whose row keeps the push of an earlier run, which the next look settles (`run`).
+        with contextlib.suppress(Exception):
+            if applying and sent:
+                release_finds()
+        settle_releases("the update ended with an error in the hub; read the hub's own log",
+                        ended=None if sent else run)
+
+
+def release_ends(rid, result, automatic, probed=False, pushed=True):
+    """In the thread of a run, outside LOCK: the end of that run, `result` (releases.Update). A run that took the
+    release, or that left it on the ref with this checkout behind it, ends as it says, and so does a run that pushed
+    nothing (`pushed`), with its own cause, also when its row keeps the push of an earlier run, which the next look
+    settles. Any other whose row names a push (release_attempts) is placed by the ref first: its push, or an earlier
+    run's, can have landed (release_settles)."""
+    row = q1("SELECT * FROM releases WHERE id=?", (rid,))
+    if result["state"] in (releases.DONE, releases.FAILED) or not row["attempted"] or not pushed:
+        own = "own" if row["attempted"] and result["state"] not in (releases.DONE, releases.FAILED) else None
         with LOCK:
-            for row in settle_releases("the update ended with an error in the hub; read the hub's own log"):
-                # This process runs the code it started with. When its checkout followed the ref before the error, the
-                # next run stops at "already" and restarts nothing, so the restart of a run that ended is done here.
-                restart_hub_soon(row["pinned"], kit_revision(fresh=True))
+            release_count_unreached(probed, finish_release(rid, result["state"], result["step"], result["says"],
+                                                           automatic, result, placed=own))
+    else:
+        release_settles(row, result, automatic, probed)
 
 
 def release_count_unreached(probed, row):
@@ -82218,37 +82292,328 @@ def release_pushed(rid, merged):
     q("UPDATE releases SET reached=? WHERE id=?", (merged, rid))
 
 
-def settle_releases(says="the hub stopped before this update ended; the next update takes it again", ask=True):
-    """The runs that ended without finish_release: at the start of the hub, and after an error in release_work. An
-    update run lives in the process that started it, and its row says what came of it before the hub restarts onto
-    the release. A row that still says updating was a run that a stop of the hub or an error cut off, so it ends as a
-    run that ended with an error, and the next run of that release finds out where the checkout is.
+# **A push whose end no run saw** (the audit of 24 November 2026, finding 4). The push of a release is the step that
+# leaves this machine, and its run can end without knowing whether it landed: the ref could not be read after a push
+# that failed, or the hub stopped in between. Until then such a run ended rolled back, or failed, while the ref could
+# hold the release: no machine was asked, the hub did not restart, commit_kit_file refused every write of the owner's,
+# and with automatic updates off that lasted until a person acted. So the row of a release keeps each push before it is
+# made (release_pushing, as KIT_PUSHED keeps a write of the hub's own), and keeps it until something settles it:
+#
+#   - the ref's tip, or this checkout, holds that commit and the code there is still its own: all of the end of a run
+#     that took the release (release_lands), at the first moment no turn runs;
+#   - the ref moved on without it: that push can never land, because a push is a fast-forward. It goes from the list;
+#   - the ref stands where the push found it: the push did not land, and the run is rolled back. It stays in the list
+#     until the ref moves, so one that lands late is found all the same;
+#   - the ref cannot be read: nothing is known, and nothing is said of it but that (releases.unconfirmed). The row stays
+#     `updating` until the next look, so for one RELEASE_POLL at most; a look that cannot read the ref either ends it
+#     `failed` at the step push. The apps show an `updating` row as a run that goes on, with no button, and this row
+#     must not hide the owner's Update for a newer release; the record stays, and each later look settles it;
+#   - a later release that this fleet took holds it: its row is `passed` (release_done), and never `done` after the
+#     later one, whose row must stay the newest that this hub applied (applied_release, and the publisher's job, which
+#     sends a release to customers only then).
+#
+# No rest is counted and no cause is set before a look says rolled back. The same release is not run again by itself
+# while its push is not settled; a newer one is, and the owner's press runs either, after a look.
+
+
+def release_attempts(row):
+    """The pushes of this release that nothing settled yet, oldest first, each {"commit", "base": the ref's tip that it
+    went onto, "ref"}: the row's `attempted`, as release_pushing wrote it. One for each run that did not see its end."""
+    try:
+        kept = json.loads(row["attempted"] or "[]")
+    except ValueError:
+        kept = []
+    return [one for one in (kept if isinstance(kept, list) else ())
+            if isinstance(one, dict) and all(isinstance(one.get(k), str) for k in ("commit", "base", "ref"))
+            and COMMIT_ID.fullmatch(one["commit"])]
+
+
+def release_pushing(rid, before, attempt):
+    """releases.Update's `pushing`: this run pushes `attempt` next. `before`: the row's pushes of earlier runs. An
+    earlier push of this run was refused because the ref moved, so it can never land, and only its newest is kept."""
+    q("UPDATE releases SET attempted=? WHERE id=?", (json.dumps([*before, attempt][-RELEASE_SENT_MOST:]), rid))
+
+
+def release_sent():
+    """The rows of the releases with a push that nothing settled yet, the newest run first."""
+    return q("SELECT * FROM releases WHERE attempted IS NOT NULL ORDER BY started DESC, id DESC")
+
+
+def release_unconfirmed(row):
+    """True for a row whose run ended, or was cut off, without knowing whether its push landed: the only rows that say
+    so, beside those whose push is settled and kept in case it lands late. Ask it only while no run of it goes on."""
+    return bool(row["attempted"]) and (row["state"] == "updating" or
+                                       row["state"] == releases.FAILED and row["step"] == "push")
+
+
+def kit_holds(commit, rev="HEAD"):
+    """True when `rev` of the hub's repository has `commit` in its history; false for a commit it does not have."""
+    return git_kit("merge-base", "--is-ancestor", commit, rev)[0] == 0
+
+
+def release_stands(commit, rev):
+    """True when the code at `rev` is the code of the release commit `commit`: what came after it is the fleet's own
+    data (lifecycle.data_path), so no later release took its place there."""
+    code, out, _ = git_kit("diff", "--no-renames", "--name-only", "-z", commit, rev)
+    return code == 0 and all(lifecycle.data_path(one) for one in out.split("\0") if one)
+
+
+def release_sent_here(rev, remote):
+    """For commit_kit_file, in its turn: True when what the ref's tip `remote` has over the hub's checkout `rev` is a
+    release that a run of this hub sent and that nothing settled yet, with no Fleet file changed after it."""
+    return any(kit_holds(one["commit"], remote) and not kit_holds(one["commit"], rev) and
+               kit_holds(rev, one["commit"]) and same_code(one["commit"], remote)
+               for row in release_sent() for one in release_attempts(row))
+
+
+RELEASE_LOOK = "refs/fleet/release-look-"       # + a ref: where a look fetches that ref's tip (release_tip)
+
+
+def release_tip(url, ref):
+    """The tip of `ref` in this fleet's own repository at `url`, fetched by its address into a ref of the look's own
+    (RELEASE_LOOK), as releases.Update.ref_now fetches into MOVED: so git writes no remote-tracking ref of origin and no
+    FETCH_HEAD, and no other fetch of the hub (commit_kit_file's, fetch_soon's) meets this one on a lock. READS tries;
+    None when it cannot be read."""
+    mine = RELEASE_LOOK + ref
+    if not url or not BRANCH_NAME.match(ref):
+        return None
+    for left in range(releases.READS - 1, -1, -1):
+        if git_kit("fetch", "-q", "--no-write-fetch-head", url, f"+refs/heads/{ref}:{mine}",
+                   timeout=releases.READ_WAIT)[0] == 0:
+            code, tip, _ = git_kit("rev-parse", "--verify", "--quiet", mine + "^{commit}")
+            return tip if code == 0 else None
+        if left:
+            time.sleep(releases.READ_PAUSE)
+    return None
+
+
+def release_place(row, read=True):
+    """Outside LOCK and KIT: where the pushes of this release came to rest. {"where": "on" (with `attempt`, the push,
+    and `tip`, what holds it: HEAD, or the ref's tip), "off" (with `rest`, the pushes that can still land), None: the
+    ref could not be read, or "later": this checkout holds none of them, and `read` is false}. The newest push first.
+    The ref is read only when this checkout holds none of them."""
+    attempts = release_attempts(row)
+    for one in reversed(attempts):
+        if kit_holds(one["commit"]):
+            return {"where": "on", "attempt": one, "tip": "HEAD"}
+    if not read:
+        return {"where": "later"}
+    code, url, _ = git_kit("remote", "get-url", "origin")
+    rest, tips = [], {}
+    for one in reversed(attempts):
+        if one["ref"] not in tips:
+            tips[one["ref"]] = release_tip(url if code == 0 else "", one["ref"])
+        tip = tips[one["ref"]]
+        if tip is None:
+            return {"where": None}
+        if kit_holds(one["commit"], tip):
+            return {"where": "on", "attempt": one, "tip": tip}
+        if tip == one["base"]:
+            rest.insert(0, one)
+    return {"where": "off", "rest": rest}
+
+
+def release_finds():
+    """In the thread of a run or a look, outside LOCK and KIT, before anything else: the look for each release with a
+    push that nothing settled (release_settles), the newest run first. True when that thread goes no further now: one
+    of them is on the ref, and it ended (the hub restarts) or waits for the turns that run. It costs one read of the
+    records while there is none.
+
+    The hold of a release that waits (`found`) stays while the look reads, which can take minutes (a ref that does not
+    answer, a write that holds the turn), and is written at its end: kept for a release that still waits, ended when
+    none does, unless a write took one in meanwhile and asked for the next look (commit_kit_file). This pass is the
+    look that such a flag asks for, so it clears the flag first: a flag that stayed would keep an old hold for good,
+    and a later release that waits would take that old time, past RELEASE_POLL, and hold nothing."""
+    since, said = _release["found"], None
+    _release["look"] = False
+    for row in release_sent():
+        try:
+            said = release_settles(row)
+        except Exception:
+            print_fault()       # its record stays: the next look settles it
+            continue
+        if said:
+            break
+    if said == "waits":
+        _release["found"] = since or now()
+    elif not _release["look"]:
+        _release["found"] = None
+    return bool(said)
+
+
+def release_settles(row, result=None, automatic=None, probed=False, start=False):
+    """Outside LOCK and KIT: the pushes of this release by what the ref holds now, as the comment above says, in the
+    turn of the hub's writes (kit_lock), which it takes itself. `result` is the run of it that ends now (release_ends),
+    whose own answer stands when none of them landed. `start`: at the hub's start, which reads no repository: only a
+    push that this checkout holds is settled then. Returns "done" for a release that was found and ended, "waits" for
+    one that waits for the turns that run, else None."""
+    place = release_place(row, read=not start)
+    if place["where"] == "later":
+        return None
+    with kit_lock():
+        row = q1("SELECT * FROM releases WHERE id=?", (row["id"],))
+        automatic = row["automatic"] if automatic is None else automatic
+        if place["where"] != "on" and row["attempted"]:
+            again = release_place(row, read=False)      # a write took the push in since the ref was read
+            place = again if again["where"] == "on" else place
+        if place["where"] == "on" and row["attempted"]:
+            return release_lands(row, place, start=start)
+        if place["where"] is None:
+            if result:
+                finish_release(row["id"], releases.UNCONFIRMED, "push", None, automatic, result)
+                return None
+            if row["state"] != "updating":
+                return None
+            if row["reached"]:          # the push landed (release_pushed): only the follow is missing, which a look does
+                finish_release(row["id"], releases.FAILED, "follow", releases._said(releases.not_followed(
+                    row["version"], config_branch(), row["reached"], kit_dir())), automatic,
+                    {"reached": row["reached"]}, placed="on")
+                return None
+            finish_release(row["id"], releases.FAILED, "push", releases._said(releases.unconfirmed(row["version"])),
+                           automatic, placed="unread")
+            return None
+        rest = json.dumps(place["rest"]) if place.get("rest") else None
+        unsettled = release_unconfirmed(row)
+        if rest != row["attempted"]:
+            q("UPDATE releases SET attempted=? WHERE id=?", (rest, row["id"]))
+        if result and result["state"] != releases.UNCONFIRMED:
+            release_count_unreached(probed, finish_release(row["id"], result["state"], result["step"], result["says"],
+                                                           automatic, result, placed="off"))
+        elif result or unsettled:
+            finish_release(row["id"], releases.ROLLED_BACK, "push", f"Release {row['version']} passed every check, and "
+                           f"its push did not reach this fleet's own ref. The fleet stays at "
+                           f"{(row['pinned'] or '')[:12]}.", automatic, {"pinned": row["pinned"]}, placed="off")
+    return None
+
+
+def release_lands(row, place, start=False):
+    """Inside KIT and LOCK: the release of this row is on the ref, or in this checkout, as the push of `place`, and the
+    end of its run was never done. All of it now (finish_release): this checkout onto that commit, the machines'
+    requests, the row and the hub's restart; at the first moment no turn runs, as a release is taken, and new sessions
+    wait meanwhile for one RELEASE_POLL at most (release_holds_starts). `start`: at the hub's start, whose process runs
+    this checkout already. "done", "waits", or None when nothing more can be done now: the checkout did not move (the
+    row is failed at the step follow, as after a run), or a later change took the release's place on the ref."""
+    commit, ref = place["attempt"]["commit"], place["attempt"]["ref"]
+    here = kit_holds(commit)
+    if not release_stands(commit, place["tip"]):
+        if here:                    # this checkout runs a later release, which holds this one
+            release_passes(row)
+            return None
+        problem = "a later change took its place"
+    else:
+        # The check of every move first (local, and cheap): a follow that it refuses ends now, and holds no start. A
+        # follow that failed before waits for nothing either: the first look at a moment that no turn runs tries it
+        # again. Else a follow that failed at each try held new sessions for up to RELEASE_POLL at each busy poll.
+        problem = None if here else may_take(kit_dir(), commit, floor=kit_floor())
+        if not problem and not start and not (fleet_idle()[0] and not copies_going()):
+            if not here and (row["state"], row["step"]) == (releases.FAILED, "follow"):
+                return None     # a write that takes it in (commit_kit_file) waits as a found release: below
+            says = releases._said(f"release {row['version']} arrived. This fleet goes over to it when no task runs.")
+            if (row["state"], row["says"]) != ("updating", says):
+                q("UPDATE releases SET state='updating', step='push', says=?, finished=NULL WHERE id=?",
+                  (says, row["id"]))
+                log("hub", f"release {row['version']} ({row['revision'][:12]}) is on the ref, and waits for the turns "
+                           f"that run now")
+            return "waits"
+        if not problem:
+            if _release["thread"] is threading.current_thread():
+                _release["applying"] = True     # the thread of a look or a run: from here it holds every start
+            problem = None if here else move_kit(commit)
+    result = {"pinned": row["pinned"], "reached": commit}
+    if problem:
+        if (row["state"], row["step"]) != (releases.FAILED, "follow"):
+            finish_release(row["id"], releases.FAILED, "follow", releases._said(releases.not_followed(
+                row["version"], ref, commit, kit_dir())), row["automatic"], result, placed="on")
+        return None
+    finish_release(row["id"], releases.DONE, "follow", releases._said(releases.followed(
+        row["version"], ref, commit, row["pinned"] or "")), row["automatic"], result,
+        placed="start" if start else "on")
+    return "done"
+
+
+def release_passes(row):
+    """Inside LOCK: a later release that this fleet took holds this one, whose push nothing settled. Its record ends.
+    A row that did not know whether its push landed (release_unconfirmed) is `passed`, as pass_held_releases marks a
+    release that no run took; one whose run ended, rolled back, keeps what it said."""
+    if not release_unconfirmed(row):
+        q("UPDATE releases SET attempted=NULL WHERE id=?", (row["id"],))
+        return
+    q("UPDATE releases SET state=?, step=NULL, says=NULL, cause=NULL, attempted=NULL, finished=COALESCE(finished,?) "
+      "WHERE id=?", (PASSED, now(), row["id"]))
+    log("hub", f"release {row['version']} ({row['revision'][:12]}) is passed: this fleet runs a later release that "
+               f"holds it")
+
+
+def release_look_sweep(t0):
+    """A step of release_sweep, inside LOCK: the look for a release whose push nothing settled, in the thread of the
+    release work. A fleet that takes releases by itself looks at each of its polls (release_work); this is the rest of
+    it: the first tick after the hub's start (settle_releases) and after a write took such a release in
+    (commit_kit_file), the first moment no turn runs for one that was found, and, with automatic updates off, one look
+    in each RELEASE_POLL, so that the fleet does not stay between two releases until a person acts. True when this
+    tick's look began. One read of the records while there is none."""
+    if release_running():
+        return False
+    if not release_sent():
+        _release.update(look=False, found=None)     # no push to look for: no look is due, and nothing waits
+        return False
+    if _release["found"] is not None:
+        due = fleet_idle()[0] and not copies_going()
+    else:
+        due = _release["look"] or (not (releases_automatic() and (entitlement_token() or installed_hub()))
+                                   and not 0 <= t0 - _release["looked"] < RELEASE_POLL)
+    if due:
+        _release.update(look=False, looked=t0)
+        try:
+            start_release_work(True, automatic=True, look=True)
+        except Refusal:
+            return False
+    return due
+
+
+def settle_releases(says=None, ask=True, ended=None):
+    """The runs that ended without finish_release: at the start of the hub (no `says`), and after an error in
+    release_work, with what to say of it. An update run lives in the process that started it, and its row says what came
+    of it before the hub restarts onto the release. A row that still says updating was a run that a stop of the hub or
+    an error cut off, so it ends as a run that ended with an error, and the next run of that release finds out where
+    the checkout is.
+
+    **A run that was cut off at or after its push** (release_attempts) **does not end so**: its release can be on the
+    ref. At the hub's start, one that this checkout holds ends done here, as release_lands says, and with no restart,
+    because this process runs that code already. Any other is looked for at the first tick (release_look_sweep), so
+    the start waits for no repository.
 
     A run whose push had landed (its `reached`, release_pushed) put the release on the configuration ref, and every
     machine takes it at its next sync while its helper keeps the code it started with. So each is asked for its idle
-    update, as finish_release asks it, and before the row ends, so that a stop in between leaves it to the next start.
-    The next run does not ask: when this hub's checkout had followed the ref, it stops at KEPT "already". A start on
-    restored records does not ask either (`ask`): the copy's run is history, and its revision may not be on this
-    hub's ref. An ask that fails is printed and skipped, because this runs before the hub serves anything: a row
-    left at updating would meet the same failure at every later start. Returns those rows."""
+    update now, as finish_release asks it, and before the row ends, so that a stop in between leaves it to the next
+    start. A start on restored records does not ask (`ask`), and ends nothing done: the copy's runs are history, and
+    their pushes may not be on this hub's ref, so it forgets them, and ends each run that was cut off as before. An ask
+    that fails is printed and skipped, because this runs before the hub serves anything: a row left at updating would
+    meet the same failure at every later start. `ended`: after an error, the row of the run that it cut off before its
+    own push, which ends so too, also when it keeps the push of an earlier run."""
+    start = says is None
+    for row in release_sent() if start and ask else ():
+        try:
+            release_settles(row, start=True)
+        except Exception:
+            print_fault()
     with LOCK:
-        cut = q("SELECT pinned, reached FROM releases WHERE state='updating' AND reached IS NOT NULL")
-        for row in cut if ask else ():
-            for name in agents():
-                try:
-                    request_update(name, row["reached"])
-                except Exception:
-                    print_fault()
+        if not ask:
+            q("UPDATE releases SET attempted=NULL WHERE attempted IS NOT NULL")
+        for row in q("SELECT reached FROM releases WHERE state='updating' AND reached IS NOT NULL") if ask else ():
+            release_asks(row["reached"], skip=True)
         # A run that was cut off before its push took nothing, and the next poll runs its release again. When the run
         # itself is what stops the hub (a server with too little memory for the checks: the system ends one of them,
         # and systemd's default then stops the service that started it, as it did until the hub's unit said
         # OOMPolicy=continue; or the system ends the hub's own process), that is a stop of the hub at every poll: so
         # the run counts as one that failed here, and more polls pass before the next one (release_rests).
-        for row in q("SELECT * FROM releases WHERE state='updating' AND reached IS NULL"):
+        cut = "state='updating' AND (attempted IS NULL OR id=?)"
+        for row in q(f"SELECT * FROM releases WHERE {cut} AND reached IS NULL", (ended,)):
             release_rolled(row)
-        q("UPDATE releases SET state=?, step=?, says=?, finished=? WHERE state='updating'",
-          (releases.FAILED, "merge", says, now()))
-        return cut
+        q(f"UPDATE releases SET state=?, step=?, says=?, finished=? WHERE {cut}",
+          (releases.FAILED, "merge", says or "the hub stopped before this update ended; the next update takes it again",
+           now(), ended))
+        if start and release_sent():
+            _release["look"] = True
 
 
 RELEASE_SMALL_SERVER = 3 << 29     # 1.5 GiB of memory: under it, a type with 2 GB is the step (release_memory_told)
@@ -82288,7 +82653,23 @@ def release_memory_told():
     return True
 
 
-def finish_release(rid, state, step, says, automatic, result=None, cause=None):
+def release_asks(desired, skip=False):
+    """Inside LOCK: each machine asked for its idle update onto `desired`, the hub's own included: its agent's helper
+    fast-forwards its own checkout and restarts its own user service, exactly as a worker's does (request_update).
+    `skip`: an ask that fails is printed and left out, where a row must end all the same. The names that it asked."""
+    asked = []
+    for name in agents():
+        try:
+            if request_update(name, desired) == "requested":
+                asked.append(name)
+        except Exception:
+            if not skip:
+                raise
+            print_fault()
+    return asked
+
+
+def finish_release(rid, state, step, says, automatic, result=None, cause=None, placed=None):
     """Inside LOCK: what came of one update run, and what the fleet does about it. A run that reached the released
     revision asks every machine for its idle update and restarts the hub's own service; any other state leaves the
     fleet exactly as it was. A run that failed after its push (releases.FAILED at the step follow) reached the ref but
@@ -82299,16 +82680,35 @@ def finish_release(rid, state, step, says, automatic, result=None, cause=None):
     null when nothing says which, and always null for a run that ended done.
 
     The machines are asked before the row ends: a stop or an error before then leaves it at updating, and
-    settle_releases asks them again (request_update asks each one once)."""
+    settle_releases asks them again (request_update asks each one once).
+
+    **A push of this release that may have landed** (release_unconfirmed) lets no run end kept or rolled back: the row
+    keeps what it says, or says releases.unconfirmed, and the next look settles it. `placed` says that the look did: it
+    found the push on the ref ("on"; "start" at the hub's start, which needs no restart), or found that it did not land
+    ("off"), or could not read the ref ("unread"); "own" is the end of a run that pushed nothing, whose own words and
+    cause stand. A found release asks the machines for what this checkout holds now, and an ask that fails does not keep
+    its row from ending."""
+    row = q1("SELECT * FROM releases WHERE id=?", (rid,))
+    if placed is None and state not in (releases.DONE, releases.FAILED) and release_unconfirmed(row):
+        if row["state"] == "updating":
+            q("UPDATE releases SET step='push', says=?, pinned=COALESCE(?,pinned), automatic=?, cause=NULL WHERE id=?",
+              (releases._said(releases.unconfirmed(row["version"])), (result or {}).get("pinned"),
+               1 if automatic else 0, rid))
+        log("hub" if automatic else "owner", f"release {row['version']} ({row['revision'][:12]}): its push may have "
+            f"landed, and the ref could not be read; the next look settles it. The run said: "
+            f"{(result or {}).get('state') or state} at {(result or {}).get('step') or step} — "
+            f"{(result or {}).get('says') or says}")
+        return q1("SELECT * FROM releases WHERE id=?", (rid,))
     reached = (result or {}).get("reached")
     cause = cause or (result or {}).get("cause")
     cause = cause if state != releases.DONE and cause in releases.CAUSES else None
-    # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
-    # user service, exactly as a worker's does (request_update). The hub process is restart_hub_soon below.
-    asked = [name for name in agents() if request_update(name, reached) == "requested"] if reached else []
+    # The hub process is restart_hub_soon below.
+    here = kit_revision(fresh=True) if placed in ("on", "start") and state == releases.DONE else reached
+    asked = release_asks(here, skip=placed is not None) if reached else []
     q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=?, "
-      "cause=? WHERE id=?", (state, step, says, (result or {}).get("pinned"), reached, now(), 1 if automatic else 0,
-                             cause, rid))
+      "cause=?, attempted=CASE WHEN ? THEN NULL ELSE attempted END WHERE id=?",
+      (state, step, says, (result or {}).get("pinned"), reached, now(), 1 if automatic else 0, cause,
+       state == releases.DONE, rid))
     row = q1("SELECT * FROM releases WHERE id=?", (rid,))
     log("hub" if automatic else "owner",
         f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step}"
@@ -82319,10 +82719,14 @@ def finish_release(rid, state, step, says, automatic, result=None, cause=None):
         release_memory_told()
     if state != releases.DONE:
         return row
+    _release["found"] = None            # a take-in's hold (commit_kit_file) ends with the release that it held for
     if kv_get("teams_waited"):
         kv_set("teams_waited", None)    # a taken release ends the count of the runs that waited for their Teams code
     kit_revision(fresh=True)
     pass_held_releases()        # the releases that came while the fleet worked, and that this one holds
+    for other in release_sent():
+        if kit_holds(other["revision"]):
+            release_passes(other)       # and one whose push nothing settled: this one closes it
     # Quiet (QUIET_SAY): it comes with the manager's next read. It woke the manager at every release, ten a day, to
     # read RULES.md and its profile again: each one a turn of the standing session and some 17,000 tokens that stayed
     # in its context, while no release changes a profile and most change no rule. So it names the sections of
@@ -82330,7 +82734,8 @@ def finish_release(rid, state, step, says, automatic, result=None, cause=None):
     emit(manager_name(), "say", f"[hub] This fleet took release {row['version']} ({row['reached'][:12]}). "
          + rules_news(row["pinned"], row["reached"])
          + (f" {len(asked)} machine(s) update when they are idle." if asked else ""), extra=QUIET_SAY)
-    restart_hub_soon(row["pinned"], row["reached"])
+    if placed != "start":
+        restart_hub_soon(row["pinned"], here)
     return row
 
 
@@ -83233,7 +83638,12 @@ def release_sweep(t0):
     holds nothing (release_probe), and a probe that passes writes `releases_found` too, so the next tick polls and
     takes the release as a new one (release_again). A probe that fails tries the second route in the same thread
     (W12, release_bundle_work): the release's commit from the release channel's file, which writes `releases_found`
-    in the same way when it gives that commit."""
+    in the same way when it gives that commit.
+
+    **A release that a run sent, and whose end nobody saw, is looked for first** (release_look_sweep), whatever the
+    owner's setting: that look asks this fleet's own repository and no channel."""
+    if release_look_sweep(t0):
+        return
     token = entitlement_token()
     if not releases_automatic() or not (token or installed_hub()):
         if release_waiting():
@@ -92788,11 +93198,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(404, {"error": "unknown agent"})
             with LOCK:
                 # plan P0: an update run that began after this round's filter read `updating` holds from here what it
-                # holds there. start_release_work marks the run under LOCK before the run checks the turns, under
-                # LOCK too, so no start or line of this answer goes out that the run's check did not see.
+                # holds there. release_work marks the run under LOCK, after its look, before the run checks the
+                # turns, under LOCK too, so no start or line of this answer goes out that the run's check did not see.
                 if not updating and release_applying():
                     rows = [r for r in rows if not (r["kind"] in ("task", "conversation") or
                                                     worker and r["kind"] == "say" and r["task"])]
+                # and a hold that began after it read `holding` (a write that took a release in, commit_kit_file; a
+                # look that found one) holds the task starts of this answer by the round's own rule: a duty's case and
+                # a start that its helper took already pass
+                if not holding and release_holds_starts():
+                    late = {r["task"] for r in rows if r["kind"] == "task" and not (once and r["helper_ack"]) and
+                            not (q1("SELECT duty_case FROM tasks WHERE id=?", (r["task"],)) or {"duty_case": None})[
+                                "duty_case"]}
+                    # and the lines for those tasks wait with their starts, as in the round (waiting - starts)
+                    rows = [r for r in rows if not (r["task"] in late and (
+                        r["kind"] == "task" or r["kind"] == "say" and r["task"] in waiting))]
                 # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
                 # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at
                 # once. So does a task's start, whose ack comes only once its session runs: from here its helper

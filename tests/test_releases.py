@@ -943,6 +943,9 @@ class Repositories(unittest.TestCase):
         self.seeded = git("rev-parse", "HEAD", cwd=self.kit)
         self.owner_commit("knowledge/owner/brand.md", "# Brand\n\nBlue, and the owner's own.\n")
         self.pinned = git("rev-parse", "HEAD", cwd=self.kit)
+        pause = patch.object(releases, "READ_PAUSE", 0)     # the readings of a ref that did not answer, at once
+        pause.start()
+        self.addCleanup(pause.stop)
 
     # ---- the three people who write to this repository
 
@@ -1030,6 +1033,25 @@ class Repositories(unittest.TestCase):
                 self.wrote.append(write(len(self.wrote)))
             return inner(argv, timeout=timeout, cwd=cwd, input=input)
         return run
+
+    def cut_push(self, landed=True):
+        """The runner above, with a push whose answer never came: it landed on the configuration ref (or, not
+        `landed`, it only sent its objects, under another ref, so that it can land later), git ended badly, and the
+        fleet's own repository could not be read after it: it is away until back()."""
+        inner = self.runner()
+
+        def run(argv, timeout=None, cwd=None, input=None):
+            if argv[0] == "git" and argv[3:4] == ["push"] and os.path.exists(self.origin):
+                inner(argv if landed else argv[:-1] + ["HEAD:refs/late/push"], timeout=timeout, cwd=cwd, input=input)
+                os.rename(self.origin, self.origin + ".away")
+                return 1, "", "fatal: the remote end hung up unexpectedly"
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        return run
+
+    def back(self, *_):
+        """The fleet's own repository answers again (cut_push)."""
+        if os.path.exists(self.origin + ".away"):
+            os.rename(self.origin + ".away", self.origin)
 
     def update(self, released, *, origin=None, run=None, **how):
         return releases.Update(str(self.kit), releases.check(manifest(released, **how), KEY), upstream=self.upstream,
@@ -1326,12 +1348,31 @@ class Updates(Repositories):
         self.assertEqual((answer["state"], answer["step"]), (releases.KEPT, "branch"))
 
     def test_a_push_that_is_refused_leaves_the_fleet_where_it_was(self):
-        """Both checks passed, and the ref moved under us meanwhile: nothing has left the clone, so the fleet is
-        simply still where it was and the owner is told."""
+        """Both checks passed, and the fleet's own repository did not answer: nothing has left the clone, so the fleet
+        is still where it was. The ref cannot be read either, so the run does not say that it was rolled back: it says
+        that it does not know, and the hub finds out (hub.release_settles)."""
         released = self.publish(self.code(2))
         answer = self.update(released, origin=str(self.root / "nowhere.git"))
-        self.assertEqual((answer["state"], answer["step"]), (releases.ROLLED_BACK, "push"))
+        self.assertEqual((answer["state"], answer["step"], answer["cause"]), (releases.UNCONFIRMED, "push", None))
         self.unchanged(answer)
+
+    def test_a_push_whose_answer_never_came_is_unconfirmed_and_never_a_roll_back(self):
+        """The audit of 24 November 2026, finding 4: the push landed, git ended badly, and the ref could not be read
+        after it. Read as a roll back, the hub asked no machine and did not restart while the ref held the release,
+        and it refused every write of the owner's. The run reads the ref READS times, then says that it does not know:
+        no cause, and no `reached`; and `pushing` named the commit and the tip that it went onto before the push."""
+        sent = []
+        update = releases.Update(str(self.kit), releases.check(manifest(self.publish(self.code(2))), KEY),
+                                 upstream=self.upstream, origin=self.origin, run=self.cut_push(), pushing=sent.append)
+        answer = update.apply()
+        self.assertEqual((answer["state"], answer["step"], answer["cause"], answer["reached"]),
+                         (releases.UNCONFIRMED, "push", None, None), answer["says"])
+        self.assertIn("no answer came", answer["says"])
+        self.assertEqual(len([argv for argv in self.ran if argv[3:4] == ["fetch"] and
+                              argv[-1].endswith(releases.MOVED)]), releases.READS)
+        self.back()
+        self.assertEqual(sent, [{"commit": self.ref(hub.CONFIG_BRANCH), "base": self.pinned, "ref": hub.CONFIG_BRANCH}])
+        self.assertEqual(self.head(), self.pinned)
 
     def test_a_hub_commit_while_the_checks_run_does_not_cost_the_release(self):
         """The race the owner's own fleet met on 19 October 2026. The hub commits the owner's own file to the
@@ -1633,7 +1674,7 @@ class HubRoutes(OwnerAPI):
         hub.CFG["release_channel"] = "https://channel.invalid"
         hub.CFG["hub_restart"] = []
         hub._revision_cache.update(at=0.0, value=None)
-        hub._release["thread"] = None
+        hub._release.update(thread=None, look=False, looked=0.0, found=None)
         self.no_release_file()
         hub._licence.update(thread=None, token=None, at=0.0, said=None)
         # The licence's poll reaches no network in a test: a call that no stand-in answers is counted here.
@@ -1647,7 +1688,7 @@ class HubRoutes(OwnerAPI):
         for key in ("team_path", "release_channel", "release_upstream", "hub_restart"):
             hub.CFG.pop(key, None)
         hub._revision_cache.update(at=0.0, value=None)
-        hub._release["thread"] = None
+        hub._release.update(thread=None, look=False, looked=0.0, found=None)
         thread = hub._licence["thread"]
         if thread is not None:
             thread.join(30)
@@ -2872,6 +2913,462 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertIn(self.wrote[0], git("rev-list", one["reached"], cwd=self.kit).split("\n"))
         self.assertNotIn("title", json.loads((self.kit / "team.json").read_text())["agents"]["vps"])
 
+    def look(self):
+        """One tick's look for a release whose push nothing settled (release_look_sweep), run to its end."""
+        hub._release["looked"] = 0.0
+        hub.release_sweep(hub.now())
+        self.finish()
+
+    def sent(self, version="2026.10.2"):
+        row = hub.q1("SELECT * FROM releases WHERE version=?", (version,))
+        return [one["commit"] for one in hub.release_attempts(row)]
+
+    def asked(self):
+        return [tuple(r) for r in hub.q("SELECT agent, state, desired FROM machine_updates ORDER BY agent")]
+
+    def test_a_release_whose_push_had_no_answer_is_found_on_the_ref_and_taken_as_a_run_takes_it(self):
+        """The audit of 24 November 2026, finding 4, at the hub. The push landed and nothing could read the ref after
+        it. The row says so in plain words, counts no rest and names no cause, and stays `updating` until the next
+        look, which ends it `failed` at the push while the ref still says nothing: an `updating` row hides the
+        owner's Update for a newer release. The owner's write meanwhile takes the release in, under the check of
+        every move, and lands on top of it; the look after that does the rest of a run that took the release, at
+        that moment: every machine asked, the hub restarted, and the row the newest applied one. Before, the run
+        ended rolled back, no machine was asked, the hub ran the old code, and every write was refused."""
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            code, _ = self.run_update(self.publish(self.code(2)), run=self.cut_push())
+            one = self.newest()
+            self.assertEqual((code, one["state"], one["step"], one["cause"]), (200, "updating", "push", None))
+            self.assertEqual(one["says"], "Release 2026.10.2 passed its checks and was sent, but no answer came. "
+                                          "This fleet looks for it again by itself.")
+            self.look()
+            one = self.newest()
+            self.assertEqual((one["state"], one["step"], one["cause"]), (releases.FAILED, "push", None))
+            self.assertIn("no answer came", one["says"])
+            self.assertEqual((hub.release_rolled_said(), self.asked(), restarts), (None, [], []))
+            self.back()
+            landed = self.ref(hub.CONFIG_BRANCH)
+            self.assertEqual(self.sent(), [landed])
+            profile = (PROFILE + "\n**Very careful.**\n").encode()
+            with patch.object(hub, "release_applying", lambda: True), self.assertRaises(hub.KitFault) as caught:
+                hub.commit_kit_file("profiles/vps.md", profile, "Owner changed the vps profile")   # a run follows now
+            self.assertIn("which takes some minutes", str(caught.exception))
+            written = hub.commit_kit_file("profiles/vps.md", profile, "Owner changed the vps profile")
+            self.assertEqual((self.ref(hub.CONFIG_BRANCH), self.head()), (written, written))
+            self.assertEqual(git("rev-parse", written + "^", cwd=self.kit), landed)
+            self.assertEqual((self.asked(), restarts), ([], []))
+            self.assertTrue(hub.release_holds_starts())     # the checkout holds the new code, the process the old
+            hub.release_sweep(hub.now())        # the look that the write asked for
+            self.finish()
+            self.assertFalse(hub.release_holds_starts())
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], one["reached"], one["applied"], one["cause"]),
+                         (releases.DONE, "follow", landed, True, None), one["says"])
+        self.assertEqual(restarts, [(self.pinned, written)])
+        self.assertEqual(self.asked(), [("manager", "requested", written), ("vps", "requested", written)])
+        self.assertEqual(hub.applied_release(), (one["revision"], "2026.10.2"))
+        self.assertEqual(self.sent(), [])
+        self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 2\n")
+        self.assertIn("**Very careful.**", (self.kit / "profiles/vps.md").read_text())
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        self.assertIn("took release 2026.10.2", said)
+
+    def test_a_write_takes_in_only_a_sent_release_that_passes_the_check_of_every_move(self):
+        """A commit on the ref that changes the code with no signed release, named as a push of a release's row (a row
+        that came wrong, or a ref that somebody else wrote), is taken in by no write: the write takes it in only
+        through the check of every move (move_kit, lifecycle.may_take), and is refused as before."""
+        work = self.root / "forged"
+        git("clone", "-q", "-b", hub.CONFIG_BRANCH, self.origin, str(work))
+        (work / "hub.py").write_text("# the hub\nVERSION = 666\n")
+        git("commit", "-qam", "code with no release", cwd=work)
+        git("push", "-q", "origin", "HEAD:" + hub.CONFIG_BRANCH, cwd=work)
+        forged = git("rev-parse", "HEAD", cwd=work)
+        hub.ins("INSERT INTO releases(seen,revision,version,state,step,started,attempted) VALUES(?,?,?,?,?,?,?)",
+                (hub.now(), "c" * 40, "2026.10.9", releases.FAILED, "push", hub.now(),
+                 json.dumps([{"commit": forged, "base": self.pinned, "ref": hub.CONFIG_BRANCH}])))
+        with self.assertRaises(hub.Refusal) as caught:
+            hub.commit_kit_file("profiles/vps.md", PROFILE.encode() + b"\nMore.\n", "Owner changed the vps profile")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("could not take in", str(caught.exception))
+        self.assertEqual(self.head(), self.pinned)
+
+    def test_a_push_that_never_landed_is_a_roll_back_once_the_ref_says_so_and_a_late_landing_is_taken(self):
+        """A push that did not land, with the ref unread after it: no rest until a look reads the ref, which still
+        stands where the push found it, and only then a roll back, counted once. The push stays named while the ref
+        stands there, so one that lands later is found: it waits for the turns that run, with no session start
+        meanwhile, and the first moment no turn runs takes it."""
+        released = self.publish(self.code(2))
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(released, run=self.cut_push(landed=False))
+            self.assertEqual((self.newest()["state"], hub.release_rolled_said()), ("updating", None))
+            self.back()
+            self.look()
+            one = self.newest()
+            self.assertEqual((one["state"], one["step"], one["reached"]), (releases.ROLLED_BACK, "push", None))
+            self.assertEqual(hub.release_rolled_said(), {"revision": released, "runs": 1, "passed": 0})
+            self.assertEqual((self.ref(hub.CONFIG_BRANCH), self.head(), restarts), (self.pinned, self.pinned, []))
+            late = git("rev-parse", "refs/late/push", cwd=self.origin)
+            self.assertEqual(self.sent(), [late])
+            self.look()                                         # nothing moved: the roll back stays as it is
+            self.assertEqual((self.newest()["state"], hub.release_rolled_said()["runs"]), (releases.ROLLED_BACK, 1))
+            git("update-ref", "refs/heads/" + hub.CONFIG_BRANCH, late, cwd=self.origin)       # it lands, late
+            tid = hub.ins("INSERT INTO tasks(title,owner,requester,state,created) VALUES('t','vps','manager',"
+                          "'working',?)", (hub.now(),))
+            hub.touch("vps")
+            self.look()
+            one = self.newest()
+            self.assertEqual((one["state"], self.head(), restarts), ("updating", self.pinned, []))
+            self.assertIn("goes over to it when no task runs", one["says"])
+            self.assertTrue(hub.release_holds_starts())
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+            hub.release_sweep(hub.now())                        # the first tick with no turn
+            self.finish()
+        one = self.newest()
+        self.assertEqual((one["state"], one["reached"], self.head(), restarts),
+                         (releases.DONE, late, late, [(self.pinned, late)]), one["says"])
+        self.assertFalse(hub.release_holds_starts())
+
+    def test_a_stop_of_the_hub_between_the_push_and_its_answer_ends_no_run_as_failed(self):
+        """The push landed and the hub stopped before the run's answer, before its own checkout followed. The next
+        start ended the row failed at the merge, counted a rest and asked nobody, while the ref held the release. Now
+        the start leaves it to the first tick, which looks with automatic updates off too, and takes the release as
+        a run takes it. A tick in the same poll time with nothing left to look for starts nothing."""
+        inner = self.runner()
+
+        def stopped(argv, timeout=None, cwd=None, input=None):
+            answer = inner(argv, timeout=timeout, cwd=cwd, input=input)
+            if argv[0] == "git" and argv[3:4] == ["push"]:
+                raise SystemExit()              # the process is gone: no answer, no follow
+            return answer
+        self.assertEqual(self.press("auto", automatic=False)[0], 200)
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=stopped)
+            landed = self.ref(hub.CONFIG_BRANCH)
+            self.assertEqual((self.newest()["state"], self.head(), self.sent()), ("updating", self.pinned, [landed]))
+            hub.settle_releases()                               # the next start
+            self.assertEqual((self.newest()["state"], hub.release_rolled_said()), ("updating", None))
+            hub.release_sweep(hub.now())                        # its first tick
+            self.finish()
+            one = self.newest()
+            self.assertEqual((one["state"], one["reached"], self.head()), (releases.DONE, landed, landed), one["says"])
+            self.assertEqual(restarts, [(self.pinned, landed)])
+            self.assertEqual(self.asked(), [("manager", "requested", landed), ("vps", "requested", landed)])
+            self.assertFalse(hub.release_look_sweep(hub.now()))
+
+    def test_two_releases_whose_pushes_had_no_answer_end_by_the_later_one_that_landed(self):
+        """The first release landed with no answer, and the ref could not be read at its look. The second run's push
+        goes onto the ref that holds the first, and lands: the second is done and the newest applied release, and the
+        first is passed, never done after it (the publisher sends a release to customers only while it is the newest
+        done one, autopublish.applied_last)."""
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=self.cut_push())
+            self.look()
+            first = git("rev-parse", "refs/heads/" + hub.CONFIG_BRANCH, cwd=self.origin + ".away")
+            self.assertEqual(self.sent("2026.10.2"), [first])
+            second = self.publish(self.code(3))
+            self.run_update(second, run=self.runner_that(self.back), version="2026.10.3")
+        rows = {r["version"]: r for r in self.releases_state()["releases"]}
+        self.assertEqual((rows["2026.10.2"]["state"], rows["2026.10.3"]["state"]), (hub.PASSED, releases.DONE))
+        reached = rows["2026.10.3"]["reached"]
+        self.assertEqual((self.ref(hub.CONFIG_BRANCH), self.head()), (reached, reached))
+        self.assertEqual(git("rev-parse", reached + "^1", cwd=self.kit), first)
+        self.assertEqual(hub.applied_release(), (second, "2026.10.3"))
+        self.assertEqual((self.sent("2026.10.2"), self.sent("2026.10.3")), ([], []))
+        self.assertEqual(restarts, [(self.pinned, reached)])
+
+    def test_a_push_s_record_ends_when_the_ref_moves_past_it_and_keeps_the_newest_few(self):
+        """A push that did not land stays named only while the ref stands where it found it: once the ref moved, it can
+        never land (a push is a fast-forward of that tip), and a look forgets it, so that no look runs for it again.
+        One row keeps the newest RELEASE_SENT_MOST pushes, so that runs that end with no answer do not grow it."""
+        self.run_update(self.publish(self.code(2)), run=self.cut_push(landed=False))
+        self.back()
+        self.look()
+        self.assertEqual((self.newest()["state"], len(self.sent())), (releases.ROLLED_BACK, 1))
+        self.owner_commit("knowledge/owner/brand.md", "# Brand\n\nGreen.\n")
+        self.look()
+        self.assertEqual((self.newest()["state"], self.sent()), (releases.ROLLED_BACK, []))
+        self.assertFalse(hub.release_look_sweep(hub.now()))
+        one = {"commit": "a" * 40, "base": self.pinned, "ref": hub.CONFIG_BRANCH}
+        hub.release_pushing(self.newest()["id"], [dict(one, commit=f"{n:040x}") for n in range(20)], one)
+        self.assertEqual(len(self.sent()), hub.RELEASE_SENT_MOST)
+        self.assertEqual(self.sent()[-1], "a" * 40)
+
+    def working(self):
+        """A task whose turn runs now: the fleet is not idle (fleet_idle)."""
+        tid = hub.ins("INSERT INTO tasks(title,owner,requester,state,created) VALUES('t','vps','manager','working',?)",
+                      (hub.now(),))
+        hub.touch("vps")
+        return tid
+
+    def test_a_delivery_while_its_turn_runs_keeps_its_files_on_the_ref_beside_a_landed_push(self):
+        """The audit's worst effect, for an agent: a push landed with no answer, and an agent delivers files during its
+        own turn. Refused, its delivery would go through without its files the second time, because the release waits
+        for a moment that its own turn prevents. The write takes the release in and its files land on top of it; no
+        new session starts from then on the old process; the look while the turn runs puts nothing in place; the first
+        tick at which no turn runs does, and the session that waited starts then."""
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=self.cut_push())
+            self.back()
+            landed = self.ref(hub.CONFIG_BRANCH)
+            tid = self.working()
+            path = f"outputs/{hub.tref(tid)}/report.txt"
+            said = hub.outputs_sentence("vps", hub.q1("SELECT * FROM tasks WHERE id=?", (tid,)),
+                                        {"files": {path: b"the report\n"}, "skipped": []}, completed=True)
+            self.assertIn("Its files are on the configuration ref", said)
+            self.assertEqual(git("show", f"{hub.CONFIG_BRANCH}:{path}", cwd=self.origin), "the report")
+            self.assertEqual(git("rev-parse", hub.CONFIG_BRANCH + "^", cwd=self.origin), landed)
+            later = self.task_for()
+            self.assertEqual(self.starts(), [], "a session started on the old process beside the new files")
+            self.look()
+            self.assertEqual((self.newest()["state"], restarts), ("updating", []))
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+            # its helper lists no window now: the start that waits runs no turn (running_turns)
+            hub.q("UPDATE agents SET alive='', alive_ts=? WHERE name='vps'", (hub.now(),))
+            hub.release_sweep(hub.now())
+            self.finish()
+        self.assertEqual((self.newest()["state"], restarts), (releases.DONE, [(self.pinned, self.head())]))
+        self.assertEqual(self.starts(), [hub.tref(later)])
+
+    def test_a_failed_follow_that_the_checkout_took_in_holds_new_sessions_until_the_first_idle_tick(self):
+        """The row failed at the follow, and then this checkout took the release in by another way than the look: a
+        reload at the tip (reload_team), which holds nothing by itself. A poll's look while a turn runs must not let
+        the row wait for nothing because it failed at the follow before: it holds new sessions (none on the old process
+        beside the new files), and the first idle tick ends the row done. (A write's take-in holds them already.)"""
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=self.cut_push())
+            self.back()
+            landed = self.ref(hub.CONFIG_BRANCH)
+            with patch.object(hub, "may_take", lambda *args, **kw: "the floor of this machine refuses it"):
+                self.look()
+            self.assertEqual((self.newest()["state"], self.newest()["step"]), (releases.FAILED, "follow"))
+            hub.reload_team(landed)
+            self.assertEqual((self.head(), hub.release_holds_starts()), (landed, False))
+            tid = self.working()
+            hub.release_finds()                     # the look of a poll, while the turn runs
+            self.assertTrue(hub.release_holds_starts())
+            self.assertEqual(restarts, [])
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+            hub.release_sweep(hub.now())
+            self.finish()
+        one = self.newest()
+        self.assertEqual((one["state"], one["reached"], restarts), (releases.DONE, landed, [(self.pinned, landed)]))
+        self.assertFalse(hub.release_holds_starts())
+
+    def test_a_look_that_settles_nothing_after_a_take_in_leaves_no_old_hold(self):
+        """A write took a release in (a hold from that moment, and a look asked for), and the poll's look settled
+        nothing. That look was the one asked for, so neither the flag nor the old hold stays: a release that waits
+        for a turn much later holds new sessions from then. With the old hold kept, that later wait took its old time,
+        past RELEASE_POLL, and held nothing; with no push left to look for, nothing stays either."""
+        self.run_update(self.publish(self.code(2)), run=self.cut_push())
+        self.back()
+        hub.commit_kit_file("profiles/vps.md", (PROFILE + "\nMore.\n").encode(), "Owner changed vps")
+        self.assertTrue(hub._release["look"] and hub.release_holds_starts())
+        with patch.object(hub, "release_settles", lambda *args, **kw: None):
+            self.assertFalse(hub.release_finds())           # the poll's look, which settles nothing
+        self.assertEqual((hub._release["look"], hub._release["found"]), (False, None))
+        later = hub.now() + 2 * hub.RELEASE_POLL
+        with patch.object(hub, "now", lambda: later):
+            self.working()                                  # a turn runs then
+            self.assertTrue(hub.release_finds())
+            self.assertTrue(hub.release_holds_starts(), "a release that waits held nothing")
+        hub.q("UPDATE releases SET attempted=NULL")
+        hub._release.update(look=True)
+        self.assertFalse(hub.release_look_sweep(hub.now()))
+        self.assertEqual((hub._release["look"], hub._release["found"]), (False, None))
+
+    def test_a_round_of_the_poll_that_read_no_hold_gives_out_no_start_after_one_began(self):
+        """A round of a helper's poll reads the hold once; a write that takes a release in can begin one after that
+        read, in the same round. The round's answer holds the task starts all the same, by its own rule, and the lines
+        for those tasks wait with them: a line in the window of the attempt before would begin a turn there."""
+        key = os.urandom(24).hex()
+        hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('vps',?,?,'owner')",
+              (hashlib.sha256(key.encode()).hexdigest(), hub.now()))
+        later = self.task_for()
+        hub.emit("vps", "say", "[hub] a line for the task whose start waits", task=later)
+
+        def poll():
+            code, data = self.request("/events/vps?delivery=1&after=0&wait=0",
+                                      headers={"Authorization": "Bearer " + key}, source=hub.address_of("vps"))
+            self.assertEqual(code, 200, data)
+            return [(e["kind"], e["task"]) for e in data["events"] if e["kind"] in ("task", "say")]
+        calls = []
+
+        def holds():
+            calls.append(1)
+            return len(calls) > 1               # no hold when the round read it, a hold after that
+        with patch.object(hub, "release_holds_starts", holds):
+            self.assertEqual(poll(), [], "a start, or a line for it, went out after a hold began")
+        self.assertEqual(poll(), [("task", hub.tref(later)), ("say", hub.tref(later))])
+
+    def test_a_look_keeps_the_hold_while_it_reads_the_ref(self):
+        """A release that waits for the running turns holds new sessions. The next look reads the ref, which can take
+        minutes; it must not end the hold for that time, and gives it back only if no release waits at its end."""
+        self.run_update(self.publish(self.code(2)), run=self.cut_push())
+        self.back()
+        tid = self.working()
+        self.look()
+        self.assertTrue(hub.release_holds_starts())
+        real, held = hub.release_place, []
+
+        def place(row, read=True):
+            held.append(hub.release_holds_starts())
+            return real(row, read)
+        with patch.object(hub, "release_place", place):
+            self.assertTrue(hub.release_finds())        # the look of a poll, while the turn runs
+        self.assertEqual((held[:1], hub.release_holds_starts()), ([True], True))
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: None):
+            hub.release_sweep(hub.now())
+            self.finish()
+        self.assertEqual((self.newest()["state"], hub.release_holds_starts()), (releases.DONE, False))
+
+    def test_a_follow_that_the_check_of_every_move_refuses_ends_at_once_and_holds_no_start(self):
+        """The release is on the ref and this checkout cannot move onto it. The look ends the row failed at the follow
+        at once, while turns run, and holds no session start; a later look while turns run moves nothing, rewrites
+        nothing and holds nothing; the first look at a moment that no turn runs takes the release. Before, each busy
+        poll made the row `updating` again and held new sessions for up to 15 minutes, and each idle tick failed it."""
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=self.cut_push())
+            self.back()
+            landed = self.ref(hub.CONFIG_BRANCH)
+            tid = self.working()
+            with patch.object(hub, "may_take", lambda *args, **kw: "the floor of this machine refuses it"):
+                self.look()
+                one = self.newest()
+                self.assertEqual((one["state"], one["step"], one["reached"]), (releases.FAILED, "follow", landed))
+                self.assertIn("tries again by itself", one["says"])
+                self.assertEqual((hub.release_holds_starts(), hub._release["found"]), (False, None))
+                self.look()
+                self.assertEqual(self.newest()["finished_at"], one["finished_at"])
+            self.look()                                         # the check passes now, and a turn still runs
+            self.assertEqual((self.newest()["state"], self.newest()["finished_at"]), (releases.FAILED,
+                                                                                      one["finished_at"]))
+            self.assertFalse(hub.release_holds_starts())
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+            self.look()
+        one = self.newest()
+        self.assertEqual((one["state"], self.head(), restarts), (releases.DONE, landed, [(self.pinned, landed)]))
+
+    def test_a_push_that_a_write_takes_in_while_the_look_reads_the_ref_is_taken_not_rolled_back(self):
+        """The look reads the ref outside the turn of the hub's writes. If the push lands then and a write takes it in
+        before the look's turn, the ref that the look read stands where the push found it, and this checkout holds the
+        push: the look reads this checkout again in its turn, and takes the release. Else it said rolled back and
+        counted a rest, and the next tick made it done."""
+        released = self.publish(self.code(2))
+        self.run_update(released, run=self.cut_push(landed=False))
+        self.back()
+        late, real, raced = git("rev-parse", "refs/late/push", cwd=self.origin), hub.release_place, []
+
+        def place(row, read=True):
+            found = real(row, read)
+            if read and not raced:
+                raced.append(found["where"])
+                git("update-ref", "refs/heads/" + hub.CONFIG_BRANCH, late, cwd=self.origin)
+                hub.commit_kit_file("profiles/vps.md", (PROFILE + "\nMore.\n").encode(), "Owner changed vps")
+            return found
+        restarts = []
+        with patch.object(hub, "release_place", place), \
+                patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.look()
+        one = self.newest()
+        self.assertEqual((raced, one["state"], one["reached"], hub.release_rolled_said()),
+                         (["off"], releases.DONE, late, None), one["says"])
+        self.assertFalse(hub.release_holds_starts(), "the take-in's hold outlived the release that it held for")
+
+    def test_a_look_reads_the_ref_into_its_own_ref_and_holds_nothing_meanwhile(self):
+        """The owner's press looks first, and a look reads this fleet's own ref, which can take minutes on a network
+        that does not answer: no session start is held and no write refused meanwhile, and it fetches that one ref into
+        a ref of its own, so that commit_kit_file's fetch of origin never meets it on a lock (a 502 for the owner)."""
+        released = self.publish(self.code(2))
+        self.run_update(released, run=self.cut_push(landed=False))
+        self.back()
+        tracking = git("rev-parse", "refs/remotes/origin/" + hub.CONFIG_BRANCH, cwd=self.kit)
+        late = git("rev-parse", "refs/late/push", cwd=self.origin)
+        git("update-ref", "refs/heads/" + hub.CONFIG_BRANCH, late, cwd=self.origin)
+        real, seen = hub.git_kit, []
+
+        def watched(*args, **how):
+            if args[:1] == ("fetch",):
+                seen.append((hub.release_applying(), hub.release_holds_starts()))
+            return real(*args, **how)
+        with patch.object(hub, "git_kit", watched), patch.object(hub, "restart_hub_soon", lambda *args, **kw: None):
+            code, _ = self.run_update(released)
+        self.assertEqual((code, seen, self.newest()["state"]), (200, [(False, False)], releases.DONE))
+        self.assertEqual(git("rev-parse", "refs/remotes/origin/" + hub.CONFIG_BRANCH, cwd=self.kit), tracking)
+        self.assertEqual(git("rev-parse", hub.RELEASE_LOOK + hub.CONFIG_BRANCH, cwd=self.kit), late)
+
+    def test_a_start_on_restored_records_forgets_their_pushes_and_ends_the_cut_runs_as_before(self):
+        """The copy's runs are history, and their pushes may not be on this hub's ref: a look would end such a row done
+        (the machines asked, the manager told, the hub restarted) or rolled back with a rest. The start forgets them,
+        and ends each run that was cut off failed at the merge, as it did before."""
+        sent = json.dumps([{"commit": "e" * 40, "base": self.pinned, "ref": hub.CONFIG_BRANCH}])
+        for revision, state, step in (("d" * 40, "updating", "push"), ("f" * 40, releases.FAILED, "push")):
+            hub.ins("INSERT INTO releases(seen,revision,version,state,step,started,attempted) VALUES(?,?,?,?,?,?,?)",
+                    (hub.now(), revision, "2026.10." + revision[0], state, step, hub.now(), sent))
+        hub.settle_releases(ask=False)
+        rows = [tuple(r) for r in hub.q("SELECT revision, state, step, attempted FROM releases ORDER BY id")]
+        self.assertEqual(rows, [("d" * 40, releases.FAILED, "merge", None), ("f" * 40, releases.FAILED, "push", None)])
+        self.assertEqual((hub._release["look"], hub.release_look_sweep(hub.now())), (False, False))
+
+    def test_a_run_that_pushed_nothing_ends_with_its_own_words_beside_an_earlier_push(self):
+        """The row keeps the push of an earlier run that had no answer. A run that fails its checks, with the ref
+        unread, is rolled back with its own cause and words, not "sent, but no answer came"; and an error in the hub
+        before its push ends it failed at the merge, as an error does, not rolled back at the push. The earlier push
+        stays named for the next look in both."""
+        released = self.publish(self.code(2))
+        self.run_update(released, run=self.cut_push(landed=False))
+        broken = self.runner(selftest=(1, "110 of 121 checks passed. FAILED: ['the hub answers nothing']", ""))
+        self.run_update(released, run=broken)
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], one["cause"]), (releases.ROLLED_BACK, "selftest", "check"))
+        self.assertIn("the hub answers nothing", one["says"])
+        self.assertEqual(len(self.sent()), 1)
+        self.back()
+
+        def broke(path):
+            raise RuntimeError("the disk broke")
+        with patch.object(hub, "records_copy", broke), patch.object(hub.traceback, "print_exc", lambda: None):
+            self.run_update(released)
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], len(self.sent())), (releases.FAILED, "merge", 1))
+        self.assertIn("error in the hub", one["says"])
+
+    def test_a_stop_after_the_push_landed_and_before_the_follow_asks_the_machines_and_follows_later(self):
+        """The push landed (the row has `reached`) and the hub stopped before its own follow, and the ref could not be
+        read after it. The start asks every machine for the release; the look that cannot read the ref says that the
+        release is on the ref and that this fleet tries the follow again by itself, with no rest; the next look that
+        reads it takes the release."""
+        inner = self.runner()
+
+        def stopped(argv, timeout=None, cwd=None, input=None):
+            if argv[:6] == ["git", "-C", str(self.kit), "fetch", "-q", "origin"]:        # the run's own follow
+                os.rename(self.origin, self.origin + ".away")
+                raise SystemExit()
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        restarts = []
+        with patch.object(hub, "restart_hub_soon", lambda *args, **kw: restarts.append(args)):
+            self.run_update(self.publish(self.code(2)), run=stopped)
+            reached = self.newest()["reached"]
+            self.assertEqual((self.newest()["state"], self.head()), ("updating", self.pinned))
+            hub.settle_releases()
+            self.assertEqual(self.asked(), [("manager", "requested", reached), ("vps", "requested", reached)])
+            hub.release_sweep(hub.now())
+            self.finish()
+            one = self.newest()
+            self.assertEqual((one["state"], one["step"], one["reached"]), (releases.FAILED, "follow", reached))
+            self.assertIn("tries again by itself", one["says"])
+            self.assertIsNone(hub.release_rolled_said())
+            self.back()
+            self.look()
+        one = self.newest()
+        self.assertEqual((one["state"], self.head(), restarts), (releases.DONE, reached, [(self.pinned, reached)]))
+
     def test_a_release_this_fleet_took_asks_every_machine_for_its_idle_update(self):
         """The hub's own machine too. Its agent's helper has its own home, its own checkout and its own user
         service, so it takes a release exactly as a worker does; leaving it out is what kept the owner's hub two
@@ -2914,10 +3411,11 @@ class HubUpdates(Repositories, HubRoutes):
     def test_a_run_cut_off_after_its_push_still_asks_every_machine(self):
         """The push landed, this hub's own checkout followed it, and the run was cut off before finish_release: by an
         error in the hub's thread (release_work), or by a stop of the hub, whose row settle_releases ends at the next
-        start. Every machine takes the release at its next sync all the same, and the next run of it stops at KEPT
-        "already" and asks nobody. So the row keeps `reached` from the moment the push lands, and the end of a run
-        that was cut off asks every machine for its idle update, as finish_release does. After an error the hub's
-        process still runs the code it started with, so it restarts; after a stop it already runs its checkout."""
+        start. Every machine takes the release at its next sync all the same. So the row names its push before the
+        push (release_pushing), and the end of a run that was cut off is the end of a run that took the release
+        (release_lands): done, every machine asked for its idle update, and nobody asked again later. After an error
+        the hub's process still runs the code it started with, so it restarts; after a stop it already runs its
+        checkout. Until 25 November 2026 both ended failed at the merge."""
         def cut_by_an_error(released):
             inner = self.runner()
 
@@ -2946,7 +3444,7 @@ class HubUpdates(Repositories, HubRoutes):
                 pinned, released = self.head(), self.publish(self.code(number))
                 code = cut(released)
                 one = self.newest()
-                self.assertEqual((code, one["state"], one["step"]), (200, releases.FAILED, "merge"), cut.__name__)
+                self.assertEqual((code, one["state"], one["step"]), (200, releases.DONE, "follow"), cut.__name__)
                 self.assertEqual((self.ref(hub.CONFIG_BRANCH), self.head()), (one["reached"], one["reached"]),
                                  cut.__name__)
                 self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state, desired FROM machine_updates "
@@ -2955,14 +3453,14 @@ class HubUpdates(Repositories, HubRoutes):
                                  cut.__name__)
                 hub.q("DELETE FROM machine_updates")
                 hub.settle_releases()                   # a later start: this run is settled, and asks nobody again
-                self.run_update(released)               # nor does the next run of the release
-                self.assertEqual((self.newest()["state"], self.newest()["step"]), (releases.KEPT, "already"))
+                self.run_update(released)               # nor does the next press of the release
+                self.assertEqual((self.newest()["state"], self.newest()["step"]), (releases.DONE, "follow"))
                 self.assertEqual(hub.q("SELECT * FROM machine_updates"), [], cut.__name__)
                 self.assertEqual(restarts, [(pinned, one["reached"])] if restart else [], cut.__name__)
 
     def test_an_ask_that_fails_is_made_again_and_never_keeps_a_run_from_ending(self):
         """The machines are asked before a run's row ends, so an ask that raises in finish_release leaves the row at
-        updating, and the error handler's settle_releases asks again. An ask that raises there is skipped: at the
+        updating, and the error handler's look (release_finds) asks again. An ask that raises there is skipped: at the
         hub's start, before it serves anything, a row left at updating would meet the same failure at every later
         start. A start on restored records ends such a row and asks nobody."""
         real, calls = hub.request_update, []
@@ -2976,7 +3474,7 @@ class HubUpdates(Repositories, HubRoutes):
                 patch.object(hub.traceback, "print_exc", lambda: None):
             code, _ = self.run_update(self.publish(self.code(2)))
         one = self.newest()
-        self.assertEqual((code, one["state"], one["step"], len(calls)), (200, releases.FAILED, "merge", 4))
+        self.assertEqual((code, one["state"], one["step"], len(calls)), (200, releases.DONE, "follow", 4))
         self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state, desired FROM machine_updates ORDER BY agent")],
                          [("manager", "requested", one["reached"]), ("vps", "requested", one["reached"])])
         hub.q("DELETE FROM machine_updates")

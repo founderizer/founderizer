@@ -573,8 +573,11 @@ class ConfigRef(OwnerAPI):
                     and c.id in defs and c.id not in bound}
         used = {name: names(node) for name, node in defs.items()}
         writes = {"commit_kit_file", "move_kit", "undo_kit_push"}       # a commit, a move, an undo of the checkout
-        while True:     # settle_kit_push takes the turn itself, as commit_kit_file does for a caller with no LOCK
-            more = {name for name, them in used.items() if them & writes} - writes - {"settle_kit_push"}
+        while True:     # settle_kit_push takes the turn itself, as commit_kit_file does for a caller with no LOCK,
+            # and so does release_settles (its kit_lock), the one way to a move of the checkout onto a release whose push
+            # had no answer (release_lands)
+            more = {name for name, them in used.items() if them & writes} - writes - {"settle_kit_push",
+                                                                                        "release_settles"}
             if not more:
                 break
             writes |= more

@@ -92,6 +92,9 @@ SCHEMA_WAIT = 120           # seconds for the released code's schema against a c
 PIECES_WAIT = 120           # seconds for the clone's hubpieces.py, which compiles hub.py in pieces in about a second
 GIT_WAIT = 300              # seconds for one git step; a fetch of the whole repository is the slow one
 PUSH_TRIES = 4              # the push of the configuration ref, and three more when the hub moved the ref under it
+READS = 3                   # readings of the configuration ref after a push that ended badly (Update.ref_after)
+READ_PAUSE = 2              # seconds between two of them
+READ_WAIT = 60              # seconds for one of them
 
 REVISION = re.compile(r"[0-9a-f]{40}")                          # a full commit id, never a short one
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+-]{0,40}")      # the name the owner reads, "2026.10.2"
@@ -1081,6 +1084,9 @@ def schema_summary(out):
 # What an update run says about itself. The app shows the state and the line; nothing else reads them.
 KEPT, ROLLED_BACK, DONE, FAILED = "kept", "rolled_back", "done", "failed"
 STATES = (KEPT, ROLLED_BACK, DONE, FAILED)
+# What a run says whose push may have landed: it ended badly, and the ref could not be read after it. It is no state
+# of a row: the hub looks for the commit first (hub.release_settles).
+UNCONFIRMED = "unconfirmed"
 # `room` is the hub's own step before a run (hub.release_work): the machine had too little memory for the checks.
 STEPS = ("room", "hold", "branch", "clean", "pinned", "fetch", "have", "already", "minimum", "clone", "merge", "keep",
          "schema", "selftest", "verify", "take", "push", "follow")
@@ -1322,6 +1328,25 @@ def take_bundle(kit, channel, revision, *, run=None, fetch=None):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def followed(version, ref, merged, pinned):
+    """The line of a run that ended DONE."""
+    return f"release {version} is on {ref} as {merged[:12]}; this fleet moved from {pinned[:12]}"
+
+
+def not_followed(version, ref, merged, kit):
+    """The line of a run that ended FAILED at the step follow. The hub keeps the push (hub.release_attempts), and each
+    of its looks tries the move again."""
+    return (f"release {version} is on {ref} as {merged[:12]}, and this hub's own checkout did not move onto it. This "
+            f"fleet tries again by itself; if it stays so, bring it up to date by hand: git -C {kit} merge --ff-only "
+            f"{merged[:12]}, then restart the hub's service, which runs the code it started with")
+
+
+def unconfirmed(version):
+    """The line of a run whose push may have landed (UNCONFIRMED), as the owner reads it on the Updates row."""
+    return (f"release {version} passed its checks and was sent, but no answer came. This fleet looks for it again by "
+            f"itself.")
+
+
 class Update:
     """One update run of one fleet.
 
@@ -1345,6 +1370,10 @@ class Update:
     an error or a stop of the hub cuts off before its answer still asks each machine for its idle update. An error
     in it is printed and stops nothing.
 
+    `pushing` is called before each push, with what the push would put on the ref: {"commit", "base": the tip that it
+    goes onto, "ref"}. The hub keeps it, so that a push whose answer never came (a stop of the hub, a ref that could
+    not be read after it) names its commit and the hub can look for it. An error in it stops the run before that push.
+
     `own` is called with a tip that the ref moved to under the push: true for a write of the hub's own whose push
     landed while the rest of it never ran (hub.KIT_PUSHED). The run does not merge onto that tip, which the hub
     takes back; it ends rolled back at the push, and the next run takes the release.
@@ -1360,11 +1389,12 @@ class Update:
 
     def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None, limit=(), bundled=False):
+                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None, limit=(), bundled=False, pushing=None):
         from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
         self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
         self.floor, self.pushed, self.own, self.limit = floor, pushed, own, list(limit or ())
+        self.pushing = pushing
         self.bundled = bool(bundled)
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
@@ -1390,8 +1420,8 @@ class Update:
 
     def apply(self):
         """Do the update. One of KEPT (nothing was touched), ROLLED_BACK (the merge or a check failed and the fleet
-        keeps the pinned revision), DONE, or FAILED (the ref moved and this hub did not follow it: the one state a
-        person must look at)."""
+        keeps the pinned revision), DONE, FAILED (the ref moved and this hub did not follow it: the one state a
+        person must look at), or UNCONFIRMED (the push may have landed, and the ref could not be read after it)."""
         ready = self.before()
         if ready:
             return ready
@@ -1671,23 +1701,34 @@ class Update:
         thrown away over it. It is not a verdict on the release: it is two writers of one ref, and the owner's
         files and the released code touch different paths by design. So a refused push is followed, not given
         up: merge the released revision onto the new tip and push that (`catch_up`), up to PUSH_TRIES times.
-        What is given up is the fleet whose ref moves faster than a push takes, and the line says so."""
-        version = self.manifest["version"]
+        What is given up is the fleet whose ref moves faster than a push takes, and the line says so.
+
+        **A push that ended badly is no roll back by itself.** A connection that fails after the ref moved, or a push
+        that this run's limit ended, can have landed. So the ref is read, READS times when it does not answer, and a
+        ref that still says nothing ends the run UNCONFIRMED, with no cause, because none is known. Until 25 November
+        2026 one failed reading ended it rolled back: no machine was asked and the hub did not restart, while the ref
+        held the release and every write of the owner's was refused for it (the audit of 24 November 2026, finding
+        4)."""
+        version, base = self.manifest["version"], self.pinned
         if not self.origin:
             return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and this fleet has no "
                                                     f"address for its configuration ref, so nothing was pushed")
         for left in range(PUSH_TRIES - 1, -1, -1):
+            if self.pushing:
+                self.pushing({"commit": merged, "base": base, "ref": self.branch})
             code, _, err = self.run(["git", "-C", self.clone, "push", "-q", self.origin, f"HEAD:{self.branch}"])
             if code == 0:
                 break
             # The push is the step that leaves this machine, so what it did is read from the ref and not from
-            # git's exit code (RULES.md rule 9). A ref that carries exactly what was pushed means the push landed
+            # git's exit code (RULES.md rule 9). A ref that carries what was pushed means the push landed
             # and something after it failed: the fleet has moved, and saying it was rolled back would be a lie
             # the owner acts on.
-            tip = self.ref_now()
-            if tip == merged:
+            tip = self.ref_after()
+            if tip is None:
+                return self.answer(UNCONFIRMED, "push", unconfirmed(version))
+            if self.clone_git("merge-base", "--is-ancestor", merged, tip)[0] == 0:
                 break
-            if tip is None or not self.may_follow(tip, merged):
+            if not self.may_follow(tip, merged):
                 return self.answer(ROLLED_BACK, "push", f"release {version} passed every check and the push to "
                                                         f"{self.branch} was refused: {_line(err)}. The fleet stays "
                                                         f"at {self.pinned[:12]}.",
@@ -1697,6 +1738,7 @@ class Update:
                                                         f"moved under it {PUSH_TRIES} times while it was pushed, "
                                                         f"so the fleet stays at {self.pinned[:12]}. Press Update "
                                                         f"again when this fleet is writing less.", "busy")
+            base = tip
             answer, merged = self.catch_up(tip, merged)
             if answer:
                 return answer
@@ -1709,21 +1751,30 @@ class Update:
         import lifecycle
         # The hub's own checkout moves as every other does: under lifecycle.may_take, with its floor raised after.
         if self.git("fetch", "-q", "origin")[0] != 0 or lifecycle.take(self.kit, merged, self.run, self.floor):
-            return self.answer(FAILED, "follow", f"release {version} is on {self.branch} as {merged[:12]}, and this "
-                                                 f"hub's own checkout did not move onto it. Bring it up to date by "
-                                                 f"hand: git -C {self.kit} merge --ff-only {merged[:12]}, then "
-                                                 f"restart the hub's service, which runs the code it started with")
-        return self.answer(DONE, "follow", f"release {version} is on {self.branch} as {merged[:12]}; this fleet "
-                                           f"moved from {self.pinned[:12]}")
+            return self.answer(FAILED, "follow", not_followed(version, self.branch, merged, self.kit))
+        return self.answer(DONE, "follow", followed(version, self.branch, merged, self.pinned))
 
     def ref_now(self):
         """The configuration ref's own tip in the repository this fleet pushes to, or None when it cannot be
         read. The ref is read, never the text git printed: "non-fast-forward" is English from a program whose
         wording is not ours to depend on, and the ref itself says the same thing exactly."""
-        if self.run(["git", "-C", self.clone, "fetch", "-q", self.origin, f"+{self.branch}:{MOVED}"])[0] != 0:
+        if self.run(["git", "-C", self.clone, "fetch", "-q", self.origin, f"+{self.branch}:{MOVED}"],
+                    timeout=READ_WAIT)[0] != 0:
             return None
         code, tip, _ = self.clone_git("rev-parse", MOVED)
         return tip if code == 0 and REVISION.fullmatch(tip) else None
+
+    def ref_after(self):
+        """The configuration ref's tip after a push that ended badly, read again while it cannot be read, READS times
+        in all, or None. A push that lands after this reading is the hub's to find (hub.release_settles reads the ref
+        once more at the run's end, and each later look while the ref stands where the push found it)."""
+        tip = None
+        for left in range(READS - 1, -1, -1):
+            tip = self.ref_now()
+            if tip is not None or not left:
+                break
+            time.sleep(READ_PAUSE)
+        return tip
 
     def may_follow(self, tip, merged):
         """Is this tip one that a refused push may be merged onto and pushed again? It must hold the revision
