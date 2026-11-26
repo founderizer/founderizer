@@ -1124,8 +1124,10 @@ for a part, because the hub makes the copy before its first byte, and 25 minutes
 under the 30 minutes of one tool call; a copy that takes longer is refused with words that send the
 owner to Save copy in the app. A known limit: a copy from `take_backup` carries no access key of
 the fleet (`owner-access.key`), which only a copy that the Founderizer app keeps has
-(`OwnerAccess.withKey`), so after a lost Mac only such a copy is the way back into the servers; the
-hub counts both as the fleet's confirmed copy. An answer that is not a success is words, never a file: both
+(`OwnerAccess.withKey`), so after a lost Mac only such a copy is the way back into the servers. So both
+programs confirm their copy with `keyed: false, maker: "command"` and say so in the result (`keyed`,
+`note`): the hub keeps it as the newest copy of an owner command, and its copy warnings stay until the
+app keeps a copy with the key (UI-API.md 1.346). An answer that is not a success is words, never a file: both
 programs read at most 8 MiB of it, under the same total time. The whole
 snapshot (`GET /ui/state`), which a process reads before its first call for the hub's generation,
 has a limit of its own in both programs, 64 MiB (`STATE_MAX`, `Transfer.state`): it is an

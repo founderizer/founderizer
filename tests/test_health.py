@@ -57,9 +57,17 @@ class Health(OwnerAPI):
             with e:
                 return e.code, dict(e.headers), e.read()
 
-    def confirm(self, sha256, size):
-        return self.request("/ui/backups/confirm", dict(request_id=str(uuid.uuid4()), db="test-generation",
-                                                        sha256=sha256, bytes=size))
+    def confirm(self, sha256, size, request_id=None, client="founderizer-swift/1/test", **fields):
+        """The confirm of a saved copy; with no `keyed` and `maker`, as an older app sends it; `client` its label."""
+        return self.request("/ui/backups/confirm", dict(request_id=request_id or str(uuid.uuid4()), db="test-generation",
+                                                        sha256=sha256, bytes=size, **fields),
+                            headers={"Content-Type": "application/json", "X-Fleet-Client": client})
+
+    def served(self):
+        """One copy downloaded: its SHA-256 and its size."""
+        code, _headers, data = self.download()
+        self.assertEqual(code, 200)
+        return hashlib.sha256(data).hexdigest(), len(data)
 
     def test_backups_are_on_unless_the_team_turns_them_off(self):
         """They were off until 18 October 2026, and nothing in the app could press them: a product whose records
@@ -114,8 +122,115 @@ class Health(OwnerAPI):
         health = self.health()
         self.assertEqual(health["backup"]["sha256"], digest)
         self.assertNotIn("backup_missing", [w["kind"] for w in health["warnings"]])
-        self.download()                                     # a newer copy was served: the old one no longer confirms
-        self.assertEqual(self.confirm(digest, len(data))[0], 409)
+
+    def test_each_copy_that_the_hub_served_lately_can_be_confirmed(self):
+        """The audit's finding 9 (24 November 2026): the hub kept one receipt, the copy that it served last, so an
+        automatic copy that started while the save panel waited for a person made the first copy's confirm a 409, and
+        its retry another. Now the newest BACKUP_RECEIPTS copies can each be confirmed, in any order; `backup` stays the
+        newest of them, and of its maker's, and the answer names the copy that was confirmed. A copy that the hub never
+        served, or one that sixteen later copies pushed out, is still refused. The one receipt that a hub before this
+        version kept (a dict) is confirmed across the update. A time ahead of the hub's clock is replaced by the next
+        copy. The bugs that it catches: a second download that refuses the first copy's confirm; an older copy's
+        confirm that takes `backup` or its maker's copy back to it; a set with no bound; a 409 for the copy served
+        before the update; a `backup` from a clock that was ahead, which no later copy replaces, so that "Your copy is
+        old" never comes."""
+        before = self.served()
+        hub.kv_set("backup_served", json.dumps(hub.served_copies()[-1]))      # as a hub before this version kept it
+        self.assertEqual(self.confirm(*before)[0], 200)
+        first, second = self.served(), self.served()
+        code, result = self.confirm(*second)
+        self.assertEqual((code, result["backup"]["sha256"]), (200, second[0]))
+        again = str(uuid.uuid4())
+        code, result = self.confirm(*first, request_id=again)
+        self.assertEqual((code, result["backup"]["sha256"], result["backup"]["bytes"]), (200, first[0], first[1]))
+        health = self.health()
+        self.assertEqual(health["backup"]["sha256"], second[0])                 # the newer copy stays the one
+        self.assertEqual(health["copies"]["older"]["sha256"], second[0])        # and its maker's too
+        self.assertTrue(self.confirm(*first, request_id=again)[1]["replayed"])
+        self.assertEqual(self.confirm("0" * 64, first[1])[0], 409)               # never served
+        for n in range(hub.BACKUP_RECEIPTS - 2):
+            hub.copy_served(f"{n:064x}", 10, hub.now())
+        self.assertEqual(self.confirm(*first)[0], 200)                          # the oldest of sixteen
+        hub.copy_served("f" * 64, 10, hub.now())
+        self.assertEqual(self.confirm(*first)[0], 409)                          # the seventeenth pushed it out
+        self.assertEqual(len(hub.served_copies()), hub.BACKUP_RECEIPTS)
+        hub.kv_set("backup_at", hub.now() + 365 * 86400)                        # a clock that was a year ahead
+        today = self.served()
+        self.assertEqual(self.confirm(*today)[0], 200)
+        self.assertEqual(self.health()["backup"]["sha256"], today[0])
+
+    def test_only_a_copy_with_the_access_key_answers_the_copy_warnings(self):
+        """The audit's finding 1 and G7 H4: a Mac whose key step failed kept the bare copy and confirmed it, and the hub
+        cleared its warning, so nobody learned that no copy could give a new Mac its servers back. Now the confirm says
+        whether the copy carries the key and who saved it: `backup_missing` stands until a copy with the key is
+        confirmed, and `backup_old` judges the newest such copy, also after newer copies with no key. Only the Mac app
+        may say that a copy carries the key. `copies` keeps the newest copy of each maker. The bugs that it catches: a
+        copy with no key that clears or refreshes the warning; a phone or a command that says it holds the key; a client
+        that names its maker and leaves out `keyed`, whose copy would count as one with the key."""
+        bare = self.served()
+        self.assertEqual(self.confirm(*bare, keyed=False, maker="mac")[0], 200)
+        health = self.health()
+        warnings = {w["kind"]: w for w in health["warnings"]}
+        self.assertIsNone(health["backup"])
+        self.assertEqual(warnings["backup_missing"]["detail"],
+                         "Your copies hold your records, but none holds the key to your servers.")
+        self.assertEqual((health["copies"]["mac"]["sha256"], health["copies"]["mac"]["keyed"]), (bare[0], False))
+        keyed = self.served()
+        self.assertEqual(self.confirm(*keyed, keyed=True, maker="mac")[0], 200)
+        health = self.health()
+        self.assertEqual(health["backup"]["sha256"], keyed[0])
+        self.assertFalse({"backup_missing", "backup_old"} & {w["kind"] for w in health["warnings"]})
+        hub.kv_set("backup_at", hub.now() - hub.BACKUP_WARN - 3600)            # that copy is a day old now
+        later = self.served()
+        self.assertEqual(self.confirm(*later, keyed=False, maker="command")[0], 200)
+        health = self.health()
+        warnings = {w["kind"]: w for w in health["warnings"]}
+        self.assertEqual(health["backup"]["sha256"], keyed[0])
+        self.assertTrue(warnings["backup_old"]["detail"].startswith("The last copy with the key to your servers is "))
+        self.assertEqual(sorted(health["copies"]), ["command", "mac"])
+        for maker in ("command", "phone", None):
+            fields = {"keyed": True} if maker is None else {"keyed": True, "maker": maker}
+            self.assertEqual(self.confirm(*later, **fields)[0], 400, maker)
+        self.assertEqual(self.confirm(*later, keyed=False, maker="tablet")[0], 400)
+        silent = self.served()
+        self.assertEqual(self.confirm(*silent, maker="phone")[0], 200)          # a maker, and no word of the key
+        health = self.health()
+        self.assertEqual((health["backup"]["sha256"], health["copies"]["phone"]["keyed"]), (keyed[0], False))
+
+    def test_an_older_apps_confirm_counts_until_a_mac_app_says_what_its_copy_holds(self):
+        """An older Mac app sends no `keyed` and cannot be changed. Read as a copy with no key, its own Save copy could
+        never clear "Your copy is old"; read as one with the key for ever, an older owner command (which never adds the
+        key) or an older Mac whose key step failed would hide the gap. So such a confirm counts as one with the key only
+        from the hand of the Mac app ("app": an older owner command's, "tool", never adds the key), and only until a Mac
+        app that says what its copy holds has confirmed on this hub, with or without the key; a confirm of an owner
+        command of this version sets nothing. The bugs that it catches: a hub that breaks the older app's Save copy; one
+        that lets an older owner command's copy clear the warning; one that lets an older client hide a missing key once
+        a Mac says the truth, also a Mac whose key always fails; one where a command's confirm stops the older Mac's."""
+        tool = self.served()
+        self.assertEqual(self.confirm(*tool, client="founderizer-mcp/1/test")[0], 200)
+        health = self.health()
+        self.assertIsNone(health["backup"])
+        self.assertEqual(health["copies"]["older"]["keyed"], False)
+        older = self.served()
+        self.assertEqual(self.confirm(*older)[0], 200)
+        health = self.health()
+        self.assertEqual(health["backup"]["sha256"], older[0])
+        self.assertNotIn("backup_missing", [w["kind"] for w in health["warnings"]])
+        self.assertIsNone(health["copies"]["older"]["keyed"])
+        command = self.served()
+        self.assertEqual(self.confirm(*command, keyed=False, maker="command", client="founderizer-mcp/1/test")[0], 200)
+        still = self.served()
+        self.assertEqual(self.confirm(*still)[0], 200)
+        self.assertEqual(self.health()["backup"]["sha256"], still[0])           # a command set no contract
+        bare = self.served()
+        self.assertEqual(self.confirm(*bare, keyed=False, maker="mac")[0], 200)
+        hub.kv_set("backup_at", hub.now() - hub.BACKUP_WARN - 3600)
+        newer = self.served()
+        self.assertEqual(self.confirm(*newer)[0], 200)
+        health = self.health()
+        self.assertEqual(health["backup"]["sha256"], still[0])                  # not the older client's copy
+        self.assertIn("backup_old", [w["kind"] for w in health["warnings"]])
+        self.assertEqual(health["copies"]["older"]["sha256"], newer[0])
 
     def test_every_warning_carries_the_way_out(self):
         """The owner, 19 October 2026: a screen that reports something wrong must carry the way to put it right.

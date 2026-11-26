@@ -1112,6 +1112,15 @@ def kv_set(k, v):
               (k, str(v)))
 
 
+def kv_set_rows(k, v):
+    """kv_set inside a transaction(): its write, which commits with the block (kv_set commits at once)."""
+    if v is None:
+        DB.execute("DELETE FROM kv WHERE k=?", (k,))
+    else:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE kv.v IS NOT "
+                   "excluded.v", (k, str(v)))
+
+
 def kv_range(prefix):
     """The two bounds of the kv keys that begin with `prefix`, for `k >= ? AND k < ?`: a range of the primary key.
     LIKE and substr() read every key of the table, which grows with the fleet's history: 6,400 keys on the first fleet
@@ -77090,6 +77099,81 @@ def backups_enabled():
     return not (isinstance(conf, dict) and conf.get("enabled") is False)
 
 
+# **The copies that this hub served and a client can still confirm** (the audit's finding 9, 24 November 2026): the
+# newest BACKUP_RECEIPTS downloads, `{sha256, bytes, at}` each, newest last, in kv `backup_served`. One receipt was kept,
+# so a second download (an automatic copy while the save panel waited for a person) made the first copy's confirm a
+# 409, also on a retry. 16: between one download and its confirm can come a person's save panel, the automatic copy (at
+# most one an hour after a failure), owner commands and the phone's copy (G7), and the value stays near 2 KB. A
+# restore's start clears it, with the generation (main).
+BACKUP_RECEIPTS = 16
+# Who saved a confirmed copy (G7 H4): the Mac app (Save copy and the automatic copy), an owner command (`take_backup`
+# of owner_mcp.py or of the app's own program), the phone (G7). A confirm with none is an older client's: `older`.
+BACKUP_MAKERS = ("mac", "command", "phone")
+
+
+def served_copies():
+    """The receipts of the copies served last, oldest first. A hub before this version kept one receipt as a dict, which
+    reads as one; a value that is neither reads as none."""
+    try:
+        kept = json.loads(kv_get("backup_served") or "[]")
+    except ValueError:
+        return []
+    kept = [kept] if isinstance(kept, dict) else kept
+    return [r for r in kept if isinstance(r, dict)] if isinstance(kept, list) else []
+
+
+def copy_served(digest, size, at):
+    """One more receipt, under LOCK, before the copy's first byte goes out; the oldest beyond BACKUP_RECEIPTS go."""
+    kept = served_copies() + [{"sha256": digest, "bytes": size, "at": at}]
+    kv_set("backup_served", json.dumps(kept[-BACKUP_RECEIPTS:]))
+
+
+def copy_confirmed(receipt, keyed, maker):
+    """A client saved the served copy `receipt` (G7 H4 and the audit's finding 1): the newest copy of its maker, and,
+    when it counts as one that carries the fleet's access key, the newest such copy (kv `backup_at`, `backup_bytes`,
+    `backup_sha256`: health's `backup`, which `backup_missing` and `backup_old` judge). Each moves only to a newer
+    receipt, so the confirm of a copy served before another that was confirmed already changes neither.
+
+    A confirm that does not say `keyed` (`None`: an older Mac app, whose hand is "app"; ui_backup_confirm reads any
+    other such confirm as one with no key) counts as one with the key only while no Mac app that says it has confirmed
+    on this hub (kv `backup_mac_contract`). An older Mac app cannot be changed: read as no key, its own Save copy could
+    never clear "Your copy is old". Once a Mac app that says the truth has confirmed, with or without the key, a confirm
+    that says nothing hides no gap: an older Mac's key step can fail with no word. A fleet whose Macs are all older
+    keeps the old meaning: the hub cannot know more.
+
+    A time ahead of the hub's clock (a clock that was put right, a server that booted before its time sync) is moved
+    past as well: else no later copy would replace it, and "Your copy is old" could not come until the clock reached it.
+    The writes commit together, so a hub that stops between them leaves no `backup_at` without its size."""
+    t0 = now()
+    copy = {"at": receipt["at"], "bytes": receipt["bytes"], "sha256": receipt["sha256"]}
+    makers = copy_makers()
+    one = makers.get(maker or "older")
+    newer = not one or copy["at"] >= float(one.get("at") or 0) or float(one.get("at") or 0) > t0
+    if newer:
+        makers[maker or "older"] = dict(copy, keyed=keyed)
+    counts = keyed is True or (keyed is None and not kv_get("backup_mac_contract"))
+    kept_at = float(kv_get("backup_at") or 0)
+    with transaction():
+        if maker == "mac" and keyed is not None:
+            kv_set_rows("backup_mac_contract", "1")
+        if newer:
+            kv_set_rows("backup_makers", json.dumps(makers, sort_keys=True))
+        if counts and (copy["at"] >= kept_at or kept_at > t0):
+            kv_set_rows("backup_at", copy["at"])
+            kv_set_rows("backup_bytes", copy["bytes"])
+            kv_set_rows("backup_sha256", copy["sha256"])
+    return dict(copy, keyed=keyed, maker=maker)
+
+
+def copy_makers():
+    """The newest confirmed copy of each maker: {maker: {at, bytes, sha256, keyed}}."""
+    try:
+        makers = json.loads(kv_get("backup_makers") or "{}")
+    except ValueError:
+        return {}
+    return {k: v for k, v in makers.items() if isinstance(v, dict)} if isinstance(makers, dict) else {}
+
+
 HANDOVER_UNOPENED = 24 * 3600      # an unopened sealed handover is thrown away after a day
 
 
@@ -78422,14 +78506,20 @@ def health_view(kinds_seen=None):
                 server = (agents().get(agent) or {}).get("machine")
             kinds_seen.append((kind, server))
 
+    # `backup` is the newest copy that carries the fleet's access key (copy_confirmed), and only it answers the two
+    # warnings (G7 H4, the audit's finding 1): a copy of the records alone cannot give a new Mac its servers back.
+    # `copies` is the newest confirmed copy of each maker, with or without the key.
     backup = None
     if kv_get("backup_at"):
         backup = {"at": float(kv_get("backup_at")), "bytes": int(kv_get("backup_bytes")), "sha256": kv_get("backup_sha256")}
         backup["age"] = t0 - backup["at"]
+    copies = {maker: dict(one, age=t0 - float(one.get("at") or 0)) for maker, one in copy_makers().items()}
     if backups_enabled() and not backup:
-        warn("backup_missing", "None saved yet.", None)      # the title: No copy of your fleet; the button: Save a copy
+        # the title: No copy of your fleet; the button: Save a copy
+        warn("backup_missing", "Your copies hold your records, but none holds the key to your servers." if copies
+             else "None saved yet.", None)
     elif backups_enabled() and backup["age"] > BACKUP_WARN:
-        warn("backup_old", f"The last confirmed backup is {span(backup['age'])} old.",
+        warn("backup_old", f"The last copy with the key to your servers is {span(backup['age'])} old.",
              "Save a new copy on your own Mac.")
     integrity = {"result": kv_get("integrity"), "at": float(kv_get("integrity_at")) if kv_get("integrity_at") else None}
     if integrity["result"] not in (None, "ok"):
@@ -78642,7 +78732,7 @@ def health_view(kinds_seen=None):
             "hub": {"started_at": STARTED, "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
                     "db_bytes": pages, "disk_free_bytes": free, "disk_total_bytes": total, "machine": hub_machine,
                     "integrity": integrity, "schema": schema},
-            "backup": backup, "helpers": helpers, "warnings": warnings}
+            "backup": backup, "copies": copies, "helpers": helpers, "warnings": warnings}
 
 
 # ---------------------------------------------------------------- the owner signs a machine in (machine_signin)
@@ -87024,7 +87114,7 @@ class Handler(BaseHTTPRequestHandler):
                 size, digest = file_digest(path)
                 t0 = now()
                 with LOCK:      # before the first byte goes out: a confirm names this copy only once it is whole
-                    kv_set("backup_served", json.dumps({"sha256": digest, "bytes": size, "at": t0}))
+                    copy_served(digest, size, t0)
                     log("owner", f"took a copy of this fleet ({size} bytes, {len(manifest['files'])} files)")
                 name = f"founderizer-{manifest['fleet_id']}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(t0))}.zip"
                 return self.send_file(200, path, size, "application/zip", headers={
@@ -87204,24 +87294,40 @@ class Handler(BaseHTTPRequestHandler):
                 self.connection.settimeout(kept)
 
     def ui_backup_confirm(self):
-        """The app saved and checked the copy. Only the copy that the hub served last can be confirmed."""
+        """The client saved and checked the copy: one of the copies that this hub served lately (served_copies), with
+        whether it carries the fleet's access key (`keyed`) and who saved it (`maker`), both optional for an older
+        client (copy_confirmed). The answer's `backup` is that copy, also when a newer one was confirmed already."""
         def read(data):
             digest, size = data.get("sha256"), data.get("bytes")
             if not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)) or \
                     isinstance(size, bool) or not isinstance(size, int) or size < 1:
                 raise ValueError("sha256 and bytes of the saved copy are required")
-            return {"sha256": digest, "bytes": size}
+            keyed, maker = data.get("keyed"), data.get("maker")
+            if keyed is not None and not isinstance(keyed, bool):
+                raise ValueError("keyed must be true or false")
+            if maker is not None and maker not in BACKUP_MAKERS:
+                raise ValueError("maker must be one of " + ", ".join(BACKUP_MAKERS))
+            if keyed is True and maker != "mac":
+                raise ValueError("only the Mac app puts the fleet's access key into a copy")
+            # A confirm that does not say whether its copy has the key counts as one with it only from an older Mac
+            # app (copy_confirmed): a client that names its maker is of this version and says it, and an older owner
+            # command (the hand "tool") or any other program never adds the key.
+            client = self.headers.get("X-Fleet-Client", "").strip()
+            session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+            if keyed is None and (maker is not None or
+                                  request_hand(client, owner_device_at(self.client_address[0]), None, None,
+                                               session) != "app"):
+                keyed = False
+            return {"sha256": digest, "bytes": size, "keyed": keyed, "maker": maker}
 
         def act(body):
             if not backups_enabled():
                 raise Refusal(403, "owner backups are not enabled on this hub")
-            served = json.loads(kv_get("backup_served") or "{}")
-            if (served.get("sha256"), served.get("bytes")) != (body["sha256"], body["bytes"]):
-                raise Refusal(409, "that is not the copy the hub served last; download it again")
-            kv_set("backup_at", served["at"])
-            kv_set("backup_bytes", served["bytes"])
-            kv_set("backup_sha256", served["sha256"])
-            return {"backup": {"at": served["at"], "bytes": served["bytes"], "sha256": served["sha256"]}}
+            receipt = next((r for r in reversed(served_copies())
+                            if (r.get("sha256"), r.get("bytes")) == (body["sha256"], body["bytes"])), None)
+            if receipt is None:
+                raise Refusal(409, "that is not a copy that this hub served lately; download it again")
+            return {"backup": copy_confirmed(receipt, body["keyed"], body["maker"])}
         return self.ui_command("backups/confirm", read, act)
 
     def ui_team(self, query):

@@ -570,7 +570,7 @@ class Copy(Fixture):
         self.assertEqual((int(headers["Content-Length"]), headers["X-Fleet-Backup-SHA256"]), (size, digest))
         self.assertLess(peak, 8 << 20)
         self.assertEqual(self.copy_files(), [])
-        self.assertEqual(json.loads(hub.kv_get("backup_served"))["bytes"], size)
+        self.assertEqual(hub.served_copies()[-1]["bytes"], size)
         bundle = hub.read_bundle(path, os.path.join(self.tmp.name, "read.records"))
         self.assertEqual(bundle["records_bytes"], json.loads(zipfile.ZipFile(path).read("fleet.json"))["files"]
                          ["fleet.sqlite3"]["bytes"])

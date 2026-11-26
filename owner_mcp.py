@@ -1872,6 +1872,11 @@ def share_resource(args):
                    "the standing of this resource", args.get("request_id"))
 
 
+# What take_backup's result says of the key, also in the app's own program (OwnerWrites.swift `copyNoKey`).
+COPY_NO_KEY = ("This copy has no access key of the fleet, so it cannot reach the fleet's servers from a new Mac: only a "
+               "copy that the Founderizer app keeps has it.")
+
+
 def take_backup(args):
     """`GET /ui/backup` into a file on this Mac, then `POST /ui/backups/confirm` once the bytes are checked against
     the hub's own SHA-256. No copy stays on the hub machine.
@@ -1909,9 +1914,11 @@ def take_backup(args):
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.remove(coming)
-    receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": into.size},
+    # This program never adds the fleet's access key (only the app keeps it), so the hub records a copy with no key,
+    # which keeps "Your copy is old" up until the app keeps one with the key (UI-API.md 1.346).
+    receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": into.size, "keyed": False, "maker": "command"},
                       "the confirmation of the copy", args.get("request_id"))
-    return dict(receipt, path=str(place), bytes=into.size, sha256=digest)
+    return dict(receipt, path=str(place), bytes=into.size, sha256=digest, keyed=False, note=COPY_NO_KEY)
 
 
 def kept_as(coming, place, folder=None):

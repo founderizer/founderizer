@@ -701,19 +701,27 @@ class FromNothing(WithServer):
         the hub is told that the copy is kept: a copy of 12 MiB of records that do not pack is kept with a peak of
         Python's memory of a few MiB, the hub's side of this process included, and no passing file stays beside it.
         A copy that does not arrive within COPY_TOTAL gets the words that send the owner to Save copy in the app, the
-        hub is not told, and nothing stays. The bugs that it catches: the tool reads the whole copy into memory again,
-        under a limit of its size, which a fleet passes (the owner, 22 November 2026: "why is there a backup limit? it
-        shouldn't?"); a copy past the time of one tool call that the agent reads as a lost call, with no way on."""
+        hub is not told, and nothing stays. The tool never adds the fleet's access key, so it tells the hub that its copy
+        has none, and its result says so (the audit's finding 1, 24 November 2026). The bugs that it catches: the tool
+        reads the whole copy into memory again, under a limit of its size, which a fleet passes (the owner, 22 November
+        2026: "why is there a backup limit? it shouldn't?"); a copy past the time of one tool call that the agent reads
+        as a lost call, with no way on; a copy with no key that clears the hub's warning, or that the agent takes for
+        one that gives a new Mac the servers back."""
         client = self.started()
         where = pathlib.Path(tempfile.mkdtemp(prefix="fleet-copy-"))
         self.addCleanup(shutil.rmtree, str(where), True)
+        confirmed = lambda: json.loads(hub.kv_get("backup_makers"))["command"]["sha256"]     # noqa: E731
         taken = client.call("take_backup", path=str(where))
         first = pathlib.Path(taken["path"])
         self.assertTrue(first.exists())
         self.assertEqual(first.stat().st_size, taken["bytes"])
         self.assertEqual(hashlib.sha256(first.read_bytes()).hexdigest(), taken["sha256"])
-        self.assertEqual(hub.kv_get("backup_sha256"), taken["sha256"])
-        self.assertEqual(client.call("fleet_read", page="health")["backup"]["sha256"], taken["sha256"])
+        self.assertEqual((taken["keyed"], taken["note"]), (False, owner_mcp.COPY_NO_KEY))
+        health = client.call("fleet_read", page="health")
+        self.assertEqual((health["copies"]["command"]["sha256"], health["copies"]["command"]["keyed"]),
+                         (taken["sha256"], False))
+        self.assertIsNone(health["backup"])                             # no copy with the key answers the warning
+        self.assertIn("backup_missing", [w["kind"] for w in health["warnings"]])
         hub.q("CREATE TABLE ballast(x BLOB)")
         for _ in range(12 * 16):
             hub.q("INSERT INTO ballast VALUES(?)", (os.urandom(64 * 1024),))
@@ -739,13 +747,13 @@ class FromNothing(WithServer):
         with open(saved, "rb") as f:
             for piece in iter(lambda: f.read(1 << 20), b""):
                 digest.update(piece)
-        self.assertEqual((digest.hexdigest(), hub.kv_get("backup_sha256")), (taken["sha256"], taken["sha256"]))
+        self.assertEqual((digest.hexdigest(), confirmed()), (taken["sha256"], taken["sha256"]))
         self.assertLess(peak, 6 << 20)
         with patch.object(owner_mcp, "COPY_TOTAL", 0), self.assertRaises(Refused) as slow:     # past its time
             self.direct("take_backup", path=str(where))
         self.assertEqual(str(slow.exception), owner_mcp.COPY_SLOW)
         self.assertIn("has no such limit of time.", owner_mcp.COPY_SLOW)    # and no claim of size: 2 GB is a bound
-        self.assertEqual(hub.kv_get("backup_sha256"), taken["sha256"])
+        self.assertEqual(confirmed(), taken["sha256"])
         self.assertEqual(sorted(path.name for path in where.iterdir()), sorted([first.name, "larger.zip"]))
         self.assertLess(owner_mcp.COPY_TOTAL, 30 * 60)          # under the 30 minutes of one tool call
 
