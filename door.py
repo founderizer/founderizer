@@ -3297,11 +3297,17 @@ def host_sweep(door, once=False):
 def item_secret(text):
     """The key in one opened copy. The central vault seals the item as the owner's app saved it, one JSON object with the
     key as its "password" (and the user name, the address and the seed beside it); a copy that is no such object is the
-    key itself."""
+    key itself (a provider's JSON key file too). None for a key that the fleet made (an object with a "made" member,
+    VAULT.md limit 35): it reads one site for a session's swap, and the door, which uses a key whole, takes none; the
+    hub sends it none and the central vault seals none for it, so one that comes anyway is a fault, and stays out."""
     try:
-        item = json.loads(text)
+        item = json.loads(text.lstrip("\ufeff"))
     except ValueError:
         return text
+    except RecursionError:              # no key nests that deep: none, and the pass goes on
+        return None
+    if isinstance(item, dict) and "made" in item:
+        return None
     secret = item.get("password") if isinstance(item, dict) else None
     return secret if isinstance(secret, str) and secret.strip() else text
 
@@ -3475,8 +3481,14 @@ def fetch_sealed(door):
         status, value = run_program(["age", "--decrypt", "-i", P(VAULT_KEY)], sealed.encode(), {})
         if status != 0 or not value.strip():
             continue
+        opened_value = item_secret(value.strip())
+        if opened_value is None:
+            # a made key (or no key at all): not kept and not confirmed, so the hub sends it again until its copy's
+            # wait ends; the journal says it once each pass, since only a fault sends one
+            print(f"the door keeps no made key and no copy that it cannot read: the copy of {ref} stays out", flush=True)
+            continue
         os.makedirs(P(SECRETS_DIR), mode=0o700, exist_ok=True)
-        path, opened_value = value_file(ref), item_secret(value.strip())
+        path = value_file(ref)
         # The mark of a provider's key is on the disk before its value is (Door.keep_names): the next copy under the
         # same reference, in this pass too, takes the value's place. A write that fails ends the pass, as one of the
         # value does: the copy stays at the hub. A record that cannot be read or is full keeps no copy back.

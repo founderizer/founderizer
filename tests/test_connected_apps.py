@@ -152,7 +152,11 @@ class Dormant(Base):
         self.assertNotIn("connection", state["messages"][0])
         self.assertEqual(state["messages"][0]["text"], "A goal")
         # (who sent it is owner feature message_hands since UI-API.md 1.332: test_mobile's
-        # test_each_message_says_its_hand_and_never_its_session)
+        # test_each_message_says_its_hand_and_never_its_session); from where it came is never shown (the review of
+        # 24 November 2026: UI-API.md 1.351)
+        hub.q("UPDATE ui_requests SET session='claude-code/1', device='iphone'")
+        code, state = self.request()
+        self.assertTrue({"session", "device"}.isdisjoint(state["messages"][0]), state["messages"][0])
         # a request that names a connected app's label with no connection of the hub's is a program's claim: marked as
         # one, in its header as everywhere else (the last check of 21 November 2026)
         with hub.committed():

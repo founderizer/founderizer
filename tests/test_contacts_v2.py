@@ -1065,12 +1065,13 @@ class Conversations(Base):
         self.assertIn("not for a session that a person's message drives", text)
 
         def steered(task):
-            one = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client) "
-                          "VALUES(?,'steer.png','image/png',?,?,?,'test')",
-                          (str(uuid.uuid4()), len(png), hub.attachment_write(png, "image/png"), hub.now()))
+            one = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,device) "
+                          "VALUES(?,'steer.png','image/png',?,?,?,'test',?)",
+                          (str(uuid.uuid4()), len(png), hub.attachment_write(png, "image/png"), hub.now(),
+                           hub.OWNER_COMPUTER_PLACE))       # the computer's upload (owner_place)
             with hub.LOCK:
                 hub.task_steer_act(task, {"expected_attempt": None, "text": "Use this.", "attachments": [one],
-                                          "request_id": str(uuid.uuid4())}, "test")
+                                          "request_id": str(uuid.uuid4())}, "test", device=None)
             return one
         own, other = steered(work), steered(tid)
         self.assertIn("steer.png", self.ok("read_attachment", mine, attachment_id=f"A-{own}"))
@@ -1098,7 +1099,8 @@ class Conversations(Base):
         with hub.LOCK, self.assertRaises(hub.Refusal) as refused:
             hub.task_steer_act(self.conversation_task(cid)["id"], {"expected_attempt": None, "text": "Use this.",
                                                                    "attachments": [own],
-                                                                   "request_id": str(uuid.uuid4())}, "test")
+                                                                   "request_id": str(uuid.uuid4())}, "test",
+                               device=None)
         self.assertIn("send the guidance without the file", str(refused.exception))
 
     def test_a_removed_customers_words_leave_their_task_and_the_history(self):

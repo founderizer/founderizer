@@ -970,7 +970,8 @@ class Resources(OwnerAPI):
         with patch.object(hub, "owner_device_at", lambda address: "phone" if address == "100.64.0.9" else None), \
                 patch.object(hub, "owner_device_class", lambda device: "iPhone" if device == "phone" else None):
             for card in (nid, mail):        # a repository, and a mailbox (F6 piece 2)
-                code, said = hub.phone_submit(self.command(choice=0), "a phone", card, address="100.64.0.9")
+                code, said = hub.phone_submit(self.command(choice=0), "a phone", card, address="100.64.0.9",
+                                              device="phone")
                 self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WHERE))
         # the press race (25 November 2026): the route checked the device (ui_allowed), and the owner removed it while
         # the press waited for the hub's writes. Its address maps to no device then, which a lookup reads as the
@@ -996,6 +997,27 @@ class Resources(OwnerAPI):
                       f"nothing. The hub closed the card.",
                       hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
         self.assertEqual(self.commits(), before)
+
+    def test_a_press_of_give_on_a_pc_keeps_the_pc_in_its_second_call(self):
+        """A press of Give runs phone_submit again in the turn of the hub's writes (kit_lock), and that second call
+        keeps the device that the route found: an enrolled PC's press, through the real route, gives and keeps the
+        PC's hand and place (UI-API.md 1.351). A second call that drops the device fails here (its device is a required
+        keyword, and None would write the computer's hand); one that reads the address again after Remove device is the
+        press race of test_only_a_press_of_give_on_the_mac_or_a_pc_gives."""
+        nid = self.give_card()      # first: since the pool default it keeps the repository as the owner's, a commit
+        # the PC in team.json by the hub's own save, so that the Give's commit, which reads team.json again, keeps it
+        hub.save_owner_device({"device": "pc", "label": "PC", "address": "127.0.0.6", "base_sha256": None})
+        key = hub.enroll_device("pc", hub.new_device_code("pc")["code"], kind="windows")["key"]
+        before = self.commits()
+        press = self.command(choice=0)
+        code, receipt = self.request(f"/ui/needs/{nid}", press, {
+            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-windows/1/test",
+            "Authorization": "Bearer " + key, "X-Test-Source": "127.0.0.6"})
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})
+        self.assertEqual(self.commits(), before + 1)
+        self.assertEqual(tuple(hub.q1("SELECT hand, device FROM ui_requests WHERE request_id=?",
+                                      (press["request_id"],))), ("device", "pc"))
 
     def test_give_on_a_card_gives_one_mailbox_drive_or_mcp_server_and_takes_none_away(self):
         """F6 piece 2: Give on a card for a mailbox gives that level of that mailbox to that agent at the owner's press,
@@ -1193,7 +1215,7 @@ class Resources(OwnerAPI):
             return real(*args, **kw)
         press, before = self.command(choice=0), self.commits()
         with patch.object(hub, "resource_record", stops), self.assertRaises(RuntimeError):
-            hub.phone_submit(press, "founderizer-swift/1/test", card)
+            hub.phone_submit(press, "founderizer-swift/1/test", card, device=None)
         self.assertEqual((self.commits(), self.history("gmail:support@shop.test"), answer(card)),
                          (before + 1, [], None))
         code, receipt = self.request(f"/ui/needs/{card}", press)

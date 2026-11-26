@@ -463,6 +463,13 @@ class ChatApps(OwnerAPI):
         big = PICTURE + bytes(2 * 1024 * 1024)
         code, first = self.bridge_upload(big, "m-up")
         self.assertEqual(code, 200, first)
+        # a chat app's file has no place of the owner's (UI-API.md 1.351): an app of his that sends the bridge's own
+        # label takes it into no message of his, and it waits for the message of the chat app
+        code, refused = self.request("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                      "text": "See this.", "attachments": [first["id"]]},
+                                     {"Content-Type": "application/json",
+                                      "X-Fleet-Client": "fleet-channels/1/discord-studio"})
+        self.assertEqual((code, refused.get("error")), (409, "an attachment was sent up by another client"))
         self.assertEqual(self.bridge_upload(big, "m-up")[1], dict(first, replayed=True))     # again: the same one file
         code, refused = self.bridge_upload(PICTURE, "m-x", sender="999000111")              # a stranger: nothing kept
         self.assertEqual((code, refused["code"], refused["error"]),

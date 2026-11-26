@@ -626,6 +626,62 @@ class Devices(test_ui_api.OwnerAPI):
             self.assertEqual((status, got.get("device")), (200, "iphone"), got)
             self.assertEqual(hub.owner_devices(), {"iphone": {"label": "iPhone", "address": PHONE}})
 
+    def test_a_new_device_of_a_removed_devices_name_takes_none_of_its_files_or_messages(self):
+        """A device's place is its name (UI-API.md 1.351), and a new device of the same kind gets the name again
+        (enroll_new_device). Bug (the review of 24 November 2026, round 3): the new phone took the removed phone's
+        upload that no message had taken, and rewrote its message that nothing had read. The name loses its place both
+        when it leaves a device and when the hub gives it to one (place_cleared), and each of the two holds alone: a
+        removal or an addition can come through git, a restore or a reload of team.json, where no step of the hub runs.
+        The new phone still sends and edits its own."""
+        def removed_in_the_hub():
+            hub.save_owner_device({"device": "iphone", "delete": True, "base_sha256": None})
+
+        def removed_by_a_reload():
+            hub.TEAM = dict(hub.TEAM, owner_devices={})
+            hub.q("DELETE FROM owner_devices WHERE device='iphone'")
+
+        def added_with_the_code_for_a_new_phone():
+            status, got = self.enroll(self.new_code()[1]["code"], source=OTHER)
+            self.assertEqual((status, got.get("device")), (200, "iphone"), got)
+            return got["key"]
+
+        def added_by_a_reload():
+            hub.TEAM = dict(hub.TEAM, owner_devices={"iphone": {"label": "iPhone", "address": OTHER}})
+            return hub.enroll_device("iphone", hub.new_device_code("iphone")["code"])["key"]
+
+        def added_in_the_hub_by_name():
+            hub.save_owner_device({"device": "iphone", "label": "iPhone", "address": OTHER, "base_sha256": None})
+            return hub.enroll_device("iphone", hub.new_device_code("iphone")["code"])["key"]
+        for removed, added in ((removed_in_the_hub, added_by_a_reload),
+                               (removed_by_a_reload, added_with_the_code_for_a_new_phone),
+                               (removed_by_a_reload, added_in_the_hub_by_name)):
+            with self.subTest(removed=removed.__name__, added=added.__name__), \
+                    self.team_saves({"iphone": {"label": "iPhone", "address": PHONE}}):
+                old = self.enrolled()
+                status, sent = self.upload(token=old)
+                self.assertEqual(status, 200, sent)
+                said = self.command(text="Look at the build")
+                self.assertEqual(self.call("/ui/messages", said, source=PHONE, token=old)[0], 200)
+                removed()
+                new = added()
+                status, refused = self.call("/ui/messages", self.command(text="", attachments=[sent["id"]]),
+                                            source=OTHER, token=new)
+                self.assertEqual((status, refused.get("error")), (409, "an attachment was sent up by another client"))
+                status, refused = self.call("/ui/messages", self.command(text="Look at the tests",
+                                                                         replaces_request_id=said["request_id"]),
+                                            source=OTHER, token=new)
+                self.assertEqual((status, refused.get("error")),
+                                 (409, "correction must refer to this client's message in the same agent chat"))
+                self.assertEqual(hub.q1("SELECT text FROM ui_requests WHERE request_id=?",
+                                        (said["request_id"],))["text"], "Look at the build")
+                status, own = self.upload(source=OTHER, token=new)
+                mine = self.command(text="", attachments=[own["id"]])
+                self.assertEqual(self.call("/ui/messages", mine, source=OTHER, token=new)[0], 200)
+                status, edited = self.call("/ui/messages", self.command(text="My words",
+                                                                        replaces_request_id=mine["request_id"]),
+                                           source=OTHER, token=new)
+                self.assertEqual((status, edited.get("edited")), (200, True), edited)
+
     def test_the_code_for_a_new_phone_gives_a_device_what_its_own_code_gives(self):
         """F7 A2, safety claim 3: from a device's address the code of Add device has the result of the row's New code
         (new_device_code), and no more: the new signing key replaces the certified one and has no certificate, the

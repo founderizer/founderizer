@@ -1188,7 +1188,7 @@ class Owner(Base):
                           (hub.now(), str(uuid.uuid4()), said))
         with hub.LOCK:                              # and the owner's guidance on it, which nobody read yet
             hub.task_steer_act(open_one, {"expected_attempt": None, "text": "Keep the answer short, please.",
-                                          "attachments": [], "request_id": str(uuid.uuid4())}, "test")
+                                          "attachments": [], "request_id": str(uuid.uuid4())}, "test", device=None)
         steer = hub.q1("SELECT event_id FROM steers WHERE task=?", (open_one,))["event_id"]
         self.person("Kim", "manager", KIM, app="discord")       # the open task writes to another person: a row of
         self.ok("message_contact", self.context(hello["conversation"]), person="Kim",        # Kim's conversation

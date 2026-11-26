@@ -2473,6 +2473,37 @@ def message_hand(hand, session):
     runtime = str(session or "").split("/", 1)[0] if hand == "tool" else None
     return {"hand": hand, "runtime": runtime if runtime in MESSAGE_RUNTIMES else None}
 
+# The place of a row of attachments and of ui_requests (their column `device`): where the request that wrote it came
+# from (the review of 24 November 2026). An enrolled owner device is its name (ENTRY_ID), the owner's computer is
+# OWNER_COMPUTER_PLACE, and a message that came through the hub itself (a chat app's, a connected app's) has the
+# computer's place too. NO_OWNER_PLACE, the column's default, is no place of the owner's: a file that no app of his
+# sent up (an agent's attach_file, a chat app's file), a row whose place the hub did not keep (of before the column,
+# or written by an older hub after a rollback), and the rows of a device that the owner removed (save_owner_device).
+# Neither mark is a device's name (ENTRY_ID), and a request's place is never NO_OWNER_PLACE or NULL, so no request
+# takes such a file (owner_upload_rows) or corrects or edits such a message (phone_submit): what the hub does not know
+# lets nothing act.
+NO_OWNER_PLACE = "?"
+OWNER_COMPUTER_PLACE = "@computer"
+
+
+def owner_place(device):
+    """The place of an owner request (attachments.device, ui_requests.device): device, the enrolled owner device that
+    the route found by its address and its key, or OWNER_COMPUTER_PLACE for None, the owner's computer (and a connected
+    app, which reaches the hub through it)."""
+    return device if device is not None else OWNER_COMPUTER_PLACE
+
+
+def place_cleared(device):
+    """Inside the caller's transaction: the files that no message took and the owner requests of the place `device`
+    lose it (NO_OWNER_PLACE). A device's place is its name, and a new device of the same kind gets the name again
+    ("iphone", "pc"), so a name that leaves a device (save_owner_device) and a name that the hub gives a device
+    (enroll_new_device, a new one in save_owner_device) clears it: each one alone misses a removal or an addition
+    through git, a restore or a reload of team.json, a stop between team.json's commit and these rows, and a request
+    that passed ui_allowed before the removal (the review of 24 November 2026, rounds 3 and 4)."""
+    in_transaction("place_cleared")
+    DB.execute("UPDATE attachments SET device=? WHERE device=? AND message IS NULL", (NO_OWNER_PLACE, device))
+    DB.execute("UPDATE ui_requests SET device=? WHERE device=?", (NO_OWNER_PLACE, device))
+
 
 def owner_device_key(device):
     """{sha256, created} of the device's enrolled key, or None. The hub keeps only the SHA-256."""
@@ -2722,6 +2753,8 @@ def enroll_new_device(address, code, signing=None, kind="iphone"):
         team["owner_devices"] = dict(sorted(dict(team.get("owner_devices") or {},
                                                  **{device: {"label": label, "address": address}}).items()))
         return True
+    with transaction():         # the name is no device's now, so its rows lose its place before it has one again
+        place_cleared(device)
     save_integration(None, change, f"Owner added the device {device} with a code")
     q("UPDATE owner_device_codes SET device=? WHERE id=?", (device, row["id"]))
     q("DELETE FROM owner_device_tries WHERE device=?", (tries,))
@@ -2729,8 +2762,15 @@ def enroll_new_device(address, code, signing=None, kind="iphone"):
 
 
 def save_owner_device(body):
-    """One owner device saved in or removed from team.json. A removal also makes its key and its codes invalid."""
+    """One owner device saved in or removed from team.json. A removal also makes its key and its codes invalid, and its
+    files that no message took and its owner requests lose its place (NO_OWNER_PLACE): a device's place is its name,
+    and a new device of the same kind gets the name again (enroll_new_device: "iphone", "pc"), which took the removed
+    device's files and corrected or edited its messages (the review of 24 November 2026, round 3). A save of a name
+    that team.json does not hold gives a device that name, so its rows lose the place first too (place_cleared)."""
     device = body["device"]
+    if not body.get("delete") and device not in owner_devices():
+        with transaction():     # the name is no device's now (save_integration's turn checks team.json again)
+            place_cleared(device)
 
     def change(team):
         devices = dict(team.get("owner_devices") or {})
@@ -2755,6 +2795,7 @@ def save_owner_device(body):
             for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_contacts",
                           "owner_device_push", "owner_device_signing", "owner_device_recovery"):
                 DB.execute(f"DELETE FROM {table} WHERE device=?", (device,))
+            place_cleared(device)
             draws_forget(device)        # and what its app said that it draws
     return dict(result, device=device, deleted=bool(body.get("delete")))
 
@@ -5751,10 +5792,11 @@ def message_views(rows, attached, conf, named=None):
     """The messages of GET /ui/state and of a block of them, from their rows (u.* with the read time of their event):
     attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps), named the
     titles of the tasks that they are about, read in the moment of the rows (message_about_reads)."""
-    # ui_requests.connection is the hub's own record of a connected app's message, and hand and session the record of
-    # who sent it (request_hand): the apps read the hand and the AI program of the session (owner feature
-    # message_hands, message_hand), never the connection or the session's id
-    views = [dict({k: r[k] for k in r.keys() if k not in ("connection", "hand", "session")},
+    # ui_requests.connection is the hub's own record of a connected app's message, hand and session the record of
+    # who sent it (request_hand), and device where it came from (owner_place): the apps read the hand and the AI
+    # program of the session (owner feature message_hands, message_hand), never the connection, the session's id or
+    # the place
+    views = [dict({k: r[k] for k in r.keys() if k not in ("connection", "hand", "session", "device")},
                   **message_hand(r["hand"], r["session"])) for r in rows]
     for m in views:                         # owner feature chat_apps: the chat app of a message, without its IDs
         o = json.loads(m["origin"]) if m.get("origin") else None
@@ -9241,6 +9283,14 @@ def migrate():
         unready = "ready" not in {r["name"] for r in q("PRAGMA table_info(session_credentials)")}
     except sqlite3.Error:
         unready = False
+    placeless = []          # the tables of before their device column (owner_upload_rows, phone_submit's correction)
+    for table in ("attachments", "ui_requests"):
+        try:
+            names = {r["name"] for r in q(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            continue
+        if names and "device" not in names:
+            placeless.append(table)
     for table, columns in {
         "tasks": {"attempt": "INTEGER DEFAULT 1", "case_id": "TEXT", "checked_at": "REAL", "live_path": "TEXT",
                   "stalled_since": "REAL", "stalled_reason": "TEXT", "stall_told": "INTEGER DEFAULT 0",
@@ -9340,7 +9390,7 @@ def migrate():
                         # pictures), with `carried` as the time of that take; and the Needs-you item that has it as
                         # the picture of one of its options (raise_needs_you pictures). A question's picture can have
                         # both: it goes on with the item that takes that question to the owner.
-                        "question": "INTEGER", "need": "INTEGER"},
+                        "question": "INTEGER", "need": "INTEGER"},       # and `device`: placeless, below
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT",            # edit_in_place: each edit of this message, as JSON
@@ -9359,7 +9409,7 @@ def migrate():
                         "skills": "TEXT",
                         # the review of 20 November 2026, issue 4: the hand that sent it (request_hand) and the AI
                         # session that it names (X-Fleet-Session); null for a row of before
-                        "hand": "TEXT", "session": "TEXT"},
+                        "hand": "TEXT", "session": "TEXT"},             # and `device`: placeless, below
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -9587,6 +9637,33 @@ def migrate():
         sql_step("ALTER TABLE duty_steps DROP COLUMN skipped", problems)
     if unready:     # an owner chat that runs from before chat_warm lists its tools no more: it counts as ready
         sql_step("UPDATE session_credentials SET ready=created WHERE kind='chat' AND revoked IS NULL", problems)
+    # The place of a file and of an owner request (the review of 24 November 2026: owner_place, NO_OWNER_PLACE). The
+    # column's default is NO_OWNER_PLACE, so each row of before it reads as no place, with no write, and so does a row
+    # that an older hub writes after a rollback; a request's place is never that. Then the rows of before that are
+    # surely the computer's take its mark, in the same transaction as the column, so that a stop between the two leaves
+    # neither: an owner request that an app of his sent from the computer (hand "app": request_hand gives it only when
+    # no device was found), one of before the hand was kept (21 November 2026: hand NULL) with the label of an app of
+    # the computer, and a message that came through the hub itself (a connected app's, a chat app's), which can be
+    # corrected or edited; and an upload that no message took yet whose label is one of the computer's apps
+    # (OWNER_APP_LABELS: the Mac app's, the PC app's; not the iPhone's, which is never the computer, nor an AI
+    # session's tools, which also run on an enrolled device and see the words of a 409), which a message can still
+    # take. The triggers of the marks go first (older_unwatch), and the end of migrate makes them again and counts
+    # every block once, as a new column of these tables makes it do anyway: so the writes cost no trigger each.
+    theirs = {"attachments": "message IS NULL AND agent IS NULL AND (" +
+                             " OR ".join(f"client GLOB '{label}*'" for label in OWNER_APP_LABELS) + ")",
+              "ui_requests": "hand='app' OR connection IS NOT NULL OR origin IS NOT NULL OR (hand IS NULL AND (" +
+                             " OR ".join(f"client GLOB '{label}*'" for label in OWNER_APP_LABELS) + "))"}
+    if placeless:
+        older_unwatch(placeless[0])
+    for table in placeless:
+        try:
+            with transaction():
+                if not DB.in_transaction:
+                    DB.execute("BEGIN")
+                DB.execute(f"ALTER TABLE {table} ADD COLUMN device TEXT DEFAULT '{NO_OWNER_PLACE}'")
+                DB.execute(f"UPDATE {table} SET device=? WHERE {theirs[table]}", (OWNER_COMPUTER_PLACE,))
+        except sqlite3.Error as e:
+            problems.append(f"the column device of {table}: {e}")
     # KPIs version 2 (4.2): a link from before link_digest takes the digest of the check that made its newest value
     # (a point's source is "rule <id> <digest>"), so that new words of how keep the link and new code is a new link
     sql_step("UPDATE standing SET link_digest=(SELECT substr(p.source, length('rule ' || standing.\"check\" || ' ') "
@@ -23330,10 +23407,12 @@ def answer_note(ref, need, spec, body):
     return f' The owner wrote its note: "{noted}".' if writer == "owner" and not carried else ""
 
 
-def answer_secret(body, request_id, client, device=None, session=None):
+def answer_secret(body, request_id, client, device=None, session=None, place=NO_OWNER_PLACE):
     """POST /ui/needs/<id>/secret: the answer of one secret request, with a secret of the catalog or with a decline.
     The value was saved, registered and granted by the app's own steps before this one; this one says so to the
-    agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows)."""
+    agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows). device:
+    the class of the enrolled device that sent it (owner_device_class); place: the request's place (owner_place), which
+    its row keeps."""
     need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
     if not need:
         raise Refusal(404, code="request_unknown_ended")
@@ -23422,7 +23501,7 @@ def answer_secret(body, request_id, client, device=None, session=None):
                 else (" Go on without it, or deliver what you can." + kept if ref is None else
                       " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
-                                          device=device, session=session,
+                                          device=device, session=session, place=place,
                                           task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?",
@@ -23435,7 +23514,7 @@ def answer_secret(body, request_id, client, device=None, session=None):
                     secret_wait_moved(tid)
         else:
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
-                                          device=device, session=session,
+                                          device=device, session=session, place=place,
                                           note=clarified if clarify is not None else kept if ref is None else "")
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
@@ -26006,7 +26085,7 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None,
-                       pictured="", mentions=(), unsure=(), session=None, skills=()):
+                       pictured="", mentions=(), unsure=(), session=None, skills=(), place=NO_OWNER_PLACE):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -26024,12 +26103,17 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     X-Fleet-Session of the request; the row keeps it with the hand that sent it (request_hand), and a tool's message and
     answer say via ai-session in their header. skills: the skill to use and the gifts of a message (owner feature
     message_skills, as stored), which go into ui_requests.skills, with their lines (skill_lines); each gift's file is
-    bound to the message as its other files are, and only the gift's line names it."""
+    bound to the message as its other files are, and only the gift's line names it. place: the place of the request
+    (owner_place), which ui_requests.device keeps, so that only a request from the same place corrects or edits it
+    (phone_submit); a caller that names none gives a row that no request acts on (NO_OWNER_PLACE). A message that came
+    through the hub itself (origin, connection) has the owner's computer's place, whatever the caller names."""
     in_transaction("owner_message_rows")
+    if origin or connection:
+        place = OWNER_COMPUTER_PLACE
     hand = request_hand(client, device, connection, origin, session)
     if need is not None and need["kind"] == JOIN_KIND:     # Teams design 4, S9 (C26): before any word goes to an agent
         return join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t0, connection, hand,
-                                session)
+                                session, place)
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
     # once as an agent's message is: it is no message of his that waits for a reply. A request that tasks wait on
@@ -26053,9 +26137,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             # a question or a work request of a conversation: the answer goes back there, and nowhere else
             event_id = conversation_answer(need, value, t0)
             DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-                       "connection,hand,session) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                       "connection,hand,session,device) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                        (request_id, kind, need["id"], value, event_id, t0, client, recipient,
-                        connection["id"] if connection else None, hand, session))
+                        connection["id"] if connection else None, hand, session, place))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"
                        + request_hand_words(hand, session)))
@@ -26090,13 +26174,13 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection,about,mentions,hand,session,skills) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about,mentions,hand,session,skills,device) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
                 replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
                 json.dumps(about) if about and need is None else None,
                 json.dumps(list(mentions)) if mentions and need is None else None, hand, session,
-                json.dumps(list(skills)) if skills and need is None else None))
+                json.dumps(list(skills)) if skills and need is None else None, place))
     for f in [f["id"] for f in files] + (skill_gives(skills) if need is None else []):
         DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
@@ -26105,12 +26189,14 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     return event_id
 
 
-def join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t0, connection, hand, session):
+def join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t0, connection, hand, session,
+                     place=NO_OWNER_PLACE):
     """Inside owner_message_rows' transaction: the owner's answer of a join item (Founderizer for Teams, design 4, S9).
     The Teams part changes the link and gives the words that the item keeps, never the code that the owner typed (C26:
     the answer reaches the state read, the history, the answered card and the iPhone); with no part, only a press of
     Refuse came here (phone_submit), and the item keeps that. The event is the owner's own and read at once, so no
-    agent's session reads the answer, and the ui_requests row keeps the same words. Returns the event ID."""
+    agent's session reads the answer, and the ui_requests row keeps the same words, and the place (owner_message_rows').
+    Returns the event ID."""
     in_transaction("join_answer_rows")
     links = teams_part("person_links")
     words = links.join_rows(need, value, chosen, t0) if links else value
@@ -26119,9 +26205,9 @@ def join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t
                           ("owner", "say", None, f"[owner] Answer to Needs-you N-{need['id']}: {words}", t0, "{}",
                            t0)).lastrowid      # no title: it names the person, whose removal keeps no name (D69)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,connection,hand,"
-               "session) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               "session,device) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"], words, event_id, t0, client, recipient,
-                connection["id"] if connection else None, hand, session))
+                connection["id"] if connection else None, hand, session, place))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as the "
                f"answer of N-{need['id']}" + request_hand_words(hand, session)))
     return event_id
@@ -26631,7 +26717,7 @@ def chat_unavailable(recipient):
     return None
 
 
-def message_gifts(request_id, client, hand, recipient, gives, db, files, about):
+def message_gifts(request_id, client, hand, recipient, gives, db, files, about, device):
     """The gifts of one owner message, before its write and outside LOCK (skill_give takes the turn of the hub's writes
     itself, and its search for logins and its commits take seconds): ([the entries to store], None), or (None, (status,
     answer)) when one does not hold, and then the route writes nothing of the message. In order, each before any
@@ -26641,7 +26727,8 @@ def message_gifts(request_id, client, hand, recipient, gives, db, files, about):
     message that can refuse it under LOCK, so that no gift commits for a message that the route then refuses: the
     generation, the request id of a steer, the recipient's chat (chat_unavailable), the work that the message is about
     (message_about_held) and its other files; an agent whose Shell box is off takes none (skill_gift_taker); each gift
-    is this client's upload of a ZIP that no message took yet (owner_upload_rows), and with two gifts or more, each
+    is this client's upload of a ZIP that no message took yet (owner_upload_rows; device: the enrolled device that
+    sends the message, None for the owner's computer), and with two gifts or more, each
     one's bytes, its name once, the folder of that name that is there and the room for all of them are checked before
     the first commit. Then skill_give, gift by gift. A
     refused gift answers with its own words, its code where it has one, and `refused_gift`: the attachment id of the
@@ -26660,7 +26747,7 @@ def message_gifts(request_id, client, hand, recipient, gives, db, files, about):
     if unavailable:
         return None, unavailable
     try:
-        owner_upload_rows(files, client)
+        owner_upload_rows(files, client, device)
     except Refusal as e:
         return None, (e.status, refusal_body(e))
     # every gift's own checks before the first commit: its file, its type and its bytes (skill_gift_read and, for each
@@ -26675,7 +26762,7 @@ def message_gifts(request_id, client, hand, recipient, gives, db, files, about):
     zips, names = [], []
     for at, give in enumerate(gives):
         try:
-            row = owner_upload_rows([give], client)[0]
+            row = owner_upload_rows([give], client, device)[0]
             if row["mime"] != "application/zip":
                 raise Refusal(422, SKILL_GIFT_ZIP)
             data = attachment_bytes(row)
@@ -38421,17 +38508,21 @@ def attachment_ids_ok(files):
 ATTACH_IDS_WORDS = f"attachments names at most {ATTACH_PER_MESSAGE} attachment ids, each one time"
 
 
-def owner_upload_rows(ids, client):
+def owner_upload_rows(ids, client, device):
     """The rows of the files that one owner message, answer or steer (owner API 1.223) names, each checked by the one
     rule of all three: it exists and its bytes are still on the hub, no message or steer took it yet, and this client
-    of the owner's sent it up (POST /ui/attachments), so an agent's own file (attach_file) is never one. Refusal. A
-    read, safe inside a transaction."""
+    of the owner's sent it up (POST /ui/attachments), so an agent's own file (attach_file) is never one. device: the
+    enrolled owner device that sends the request (owner_device_at of its address, whose key ui_allowed checked), None
+    for the owner's computer. "This client" is the same label from the same place: the label is the client's own
+    claim, and an enrolled device read each owner message's label (mobile_chat) while upload ids count up, so with the
+    label alone a device took the computer's upload that no message had taken yet, the computer a device's, and one
+    device another's (the review of 24 November 2026). Refusal. A read, safe inside a transaction."""
     rows = [read_row("SELECT * FROM attachments WHERE id=?", (f,)) for f in ids]
     if any(r is None or not attachment_on_disk(r) for r in rows):
         raise Refusal(404, "an attachment does not exist")
     if any(r["message"] is not None for r in rows):
         raise Refusal(409, "an attachment already belongs to another message")
-    if any(r["client"] != client or r["agent"] is not None for r in rows):
+    if any(r["client"] != client or r["device"] != owner_place(device) or r["agent"] is not None for r in rows):
         raise Refusal(409, "an attachment was sent up by another client")
     return rows
 
@@ -83115,14 +83206,15 @@ STEER_WHO = {OWNER_TOOL_VIA: "'s AI session", OWNER_PROGRAM_VIA: "'s program"}  
 STEER_THROUGH = {OWNER_TOOL_VIA: " through their AI session", OWNER_PROGRAM_VIA: " through a program"}
 
 
-def task_steer_act(task_id, body, client, via=None, connection=None, session=None, device=None):
+def task_steer_act(task_id, body, client, via=None, connection=None, session=None, *, device):
     """POST /ui/tasks/<id>/steer, under LOCK (command_run): an inbox message to the task's session, with a copy to its
     requester. client: the X-Fleet-Client of the command; via: the shown name of the connected app that sent it
     (capp_act), which both messages say: [owner via app:<name>] and "through the app <name>"; connection: that app's
     connection id, which the steer's row keeps (steers.connection), so that the history says it too (history_steer).
     session: its X-Fleet-Session; the row keeps it with the hand (request_hand), and an AI session's steer says so in
     both messages: [owner via ai-session] and "through their AI session". device: the enrolled owner device that it
-    came from (owner_device_at), for its hand."""
+    came from (owner_device_at), for its hand and for its files (owner_upload_rows), None for the owner's computer and
+    a connected app; each caller names it (the review of 24 November 2026, round 4)."""
     hand = request_hand(client, device, connection, None, session)
     tool = request_via(hand) if not via else None
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -83144,7 +83236,7 @@ def task_steer_act(task_id, body, client, via=None, connection=None, session=Non
     if body.get("attachments") and is_conversation_task(t):
         raise Refusal(409, "this task answers a person in a conversation, and that conversation cannot open a file: "
                            "send the guidance without the file")
-    files = owner_upload_rows(body.get("attachments", []), client)
+    files = owner_upload_rows(body.get("attachments", []), client, device)
     text, t0 = body["text"], now()
     # The two messages, the steer and the link of its files in one write: a session is never told of a file that no
     # steer links (read_attachment), and no steer stands without its messages. emit's rows, as event_rows writes them.
@@ -83338,7 +83430,7 @@ def job_message(data, client, request_id, session):
     return (200, job_answer(request_id, first, None, False, client, recipient))
 
 
-def phone_submit(data, client, need_id=None, address=None, connection=None, session=None, device=""):
+def phone_submit(data, client, need_id=None, address=None, connection=None, session=None, *, device):
     """POST /ui/messages and /ui/needs/<id> after the route's checks (ui_allowed, the body's type and size):
     (status, answer). data: the JSON body; client: its X-Fleet-Client, stripped; address: the source address of
     the request, or None for a caller that is no device; its enrolled owner device (`device`, below) marks the message
@@ -83347,12 +83439,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
     X-Fleet-Session (Handler.request_session), which marks it as an AI session's (request_hand). A message's `skills`
     (owner feature message_skills): its use is read before LOCK (skill_use_kept), and its gifts commit before LOCK
     (message_gifts), so that the turn of the hub's writes and the search for logins never wait under LOCK.
-    device: the enrolled owner device that ui_allowed checked for address (Handler.ui_device), None for the owner's
-    computer, or "" when the caller checked none, and then it is looked up here, before any wait. Each decision below
-    takes this one: a lookup after a wait (for kit_lock or LOCK) reads a device that the owner removed in the
-    meantime as the owner's computer, whose press gives, makes a team plan or counts as the Mac's yes."""
-    if device == "":
-        device = owner_device_at(address) if address else None
+    device: the enrolled owner device that ui_allowed checked for address by its address and its key
+    (Handler.ui_device), None for the owner's computer and a connected app. Every caller names it, with no default: a
+    lookup by the address alone checks no key, and a lookup after a wait (for kit_lock or LOCK) reads a device that the
+    owner removed in the meantime as the owner's computer, whose press gives, makes a team plan or counts as the Mac's
+    yes. Each decision below takes this one. It is also the request's place (owner_place), which the row keeps
+    (ui_requests.device) and which the message's files and the message that it corrects or edits must have (UI-API.md
+    1.351)."""
     if not client or len(client) > 128:
         return (400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
     hand = request_hand(client, device, connection, None, session)
@@ -83481,7 +83574,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         GIVE_TURN.on = True
         try:
             with kit_lock():
-                return phone_submit(data, client, need_id, address, connection, session, device)
+                return phone_submit(data, client, need_id, address, connection, session, device=device)
         finally:
             GIVE_TURN.on = False
     gave = need_give_press(need_id, request_id, data.get("db"), connection, address,
@@ -83495,7 +83588,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
     use = skill_use_kept(value, skills, recipient, hand) if need_id is None else None
     gifted = None
     if gives:
-        gifted, refused = message_gifts(request_id, client, hand, recipient, gives, data.get("db"), files, about)
+        gifted, refused = message_gifts(request_id, client, hand, recipient, gives, data.get("db"), files, about,
+                                        device)
         if refused:
             return refused
     with LOCK:
@@ -83598,7 +83692,9 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
                                                (request_id,)).fetchall()]
             said = old["text"] if need is not None and need["kind"] == JOIN_KIND else value     # S9: never the code
             # a gift is one of the message's files (owner feature message_skills): the same request names the same
-            # files and the same gifts, and the receipt names the gifts in `skills` alone
+            # files and the same gifts, and the receipt names the gifts in `skills` alone. A repeat writes nothing and
+            # answers what a chat page shows, so it keeps the check of the label alone: the repeat of a message of
+            # before ui_requests.device (NO_OWNER_PLACE) still gets its stored answer after the release
             stored = message_skills_read(old["skills"])
             if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, said, client, recipient, replaces) or had != sorted(files + gives):
                 return (409, refusal_words.answer("command_reused_content"))
@@ -83650,7 +83746,11 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         previous = None
         if replaces is not None:
             previous = DB.execute("SELECT * FROM ui_requests WHERE request_id=?", (replaces,)).fetchone()
-            if not previous or previous["kind"] != "message" or previous["recipient"] != recipient or previous["client"] != client:
+            # this client's message is its label from its place (ui_requests.device): a device reads each owner
+            # message's label and request id on its chat page, so by the label alone it corrected the computer's
+            # message, or rewrote it while nothing had read it (the review of 24 November 2026)
+            if not previous or previous["kind"] != "message" or previous["recipient"] != recipient or \
+                    previous["client"] != client or previous["device"] != owner_place(device):
                 return (409, {"error": "correction must refer to this client's message in the same agent chat"})
             # The same edit again (edit_in_place). It left no row of its own, so the message it changed carries
             # it: the answer is the same one and nothing is written a second time.
@@ -83681,8 +83781,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         else:
             mentions = mentions_kept(value, mentions, recipient, lead)
         try:
-            rows = owner_upload_rows(files, client)
-            owner_upload_rows(gives, client)    # a gift's file is the message's too: no other message took it since
+            rows = owner_upload_rows(files, client, device)
+            owner_upload_rows(gives, client, device)    # a gift's file is the message's too: no other message took it
         except Refusal as e:
             return (e.status, refusal_body(e))
         # owner feature message_skills: the use, then the gifts, as stored; an answer to a Needs-you item has none
@@ -83707,7 +83807,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
-                                              device=via, connection=connection, about=about, session=session,
+                                              device=via, connection=connection, about=about,
+                                              session=session, place=owner_place(device),
                                               mentions=mentions, unsure=unsure, skills=skills,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
@@ -83893,7 +83994,7 @@ def capp_act(connection, tool, args):
         data = {"request_id": request_id, "db": db, "text": capp_text_arg(args, "text", 16000)}
         if args.get("agent") is not None:
             data["recipient"] = args["agent"]
-        return request_id, phone_submit(data, client, None, None, who)
+        return request_id, phone_submit(data, client, None, None, who, device=None)   # no device: the hub's socket
     if tool == "answer_need":
         need_id = capp_need_arg(args.get("need"))
         given = [k for k in ("answer", "choice", "choices") if args.get(k) is not None]
@@ -83905,7 +84006,7 @@ def capp_act(connection, tool, args):
                                                f"login, a door call, a GitHub App, a phone, a key renewal, a team "
                                                f"change, or it is a person's question"})
         data = {"request_id": request_id, "db": db, given[0]: args[given[0]]}
-        return request_id, phone_submit(data, client, need_id, None, who)
+        return request_id, phone_submit(data, client, need_id, None, who, device=None)
     if tool == "control_task":
         task_id = capp_task_arg(args.get("task"))
         body = task_control_read(task_id, {"action": args.get("action"), "note": args.get("note", "")})
@@ -83916,7 +84017,8 @@ def capp_act(connection, tool, args):
         body = task_steer_read(task_id, {"request_id": request_id, "text": capp_text_arg(args, "text", 4000)})
         return request_id, command_run(f"tasks/{task_id}/steer", request_id, client, db, body,
                                        lambda b: task_steer_act(task_id, b, client, via=who["name"],
-                                                                connection=who["id"]), hand="connected")
+                                                                connection=who["id"], device=None),
+                                       hand="connected")
     raise ValueError("no such tool")
 
 
@@ -85735,16 +85837,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(e.status, refusal_body(e))
         name = attachment_name(self.headers.get("X-Fleet-Name", ""), mime)
         digest, t0 = attachment_write(data, mime), now()
+        # the row keeps where it came from with its label: the enrolled device that ui_allowed found by its address
+        # and its key, or the owner's computer (owner_place). A label is the client's own claim, so the message, the
+        # answer or the steer that takes the file must come from the same place too (owner_upload_rows), and so must a
+        # repeat
+        place = owner_place(self.ui_device)
         with LOCK:
             try:
-                row_id = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client) "
-                                    "VALUES(?,?,?,?,?,?,?)",
-                                    (request_id, name, mime, len(data), digest, t0, client)).lastrowid
+                row_id = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,device) "
+                                    "VALUES(?,?,?,?,?,?,?,?)",
+                                    (request_id, name, mime, len(data), digest, t0, client, place)).lastrowid
                 commit()
             except sqlite3.IntegrityError:
                 rollback()
                 old = DB.execute("SELECT * FROM attachments WHERE request_id=?", (request_id,)).fetchone()
-                if not old or (old["sha256"], old["mime"], old["name"], old["client"]) != (digest, mime, name, client):
+                if not old or (old["sha256"], old["mime"], old["name"], old["client"], old["device"]) != \
+                        (digest, mime, name, client, place):
                     return self.json(409, refusal_words.answer("command_reused_file"))
                 return self.json(200, dict(ok=True, replayed=True, **attachment_view(old)))
         log("owner", f"attachment A-{row_id} {mime} {len(data)} bytes from {client}")
@@ -85869,9 +85977,10 @@ class Handler(BaseHTTPRequestHandler):
                              plain)
         digest, t0 = attachment_write(data, link["mime"]), now()
         with transaction():
-            aid = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
-                             "VALUES(?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), link["name"], link["mime"], len(data),
-                                                         digest, t0, f"agent/{agent}", agent)).lastrowid
+            aid = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent,device) "
+                             "VALUES(?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), link["name"], link["mime"], len(data),
+                                                           digest, t0, f"agent/{agent}", agent,
+                                                           NO_OWNER_PLACE)).lastrowid
         log(agent, f"attach_file A-{aid}: a {CHAT_FILE_KINDS[link['mime']]} of {len(data)} bytes")
         size = chat_file_size(len(data))
         return self.send(200, f"A-{aid} {link['name']} ({CHAT_FILE_KINDS[link['mime']]}, {size}) is on the hub for one "
@@ -88516,9 +88625,9 @@ class Handler(BaseHTTPRequestHandler):
             # the hand of the answer (request_hand): the enrolled device that sent it, and its session, which
             # ui_command checked (Fable's second check of 20 November 2026: a phone's clarify read [owner via program])
             return answer_secret(body, str(self.form()["request_id"]).lower(),
-                                 self.headers.get("X-Fleet-Client", "").strip(),
-                                 owner_device_class(self.ui_device),
-                                 (self.headers.get("X-Fleet-Session") or "").strip() or None)
+                                 self.headers.get("X-Fleet-Client", "").strip(), owner_device_class(self.ui_device),
+                                 (self.headers.get("X-Fleet-Session") or "").strip() or None,
+                                 owner_place(self.ui_device))
         return self.ui_command(f"needs/{need_id}/secret", read, act, kit=True)
 
     def ui_secret_grant(self):
@@ -89407,9 +89516,11 @@ class Handler(BaseHTTPRequestHandler):
         client = self.headers.get("X-Fleet-Client", "").strip()
         # ui_command checks who calls first, and then the session's form, so this read stands behind both
         session = (self.headers.get("X-Fleet-Session") or "").strip() or None
-        device = owner_device_at(self.client_address[0])
+        # the device that ui_allowed found by the address and the key, read when act runs, after that check: a reading
+        # of the address here came before it, and a device removed in between named the steer's place
         return self.ui_command(f"tasks/{task_id}/steer", lambda data: task_steer_read(task_id, data),
-                               lambda body: task_steer_act(task_id, body, client, session=session, device=device))
+                               lambda body: task_steer_act(task_id, body, client, session=session,
+                                                           device=self.ui_device))
 
     def ui_chat_stop(self, agent):
         """POST /ui/chats/<agent>/stop (owner feature chat_stop): the owner's press of Stop in the chat box while the
@@ -89706,9 +89817,10 @@ class Handler(BaseHTTPRequestHandler):
                 why = "the account left the fleet" if acc is None else \
                     chat_file_welcome(account, acc, sender, alt, now())
                 if not why:
-                    aid = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client) "
-                                     "VALUES(?,?,?,?,?,?,?)", (key, name, mime, len(data), digest, t0,
-                                                               f"fleet-channels/1/{account}")).lastrowid
+                    aid = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,"
+                                     "device) VALUES(?,?,?,?,?,?,?,?)",
+                                     (key, name, mime, len(data), digest, t0, f"fleet-channels/1/{account}",
+                                      NO_OWNER_PLACE)).lastrowid
         if why:
             return self.json(403, {"db": db, "code": "not_welcome", "error": f"not taken: {why}"})
         if not replayed:

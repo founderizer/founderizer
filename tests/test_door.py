@@ -6416,6 +6416,36 @@ class Vault(DoorCase):
         self.assertEqual(self.door.secret(ref(6)), pem)
         self.assertEqual(door.item_secret('{"password": "", "username": "x"}'), '{"password": "", "username": "x"}')
         self.assertEqual(door.item_secret("tskey-client-abc-def"), "tskey-client-abc-def")
+        service = json.dumps({"type": "service_account", "private_key": pem})     # a provider's JSON key file, whole
+        self.assertEqual(door.item_secret(service), service)
+        self.assertIsNone(door.item_secret("\ufeff" + json.dumps({"made": {"password": "x", "url": "https://a.example"}})))
+        def too_deep(text):                         # json's own limit, which the Python's version moves
+            raise RecursionError("maximum recursion depth exceeded")
+        with patch.object(door.json, "loads", too_deep):
+            self.assertIsNone(door.item_secret("[[[[]]]]"))                     # no key nests that deep
+        # A key that the fleet made (VAULT.md limit 35) reads one site for a session's swap: in either form, nested or
+        # the flat one of the central store, the door keeps none of it and confirms none, though its password is
+        # there. Bug: the door would use a read-only made key whole, as a provider's key.
+        for made in ({"made": {"password": "made-value", "url": "https://shop.example"}},
+                     {"made": True, "password": "made-value", "url": "https://shop.example", "requests": []}):
+            calls = []
+
+            def http(method, url, headers, data, **more):
+                calls.append(url)
+                return (200, {"copies": [{"id": 9, "login": ref(7), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"},
+                                         {"id": 10, "login": ref(31), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}) \
+                    if url.endswith("/door/sealed") else (200, {})
+            self.door.http = http
+            said = io.StringIO()
+            opened = iter([json.dumps(made), "the-good-value\n"])     # the made copy first, a good one after it
+            with patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, next(opened))), \
+                    contextlib.redirect_stdout(said):
+                self.assertEqual(door.fetch_sealed(self.door), 1)      # the pass goes on past the made copy
+            self.assertIn(f"the copy of {ref(7)} stays out", said.getvalue())      # the journal says it
+            self.assertEqual(self.door.secret(ref(7)), "value-of-0000")     # the value that it held, whole
+            self.assertEqual(self.door.secret(ref(31)), "the-good-value")
+            self.assertNotIn(f"http://{HUB}:8765/door/sealed/9", calls)
+            self.assertIn(f"http://{HUB}:8765/door/sealed/10", calls)
 
     def test_a_grant_that_ended_leaves_the_door_and_a_minted_key_stays(self):
         folder = self.root + door.SECRETS_DIR

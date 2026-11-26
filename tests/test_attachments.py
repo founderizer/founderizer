@@ -68,10 +68,17 @@ class Attachments(test_ui_api.OwnerAPI):
     # ---- the helpers of these checks
 
     def send_bytes(self, data, mime="image/png", name="shot.png", request_id=None, client="founderizer-swift/1/test",
-                   db="test-generation"):
+                   db="test-generation", device=None):
         headers = {"Content-Type": mime, "X-Fleet-Client": client, "X-Fleet-Name": name,
-                   "X-Fleet-Request-Id": request_id or str(uuid.uuid4())}
+                   "X-Fleet-Request-Id": request_id or str(uuid.uuid4()), **(device or {})}
         return self.call("POST", f"/ui/attachments?db={db}", data, headers)
+
+    def device(self, name, address):
+        """An enrolled owner device (MOBILE-APP.md) at its own address with its own key: the headers of its requests,
+        which name its address to the test's hub (X-Test-Source)."""
+        hub.TEAM.setdefault("owner_devices", {})[name] = {"label": name, "address": address}
+        key = hub.enroll_device(name, hub.new_device_code(name)["code"])["key"]
+        return {"Authorization": "Bearer " + key, "X-Test-Source": address}
 
     def call(self, method, path, data=None, headers=None):
         req = urllib.request.Request(self.base + path, data=data, headers=headers or {}, method=method)
@@ -255,6 +262,11 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertEqual(self.count("events"), 1)
 
     def test_a_file_belongs_to_one_message_and_to_the_client_that_sent_it(self):
+        """The client that sent a file up is its label from the same place: the owner's computer, or one enrolled
+        device. Bug (the review of 24 November 2026): the label alone decided, and a device reads each owner message's
+        label on its chat page while the ids of uploads count up, so a device that sent the computer's exact label took
+        the computer's upload that no message had taken yet into its own message, answer or steer, the computer took a
+        device's, and one device another's."""
         one = self.upload(PNG)
         self.assertEqual(self.message([one["id"]])[0], 200)
         code, refused, _ = self.message([one["id"]])
@@ -269,6 +281,53 @@ class Attachments(test_ui_api.OwnerAPI):
         code, refused, _ = self.message(list(range(1, hub.ATTACH_PER_MESSAGE + 2)))
         self.assertEqual(code, 400, refused)
         self.assertEqual(self.count("events"), 1)
+        # the same label from another place: each request below sends the computer's exact X-Fleet-Client
+        phone, pc = self.device("iphone", "127.0.0.5"), self.device("pc", "127.0.0.6")
+        mac = self.upload(JPEG, mime="image/jpeg", name="mac.jpg")          # the computer's, which no message took
+        mine = self.upload(PDF, mime="application/pdf", name="phone.pdf", device=phone)
+        task, _ = self.task()
+        hub.q("UPDATE tasks SET requester='manager' WHERE id=?", (task,))
+        need = self.need()
+
+        def send(device, route, file):
+            body = self.command(**{"messages": dict(recipient="worker"), "answer": dict(answer="Here it is."),
+                                   "steer": dict(text="Match this.")}[route], attachments=[file["id"]])
+            path = {"messages": "/ui/messages", "answer": f"/ui/needs/{need}", "steer": f"/ui/tasks/{task}/steer"}
+            headers = {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-swift/1/test"}
+            return self.request(path[route], body, dict(headers, **(device or {})))
+        before = [self.count(t) for t in ("events", "ui_requests", "steers", "ui_controls")]
+        for device, file, who in ((phone, mac, "a device, the computer's"), (None, mine, "the computer, a device's"),
+                                  (pc, mine, "a device, another device's")):
+            for route in ("messages", "answer", "steer"):
+                with self.subTest(who=who, route=route):
+                    code, refused = send(device, route, file)
+                    self.assertEqual((code, refused.get("error")), (409, "an attachment was sent up by another client"))
+        self.assertEqual([self.count(t) for t in ("events", "ui_requests", "steers", "ui_controls")], before)
+        self.assertEqual([hub.q1("SELECT message FROM attachments WHERE id=?", (f["id"],))["message"]
+                          for f in (mac, mine)], [None, None])
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (need,))["answer"])
+        # the computer's upload again, with its request id, label and bytes, from a device: no replay that names it
+        code, body, _ = self.send_bytes(JPEG, mime="image/jpeg", name="mac.jpg", request_id=hub.q1(
+            "SELECT request_id FROM attachments WHERE id=?", (mac["id"],))["request_id"], device=phone)
+        self.assertEqual(code, 409, body)
+        # each place still sends its own: the computer, and a device on each route
+        self.assertEqual(send(None, "steer", mac)[0], 200)
+        for route in ("messages", "answer", "steer"):
+            with self.subTest(own=route):
+                own = mine if route == "messages" else self.upload(PNG, name=f"{route}.png", device=phone)
+                code, said = send(phone, route, own)
+                self.assertEqual(code, 200, said)
+        # a file sent up before the hub kept its place: one that an app of the computer sent up (by its label) and no
+        # message took stays the computer's, so his outbox goes on; any other has no place, and no request takes it
+        mac_old = self.upload(PNG, name="before.png")
+        tool_old = self.upload(PNG, name="tool.png", client="founderizer-cli/1/test")      # an AI session's tools
+        hub.older_unwatch("attachments")    # the marks' triggers name each column of the table (owner API 1.254)
+        hub.q("ALTER TABLE attachments DROP COLUMN device")
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(self.message([mac_old["id"]])[0], 200)
+        code, refused = self.request("/ui/messages", self.command(recipient="worker", attachments=[tool_old["id"]]),
+                                     {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test"})
+        self.assertEqual((code, refused.get("error")), (409, "an attachment was sent up by another client"))
 
     def test_an_edit_keeps_the_files_and_an_edit_that_brings_one_is_a_correction(self):
         one = self.upload(PNG)

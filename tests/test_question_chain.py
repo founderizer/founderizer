@@ -293,7 +293,7 @@ class Needs(Chain):
         qid = self.up_to_manager()
         need, _ = self.raised(qid, options=["Blue", "Green"])
         code, body = hub.phone_submit({"request_id": str(uuid.uuid4()), "db": "test-generation", "choice": 1},
-                                      "connected:1", need["id"], None, {"id": 1, "name": "Example app"})
+                                      "connected:1", need["id"], None, {"id": 1, "name": "Example app"}, device=None)
         self.assertEqual(code, 200, body)
         self.assertIn("answered by the owner through a connected app (not the owner's own words): Green",
                       self.said("w", self.t3)[-1])

@@ -165,6 +165,9 @@ class Together(RowsCase):
         self.assertIn(open_old, [n["id"] for n in window["needs"]], "an open item stays in the window")
         self.assertTrue(all(n["answer"] is not None for b in self.blocks("needs").values() for n in b["needs"]))
         kept = {m["request_id"]: m for b in self.blocks("messages").values() for m in b["messages"]}
+        # the place of a message's sender is the hub's own record (ui_requests.device, UI-API.md 1.351): in no block
+        # and not in the state
+        self.assertEqual([m["request_id"] for m in list(kept.values()) + whole["messages"] if "device" in m], [])
         self.assertEqual([f["name"] for f in kept[self.messages[1]]["attachments"]], ["plan.pdf"])
         self.assertEqual(kept[self.messages[2]]["origin"]["label"], "Shop phone")
         self.assertEqual(kept[self.messages[4]]["edited"], T0 - 100)
