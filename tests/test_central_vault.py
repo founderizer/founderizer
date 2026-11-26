@@ -44,6 +44,8 @@ LOGIN_A = "bws://11111111-2222-4333-8444-55555555555b"      # an API key: vps re
 LOGIN_B = "bws://21111111-2222-4333-8444-55555555555b"      # a login: vps uses it
 LOGIN_C = "bws://31111111-2222-4333-8444-55555555555b"      # an API key the central vault does not hold
 LOGIN_D = "bws://41111111-2222-4333-8444-55555555555b"      # a secret the central vault holds, out of the catalog
+LOGIN_M = "bws://51111111-2222-4333-8444-55555555555b"      # a key that the central vault made itself (make)
+LOGIN_N = "bws://61111111-2222-4333-8444-55555555555b"      # one more, made after the hub's read of its status
 STORE_A, STORE_B, OTHER = "age1" + "q" * 58, "age1" + "r" * 58, "age1" + "s" * 58
 CENTRAL_KEY, STORE_KEY, RECOVERY = "age1" + "c" * 58, "age1" + "d" * 58, "age1" + "e" * 58
 TEAM = {"hub": {"machine": "hub", "port": 8765},
@@ -105,6 +107,7 @@ class FakeCentral:
         self.lists = True                       # and the statements of the list of the owner's devices
         self.clients = None                     # that list, {"entries", "ended"}, or none yet
         self.values = {}                        # the checksum of the copy of the newest replace of each login
+        self.made = None                        # the keys that it made: a set says `makes`, `made` and `stored`
         self.prints = None                      # the fingerprints that it names for the value of an intake
         self.stop = threading.Event()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -162,7 +165,10 @@ class FakeCentral:
                     "recovery": self.recovery, "grants": list(self.grants), "pool": list(self.pool),
                     "items": len(self.items), "source": "0" * 64, **({"removes": True} if self.removes else {}),
                     **({"replaces": True, "values": dict(self.values)} if self.replaces else {}),
-                    **({"lists": True, "clients": self.clients} if self.lists else {})}
+                    **({"lists": True, "clients": self.clients} if self.lists else {}),
+                    **({"makes": True, "stored": sorted(self.items),
+                        "made": {ref: {"hash": "{SHA}" + "A" * 27 + "=", "request_id": str(uuid.uuid4())}
+                                 for ref in sorted(self.made)}} if self.made is not None else {})}
         if op in ("client-add", "client-end"):
             said = json.loads(r["statement"])
             if said["kind"] != op:
@@ -273,13 +279,15 @@ class Central(WithCentral, OwnerAPI):
                 for ref in sorted(a.get("secrets") or {})]
 
     def report(self, agent, key=None, features=("secret_deposits", "secret_withdrawals"), withdrawals=True,
-               replaces=True):
-        """One helper status, as a machine reports its vault (hub.broker_report)."""
+               replaces=True, made_keys=None):
+        """One helper status, as a machine reports its vault (hub.broker_report). made_keys: the vault's word that it
+        keeps a key that the fleet made out of sessions; None, as a vault program from before that word."""
         key = key or {"vps": STORE_A, "studio": STORE_B}[agent]
         data = {"features": list(features),
-                "security": {"vault": {"broker_recipient": key, "callers": True, "deposits": True,
-                                       "withdrawals": withdrawals, "replaces": replaces, "broker_read_at": hub.now(),
-                                       "mode": "broker"}}}
+                "security": {"vault": dict({"broker_recipient": key, "callers": True, "deposits": True,
+                                            "withdrawals": withdrawals, "replaces": replaces,
+                                            "broker_read_at": hub.now(), "mode": "broker"},
+                                           **({"made_keys": made_keys} if made_keys is not None else {}))}}
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), hub.now()))
 
@@ -849,6 +857,111 @@ class Central(WithCentral, OwnerAPI):
         self.assertEqual(code, 200)
         self.assertEqual(self.view()["held"]["vps"], [row["login"]])
         self.assertIn("is now in the vault of vps", self.said()["text"])
+
+    def test_a_made_key_goes_only_to_a_vault_that_keeps_it_out_of_sessions(self):
+        """Piece 2a of the read routes (made keys): a key that the central vault made goes to no vault that does not say
+        that it keeps such a key out of each session and check. Bugs: the plan sends a made key to each machine whose
+        agent holds it, so a broker from before the rule (or Fleet Vault on a Mac) gives it to a session as a value; the
+        plan or the delivery reads a key that was made after the hub's last status read as no made key; the hub gives
+        the copy on the helper's report alone, which a process of the agent can forge, and not on the vault's own word
+        in its request; a made key that such a vault holds from before stays there."""
+        for ref, env in ((LOGIN_M, "ROUTE_KEY"), (LOGIN_N, "OTHER_ROUTE_KEY")):
+            hub.TEAM["logins"][ref] = {"title": env, "kind": "api_key", "env": env, "site": "https://route.example.com"}
+            hub.TEAM["agents"]["vps"]["secrets"][ref] = "read"
+            hub.TEAM["agents"]["studio"]["secrets"][ref] = "use"
+        self.vault.items[LOGIN_M], self.vault.made = "route.example.com", {LOGIN_M}
+        self.vault.grants, self.vault.pins = self.signed_grants(), {"vps": STORE_A, "studio": STORE_B}
+        self.report("vps", made_keys=True)                  # a broker of this release; studio's says nothing
+
+        def planned(machine):
+            return {r["login"]: r["request_id"].startswith(hub.CENTRAL_MADE) for r in self.deposits(machine)}
+        hub.central_read()
+        hub.central_reconcile()
+        self.assertEqual(planned("vps"), {LOGIN_A: False, LOGIN_B: False, LOGIN_M: True})
+        self.assertEqual(planned("studio"), {LOGIN_A: False})     # a value that is no made key goes as before
+        # the central vault seals a made key only with the hub's word, which the hub says only for such a vault
+        self.assertEqual({(r["machine"], r["login"]): r.get("made_keys") for r in self.vault.ops("seal")},
+                         {("vps", LOGIN_A): True, ("vps", LOGIN_B): True, ("vps", LOGIN_M): True,
+                          ("studio", LOGIN_A): None})
+        # the copy of a made key goes only to a request in which the vault says the word itself
+        row = next(r for r in self.deposits("vps") if r["login"] == LOGIN_M)
+        code, body = self.request("/helper/vault/vps", {"job": row["id"], "kind": "deposit"})
+        self.assertEqual((code, body["error"]), (409, "this can be a key that the fleet made, and this vault does not "
+                                                      "say that it keeps such a key out of sessions"))
+        code, given = self.request("/helper/vault/vps", {"job": row["id"], "kind": "deposit", "made_keys": True})
+        self.assertEqual((code, given["login"], given["ciphertext"]), (200, LOGIN_M, row["ciphertext"]), given)
+        plain = next(r for r in self.deposits("studio") if r["login"] == LOGIN_A)
+        self.assertEqual(self.request("/helper/vault/studio", {"job": plain["id"], "kind": "deposit"})[0], 200)
+        # a key that the central vault made after the hub's last read of its status: no list of that status names it
+        self.vault.items[LOGIN_N], self.vault.made = "route.example.com", {LOGIN_M, LOGIN_N}
+        self.vault.grants = self.signed_grants()
+        hub.central_reconcile()
+        self.assertEqual(planned("vps")[LOGIN_N], True)
+        self.assertNotIn(LOGIN_N, planned("studio"))
+        # studio's vault says the word now: it gets both, each with the mark of its delivery
+        self.report("studio", made_keys=True)
+        hub.central_read()
+        hub.central_reconcile()
+        self.assertEqual(planned("studio"), {LOGIN_A: False, LOGIN_M: True, LOGIN_N: True})
+        for r in self.deposits("studio"):
+            if r["finished"] is None:
+                hub.finish_deposit(r, True, "Saved.")
+        # its vault is put back to a program from before the word: each made key goes back, and the other value stays
+        self.report("studio")
+        withdrawn = hub.central_reconcile()["withdrawn"]
+        self.assertEqual(sorted(r["login"] for r in hub.q(f"SELECT * FROM withdrawals WHERE id IN "
+                                                           f"({','.join('?' * len(withdrawn))})", tuple(withdrawn))),
+                         [LOGIN_M, LOGIN_N])
+        self.assertEqual(self.vault.locked, [])
+
+    def test_a_status_that_cannot_say_which_key_is_made_takes_nothing_away(self):
+        """The Door area's read of 2a. A status that says `makes` but whose lists do not read counts each reference as
+        made for what goes out (central_unmade), and as unknown for what is taken away (central_named). Bugs: each key
+        is withdrawn from each vault that does not say made_keys (a Mac, an older broker); the door's keep list is
+        empty, so the door deletes each key file, until the next good status; the door's copy rows go, also the
+        fetched ones, so the door seals each key again; a status whose grants do not read does the same."""
+        self.vault.made = set()                             # a program that makes keys, and made none
+        self.deliver_and_keep()                             # vps holds LOGIN_A and LOGIN_B; its report has no made_keys
+        hub.TEAM["door"] = {"address": "127.0.0.20", "secrets": [LOGIN_A]}
+        self.vault.grants.append({"login": LOGIN_A, "agent": "door", "machine": "door"})
+        hub.central_read()
+        self.assertEqual(hub.door_sealed("127.0.0.20")["keep"], [LOGIN_A])
+        hub.q("INSERT INTO door_copies(login,sealed,created,fetched) VALUES(?,?,?,?)",
+              (LOGIN_A, armored(b"for the door"), hub.now(), hub.now()))        # the door fetched its copy
+        for damaged in ({"made": "the list"}, {"stored": None}):
+            with self.subTest(damaged), patch.dict(hub.CENTRAL, status=dict(hub.CENTRAL["status"], **damaged)):
+                self.assertEqual(hub.central_reconcile()["withdrawn"], [])
+                self.assertIsNone(hub.door_sealed("127.0.0.20")["keep"])
+                hub.door_reconcile()            # and the door's copy row stays, so no seal of each key follows
+                self.assertEqual([r["login"] for r in hub.q("SELECT login FROM door_copies")], [LOGIN_A])
+        # a status whose grants do not read takes nothing from the door either (the Door area's read of 2a, round 2)
+        with patch.dict(hub.CENTRAL, status=dict(hub.CENTRAL["status"], grants="the list")):
+            self.assertIsNone(hub.door_sealed("127.0.0.20")["keep"])
+            hub.door_reconcile()
+            self.assertEqual([r["login"] for r in hub.q("SELECT login FROM door_copies")], [LOGIN_A])
+        self.assertEqual(hub.q("SELECT * FROM withdrawals"), [])
+
+    def test_the_door_gets_no_key_that_the_central_vault_made(self):
+        """2a-S2. The door keeps the value of each copy in its file and writes it into an app's setting on a host, and
+        it takes a copy with no password at its top as one whole key (door.py item_secret). Bugs: the door's
+        minute seals a made key for the door as each secret that the owner signed for it, also one made after the
+        hub's last status read; the door's keep list names a made key, so the door keeps one that it holds."""
+        self.vault.items[LOGIN_M] = "route.example.com"
+        self.vault.made, self.vault.pins = {LOGIN_M}, {"door": OTHER}
+        self.vault.grants += [{"login": ref, "agent": "door", "machine": "door"} for ref in (LOGIN_A, LOGIN_M, LOGIN_N)]
+        hub.TEAM["door"] = {"address": "127.0.0.20", "secrets": [LOGIN_A, LOGIN_M.upper().replace("BWS", "bws"),
+                                                                 LOGIN_N]}
+        hub.central_read()
+        self.vault.items[LOGIN_N] = "route.example.com"        # made after that read: no list of that status names it
+        self.vault.made = {LOGIN_M, LOGIN_N}
+        hub.door_reconcile()
+        self.assertEqual([r["login"] for r in hub.q("SELECT login FROM door_copies")], [LOGIN_A])
+        self.assertEqual([(r["login"], r.get("made_keys")) for r in self.vault.ops("seal")], [(LOGIN_A, None)])
+        # the keep list leaves out what the status names as made; a key that it cannot say of yet was never sealed for
+        # the door (above), so the door holds no file of it to keep
+        self.assertEqual(hub.door_sealed("127.0.0.20")["keep"], [LOGIN_A, LOGIN_N])
+        hub.central_read()
+        self.assertEqual(hub.door_sealed("127.0.0.20")["keep"], [LOGIN_A])
 
     def test_a_delivery_that_failed_waits_before_it_is_sent_again(self):
         self.vault.pins = {"vps": STORE_A}

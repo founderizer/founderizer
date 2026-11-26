@@ -113,6 +113,17 @@ class SessionEnv(Checkout):
         with patch.object(fleet, "broker_job_request", return_value=dict(given, logins=None)), patch("sys.stdout", printed):
             fleet.session_env("alpha", CLAUDE, "task")
         self.assertEqual(fleet.READ_MISSING["alpha"], {"missing": ["GONE_KEY", "SHOP_KEY"], "logins": []})
+        # a key that the fleet made (the vault's `made`), which a session gets only as a placeholder for its own site:
+        # no fault that time repairs either, so one read and its own word (a bug: three reads again at each first start)
+        fleet.READ_BEFORE["alpha"] = {"missing": [], "failed": False}
+        made = dict(given, missing=["ROUTE_KEY"], logins=[], made=["ROUTE_KEY", "NOT_MISSING"])
+        printed = io.StringIO()
+        with patch.object(fleet, "broker_job_request", return_value=made) as vault, patch("sys.stdout", printed):
+            fleet.session_env("alpha", CLAUDE, "task")
+        self.assertEqual(vault.call_count, 1)
+        self.assertEqual(fleet.READ_MISSING["alpha"], {"missing": ["ROUTE_KEY"], "logins": [], "made": ["ROUTE_KEY"]})
+        self.assertIn("(ROUTE_KEY: a key that the fleet made, given only as a placeholder for its own site)",
+                      printed.getvalue())
 
     def test_an_agent_that_still_says_file_reads_nothing_and_asks_nothing(self):
         """File mode read the value with this helper's own Bitwarden token. It is gone: such an agent has no

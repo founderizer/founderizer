@@ -660,8 +660,9 @@ def read_env(agent, conf, kind):
     this agent's session read before did not leave out, or while it fails as a whole: the vault leaves a value out when
     its call to the hub does not answer, and a session keeps what its start got for its whole life. A name that the
     session read before left out too, a whole failure after a session read that failed as a whole too, a name with the
-    shape of a login (C11, no fault that time repairs) and the read of a check (which reads again by itself) start no
-    wait, so a fault that stays makes one slow start and not each start slow. No read starts again once READ_PATIENCE
+    shape of a login (C11, no fault that time repairs), a key that the fleet made (the vault's `made`: the same) and the
+    read of a check (which reads again by itself) start no wait, so a fault that stays makes one slow start and not
+    each start slow. No read starts again once READ_PATIENCE
     seconds passed since the first read of this start began (a clock that does not jump), so a hub that answers slowly
     gets no more calls and a start stays about as long as before. The record of the read before is READ_BEFORE, of
     session reads only; READ_MISSING stays the hub's record of the last read of any kind. After the last read, the
@@ -703,7 +704,10 @@ def read_env(agent, conf, kind):
         # in this helper's status (vault_status), and the hub tells the agent's manager once when a name starts to be
         # missing.
         logins = sorted(x for x in done.get("logins") or [] if isinstance(x, str) and x in missing)
-        lost = sorted(x for x in missing if x not in logins and x not in before["missing"])
+        # the keys that the fleet made, which a session gets only as a placeholder for the key's own site on a server
+        # that swaps keys (vault.py read): no fault that time repairs either
+        made = sorted(x for x in done.get("made") or [] if isinstance(x, str) and x in missing and x not in logins)
+        lost = sorted(x for x in missing if x not in logins and x not in made and x not in before["missing"])
         if not session or not lost or again == READ_AGAIN or time.monotonic() - began > READ_PATIENCE:
             break
         print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(lost)}: the helper reads again "
@@ -711,10 +715,12 @@ def read_env(agent, conf, kind):
         time.sleep(READ_WAIT)
     if session:
         READ_BEFORE[agent] = {"missing": sorted(missing), "failed": False}
-    READ_MISSING[agent] = {"missing": sorted(missing), "logins": logins}
+    READ_MISSING[agent] = dict({"missing": sorted(missing), "logins": logins}, **({"made": made} if made else {}))
     if missing:
         print(time.strftime("%H:%M:%S"), f"{kind}: the vault did not give {', '.join(missing)}"
-              + (f" ({', '.join(logins)}: a value with the shape of a login)" if logins else ""), flush=True)
+              + (f" ({', '.join(logins)}: a value with the shape of a login)" if logins else "")
+              + (f" ({', '.join(made)}: a key that the fleet made, given only as a placeholder for its own site)"
+                 if made else ""), flush=True)
     # The key swap (VAULT.md): a key can come as a placeholder, which works only through the vault's proxy. Then the
     # session gets the proxy's variables too. When they cannot be made, it starts without each placeholder and
     # without them, so that its other HTTPS programs work.
@@ -12486,6 +12492,8 @@ def vault_status(agent):
               "deposits": (status.get("deposits") is True) if status else None,     # a delivered secret of the owner's
               "withdrawals": (status.get("withdrawals") is True) if status else None,   # and taking one back
               "replaces": (status.get("replaces") is True) if status else None,     # and a new value over a delivered one
+              # and a key that the fleet made in no session or check (hub.keeps_made_keys)
+              "made_keys": (status.get("made_keys") is True) if status else None,
               "places": (status.get("places") is True) if status else None,         # vault.py place: unused now
               "place_key": status.get("place_key") if status and isinstance(status.get("place_key"), str)
               and PLACE_PUBLIC.fullmatch(status["place_key"]) else None,

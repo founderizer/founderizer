@@ -2120,8 +2120,10 @@ class Door:
 
     def installation_repos(self, jwt, iid, login, active=False):
         """Every repository of one installation, in lower case, read with a token of metadata only; None when it has
-        more than the door reads. active (github_repos): archived repositories are left out, and a page that GitHub
-        does not give is an error instead of the end of the list."""
+        more than the door reads. A page that GitHub does not give (a 5xx, a rate limit) is an error, never the end of
+        the list: a short list would mark repositories that the App reaches as unreached for the hub (github_reach)
+        and drop them from a token as no longer listed (selected; the coordinator's validator of 26 November 2026).
+        active (github_repos): archived repositories are left out."""
         status, got = self.http("POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
                                 {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                  "Content-Type": "application/json"},
@@ -2134,7 +2136,7 @@ class Door:
             status, got = self.http("GET", f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
                                     {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}, None)
             rows = got.get("repositories") if status == 200 and isinstance(got, dict) else None
-            if active and not isinstance(rows, list):
+            if not isinstance(rows, list):
                 raise door_providers.Stop(f"GitHub gave no list of {login}'s repositories ({status})")
             rows = [r for r in rows or [] if isinstance(r, dict)]
             repos.update(r["full_name"].lower() for r in rows

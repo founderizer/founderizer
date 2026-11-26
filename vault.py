@@ -64,7 +64,10 @@ that the owner signed, or for a value that he signed into the grantable pool (gr
 backup only to a recovery key that the owner signed (recovery, export), while it has no list of his devices. The owner
 signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
 so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It removes a value
-that the owner took out of the fleet (remove) only while no grant or pool that he signed names it. It keeps the list
+that the owner took out of the fleet (remove) only while no grant or pool that he signed names it. It makes a key
+itself (make), for a route that an agent of the fleet built: the value stays in its store, the answer has only the key's
+hash and its fingerprints, each sealed copy of the key carries the mark "made", and the key leaves the store only after
+the owner's signed unpool of it. It keeps the list
 of the owner's devices once root gave it the first list key (owner): a device's list key adds and ends the devices
 whose keys sign the owner's decisions (client-add, client-end). It runs as its own
 user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
@@ -165,7 +168,8 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
 CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "default_pool",
-                      "seal", "inventory", "export", "remove", "key_addresses", "hub_key", "client-add", "client-end")
+                      "seal", "inventory", "export", "remove", "key_addresses", "hub_key", "client-add", "client-end",
+                      "make")
 # The hub's own files whose key the central vault keeps for it (hub_key; UI-API.md 1.202): its Google file, which the
 # hub seals so that a copy of the hub user's files does not open it.
 HUB_KEYS = ("google",)
@@ -240,7 +244,12 @@ SEALED_REF = re.compile(r"sealed:(\d{1,9})")
 RECIPIENT = re.compile(r"age1[0-9a-z]{58}")
 ARMOR = "-----BEGIN AGE ENCRYPTED FILE-----"
 DELIVERED = "delivered from the owner's vault"      # a deposit's note: only an item with it is withdrawn
-TAKEN = "taken from the owner"                      # an intake's note: only an item with it leaves the central store
+TAKEN = "taken from the owner"                      # an intake's note
+MADE = "made"               # the note of a key that the central vault made itself (make), and the name of the mark in
+                            # each sealed copy of it. Only an item with TAKEN or MADE leaves the central store (remove)
+MADE_BYTES = 32             # the random bytes of such a key: 43 characters of base64url
+MADE_REQUESTS = 16          # the records of requests that a made key keeps: its birth and the newest 15, so its item
+                            # does not grow for ever; a retry of a replace older than these is a new request
 # The central vault (`"central": true`): exactly these keys. No hub, because it never calls one; no worker_uid or
 # worker_group, because only the hub's user asks it; no Bitwarden, curl, ssh or write key, because it does none of that.
 CENTRAL_KEYS = {"central", "hub_uid", "fleet", "owner_keys", "age", "age_key", "store", "store_key", "socket", "state"}
@@ -721,6 +730,51 @@ def login_shaped(value):
     return isinstance(item, dict) and any(item.get(k) not in (None, "") for k in ("username", "totp"))
 
 
+def made_login(text):
+    """The key of a key that the fleet made, from this plain text (a copy that a vault opened, or a value of this
+    store), as check_login reads it: {"password", "url", "username": ""}. None for a text without the member "made".
+
+    The central vault writes such a key as one member and nothing beside it, {"made": {"password": ..., "url": ...}}
+    (copy_text), and this broker keeps it so in its store (deposit). No program from before this form reads a key
+    there: an older vault.py reads a password beside an address (check_value, check_login, also in its delivered), and
+    Fleet Vault on a Mac too (VaultProtocol.swift VaultDeposit.value, VaultSecret), so each refuses such a copy and
+    such a stored value with no word of the hub's. Only the text itself gives the mark: no word of the hub's beside a
+    copy sets it or clears it. A member "made" in another form is in no copy of the central vault's, so such an item
+    is refused, and nothing of it is used."""
+    try:
+        item = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(item, dict) or MADE not in item:
+        return None
+    key = item[MADE]
+    if set(item) != {MADE} or not isinstance(key, dict) or set(key) != {"password", "url"} or \
+            not made_site(key["url"]):          # the one form of a site that make writes: https, a DNS name, a port
+        raise Refused('the item has a member "made" that is not a key that the fleet made, so it is not used')
+    return check_login(key)
+
+
+def made_text(login):
+    """The form in which a store keeps the key of a key that the fleet made (made_login): as the copy holds it."""
+    return canonical({MADE: {"password": login["password"], "url": login["url"]}})
+
+
+def opened(text):
+    """The login in this text (check_login), or the key of a key that the fleet made (made_login) with the member
+    "made": true, so that a step that takes the login can refuse a made key (handover, signin)."""
+    made = made_login(text)
+    return dict(made, **{MADE: True}) if made is not None else check_login(text)
+
+
+# A key that the fleet made (VAULT.md, "A made key") goes into a request only to its own site: with call_api, or with
+# the key swap. A handover would give it to a vault that can be of a program from before that rule, and a sign-in types
+# it into a page of the agent's own browser, which the agent's own programs can read.
+MADE_NO_HANDOVER = ("the fleet made this key for a route, so it is not handed over: the manager gives it to an agent "
+                    "with a grant")
+MADE_NO_SIGNIN = ("the fleet made this key for a route, so it is not typed into a page: use it with call_api, or read "
+                  "it as a placeholder on a server that swaps keys")
+
+
 def provenance(text, data, sid):
     """The source login of a locked copy, after the provenance inside the copy matched the hub's record of the copy
     (its job and source login). Only the sending broker could put it there, because only that broker opened the
@@ -739,11 +793,11 @@ def provenance(text, data, sid):
 
 def open_login(conf, ref, task, store):
     """(the login, its name, its source login), inside the broker only. store: this machine's own store, which opens
-    a saved login (LocalStore)."""
+    a saved login (LocalStore). The login has the member "made" when it is a key that the fleet made (opened)."""
     m = SECRET_REF.fullmatch(ref)
     if m:
         item = store.item(m.group(1))
-        return check_login(item["value"]), item["key"], ref.lower()
+        return opened(item["value"]), item["key"], ref.lower()
     sid = SEALED_REF.fullmatch(ref).group(1)
     query = urllib.parse.urlencode({"agent": conf["agent"], "task": task or ""})
     code, data = hub(conf, "GET", f"/sealed/{sid}?{query}")
@@ -755,17 +809,20 @@ def open_login(conf, ref, task, store):
     if r is None or r.returncode != 0:
         raise Refused(f"sealed:{sid} cannot be opened with this machine's handover key")
     source = provenance(r.stdout, data, sid)
-    return check_login(r.stdout), str(data.get("label") or f"sealed:{sid}"), source
+    return opened(r.stdout), str(data.get("label") or f"sealed:{sid}"), source
 
 
 def handover(conf, job):
-    """Lock one login for the receiving agent's broker. The answer holds only the locked copy."""
+    """Lock one login for the receiving agent's broker. The answer holds only the locked copy. A key that the fleet
+    made is not handed over (MADE_NO_HANDOVER)."""
     owner_keys_held(conf)               # a vault that hands nothing over must not use up the job either
     store = LocalStore(conf)            # a broken vault must not use up the job
     read_private(conf["age_key"], "handover key")
     confirmed = confirm_job(conf, job, "handover")
     owner_pinned(conf, confirmed)       # DevOps plan 0.3: a recipient that the owner signed, and no other
     login, label, source = open_login(conf, confirmed["login"], confirmed.get("task"), store)
+    if login.get(MADE):
+        raise Refused(MADE_NO_HANDOVER)
     if confirmed.get("source") is not None and source != confirmed["source"]:
         raise Refused("the hub and the copy name different source logins, so the login is not handed over")
     protect(conf, confirmed, login)
@@ -790,7 +847,12 @@ def read(conf, purpose=None, uid=None):
     given as a placeholder, which this broker keeps for the calling OS user (uid) and that site, and never as the
     value; when it cannot be a placeholder, it is left out. The answer's `swap` then names the proxy, the folder of
     the sites' CA certificates, and each such variable with its host. On a machine without that part, each value is
-    given as before."""
+    given as before.
+
+    A key that the fleet made (made_login: its form is in the stored value, from the copy that the central vault
+    sealed) is never a value here. It is a placeholder only on a machine that swaps keys, and only when the site that
+    the hub names is the key's own, the address in its value. Else it is left out, and the answer's `made` names its
+    variable. No word of the hub's changes that: the form and the site are in the value itself."""
     store = LocalStore(conf)
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/read",
                      {"for": purpose} if purpose in ("check", "session") else {})
@@ -800,6 +862,8 @@ def read(conf, purpose=None, uid=None):
         raise Refused("the hub did not name the secrets to read" + (f": {reason}" if isinstance(reason, str) else ""))
     env, missing, swapped, named = {}, [], {}, set()
     logins = []             # C11: (variable, reference) of each value that has the shape of a login: none is given
+    made = []               # (variable, reference) of each key that the fleet made and that gets no placeholder here
+    placed = set()          # the references that got a placeholder: one that another name left out stays on
     for x in found:
         name, ref = x.get("env") if isinstance(x, dict) else None, x.get("login") if isinstance(x, dict) else None
         salts = x.get("fingerprint_salts") if isinstance(x, dict) else None
@@ -827,29 +891,45 @@ def read(conf, purpose=None, uid=None):
                 logins.append((name, ref.lower()))
                 missing.append(name)
                 continue
-            value = check_value(stored)
+            fleet_key = made_login(stored)
+            if fleet_key is not None and not (site and swap_site(fleet_key["url"]) == site):
+                # A key that the fleet made: a placeholder for its own site, or nothing. Its reference leaves `named`,
+                # so `Swaps.only` switches off a placeholder of it that an earlier read made for another site.
+                named.discard(ref.lower())
+                made.append((name, ref.lower()))
+                missing.append(name)
+                continue
+            value = {"password": fleet_key["password"]} if fleet_key is not None else check_value(stored)
             protect(conf, {"fingerprint_salts": salts}, value, read=ref.lower())
             if site:
                 value = {"password": conf["_swaps"].place(uid, conf["agent"], ref.lower(), site[0], site[1], form, token)}
                 swapped[name] = swap_origin(*site)
+                placed.add(ref.lower())
         except Refused:
             missing.append(name)
             continue
         env[name] = value["password"]
     if conf.get("_swaps") is not None and type(uid) is int:
         try:                    # the placeholders of keys that the hub names with a site no more
-            conf["_swaps"].only(uid, conf["agent"], named)
+            conf["_swaps"].only(uid, conf["agent"], named | placed)
         except Refused:
             pass                # the list stays as it is: each use of an entry still asks the hub
     log(f"read {len(env)} of {len(found)} value(s) for a session of {conf['agent']}"
         + (f", {len(swapped)} of them as a placeholder" if swapped else ""))
     log(f"a session read of {conf['agent']} left out {len(logins)} value(s) with a user name or an authenticator seed"
         + (f": {', '.join(ref for _, ref in logins)}" if logins else ""))   # a reference opens nothing
+    if made:
+        log(f"a session read of {conf['agent']} left out {len(made)} key(s) that the fleet made, which a session gets "
+            f"only as a placeholder for the key's own site on a machine that swaps keys: "
+            f"{', '.join(ref for _, ref in made)}")
     # `missing` names each variable that the session does not get, as before; `logins`, only when there is one, names
-    # those of them that C11 left out, so an answer with no login keeps its shape for an older helper
+    # those of them that C11 left out, and `made` those that are keys that the fleet made, so an answer with neither
+    # keeps its shape for an older helper
     reply = {"ok": True, "v": PROTOCOL, "env": env, "missing": missing}
     if logins:
         reply["logins"] = [name for name, _ in logins]
+    if made:
+        reply["made"] = [name for name, _ in made]
     if swapped:
         reply["swap"] = {"proxy": f"http://127.0.0.1:{conf['_swap']['port']}", "ca": SWAP_RUN, "names": swapped}
     return reply
@@ -877,7 +957,10 @@ def probe(conf, job):
 
 
 def delivered(text, item):
-    """The value in a delivered copy: a login needs its address, and an API key keeps one when it has it. It refuses, and never exits, because the broker serves the next request."""
+    """The value in a delivered copy: a login needs its address, and an API key keeps one when it has it. Only the
+    members of a login or a key: the central vault's intake reads the owner's copy with it too, so no other member
+    (also no mark "made") goes into a store from here. It refuses, and never exits, because the broker serves the next
+    request."""
     try:
         given = json.loads(text)
     except ValueError:
@@ -898,10 +981,20 @@ def deposit(conf, number):
     replaces: the hub's word, in its answer for this delivery and never in the helper's request, that the owner
     replaced the value of this reference. Then the value goes into the place of the one that an earlier delivery
     saved here (LocalStore.put), and the answer says "replaced". The key swap needs nothing more: its proxy reads the
-    store at each use, so the next request of a session carries the new value under the same placeholder."""
+    store at each use, so the next request of a session carries the new value under the same placeholder.
+
+    A copy of a key that the fleet made is kept in its own form (made_login, made_text): only the copy's own text
+    gives that form, never the hub's answer beside the copy, and a copy with a member "made" in another form is
+    refused.
+
+    made_keys: this broker's own word to the hub, in each request of a copy, that it keeps a key that the fleet made
+    out of each session and check (read, swap_value). The hub gives the copy of a made key only to a request with it
+    (hub helper_deposit). A process of an agent can send the hub a request with the word too, but it gets only a copy
+    that this machine's vault key opens; and a vault program from before this rule never sends it."""
     store = LocalStore(conf)            # a store that does not open refuses before the hub gives the copy
     read_private(conf["age_key"], "handover key")
-    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "deposit"})
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "deposit",
+                                                                     "made_keys": True})
     if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != number \
             or data.get("kind") != "deposit":
         reason = data.get("error") if isinstance(data, dict) else None
@@ -916,14 +1009,16 @@ def deposit(conf, number):
     r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
     if r is None or r.returncode != 0:
         raise Refused("the delivered copy cannot be opened with this machine's vault key")
-    value = delivered(r.stdout, item)
+    made = made_login(r.stdout)         # the central vault made this key (copy_text): it stays in its own form
+    value = made if made is not None else delivered(r.stdout, item)
     code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/fingerprints",
                      {"deposit": number, "fingerprints": fingerprints(value, salts)})
     if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("deposit") != number:
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not confirm this value" + (f": {reason}" if isinstance(reason, str) else ""))
-    saved = store.put(m.group(1).lower(), title, json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                                            ensure_ascii=False), DELIVERED, replace=replaces)
+    text = made_text(made) if made is not None else json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                                                ensure_ascii=False)
+    saved = store.put(m.group(1).lower(), title, text, DELIVERED, replace=replaces)
     log(f"deposit job={number}: {ref.lower()} {saved}")
     swap_given(conf, ref.lower())
     return {"ok": True, "v": PROTOCOL, "deposit": number, "login": ref.lower(), "saved": saved}
@@ -1626,6 +1721,8 @@ def signin(conf, job, uid, ports=None, tables=None):
         with cdp:
             confirmed = confirm_job(conf, job, "signin")
             login, label, source = open_login(conf, confirmed["login"], confirmed.get("task"), store)
+            if login.get(MADE):         # before the hub keeps an origin and before the browser gets a byte of it
+                raise Refused(MADE_NO_SIGNIN)
             if confirmed.get("source") is not None and source != confirmed["source"]:
                 raise Refused("the hub and the copy name different source logins, so the login is not used")
             protect(conf, confirmed, login)
@@ -1660,6 +1757,8 @@ def plain_values(value):
     because such a text can stand in any file by chance (as a handover leaves it out)."""
     try:
         item = json.loads(value)
+        if isinstance(item, dict) and isinstance(item.get(MADE), dict):     # a key that the fleet made (made_login)
+            item = item[MADE]
         found = [item[k] for k in ("password", "totp") if isinstance(item.get(k), str)] if isinstance(item, dict) else []
     except ValueError:
         found = []
@@ -1838,10 +1937,10 @@ class LocalStore:
         except Refused as e:
             return result("not_readable", "not_found" if "no such login" in str(e) else "error")
         try:
-            value = json.loads(item["value"])
+            value = made_login(item["value"]) or json.loads(item["value"])     # a key that the fleet made, or other
             good = isinstance(value, dict) and isinstance(value.get("username", ""), str) and \
                 isinstance(value.get("password"), str) and value["password"]
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, Refused):
             good = False
         return result("readable", "ok") if good else result("not_readable", "bad_format")
 
@@ -3306,6 +3405,12 @@ def central_status(conf):
             # the checksum of the copy of the newest replace of each login: no secret. A hub that stopped between
             # this vault's write and its own record of a replace reads here that a value changed.
             "values": {ref: x["sha256"] for ref, x in sorted(state["values"].items())},
+            # this program serves make (the hub asks), and each key that this vault made: the hash of the value that the
+            # store holds now, which opens nothing, and the request that made that value. A hub that stopped between
+            # this vault's write and its own record reads here that a key or a new value was made, and the same request
+            # again gives it the answer that it lost.
+            "makes": True, "made": {"bws://" + sid: {k: value["requests"][-1][k] for k in ("hash", "request_id")}
+                                    for sid, value in sorted(made_keys(items).items())},
             "lists": True,                          # this program takes client-add and client-end (the hub asks)
             # the list of the owner's devices, public keys alone, or None while this vault has none; the count of the
             # ended set. A list in force ends the recovery key's work (central_signed, export).
@@ -3340,7 +3445,10 @@ def intake(conf, req):
     whole, and the same statement again ends it. With a statement, a login that the store does not hold is saved as
     new. A new value that names no address keeps the address of the stored one (kept_address). The answer names the
     fingerprints of the value that the store holds now, which are no secret: the hub compares a delivered copy with
-    them (its helper_deposit_check)."""
+    them (its helper_deposit_check).
+
+    A reference whose key this vault made (make) takes no value from here, with or without a statement: only make puts
+    a new value under it."""
     ref, title, item, text, salts, given = (req.get(k) for k in ("login", "title", "item", "ciphertext", "salts",
                                                                  "fingerprints"))
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
@@ -3363,6 +3471,9 @@ def intake(conf, req):
         if last is not None and last != record and said["at"] <= last["at"]:
             raise Refused("the vault holds a statement that is as new or newer, so nothing changed")
     store = LocalStore(conf)
+    held = store.opened().get(m.group(1).lower())
+    if held is not None and held["note"] == MADE:   # before the record of a statement: nothing changes here
+        raise Refused("this vault made the key under this reference, so it takes no other value under it")
     read_private(conf["age_key"], "key")            # owner and mode are checked before age reads it
     r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
     if r is None or r.returncode != 0:
@@ -3374,7 +3485,7 @@ def intake(conf, req):
                                     or any(k[0] == "password" for k in mine))):
         raise Refused("the value does not match what the owner registered")
     if said is not None:
-        value = kept_address(value, store.opened().get(m.group(1).lower()))     # the key changes, its address stays
+        value = kept_address(value, held)           # the key changes, its address stays
         if state["values"].get(ref.lower()) != record:
             keep_signer(conf, "replace", said, by)
             state["values"][ref.lower()] = record   # first: from here no older statement of this login is taken
@@ -3411,6 +3522,136 @@ def kept_address(value, held):
         return check_login(dict(value, url=old["url"]))
     except Refused:
         return value                    # an address that is no address any more: the new value as it came
+
+
+# ---- the keys that this vault makes itself
+#
+# A made key guards a route that an agent of the fleet built for other agents. No person types it, and the hub never has
+# its value: the route's checker gets the key's hash, and each reader's vault gets a sealed copy. The key is an item of
+# the store with a note of its own (MADE), so that a seal, an export and a restore of the store carry it, and the note
+# decides what is a made key: no request can put it on an item or take it off.
+#
+# The item's value is {"made": {"password", "url"}, "requests"}: the key inside the mark, as in each copy of it
+# (copy_text) and in a broker's store (made_login). `url` is the route's site, because call_api sends a stored key only
+# to the address that its item has; there is no user name, so the item has not the shape of a login (login_shaped).
+# A program that is put back over this store finds no key where it reads one: the program from before make seals the
+# value as it is, and no older broker and no Fleet Vault reads a key from such a copy; piece 1's program reads a
+# password at the top, finds none and seals nothing. `requests` is the record of each value that the key had, the
+# oldest first and the value of now last:
+# {"request_id", "hash", "fingerprints"}, what the answer to that request said. It is in the item and not in the state
+# file, because a made value is random: a record in a second file could name a value that the store never held, or miss
+# one that it holds. Here the value and its record are one write of one file, a backup of the store carries both, and
+# the state stays a file that the program from before reads. A made value never comes back: none comes in from outside
+# (intake refuses the reference), and a request that has its record makes nothing again, also when a later one came
+# after it.
+
+def new_key():
+    """A new made key: MADE_BYTES random bytes of the system's source, as base64url text with no padding. One text in
+    some 10^14 has the shape of a key that moves money (MONEY_KEYS), which no default_pool takes: it is drawn again."""
+    while True:
+        secret = base64.urlsafe_b64encode(secrets.token_bytes(MADE_BYTES)).decode().rstrip("=")
+        if not MONEY_KEYS.fullmatch(secret):
+            return secret
+
+
+def sha_form(secret):
+    """The hash of a made key in the form `{SHA}` of a web server's password file, the base64 of the SHA-1 of the key,
+    as nginx reads it (auth_basic_user_file). It opens nothing: nobody finds 256 random bits from their hash. SHA-1's
+    known weakness is two texts with one hash, and not the finding of a text from its hash."""
+    return "{SHA}" + base64.b64encode(hashlib.sha1(secret.encode(), usedforsecurity=False).digest()).decode()
+
+
+def made_site(site):
+    """True for the site of a made key: an origin in the one written form that the hub's lifecycle.key_site gives,
+    `https://<host>` or `https://<host>:<port>` (swap_site), whose host is a DNS name with a dot, because the swap proxy
+    checks a certificate of a public CA, and a public CA signs no name of one word. Not localhost.<x> nor <x>.localhost
+    (RFC 6761 sends it to the loopback), and no
+    label of hex digits after 0x, which some resolvers read as an address (0x7f.1 is 127.0.0.1)."""
+    where = swap_site(site)
+    if not where or "." not in where[0] or site != "https://" + swap_origin(*where):
+        return False
+    labels = where[0].split(".")
+    return "localhost" not in (labels[0], labels[-1]) and not any(re.fullmatch(r"0x[0-9a-f]*", l) for l in labels)
+
+
+def made_key(item):
+    """The value of a key that this vault made, as {password, url, requests}; None for each other item. The note says
+    which it is, and never the value. The store keeps it as {"made": {"password", "url"}, "requests"}."""
+    if item["note"] != MADE:
+        return None
+    value = json.loads(item["value"])
+    return dict(value[MADE], requests=value["requests"])
+
+
+def made_keys(items):
+    """{id: the value} of each key of the store's items that this vault made."""
+    return {sid: made_key(item) for sid, item in items.items() if item["note"] == MADE}
+
+
+def make(conf, req):
+    """make: a new key of 256 random bits under a reference that the hub names, or, with `replaces`, a new value of a
+    key that this vault made. The answer has the key's hash (sha_form) and the fingerprints made with the hub's salts,
+    as an intake gives them, and never the value: the value leaves this vault only in a sealed copy (seal), with the
+    mark "made".
+
+    A new key needs its site (made_site), which is the item's address, and a reference that is new: this vault holds
+    no value under it, removed none under it, and has no statement of the owner's about it. A statement from before
+    would else count for the key: a grant would send it, and an old unpool would let it be removed. A new value needs
+    an item that this vault made, so that nothing types over a value of the owner's. The site stays.
+
+    One request_id gives one answer: the same request again gives the same reference, hash and fingerprints and makes
+    nothing ("same"; "old" when a later request put a newer value in the place of its own). The hub names the reference
+    of a new key, so the same request can come with another one after an answer that the hub lost: the answer names the
+    reference of the first time. A request_id that comes back with another site, or about another key or a new value, is
+    refused. Nothing that a hub that is broken into sends here can do more than make keys that open nothing yet, or
+    put a new random value in the place of one that this vault made (VAULT.md, limit 34)."""
+    ref, site, salts, again = req.get("login"), req.get("site"), req.get("salts"), req.get("replaces", False)
+    m, request = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None, canonical_id(req.get("request_id"))
+    if not (m and request and type(again) is bool and isinstance(salts, dict)
+            and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))
+            and not (again and site is not None)):
+        raise Refused("the make request is not valid")
+    if not again and not made_site(site):
+        raise Refused("the site of a key that this vault makes must be https://<host> or https://<host>:<port>, with a "
+                      "DNS name as its host")
+    sid, ref, state, store = m.group(1).lower(), ref.lower(), central_state(conf), LocalStore(conf)
+    items = store.opened()
+
+    def answer(login, record, saved):
+        log(f"make: {login} {saved}")
+        return {"ok": True, "login": login, "saved": saved, "hash": record["hash"],
+                "fingerprints": record["fingerprints"]}
+
+    for other, value in made_keys(items).items():
+        for record in value["requests"]:
+            if record["request_id"] != request:
+                continue
+            first, last = record is value["requests"][0], record is value["requests"][-1]
+            if "bws://" + other in state["removed"]:
+                raise Refused("the key of this request was removed from the fleet")
+            if first == again or (other != sid if again else site != value["url"]):
+                raise Refused("a request with this request_id made something else, so nothing is made for this one")
+            return answer("bws://" + other, record, "same" if last else "old")
+    if ref in state["removed"]:
+        raise Refused("this login was removed from the fleet, so no key is made under its name again")
+    held = items.get(sid)
+    if again:
+        value = made_key(held) if held is not None else None
+        if value is None:
+            raise Refused("this vault made no key under this reference, so it makes no new value for it")
+    else:
+        if held is not None:
+            raise Refused("the vault holds a value under this reference, so it makes no key under it")
+        if any(ref in state[part] for part in ("grants", "pool", "values")):
+            raise Refused("the owner signed a statement about this reference, so it is no new one")
+        value = {"url": site, "requests": []}
+    key = {"password": new_key(), "url": value["url"]}
+    check_login(key)                # as each vault that opens a copy of it checks it
+    record = {"request_id": request, "hash": sha_form(key["password"]), "fingerprints": fingerprints(key, salts)}
+    kept = value["requests"] + [record]          # the birth record stays first: a retry is told by its place
+    item = {MADE: key, "requests": kept[:1] + kept[1:][-(MADE_REQUESTS - 1):]}
+    title = held["key"] if again else swap_origin(*swap_site(site))[:200]
+    return answer(ref, record, store.put(sid, title, canonical(item), MADE, replace=again))
 
 
 def central_signed(conf, req, kind):
@@ -3508,11 +3749,30 @@ def sealable(state, ref, machine):
     return any(g["login"] == ref and g["machine"] == machine for g in grants) or ref in pooled(state)
 
 
+def copy_text(item):
+    """What a sealed copy of this item of the store holds: its value, byte for byte. A key that this vault made goes
+    with no record of its requests, as one member and nothing beside it: {"made": {"password": ..., "url": ...}}. So
+    each vault that opens the copy reads that the fleet made the key, and a vault program from before this form (an
+    older vault.py, Fleet Vault on a Mac) finds no password and refuses the copy (vault.py made_login). The form comes
+    from the item's note, never from a request."""
+    value = made_key(item)
+    if value is None:
+        return item["value"]
+    return canonical({MADE: {"password": value["password"], "url": value["url"]}})
+
+
 def seal(conf, req):
     """seal: one stored value, locked to the key that the owner pinned for one machine, for the hub to carry to that
     machine's broker (a deposit). Nothing is sealed to a machine without a pin, nor without the owner's signed grant
     of that value to an agent of that machine or his signed word that it is in the grantable pool (sealable), and a
-    copy that holds a value in plain is not given."""
+    copy that holds a value in plain is not given.
+
+    made_keys: the hub's word that the vault which takes this copy keeps a key that the fleet made out of each session
+    and check (hub keeps_made_keys). A key that this vault made is sealed only with it. A hub from before that word
+    never says it, nor does a hub for the door, so neither gets a copy of a made key from here. And a made key is never
+    sealed for the door, also with the word: made keys are for the routes of agents. The door also refuses a copy with
+    a `made` member (door.py item_secret), and this refusal keeps a hub that is broken into from having one sealed for
+    the door at all."""
     ref, machine = req.get("login"), req.get("machine")
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
     if not (m and isinstance(machine, str) and MACHINE.fullmatch(machine)):
@@ -3527,7 +3787,13 @@ def seal(conf, req):
     found = LocalStore(conf).opened().get(m.group(1).lower())
     if not found:
         raise Refused("the central vault has no such login")
-    r = run([conf["age"], "-a", "-r", pin["recipient"]], found["value"])
+    if found["note"] == MADE and machine == DOOR_MACHINE:
+        raise Refused("this vault made this key for a route of the agents, and the door takes no such key, so it is "
+                      "not sealed")
+    if found["note"] == MADE and req.get("made_keys") is not True:
+        raise Refused("this vault made this key, and the request does not say that the vault which takes the copy "
+                      "keeps such a key out of sessions, so it is not sealed")
+    r = run([conf["age"], "-a", "-r", pin["recipient"]], copy_text(found))
     if r is None or r.returncode != 0 or ARMOR not in r.stdout:
         raise Refused("the login could not be sealed for this machine")
     if any(value in r.stdout for value in plain_values(found["value"])):
@@ -3574,19 +3840,30 @@ def remove(conf, req):
     It needs no statement of the owner's: a removal gives no value to anybody, so it cannot weaken what his signatures
     guard, which is where a value may go. But it is refused while a grant or the pool that he signed names the
     secret, so a hub that is broken into cannot take away a secret that the owner gives to an agent or to the door.
-    And the name is kept first ("removed" of the state), so no value comes in under it again (intake). "absent" when
-    the store holds no such value, so a request that is asked again ends the same way."""
+    And the name is kept first ("removed" of the state), so no value comes in under it again (intake), and no key is
+    made under it (make). "absent" when the store holds no such value, so a request that is asked again ends the same
+    way.
+
+    A key that this vault made needs more: a signed unpool of it, also when no pool named it, so that each removal of
+    one is in the owner's signed record. It does not stop a hub that is broken into: the owner's Mac signs the unpool
+    of each secret that the hub lists as due out of the pool, with no step of the owner's (VAULT.md, limit 34); the harm
+    is a route that fails until a new key is made. The unpool stays for good, because no default_pool ends one, and the
+    reference is not used again."""
     ref = req.get("login")
     m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
     if not m:
         raise Refused("a remove request needs a login")
-    ref, state = ref.lower(), central_state(conf)
+    ref, state, store = ref.lower(), central_state(conf), LocalStore(conf)
     if any(g["login"] == ref for g in granted(state)) or ref in pooled(state):
         raise Refused("a grant or the pool that the owner signed still names this login, so it is not removed")
+    held = store.opened().get(m.group(1).lower())
+    note = MADE if held is not None and held["note"] == MADE else TAKEN
+    if note == MADE and ref not in state["pool"]:       # not in the pool (above), so a record of it is an unpool
+        raise Refused("this vault made this key, so it removes it only after the owner's signed unpool of it")
     if ref not in state["removed"]:     # first: a removal that stops halfway still takes no new value under this name
         state["removed"][ref] = int(time.time())
         keep_state(conf, state)
-    removed = LocalStore(conf).remove(m.group(1).lower(), TAKEN)
+    removed = store.remove(m.group(1).lower(), note)
     log(f"remove: {ref} {removed}")
     return {"ok": True, "login": ref, "removed": removed}
 
@@ -3712,6 +3989,8 @@ def central(conf, req):
         return export(conf)
     if op == "remove":
         return remove(conf, req)
+    if op == "make":
+        return make(conf, req)
     raise Refused("unknown operation")
 
 
@@ -3756,9 +4035,13 @@ def handle(conf, line, uid):
         # and gives it back when no agent of the machine holds it (withdrawals). A delivery that the hub marks so
         # replaces the value that an earlier one saved (replaces): the hub sends such a delivery only to a broker
         # that says this word.
+        # made_keys: this program keeps a key that the fleet made out of each session and check (read, swap_value),
+        # gives it to no sign-in and no handover, and says so in each request of a delivery (deposit). The hub plans
+        # such a key only for a vault whose report says this word (hub keeps_made_keys).
         status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": "store",
                   "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
-                  "source": conf.get("_source"), "deposits": True, "withdrawals": True, "replaces": True}
+                  "source": conf.get("_source"), "deposits": True, "withdrawals": True, "replaces": True,
+                  "made_keys": True}
         if conf.get("_journal") is not None:        # this broker can make a login: its record of saves is open
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
@@ -4535,7 +4818,12 @@ def swap_value(conf, uid, host, port, name, form):
             # C11, the second wall of `read`: the proxy puts no login's value into a request. This is the swap way of
             # a session only; call_api with a login ("Uses it") goes through `send` as before.
             return {"ok": False, "code": "refused"}
-        value = check_value(stored)["password"]
+        made = made_login(stored)
+        if made is not None and swap_site(made["url"]) != (host, port):
+            # A key that the fleet made, the second wall of `read`: only into a request to its own site. A delivery
+            # can put such a value under the reference of a placeholder that a read made for another site.
+            return {"ok": False, "code": "refused"}
+        value = made["password"] if made is not None else check_value(stored)["password"]
     except Refused:
         # Also when the store has the item no more: at the end of the last grant of a machine the hub takes the value
         # back (withdraw), and a grant that is given again brings it back (deposit). In between, there is no key.

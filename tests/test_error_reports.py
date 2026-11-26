@@ -52,11 +52,11 @@ def a_refusal(**changes):
                  "last": NOW - 5}, **changes)
 
 
-def report(view, since=0, health=None, **facts):
+def report(view, since=0, health=None, funnel=None, **facts):
     given = dict(fleet=FLEET, version="2026.11.538", system="Ubuntu 24.04", code="ab12cd", agents=3, servers=2)
     given.update(facts)
     return errorreports.report(given["fleet"], given["version"], given["system"], given["code"], given["agents"],
-                               given["servers"], view, since, health=health)
+                               given["servers"], view, since, health=health, funnel=funnel)
 
 
 class Report(unittest.TestCase):
@@ -385,6 +385,31 @@ class HealthBlock(unittest.TestCase):
         self.assertNotIn("server_update", hub.WARNING_EARLY)
 
 
+def utc_day(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+class FunnelBlock(unittest.TestCase):
+    def test_the_block_is_a_day_of_each_known_step_and_nothing_else(self):
+        """The SMB audit's Q8 ("Five funnel counts"; the owner's rule: only that a step happened and its day, no name,
+        no word): each value is the UTC day of a time, never its second and never a text that rode in. A key that is
+        not one of the hub's steps never goes (our side would refuse the report, and a name could ride in a key); a
+        step that our side took goes no more; a step of a clock that ran ahead waits; with no step that waits, the
+        report has no block, as our side refuses an empty one."""
+        firsts = {"built": NOW - 3 * 86400 + 0.25, "message": NOW - 2 * 86400, "job": "2026-11-20 Ana's invoices",
+                  "person": True, "page": NOW, "Ana Example": NOW}
+        block = errorreports.funnel(firsts, {}, NOW)
+        self.assertEqual(block, {"built": utc_day(NOW - 3 * 86400), "message": utc_day(NOW - 2 * 86400)})
+        self.assertTrue(all(errorreports.DAY_FORM.fullmatch(day) for day in block.values()))
+        self.assertEqual(errorreports.funnel(firsts, {"built": "2026-11-20"}, NOW), {"message": utc_day(NOW - 2 * 86400)})
+        self.assertEqual(errorreports.funnel({"job": NOW + 2 * errorreports.DAY}, {}, NOW), None)
+        self.assertEqual(errorreports.funnel({"job": NOW + errorreports.DAY}, {}, NOW), {"job": utc_day(NOW + 86400)})
+        self.assertEqual((errorreports.funnel({}, {}, NOW), errorreports.funnel(None, {}, NOW)), (None, None))
+        body = report({"faults": []}, funnel=block)
+        self.assertEqual(body["funnel"], block)
+        self.assertNotIn("funnel", report({"faults": []}, funnel=errorreports.funnel({}, {}, NOW)))
+
+
 def warning_kinds():
     """Every kind of warning that hub.health_view can make, read from its code: the first value of each call of its
     warn(), as a word, two words of a condition, or one of the three forms that build a kind there: "machine_" and the
@@ -506,9 +531,9 @@ class Send(unittest.TestCase):
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (Report, Endpoint, Due, HealthBlock, Send, StartAndStop):
+    for case in (Report, Endpoint, Due, HealthBlock, FunnelBlock, Send, StartAndStop):
         suite.addTests(loader.loadTestsFromTestCase(case))
-    for case in (OnTheHub, HealthOnTheHub):
+    for case in (OnTheHub, HealthOnTheHub, FunnelOnTheHub):
         suite.addTests(case(name) for name in case.__dict__ if name.startswith("test_"))
     return suite
 
@@ -532,6 +557,10 @@ class OnTheHub(OwnerAPI):
         channel = unittest.mock.patch.object(hub, "release_channel", lambda: "https://founderizer.com")
         channel.start()
         self.addCleanup(channel.stop)
+        # The funnel is off in these tests, also once our side takes it: FunnelOnTheHub turns it on.
+        funnel = unittest.mock.patch.object(errorreports, "FUNNEL", False)
+        funnel.start()
+        self.addCleanup(funnel.stop)
         # no code of a restart, and no version read at HEAD, of an earlier test
         hub._error_report.update(runs=None, code=None, head=None)
         self.addCleanup(hub._error_report.update, runs=None, code=None, head=None)
@@ -837,7 +866,8 @@ class OnTheHub(OwnerAPI):
         for key in ("error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at",
                     "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
                     "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-                    "error_reports_restart", "error_reports_warnings", "error_reports_took"):
+                    "error_reports_restart", "error_reports_warnings", "error_reports_took",
+                    "error_reports_funnel", "error_reports_funnel_hold"):
             self.assertIn(key, hub.QUIET_KEYS)
         self.assertNotIn("error_reports", hub.QUIET_KEYS)       # the owner's switch is news for every app
 
@@ -1713,6 +1743,206 @@ class HealthOnTheHub(OnTheHub):
         self.assertNotIn("health", body)
         self.watch({"hub": {"told": ["memory"]}})
         self.assertIsNone(self.look(t0 + 60))
+
+
+class FunnelOnTheHub(OnTheHub):
+    """The funnel in the hub's report (the SMB audit's Q8, the owner's "Go ahead" of 25 November 2026): the day of
+    four first steps of the fleet, under the switch of error reports, each once. Our side takes it in these tests."""
+
+    def setUp(self):
+        super().setUp()
+        funnel = unittest.mock.patch.object(errorreports, "FUNNEL", True)
+        funnel.start()
+        self.addCleanup(funnel.stop)
+
+    def steps(self, t, words="", built=True, message=True, job=True, person=True):
+        """The fleet's records of each step, at `t` (each a minute after the one before), with `words` in each text
+        that a record has: the owner's message, a task's title and result, a person's name and note. The finished task
+        was made two days before it was delivered, and a task that failed and one that was rejected were delivered the
+        day before: the first finished job is the first delivery of a completed task (the validator's S2)."""
+        with hub.LOCK:
+            if built:
+                hub.kv_set(hub.HUB_CLAIM, json.dumps({"owner": hub.address_of_machine("owner"), "at": t}))
+            if message:
+                hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,hand) "
+                      "VALUES(?,'message',?,0,?,'founderizer-swift/1/test','app')", (str(uuid.uuid4()), words, t + 60))
+            if job:
+                for state, created, delivered in (("completed", t - 2 * 86400, t + 120),
+                                                  ("failed", t - 86400, t - 86400 + 120),
+                                                  ("rejected", t - 86400, t - 86400 + 130)):
+                    hub.q("INSERT INTO tasks(title,owner,requester,state,outcome,what,created,delivered) "
+                          "VALUES(?,'manager','manager',?,?,?,?,?)", (words, state, state, words, created, delivered))
+            if person:
+                hub.q("INSERT INTO people(name,role,note,added) VALUES(?,'member',?,?)", (words or "Ana", words, t + 180))
+
+    def funnels(self):
+        return [body.get("funnel") for _, body in self.sent]
+
+    def test_no_funnel_goes_until_our_side_takes_it(self):
+        """Our side refuses a report with a key that it does not know, and counts each refusal of a released version.
+        Until the website area's change is live, with the privacy page's sentences, the block stays in this code:
+        a hub that sent it before would have each day's report refused once, at each fleet. The flip to True, in a
+        commit of its own, replaces this test (the design note's "Dormant until our site takes it")."""
+        self.steps(hub.now() - 86400)
+        self.switch(True)
+        with unittest.mock.patch.object(errorreports, "FUNNEL", False):
+            self.sweep(hub.now())
+        self.assertEqual(self.funnels(), [None])
+        with open(errorreports.__file__) as f:      # the value that ships: this class turned it on for its own tests
+            self.assertIn("\nFUNNEL = False\n", f.read())
+
+    def test_nothing_goes_while_reports_are_off_and_a_step_from_before_the_yes_goes_once_after_it(self):
+        """The owner's rule for the funnel: nothing goes while the switch is off. His switch decides when, not what
+        happened before: the days of the steps that came before his yes go in the first report after it, once (a hub
+        that read only the steps after the yes, as it reads its faults, would never say that a fleet was built). An
+        off and an on again send none of them a second time."""
+        t = hub.now() - 5 * 86400
+        self.steps(t)
+        for day in range(3):
+            self.sweep(hub.now() + day * errorreports.DAY)
+        self.assertEqual(self.sent, [])
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)
+        self.assertEqual(self.funnels(), [{"built": utc_day(t), "message": utc_day(t + 60), "job": utc_day(t + 120),
+                                           "person": utc_day(t + 180)}])
+        self.switch(False)
+        self.switch(True)
+        self.sweep(t0 + errorreports.DAY + 1)
+        self.assertEqual(len(self.funnels()), 2)
+        self.assertIsNone(self.funnels()[1])
+
+    def test_each_step_goes_once_and_a_new_step_goes_alone(self):
+        """Each step is counted once for a fleet, as the first time it happened: a report that our side took ends it
+        (error_reports_funnel). A hub that sent each step again each day would count each fleet each day, and one that
+        kept nothing after the first report would never send a step that came later. A record of a step that went,
+        also an older one (a restored message or task), sends that step no more."""
+        t = hub.now() - 2 * 86400
+        self.steps(t, person=False)
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)
+        self.assertEqual(set(self.funnels()[0]), {"built", "message", "job"})
+        self.steps(t - 86400, built=False, person=False)        # older records of steps that went: they go no more
+        self.sweep(t0 + errorreports.DAY + 1)
+        self.assertIsNone(self.funnels()[1])
+        self.steps(t0 + 60, built=False, message=False, job=False)
+        self.sweep(t0 + 2 * errorreports.DAY + 2)
+        self.assertEqual(self.funnels()[2], {"person": utc_day(t0 + 240)})
+        self.sweep(t0 + 3 * errorreports.DAY + 3)
+        self.assertEqual(self.funnels(), [self.funnels()[0], None, {"person": utc_day(t0 + 240)}, None])
+        with hub.LOCK:
+            self.assertEqual(set(hub.kv_json("error_reports_funnel", dict)), set(errorreports.FUNNEL_STEPS))
+
+    def test_only_days_go_never_a_word_of_a_step(self):
+        """No name, no word, no content (the owner's rule): a canary in the owner's message, in a task's title and
+        result, and in a person's name and note, never reaches the body, and each value of the block is a day. The
+        first message is the owner's own: a message that an AI session sent through his tools (hand "tool"), a program
+        ("other") or a connected app ("connected"), or an answer to a Needs-you item, is not it."""
+        words = canary()
+        t = hub.now() - 3 * 86400
+        with hub.LOCK:
+            for hand, ago in (("tool", 3), ("other", 2), ("connected", 1)):
+                hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,hand) "
+                      "VALUES(?,'message',?,0,?,'claude-code/1',?)", (str(uuid.uuid4()), words, t - ago * 86400, hand))
+            # rows of before the hand was kept: an AI session's and the release job's are not his either
+            for client, ago in (("founderizer-mcp/1/x", 5), ("founderizer-release/1", 4)):
+                hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client) "
+                      "VALUES(?,'message',?,0,?,?)", (str(uuid.uuid4()), words, t - ago * 86400, client))
+            hub.q("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,hand) "
+                  "VALUES(?,'message',7,?,0,?,'founderizer-swift/1/test','app')", (str(uuid.uuid4()), words,
+                                                                                   t - 86400))
+        self.steps(t, words=words)
+        self.switch(True)
+        self.sweep(hub.now())
+        ((_, body),) = self.sent
+        self.assertNotIn(words.lower(), json.dumps(body).lower())
+        self.assertEqual(body["funnel"]["message"], utc_day(t + 60))
+        self.assertTrue(all(errorreports.DAY_FORM.fullmatch(day) for day in body["funnel"].values()))
+        self.assertEqual(set(body["funnel"]), set(errorreports.FUNNEL_STEPS))
+
+    def test_an_owner_message_of_before_the_hand_counts(self):
+        """A fleet whose owner wrote before the hub kept a message's hand (21 November 2026) has his first message in
+        rows with no hand: the one of his app's screen and of a chat app each counts, by the marks that request_hand
+        reads, and an AI session's, the release job's or a connected app's does not."""
+        def first():
+            with hub.LOCK:
+                return hub.q1(hub.FIRST_STEPS["message"])["t"]
+
+        def row(created, client, connection=None, origin=None):
+            with hub.LOCK:
+                hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,connection,origin) "
+                      "VALUES(?,'message','',0,?,?,?,?)", (str(uuid.uuid4()), created, client, connection, origin))
+
+        t = hub.now() - 30 * 86400
+        row(t, "founderizer-mcp/1/x")
+        row(t + 1, "founderizer-release/1")
+        row(t + 2, "claude-code/1", origin="")
+        row(t + 3, "connected:3", connection=3)
+        self.assertIsNone(first())
+        for ago, mark in ((10, {"client": "founderizer-swift/1/test"}),
+                          (20, {"client": "fleet-channels/1", "origin": "telegram:1:2"})):
+            row(t - ago, **mark)
+            self.assertEqual(first(), t - ago, mark)
+
+    def test_the_first_steps_read_by_an_index(self):
+        """The funnel's reads run under the lock at each report until our side takes the step, and ui_requests and
+        tasks grow with the fleet's history (only an agent's removal deletes its messages): a read that scanned either
+        table grew slower each day (the second reader of 26 November 2026)."""
+        for step in ("message", "job"):
+            plan = " ".join(r["detail"] for r in hub.q("EXPLAIN QUERY PLAN " + hub.FIRST_STEPS[step]))
+            self.assertIn("USING", plan, (step, plan))
+            self.assertNotRegex(plan, r"SCAN (ui_requests|tasks)\b(?! USING)", (step, plan))
+
+    def test_an_owner_who_turns_reports_off_during_a_refused_funnel_gets_no_second(self):
+        """The switch is read again before the report goes again without the funnel, as for the health block: an owner
+        who turned error reports off while the first send waited for our side must not get a report after his no (the
+        validator's S2)."""
+        self.steps(hub.now() - 86400)
+        self.switch(True)
+        sends = []
+
+        def site(url, body, timeout=None):
+            sends.append(body)
+            with hub.LOCK:
+                hub.set_error_reports(False)
+            raise errorreports.ReportError("founderizer.com answered 400", retry_after=errorreports.DAY, status=400)
+
+        with unittest.mock.patch.object(errorreports, "send", site), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(hub.now())
+        self.assertEqual([("funnel" in body) for body in sends], [True])
+
+    def test_a_refused_funnel_goes_again_at_once_without_it_and_a_day_later(self):
+        """Our side answers 400 to a report with the funnel (it does not take it yet, or a deploy of it went back): the
+        same report goes again at once without the funnel, the funnel waits a day from the stamp, and its steps wait.
+        A hub that took the health block out first would lose the health for a day for the funnel's fault, one that
+        marked the steps as gone would never send them, and one that sent the funnel at the next report would be
+        refused again."""
+        self.steps(hub.now() - 86400)
+        self.switch(True)
+        sends = []
+
+        def site(url, body, timeout=None):
+            sends.append(body)
+            if "funnel" in body:
+                raise errorreports.ReportError("founderizer.com answered 400", retry_after=errorreports.DAY, status=400)
+
+        t0 = hub.now()
+        with unittest.mock.patch.object(errorreports, "send", site), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(t0)
+            self.assertEqual(len(sends), 2)
+            self.assertEqual(sends[1], {k: v for k, v in sends[0].items() if k != "funnel"})
+            self.assertEqual((hub.kv_time("error_reports_sent"), hub.kv_time("error_reports_hold"),
+                              hub.kv_time("error_reports_funnel_hold"), hub.kv_get("error_reports_funnel")),
+                             (t0, None, t0 + errorreports.DAY, None))
+            with hub.LOCK:
+                hub.error_report_early("a test")
+            self.sweep(t0 + 60)                 # the next report, early, goes without the funnel
+            self.assertEqual((len(sends), "funnel" in sends[2]), (3, False))
+        with hub.LOCK:
+            hub.kv_set("error_reports_funnel_hold", repr(hub.now() - 1))
+        self.sweep(t0 + 60 + errorreports.DAY)      # the next day's report: the funnel goes again, each step that waited
+        self.assertEqual(set(self.funnels()[0]), set(errorreports.FUNNEL_STEPS))
 
 
 class StartAndStop(unittest.TestCase):

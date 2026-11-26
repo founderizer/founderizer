@@ -15,6 +15,8 @@ To report a security problem, read [SECURITY.md](SECURITY.md).
 
 - **Secret**: a login or an API key. A login has an address, a user name, a password and, if the site uses one, an
   authenticator seed. An API key is the same item with no user name (`vault.py`).
+- **Made key**: an API key that the central vault makes itself (`vault.py` `make`), for a route that an agent of the
+  fleet built for other agents. No person types it. The route's checker gets the key's hash.
 - **Hub**: the program on the fleet's server that keeps the agents, their tasks and their records (`hub.py`).
 - **Central vault**: the program on the hub's server that keeps every secret that the owner adds (`vault.py` with
   `"central": true`).
@@ -39,6 +41,8 @@ The vault protects the value of each secret. The design gives these results:
   sessions too (see "The key swap").
 - **The hub does not have the value of a secret that the owner adds.** It carries sealed copies that it cannot open,
   and it keeps only fingerprints of each value (`hub.py`).
+- **The hub does not have the value of a made key.** The central vault answers with the key's hash and fingerprints,
+  which open nothing, and never with the value (`vault.py` `make`).
 - **A hub that is broken into cannot get every secret with one call.** The central vault seals a value only to a
   machine key that the owner signed. It seals it only for a grant that the owner signed, or for a value that the owner
   put into the pool (`vault.py`).
@@ -156,6 +160,19 @@ The vault protects the value of each secret. The design gives these results:
 - It confirms a sign-in, a handover, a probe and a request of a broker only once. For each of these except a probe, it
   first checks again that the task belongs to the agent, that the task is open, and that the agent still holds the
   login. It gives a delivery, a withdrawal and a new login again while they wait (`hub.py`).
+- **A made key goes only to a vault that keeps it out of sessions.** The hub plans the copy of a made key only for a
+  machine whose helper reports that its vault says `made_keys: true`. For each other machine, it plans only a reference
+  that its last read of the central vault's status names as a value that the central vault holds and did not make
+  (`stored` less `made`), so a key that was made after that read goes there in no case. The delivery of each other
+  reference has the mark `central:made:` in its request id, and the hub gives that copy only to a request in which the
+  vault itself says `made_keys: true`: a process of the agent can forge its helper's report, but not the request of a
+  vault program from before the rule. The hub's request of each seal for such a vault says `made_keys: true`, the word
+  without which the central vault seals no made key. A made key that a machine of the other kind holds from before
+  (its vault was put back to an older program) goes back with a withdrawal, when that vault gives copies back and the
+  central vault's status names the key as made; a status that cannot say (none, or one whose lists do not read) takes
+  nothing away. A process of the agent can stop the withdrawal with a forged report, but an older program finds no
+  key in the stored form all the same (`hub.py` `central_plan`, `central_named`, `central_deliver`,
+  `central_reconcile`, `helper_deposit`; limit 35).
 
 ### In the central vault
 
@@ -168,19 +185,54 @@ The vault protects the value of each secret. The design gives these results:
 - It opens a sealed copy from the owner with its own age key, which only its user can read (`vault.py`,
   `hubsetup.py`). It keeps the value only when its own fingerprints of the value are among the fingerprints that the
   hub gives as the owner's (`vault.py`).
-- It refuses another value under a reference that it holds. The one exception is a copy that comes with the owner's
-  `replace` statement: the statement names the reference and the SHA-256 of that sealed copy, so the hub cannot put
-  a copy of its own under it. The central vault keeps the newest statement of each reference and refuses an older
-  one, so an earlier copy cannot come back. It writes the record of the statement first and then the store, which
-  is one file that takes the place of the old one whole. A replace that stops between the two leaves the old value
-  whole, and the same statement again ends it (`vault.py`).
+- It refuses another value under a reference that it holds. There are two exceptions. The first is a copy that comes
+  with the owner's `replace` statement: the statement names the reference and the SHA-256 of that sealed copy, so the
+  hub cannot put a copy of its own under it. The central vault keeps the newest statement of each reference and refuses
+  an older one, so an earlier copy cannot come back. It writes the record of the statement first and then the store,
+  which is one file that takes the place of the old one whole. A replace that stops between the two leaves the old value
+  whole, and the same statement again ends it (`vault.py`). The second is a new value of a key that the vault made
+  itself (`make` with `replaces`, below), which comes from no copy. A restore of an older backup of the store brings
+  back the value of that time, of a key of the owner's and of a made key alike (limit 22).
 - A replace changes the key and not the address of its service. When the stored value has an address and the new
   value names none, the central vault keeps the address and the user name of the stored value, so a vault can still
   send the key for an agent that uses it. An address in the new value takes the place of the old one (`vault.py`).
 - It seals a copy of a value for a machine only when the owner signed a pin of that machine's key, and also signed a
   grant of the value to an agent on that machine, or put the value into the pool. It seals a value of the pool to
   each machine whose key the owner pinned (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
-- It removes a value only while no grant and no pool entry that the owner signed names it (`vault.py`).
+- It removes a value only while no grant and no pool entry that the owner signed names it (`vault.py`). It removes a
+  made key only after a signed `unpool` of it, also when no pool entry named the key; the owner's Mac signs that
+  `unpool` with no step of the owner's when the hub lists the key as due out of the pool (limit 34). A reference whose
+  value it removed takes no value and no made key again.
+- **It makes a key** (`make`) when the hub asks, and it needs no statement of the owner's for that. The hub gives a new
+  reference, the site of the route, the salts of the fingerprints and a request id. The site is an `https` origin with a
+  DNS name. The vault refuses a reference that it holds or that it removed, and one about which it has a statement of
+  the owner's. The key is 32 random bytes as base64url text of 43 characters. It is an item of the store with the note
+  `made`, with the site as its address and with no user name. The answer has the reference, the key's hash in the form
+  `{SHA}` (the base64 of the SHA-1 of the key, as nginx reads it) and the fingerprints, and never the value. No log line
+  has the value.
+- One request id gives one answer. The same request again gives the same reference, hash and fingerprints, and the vault
+  makes nothing. The record of each request is inside the item, so one write of the store saves the value and its
+  record together, and a backup has both.
+- **A new value of a made key** (`make` with `replaces`) comes under the same reference and keeps the site. The vault
+  makes it only for an item with the note `made`, so nothing types over a value of the owner's. The value before it is
+  in the store no more, and it cannot come back: an intake never writes to the reference of a made key, with or without
+  a `replace` statement, and an earlier request makes nothing again.
+- **The mark.** A sealed copy of a made key is `{"made": {"password": ..., "url": ...}}`: the key is inside the member
+  `made`, and nothing is beside it. The member `made` is the mark: it says that the fleet made the key. It comes from
+  the item's note, which only `make` writes, so the hub can neither put it on a copy nor take it off. A sealed copy of
+  each other item is the value as it was, with no mark: an intake keeps only the members of a login or a key, and
+  drops each other one. A vault program from before this form finds no password in the copy and refuses it: an older
+  `vault.py` reads a password beside an address (`check_value`, `check_login`), and so does Fleet Vault on a Mac
+  (`Sources/FleetVaultCore/VaultProtocol.swift` `VaultDeposit.value`, `VaultSecret`).
+- It seals a made key only for a request in which the hub says `made_keys: true`: the hub's word that the vault which
+  takes the copy keeps a made key out of each session and check. A hub from before that word never says it, and the
+  hub says it for no request of the door, so neither gets a copy of a made key. It seals no made key for the door, also
+  with the word, so a hub that is broken into cannot bring one there either (`vault.py` `seal`).
+- Its store keeps a made key in the same form as the copy, `{"made": {"password": ..., "url": ...}, "requests": [...]}`.
+  A central vault that is put back to an older program finds no password at the top of such an item: the program of
+  the first made keys seals nothing, and the program from before `make` seals the item as it is, a copy in which no
+  older broker and no Fleet Vault finds a key (`vault.py` `made_key`, `make`).
+- Its status names each made key, with the hash of its value now and the request that made that value (`vault.py`).
 - It keeps one key for the hub: the key that seals the hub's Google file, with each account's Google refresh token.
   It makes the key at the hub's first request, as 32 random bytes in `hub-google.key` of its state folder, mode 600,
   and never replaces it. It gives the key to the hub's OS user alone, and each request is a line of its log. The key
@@ -208,6 +260,17 @@ The vault protects the value of each secret. The design gives these results:
   helper's request cannot say this. The store is one file that takes the place of the old one whole, so a replace
   that fails leaves the old value whole (`vault.py`, `hub.py`).
 - The broker gives a delivered value back when no agent of its machine holds it any more (`vault.py`).
+- **A made key.** The broker keeps a delivered copy of a made key in its store in the copy's own form,
+  `{"made": {"password": ..., "url": ...}}`, so a broker that is put back to an older program finds no key in it.
+  Only the copy's own text gives that form, never the hub's answer beside it, and the broker refuses a copy whose
+  member `made` has another form (`vault.py` `made_login`, `deposit`). The broker gives a made key to no session and
+  no check as a value. On a server that swaps keys, it gives a placeholder, and only when the site that the hub names
+  is the address in the key's own value; else it leaves the key out, and its answer names the variable in `made`
+  (`vault.py` `read`). The swap proxy gets the value only for a request to that address, also when a delivery put the
+  made key under the reference of a placeholder of another site (`swap_value`). The broker hands no made key over to
+  another agent, and types none into a page (`handover`, `signin`). `call_api` sends it to its own address, as each
+  key (`send`). The broker's status says `made_keys: true`, and each of its requests for a delivered copy says the
+  same word to the hub (`vault.py` `deposit`).
 
 ### In Fleet Vault on a Mac
 
@@ -252,10 +315,20 @@ The vault protects the value of each secret. The design gives these results:
   place of a delivered one only when the hub's answer for the delivery says that the owner replaced the value
   (`Sources/FleetVaultCore/VaultBroker.swift`, `Sources/FleetVaultCore/VaultLocalStore.swift`,
   `Sources/FleetVaultCore/VaultProtocol.swift`).
+- It does not say `made_keys` yet, so the hub gives it no made key (`hub.py`). A copy of a made key that it got all the
+  same holds no password at the place where it reads one, so it refuses the copy
+  (`Sources/FleetVaultCore/VaultProtocol.swift` `VaultDeposit.value`).
 
 ### In the door
 
-- The central vault seals each secret that the owner signed for the door to the door's pinned key (`hub.py`).
+- The central vault seals each secret that the owner signed for the door to the door's pinned key (`hub.py`). The hub
+  asks for no copy of a made key for the door, and of no reference that the central vault's last status does not name
+  as another value, and the list of what the door keeps names no key that the status names as made (`hub.py`
+  `door_reconcile`, `door_sealed`). The door writes each value that it holds into an app's setting on a host, and it
+  takes a copy that has no password at its top as one whole key, but it refuses a copy that holds a `made` member: it
+  writes no value of it and confirms no such copy (`door.py` `item_secret`, since 26 November 2026). So three walls
+  keep a made key from the door: the hub's two filters, the central vault, which seals no made key for the door, also
+  with the word (`vault.py` `seal`; the hub's request for the door says no `made_keys`), and the door's own refusal.
 - The door opens the copy and keeps the value in a file of mode 600 of its own OS user, `door`. The hub keeps an
   SHA-256 of the value, with no salt (`door.py`, `hub.py`).
 - For a Cloudflare account, the owner can save a key that only makes tokens. The door uses that key only to ask
@@ -283,6 +356,11 @@ The vault protects the value of each secret. The design gives these results:
 - The central vault and each broker keep their secrets in one file that age locks. The file holds
   `{"v": 1, "items": {...}}` in ASCII armor, encrypted to the public half of the store key with X25519 and
   ChaCha20-Poly1305 (`vault.py`, `Sources/FleetVaultCore/VaultLocalStore.swift`).
+- Each item has a note that says where its value came from. In the central vault's store it is `taken from the owner`
+  or `made`. The value of a made key is `{"made": {"password": ..., "url": ...}, "requests": [...]}`: the key inside the
+  mark, and the record of its requests (the request id, the hash and the fingerprints of each value that the key had),
+  and no value from before. A restored store has the same notes, so a made
+  key stays a made key (`vault.py`).
 - A value goes to age on its standard input or on a pipe, never in an argument or in the environment. A locked store
   in which a value of 8 or more characters is still in clear text is not written (`vault.py`,
   `Sources/FleetVaultCore/VaultLocalStore.swift`).
@@ -466,6 +544,13 @@ The vault protects the value of each secret. The design gives these results:
   a site is not in the sessions (see "The key swap"). The variable holds a placeholder in each session of the
   agent, the owner chat included, and in the agent's checks, because each of them gets its keys by the same read
   (`fleet.py`). The swap proxy puts the key into requests to the key's site (`vault.py`).
+- **A made key, never as a value.** With "Reads it" of a made key, a session and a check of the agent get a
+  placeholder on a Linux server that swaps keys, when the hub names the key's own site there (see "Which key swaps"),
+  and nothing elsewhere: no variable and no value. With "Uses it", `call_api` sends the key to its site. No sign-in
+  and no handover takes a made key (`vault.py`; see "In a broker on a Linux server"). A Mac gets no made key. The
+  vault's answer names such a key in `made`, the helper reports it apart and reads no more for it, and the manager
+  gets its own words once, for a key that the central vault's status names as made: give "Uses it" in place of
+  "Reads it" where no placeholder works (`fleet.py`, `hub.py`).
 - **Never a login's password in a session.** The hub names only API keys with a read grant for a session (`hub.py`).
   The hub knows a key by its kind in the catalog, and nothing ties that kind to the value under its reference, so the
   broker checks the value itself. It gives a session no value that has a user name or an authenticator seed: not as
@@ -802,6 +887,8 @@ host.
    **A key that swaps is not in the sessions, with these limits:**
    - The agent can use the key for each thing that the key can do at its site, also to make a second key there if
      the service has such a call.
+   - A site that sends the request's headers back in its answer (as some test and echo services do) shows the key to
+     the session: the proxy reads no byte of an answer (`vault.py`).
    - A grant that ended still puts the key into requests for up to 60 seconds after the hub's last yes to a use of
      its placeholder, counted from the question of that yes, while the hub does not answer the vault. An agent of
      the server can make the hub slow or silent for its vault, for example with requests that keep the hub busy or
@@ -1341,6 +1428,59 @@ host.
     a copy leaked: the app makes one key for each fleet and never a second (`OwnerAccessKeychain`), so the line stays a
     way in until it is taken out of root's `authorized_keys` on each server by hand. A copy from the owner tool
     `take_backup` holds no such key.
+
+34. **A made key and a hub that is broken into.** The central vault makes a key, and a new value of a made key, when the
+    hub asks, with no signature of the owner's (`vault.py` `make`). So a hub that is broken into can ask:
+    - for new keys, with no count. Such a key opens nothing until a route's checker has its hash. Each key and each new
+      value takes room in the store, which holds 4 MiB at most: a full store takes no new secret of the owner's either.
+    - for a new value of a made key. Its readers then have a value that the route's checker does not know, so the route
+      refuses them until its checker has the new hash. A value of the owner's is never touched.
+
+    It can also name a site of its own for a new key, and it can have a made key of the pool sealed to each machine
+    whose key the owner pinned, as each value of the pool (limit 9). It can also have a made key taken away: the removal
+    needs the owner's signed `unpool`, but the owner's Mac signs the `unpool` of each secret that the hub lists as due
+    out of the pool, with no step of the owner's (`Sources/Founderizer/GrantSigning.swift` `pools`), as an honest
+    removal needs it (the design's 4.5). The harm is a route whose readers fail until a new key is made, as a new value
+    already causes. It can also fill the store with made keys or new values (about 8,400 keys, or 17,600 new values of
+    one key, reach its 4 MiB), and no code of an honest hub takes them out afterwards; each key keeps the records of its
+    newest 16 requests only. Today only root on the central vault's server repairs a full store; the hub that asks for
+    made keys (a later piece) owes an `unpool` of each made key that its catalog lacks, so that the owner's app signs it
+    and the vault removes the key.
+
+    A machine that took a copy of a made key keeps the old value until it takes a copy of the new one, as after a
+    replace (limit 22). The route takes the old value until its checker has the old hash no more.
+
+    The broker of a Linux server reads the mark, and the hub delivers a made key only to a vault that says that it
+    keeps such a key out of sessions (limit 35). Fleet Vault on a Mac does not say it yet, so a Mac gets no made key.
+    No hub asks the central vault for a made key yet.
+
+35. **A made key on a machine.** The rule that a made key is never a value in a session or a check is in the vault
+    program of the machine (`vault.py` `read`, `swap_value`, `handover`, `signin`). The central vault seals a made key
+    only for a request with the hub's word `made_keys` (`vault.py` `seal`), and the hub says it only for a vault that
+    keeps the rule, never for the door (`hub.py` `central_plan`, `central_reconcile`, `helper_deposit`,
+    `door_reconcile`). A vault program from before the rule refuses a made key by itself: the key is inside the member
+    `made` of the copy and of the stored value, where no older program reads a key (`vault.py` `copy_text`,
+    `made_login`). Where it stops:
+    - Root on a machine reads each made key that the hub delivered there, as each key there.
+    - A central vault that is put back to an older program: the program of the first made keys finds no password at
+      the top of a made item and seals nothing. The program from before `make` says no `makes` in its status, takes no
+      word, and seals a made item as its store holds it, with the key inside `made`: no vault program finds a key in
+      such a copy, and the door refuses it, because it holds a `made` member (`door.py` `item_secret`). Such a status
+      names no made key, so the hub (also one of this release) can have such a copy sealed for the door, for a key that
+      the owner pooled or gave the door, and the door's refusal is then the one wall. The hub's catalog can name a made key itself from the piece
+      that makes keys (`make_key`) on, and then keep it from the door also so.
+    - A hub that is broken into says the word for each machine whose key the owner pinned. A copy that it gets so for
+      an older vault program or for Fleet Vault on a Mac is refused there (the form above). The central vault seals no
+      made key for the door, also with the word.
+    - "Read only" is the route's own rule. `call_api` takes each path and the methods GET, POST, PUT, PATCH and DELETE,
+      and the swap proxy each method but TRACE, TRACK and CONNECT; the key opens what the route's checker lets through
+      at the key's site. So the piece that makes keys (`make_key`) gives each route a key of its own (one hash in one
+      checker), its checker takes only reads, and no other program on that host takes the key.
+    - With "Uses it", `call_api` sends the key to its own site. A site that sends the key back in another form than
+      the key itself (for example as base64 of the bare key) shows it in the answer to the agent. With "Reads it", the
+      swap proxy reads no byte of an answer, so a site that sends the request's header back shows the key to the session
+      (limit 1). The core's checker of a route clears the header with the key before the request goes on, and sends
+      nothing of it back.
 
 ## What the owner must do
 

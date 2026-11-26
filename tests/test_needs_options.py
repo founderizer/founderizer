@@ -985,3 +985,83 @@ class Talk(NeedsCase):
                                                          "I agree with option 1.")
         self.assertEqual(self.item(3)["details"].count("branding"), 1)
         self.assertNotIn("in its own words", self.item(3)["details"])
+        # the asker's codes (RULES.md, "People read words, not codes"; on 25 November 2026, 42 of 85 question cards of a
+        # fleet quoted them): a code that the question can mean is words, and every other code stays as it is written
+        t0, first = hub.now(), hub.q1("SELECT question FROM needs WHERE id=1")["question"]
+        for goal, title in ((5, "Grow the shop"), (20, "Another goal")):
+            hub.q("INSERT INTO goals(id, title, text, state, revision, limits, created, updated, request_id) "
+                  "VALUES(?,?,'The long words of the goal','active',1,'{}',?,?,?)", (goal, title, t0, t0, f"g{goal}"))
+        hub.q("UPDATE tasks SET goal_id=5 WHERE id=?", (task,))
+        later = hub.ins("INSERT INTO tasks(title, owner, requester, state, created, follows) VALUES(?,?,?,?,?,?)",
+                        ("Fix the *weekly* report", "dev", "manager", "working", t0, task))
+        narrowed = hub.ins("INSERT INTO tasks(title, owner, requester, state, created, follows, scope_person) "
+                           "VALUES(?,?,?,?,?,?,?)",
+                           ("Refund a person's order", "dev", "manager", "working", t0, task, 7))
+        hub.q("INSERT INTO tasks(id, title, owner, requester, state, created) VALUES(800,'Other work','ops','manager',"
+              "'working',?)", (t0,))
+        hub.q("INSERT INTO needs(id, title, why, todo, raised, by) VALUES(340,'Road works','W','P',?,'manager')", (t0,))
+        duty = hub.ins("INSERT INTO responsibilities(agent, text, state, revision, created, updated, created_by, "
+                       "request_id) VALUES('dev','Answer the late invoices. Then more words.','active',1,?,?,"
+                       "'manager','d1')", (t0, t0))
+        hub.q("INSERT INTO duty_cases(id, responsibility, key, title, source, state, opened, by) "
+              "VALUES(3,?,'k','Late invoice of a shop','check','open',?,'dev')", (duty, t0))
+        for item, agent in ((7, "dev"), (95, "ops")):
+            hub.q("INSERT INTO standing(id, agent, scope, kind, words, author_kind, author, created) "
+                  "VALUES(?,?,'all','instruction',?,'owner','owner',?)",
+                  (item, agent, "Each grant is a card\nfor the owner", t0))
+        for event, recipient in ((40102, "dev"), (30, "manager")):
+            hub.q("INSERT INTO ui_requests(request_id, kind, text, event_id, created, client, recipient) "
+                  "VALUES(?,'message','Use the cheaper plan',?,?,'mac',?)", (f"m{event}", event, t0, recipient))
+        hub.q("INSERT INTO agent_messages(id, sender, recipient, text, created, request_id) "
+              "VALUES(14,'dev','manager','x',?,'a14')", (t0,))
+        hub.q("INSERT INTO prompts(id, task, agent, tool, input, key, created) VALUES(9,?,'dev','Bash','x','k',?)",
+              (task, t0))
+        hub.q("INSERT INTO reports(id, from_agent, to_agent, kind, text, severity, delivered, created, request_id) "
+              "VALUES(3,'dev','manager','risk','x','low','yes',?,'u3')", (t0,))
+        hub.q("INSERT INTO owner_reports(id, text, about, created, agent) VALUES(4,'x','',?,'dev')", (t0,))
+        private, long = (hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
+                                 (on, "dev", "manager", words, t0))
+                         for on, words in ((narrowed, "Refund it?"),
+                                           (task, "Which export do I keep for the shop, the old one or the new one?\n"
+                                                  "The new one is faster and cheaper.")))
+
+        def quoted(text, **extra):
+            """The details of the card of a new question of dev's with these words, and the question's row."""
+            qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
+                          (task, "dev", "manager", text, hub.now()))
+            self.raise_item(question_id=f"Q-{qid}", **extra)
+            return (self.item(hub.q1("SELECT MAX(id) n FROM needs")["n"])["details"],
+                    hub.q1("SELECT text FROM questions WHERE id=?", (qid,))["text"])
+
+        # bugs (the validation of 26 November 2026, M1, S2 and S3): the hub names a row that the question cannot mean,
+        # as words that look like codes (a road, a model, a tax id) or a task, a card, a goal, a standing item or an
+        # owner's message of other work; "C-3PO" loses its start; a code in a web address, an email address, code or
+        # a code block changes; a bare C-<n> names a case (a conversation counts from 1 too); or the manager, which
+        # reads the card too, reads the words of a narrowed pair's task or question
+        kept = (f"Is the T-800 figure right? Carretera N-340, km 12. The G-20 summit, off the M-30; can I take I-95? "
+                f"Tax id G-28123456, case C-3, C-3PO, version T-{later}.5. See https://shop.example.com/edit?task="
+                f"T-{later}, `T-{later}`, `outputs/T-{later}/report.md`, T-{later}@example.com, "
+                f"outputs/T-{later}/plan.md, outputs/T-{later}, T-{narrowed} and Q-{private}.\n- T-99: failed\n"
+                f"Step:\n```\ncat T-{later}\n```")
+        self.assertEqual(quoted(kept)[0], f"Dev's question, in its own words:\n\"{kept}\"")
+        # bugs: a code stays where the question means a thing of its own work; a thing has another thing's words (a
+        # goal its long words, not its title); a name keeps its line break or a Markdown mark, or is longer than 70
+        # characters; a question's words read as a statement with no "the question" before them; a code of a kind
+        # with no name leaves a hole, or a kind word comes after the noun that says it ("the report a report")
+        asked = (f"Can I merge T-{task} after T-{later}? Q-{first} and Q-{long} asked it, N-1 waits, and N-340 is "
+                 f"another card. It is for G-5 and R-{duty}/C-3 of R-{duty}, per I-7 and M-40102 (AM-14, P-9, UP-3, "
+                 f"OR-4), and the report UP-3 is old.")
+        details, row = quoted(asked)
+        self.assertEqual(details, "Dev's question, in its own words: \"Can I merge “Survey” after “Fix the weekly "
+                                  "report”? The question “I need read on the repository.” and the question “Which "
+                                  "export do I keep for the shop, the old one or the new one? Th...” asked it, “Which "
+                                  "name?” waits, and N-340 is another card. It is for “Grow the shop” and “Late "
+                                  "invoice of a shop” of “Answer the late invoices”, per “Each grant is a card for the "
+                                  "owner” "
+                                  "and “Use the cheaper plan” (an agent's message, a permission request, a report, a "
+                                  "message to you), and the report is old.\"")
+        # bug: the asker's own row loses its codes, which the agents and the tools read
+        self.assertEqual(row, asked)
+        # bug: details that quote the question with the hub's words get a second copy of it (the validation, S4)
+        self.assertEqual(quoted(f"Is T-{later} done?", details="Dev asks: is “Fix the weekly report” done?")[0],
+                         "Dev asks: is “Fix the weekly report” done?")

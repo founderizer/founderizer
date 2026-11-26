@@ -126,6 +126,26 @@ class Chain(OwnerAPI):
         self.pass_up("top", qid, self.t1)
         return qid
 
+    OWNER_KEEPS = "The brand colour stays mine to choose."
+    DEFAULT = "Keep the old colour until the owner decides"
+
+    def default_card(self, asker="top", task=None):
+        """An agent of the manager (top, on its task) asks the manager with a default that only waits for the owner's
+        decision, and the manager takes it to the owner as a decision that the owner's own words keep (24 November
+        2026: the hub refused such a card, and the manager sent the decision with its options to the owner chat, with
+        no card and no buttons)."""
+        qid = self.ask(asker, task or self.t1, default=self.DEFAULT)
+        need, said = self.decided(qid, asker)
+        return qid, need, said
+
+    def decided(self, qid, asker="top"):
+        """The manager's card for question Q-<qid> with a default: a decision that the owner's own words keep, whose
+        details name the default."""
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('manager','team',"
+              "'instruction',?,'owner','owner',?)", (self.OWNER_KEEPS, hub.now()))
+        return self.raised(qid, reason="decision", owner_words=self.OWNER_KEEPS,
+                           details=f"Until you answer, {asker} goes on with: {self.DEFAULT}.")
+
 
 class PassUp(Chain):
     def test_a_lead_passes_a_question_up_and_it_moves_one_level(self):
@@ -241,6 +261,7 @@ class Needs(Chain):
         self.assertEqual(need["details"], 'W\'s question, in its own words: "Blue or green?"')
         self.assertNotIn("Quoting", need["why"])
         self.assertIn(f"the owner's answer goes to w as the answer of Q-{qid} by itself", said)
+        self.assertNotIn("goes on with", said)     # bug: the line of a default on the card of a question with none
         # /ui/state carries the link, and the task that waits for the answer (owner API 1.280: an app draws that
         # task's own mark on the answered card; with no id, or the manager's task, the card shows the wrong work)
         item = self.item(need["id"])
@@ -254,6 +275,41 @@ class Needs(Chain):
         self.assertIn(f"Q-{qid} on T-{self.t3}, answered by the owner: Green, always.", self.said("w", self.t3)[-1])
         manager = hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
         self.assertIn(f"The hub gave it to w as the answer to Q-{qid}: do not pass it on again.", manager)
+        # a question with a default that only waits for the owner becomes a card when the owner's own words keep the
+        # decision, and the owner's answer replaces the default (bug: need_question refused each question with a
+        # default, whatever the card's reason, so the owner got the decision as a chat message with no buttons)
+        qid, need, said = self.default_card()
+        self.assertEqual(need["question"], qid)
+        # bug: the hub writes a line of its own on the owner's card, which the owner never said yes to (AGENTS.md,
+        # "The owner's screen"): the manager's details name the default
+        self.assertEqual(need["details"], f"Until you answer, top goes on with: {self.DEFAULT}.\n\n"
+                                          'Top\'s question, in its own words: "Blue or green?"')
+        # bugs: the asker's running session hears nothing, and a default that sends runs before the owner's no (the
+        # validation of 25 November 2026, R2-S1); or a session that waits on another question reads "go on" (R3-S3)
+        self.assertEqual(self.said("top", self.t1)[-1],
+                         f"[hub] Your question Q-{qid} is on the owner's card now, and their answer comes to this "
+                         f"session. Until then your default holds: \"{self.DEFAULT}\". Never a default for access, "
+                         f"money or anything that leaves the building: if it sends, posts, pays or acts outside the "
+                         f"fleet, do none of it until the owner's answer comes.")
+        # bugs: the manager reads no word that the default holds; reads that the card closes at the end of the task
+        # (the validation, M1); or is told to answer the question with what was done, which closes the card that waits
+        # for the owner's decision (round 3, the area reader's should 1)
+        nid, ref = need["id"], f"T-{self.t1}"
+        self.assertEqual(said, f"Raised N-{nid}. The owner's answer will arrive as a message in this session. It is "
+                               f"for Q-{qid}: while {ref} runs, the owner's answer goes to top as the answer of "
+                               f"Q-{qid} by itself, and the hub told top that its default waits for that answer "
+                               f"when it sends, posts, pays or acts outside the fleet. If {ref} ends first, N-{nid} "
+                               f"stays open, and the owner's answer comes to you with the question and the default. "
+                               f"The decision is the owner's: do not answer Q-{qid} yourself, also when the work is "
+                               f"done, because an answer closes N-{nid}, unless the owner decided it another way: "
+                               f"then answer Q-{qid} with their decision.")
+        code, receipt = self.request(f"/ui/needs/{need['id']}", self.command(answer="Green, always."))
+        self.assertEqual(code, 200, receipt)
+        row = self.question(qid)
+        self.assertEqual((row["answer"], row["answered_by"]), ("Green, always.", "owner"))
+        told = self.said("top", self.t1)[-1]
+        self.assertIn(f"Q-{qid} on T-{self.t1}, answered by the owner: Green, always.", told)
+        self.assertIn(f"You went on with: {self.DEFAULT} If this answer says otherwise", told)
 
     def test_a_press_of_an_option_answers_the_question_too(self):
         qid = self.up_to_manager()
@@ -334,6 +390,13 @@ class Needs(Chain):
         code, _ = self.request(f"/ui/needs/{need['id']}", self.command(answer="Green."))
         self.assertEqual(code, 409)
         self.assertEqual(self.question(qid)["answer"], "Blue.")
+        # the card of a question with a default closes the same way (bug: a close that reads only the questions that
+        # block, as most reads of open questions in the hub do, leaves it on the owner's phone)
+        qid, need, _ = self.default_card()
+        self.ok("manager", "answer", {"question_id": f"Q-{qid}", "text": "Blue."})
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
+        self.assertEqual((row["answered_by"], row["answer"]),
+                         ("Fleet", f"Closed: {hub.shown_role('manager')} answered it, so it needs nothing from you."))
 
     def test_the_item_closes_when_the_task_ends(self):
         qid = self.up_to_manager()
@@ -343,6 +406,100 @@ class Needs(Chain):
         self.assertEqual(row["answered_by"], "Fleet")
         self.assertEqual(row["answer"], "Closed: the work that asked it ended before an answer came, so nothing waits "
                                         "for it.")
+
+    def test_the_card_of_a_question_with_a_default_outlives_its_task(self):
+        """The owner's decision outlives the work that asked it (owner API 1.341; the validation of 25 November 2026,
+        M1 and round 2): a question with a default does not pause its task, so its asker most often delivers before
+        the owner answers. Its card stays open when the task ends, and also when it ended before the raise; the owner's
+        later answer goes to the agent that raised the card, with the question and the default, for the follow-up work,
+        and to no session of the asker. A restart keeps the question open for the new session, which gets the answer.
+        The raiser can withdraw the card when the owner decided it another way, and the question stays."""
+        def card_open(nid):
+            return hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"] is None
+
+        def delivered(work):
+            self.ok("solo", "deliver_result", {"outcome": "completed", "what_was_done": "Kept the old colour.",
+                                               "where_output_is": f"outputs/T-{work}/note.md",
+                                               "how_checked": "Read it."}, work)
+
+        def answered(nid):
+            code, receipt = self.request(f"/ui/needs/{nid}", self.command(answer="Green, always."))
+            self.assertEqual(code, 200, receipt)
+            return hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+
+        def kept(qid, work, follow="give solo the follow-up work with it"):    # after the answer and its note on words
+            return (f" It was for Q-{qid} of solo, and T-{work} ended before this answer, so no session of solo reads "
+                    f"it. solo went on with its default: \"{self.DEFAULT}\". The question: \"Blue or green?\". When "
+                    f"this answer changes what solo did, {follow}.")
+        # a delivery (bug: end_waits closed the card, "nothing waits for it", and the decision reached nobody)
+        work = self.create("manager", "solo")
+        qid, need, _ = self.default_card("solo", work)
+        delivered(work)
+        self.assertTrue(card_open(need["id"]))
+        # the second look at the open cards says how it closes now (bug: it says "answer Q-<id>", which closes it with
+        # no word to the owner)
+        self.assertIn(f"the task that asked Q-{qid} ended: the owner's answer comes to you for the follow-up work, and "
+                      f"withdraw_need closes it when nothing needs it",
+                      hub.need_look_hints(hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))))
+        manager = answered(need["id"])
+        # bugs: the manager reads that solo has the answer, or reads no question, no default and no next step
+        self.assertTrue(manager.endswith(kept(qid, work)), manager)
+        self.assertNotIn("The hub gave it to", manager)
+        # the question keeps the owner's decision as its record, and no ended session of solo gets it
+        self.assertEqual((self.question(qid)["answer"], self.question(qid)["answered_by"]), ("Green, always.", "owner"))
+        self.assertFalse([s for s in self.said("solo") if "Green, always." in s])
+        # a restart keeps the question and its card open, and the new session gets the answer (bugs: restart_continue
+        # closed the card; or it ended the question, told the new session to ask again, and a second card rang)
+        work = self.create("manager", "solo")
+        qid, need, _ = self.default_card("solo", work)
+        self.ok("manager", "restart_task", {"task_id": f"T-{work}", "request_id": str(uuid.uuid4()),
+                                            "expected_attempt": 1, "reason": "a fresh session"})
+        with hub.LOCK:          # the helper's report of the stop (test_blocked_access.stop_confirmed)
+            hold = hub.q1("SELECT * FROM holds WHERE task=? ORDER BY id DESC LIMIT 1", (work,))
+            hub.settle_hold(hold, True, "interrupted and closed")
+            hub.restart_continue(hold["id"])
+        self.assertTrue(card_open(need["id"]))
+        self.assertIsNone(self.question(qid)["answer"])
+        start = hub.q1("SELECT text FROM events WHERE agent='solo' AND kind='task' ORDER BY id DESC LIMIT 1")["text"]
+        # bug: the new session never read the raise's notice, so it lacks the default and rule 4's hold (R3-S2)
+        self.assertIn(f"Your question Q-{qid} stays on the owner's card: do not ask again. The owner's answer comes to "
+                      f"this session. Until then the earlier session's default holds: \"{self.DEFAULT}\". Never a "
+                      f"default for access, money or anything that leaves the building: if it sends, posts, pays or "
+                      f"acts outside the fleet, do none of it until the owner's answer comes.", start)
+        self.assertNotIn("ask again if you still need an answer", start)
+        self.assertIn(f"The hub gave it to solo as the answer to Q-{qid}", answered(need["id"]))
+        self.assertIn(f"Q-{qid} on T-{work}, answered by the owner: Green, always.", self.said("solo", work)[-1])
+        # the second look while the task runs (bug: "when the work has settled it, answer Q-<id>", which closes the
+        # card that waits for the owner's decision: round 3, the area reader's should 1)
+        work = self.create("manager", "solo")
+        qid, need, _ = self.default_card("solo", work)
+        hints = hub.need_look_hints(hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],)))
+        self.assertIn(f"it takes Q-{qid}, a question with a default, to the owner: the decision is theirs, so do not "
+                      f"answer Q-{qid} yourself, also when the work is done, unless the owner decided it another way, "
+                      f"and the card stays open when that work ends", hints)
+        self.assertFalse([h for h in hints if "when the work has settled it" in h])
+        # its raiser withdraws it when the owner decided it another way, also while the task runs, and the question
+        # stays for the owner's decision to reach the asker (bug: withdraw_need refused it with "answer it instead",
+        # which the raise result forbids, so only the owner's press closed it: round 4)
+        said = self.ok("manager", "withdraw_need", {"need": f"N-{need['id']}",
+                                                    "why": "The owner chose green in their chat."})
+        self.assertIn(f"Q-{qid} of solo stays open: when the owner decided it, answer Q-{qid} with their decision, so "
+                      f"that solo reads it.", said)
+        self.assertEqual(hub.q1("SELECT answered_by FROM needs WHERE id=?", (need["id"],))["answered_by"], "manager")
+        self.assertIsNone(self.question(qid)["answer"])
+        # a raise after the task ended (bug: "nothing waits for Q-<id> any more", and the decision reached nobody),
+        # and an answer after the asker left the team (bug: the words give the work to an agent that is gone)
+        work = self.create("manager", "solo")
+        qid = self.ask("solo", work, default=self.DEFAULT)
+        delivered(work)
+        need, said = self.decided(qid, "solo")
+        self.assertTrue(said.endswith(f" It is for Q-{qid}, and T-{work} has ended: the owner's answer comes to you "
+                                      f"with the question and the default, for the follow-up work. N-{need['id']} "
+                                      f"closes by itself when Q-{qid} is answered another way."), said)
+        self.assertFalse([s for s in self.said("solo") if f"Your question Q-{qid} is on the owner's card" in s])
+        hub.TEAM["agents"].pop("solo")
+        self.assertTrue(answered(need["id"]).endswith(kept(qid, work, "give the follow-up work to the agent that does "
+                                                                      "that work now: solo is no longer on the team")))
 
     def test_the_item_closes_when_a_restart_ends_the_question(self):
         qid = self.up_to_manager()
@@ -369,6 +526,60 @@ class Needs(Chain):
         self.assertIn("already takes", self.refused("manager", "raise_needs_you", {
             "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{qid}", "reason": "person"}))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
+        # a question with a default goes to the owner only as a decision that the owner's own words keep (bug: a card
+        # of another reason takes it, and a default that the owner never decided rings their phone; or the refusal
+        # names no route, and the manager sends the decision to the owner chat in place of the card)
+        dflt = self.ask("top", self.t1, default=self.DEFAULT)
+        for reason in ({"reason": "person"}, {"reason": "money"},
+                       {"reason": "access", "needs_access": "a deploy role in the cloud account"}):
+            with self.subTest(**reason):
+                said = self.refused("manager", "raise_needs_you", dict(
+                    {"title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{dflt}"}, **reason))
+                self.assertIn(f"Q-{dflt} blocks nobody: top goes on with \"{self.DEFAULT}\", so the owner is not "
+                              f"needed for it, unless the owner's own words keep this decision: then raise it with "
+                              f"reason decision and those words in owner_words; the default holds until they answer.",
+                              said)
+        # and a decision whose details do not name the default (bug: the card rings with no word of what goes on
+        # while the owner decides, and a second card to say it rings again: the validation, R2-M2)
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('manager','team',"
+              "'instruction',?,'owner','owner',?)", (self.OWNER_KEEPS, hub.now()))
+        said = self.refused("manager", "raise_needs_you", {
+            "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{dflt}", "reason": "decision",
+            "owner_words": self.OWNER_KEEPS, "details": "Top asks which colour."})
+        self.assertEqual(said, f"Not raised: details name what top goes on with until the owner answers, so that the "
+                               f"owner sees it while they decide. Add it to details in these words: "
+                               f"\"{self.DEFAULT}\"")
+        # the check reads whole words and the whole default (bugs: "No" passes in "now"; details that hold the first
+        # 160 characters of a default leave its end, a send, off the card: round 3, R3-S1)
+        long = "Keep the old colour on each page, " * 5 + "and meanwhile email each store its list today"
+        for default, details in (("No", "The owner decides now."), (long, long[:160])):
+            with self.subTest(default=default[:20]):
+                qid = self.ask("top", self.t1, default=default)
+                self.assertIn("Not raised: details name what top goes on with", self.refused(
+                    "manager", "raise_needs_you", {"title": "x", "why": "y", "what_to_do": "z",
+                                                   "question_id": f"Q-{qid}", "reason": "decision",
+                                                   "owner_words": self.OWNER_KEEPS, "details": details}))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
+        # a default with a code: the details say the code in plain words, as each word of a card does (bug: need_words
+        # refuses the code, the default's check wants it, and the card can never go up: round 3, R3-M1)
+        coded = self.ask("top", self.t1, default=f"Keep T-{self.t1} on the old colour until the owner decides")
+        card = {"title": "Which colour?", "why": "Only the owner chose the brand", "what_to_do": "Say blue or green",
+                "question_id": f"Q-{coded}", "reason": "decision", "owner_words": self.OWNER_KEEPS}
+        self.assertEqual(self.refused("manager", "raise_needs_you", dict(card, details="Top asks which colour.")),
+                         f"Not raised: details name what top goes on with until the owner answers, so that the owner "
+                         f"sees it while they decide. Add it to details in these words, with each code in plain "
+                         f"words: \"Keep <T-{self.t1} in plain words> on the old colour until the owner decides\"")
+        self.ok("manager", "raise_needs_you", dict(card, details="Until you answer, top goes on with: keep this work "
+                                                                 "on the old colour until the owner decides."))
+        # two codes with a mark between them ask for no mark in the details (bug: a word edge on the "/" refused plain
+        # words, also the refusal's own words filled in: round 4, R4-M1, the shape of the live Q-524)
+        for between in (" and ", "/", " / "):
+            with self.subTest(between=between):
+                linked = self.ask("top", self.t1, default=f"Keep both open, and I link I-133/I-134 to the new route "
+                                                          f"until the owner decides")
+                self.ok("manager", "raise_needs_you", dict(card, question_id=f"Q-{linked}", details=(
+                    f"Until you answer, top goes on with: keep both open, and I link the route item{between}the key "
+                    f"item to the new route until the owner decides.")))
 
     def item(self, nid):
         code, state = self.request()

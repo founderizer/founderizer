@@ -36,6 +36,11 @@ Since F5 piece 3 (22 November 2026, the owner's "Yes" to its privacy sentence) t
 hub's own warnings stand whose way out is ours ("Tell us", Report a problem): each as a code of CHECKS, never its
 words (hub.WARNING_CODES).
 
+**The funnel** (the SMB audit's Q8, the owner's "Go ahead" of 25 November 2026: "Five funnel counts under the
+existing usage switch"): the day of four first steps of the fleet, each once (funnel); the Mac's report carries the
+fifth, the first page of the setup. Only a day, made from a time, and never a word. It waits until our side takes it
+(FUNNEL). The design: ~/dev/founderizer-plans/smb-x100-audit-2026-11-25/q8-funnel-design.md.
+
 Python standard library only.
 """
 import hashlib
@@ -45,6 +50,7 @@ import os
 import platform
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,6 +135,16 @@ NO_ALARM = ("hold", "branch", "own_changes")
 # The hub's own server, read for the block's `machine` (machine_reading): its memory and swap, the kernel's count of
 # processes that it ended for lack of memory since the machine started, and the id of that start.
 MEMINFO, VMSTAT, BOOT_ID = "/proc/meminfo", "/proc/vmstat", "/proc/sys/kernel/random/boot_id"
+
+# The funnel's steps of a hub, in their order (the Mac's report has the one before them, "page"): its servers were
+# built (the owner's Mac claimed it), the owner's first message, the first task that ended completed, and the first
+# person other than the owner.
+FUNNEL_STEPS = ("built", "message", "job", "person")
+DAY_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")    # a UTC day as our side takes it: day_of
+# **Our side takes the block.** False until it does: founderizer-web refuses a report with a key that it does not know,
+# and counts each refusal. The website area's change goes live first, with the privacy page's sentences that the owner
+# saw, then this is True, in a commit of its own (the design note's "Dormant until our site takes it").
+FUNNEL = False
 
 
 class ReportError(Exception):
@@ -405,11 +421,35 @@ def kinds(body):
     return sorted(found)
 
 
-def report(fleet, version, system, code, agents, servers, view, since=0, health=None):
+def day_of(t):
+    """The UTC day of a time that a report may carry ("2026-11-26"), or None for any other value: a day, never a
+    second, and made from a number, never from a text."""
+    t = _time(t)
+    return None if t is None else time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def funnel(firsts, taken, t0):
+    """The report's `funnel` block: {step: day} for each step of FUNNEL_STEPS whose first time `firsts` gives
+    ({step: seconds}), that no report that our side took carried (a key of `taken`), and whose time is at most a DAY
+    ahead of `t0` (a step of a clock that ran ahead waits). A key that is not a step, and a time out of shape, are
+    left out. None when no step waits: the report then has no block."""
+    if not isinstance(firsts, dict):
+        return None
+    taken = taken if isinstance(taken, dict) else {}
+    block = {}
+    for step in FUNNEL_STEPS:
+        first = firsts.get(step)
+        day = day_of(first) if step not in taken and _time(first) is not None and first <= t0 + DAY else None
+        if day is not None:
+            block[step] = day
+    return block or None
+
+
+def report(fleet, version, system, code, agents, servers, view, since=0, health=None, funnel=None):
     """The day's report: the facts and the faults, stalls (as faults of STALL_CLASSES) and refused calls of `view`
     (diagnostics.view) whose last time is after `since`, at most MOST of each, and the oldest of them left out until
-    the report is LIMIT bytes or less; and `health`, the block that health() made, when there is one. None when a
-    required fact is out of shape: then nothing goes."""
+    the report is LIMIT bytes or less; `health`, the block that health() made, and `funnel`, the block that funnel()
+    made, when there is one. None when a required fact is out of shape: then nothing goes."""
     if not isinstance(fleet, str) or not FLEET.fullmatch(fleet) or not isinstance(version, str) \
             or not VERSION.fullmatch(version):
         return None
@@ -423,6 +463,8 @@ def report(fleet, version, system, code, agents, servers, view, since=0, health=
             body[key] = value
     if isinstance(health, dict):
         body["health"] = health
+    if isinstance(funnel, dict) and funnel:
+        body["funnel"] = funnel
     view = view if isinstance(view, dict) else {}
 
     def checked(key, check):

@@ -14,8 +14,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
+import threading
 import unittest
 from unittest.mock import patch
 import uuid
@@ -29,10 +31,14 @@ OTHER_STORE = "age1" + "q" * 58
 AKEY = "vps-store-agent-key-".ljust(43, "k")            # the agent key that the caller fields carry
 RID = "5c2f9a10-7d41-4c88-9b55-0e3a1f6c2d90"
 API_KEY = "sk-fake-only-store-20261017"
+ROUTE, OTHER_SITE = "route.example.com", "other.example.com"
+MADE_KEY = "made-only-in-this-test-" + "r" * 20          # a key that the central vault made, in this test only
+MADE_ITEM = {"made": {"password": MADE_KEY, "url": "https://" + ROUTE}}     # as a deposit keeps it (made_text)
 
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(StoreBroker(name) for name in StoreBroker.__dict__ if name.startswith("test_"))
+    suite.addTests(loader.loadTestsFromTestCase(MadeKeys))     # its own tests only (below the class)
     suite.addTests(loader.loadTestsFromTestCase(StoreSetup))
     return suite
 
@@ -197,6 +203,195 @@ class StoreBroker(VaultBroker):
         with self.assertRaises(fleet.Refused) as refused:
             fleet.vault_call({"op": "read"})
         self.assertIn("no credential access", str(refused.exception))
+
+
+class MadeKeys(StoreBroker):
+    """A key that the central vault made (piece 2a of the read routes) reaches a process of the agent never as its
+    value: a session and a check get a placeholder for the key's own site on a broker that swaps keys, and nothing on
+    one that does not; no handover and no sign-in takes it. call_api still sends it (test_vault_request). The store
+    holds the key as a deposit keeps it, in its own form {"made": {"password", "url"}}. A run that names this class
+    runs its own tests only (the names of the inherited ones are None below the class)."""
+    PART = {"user": "founderizer-swap", "vault": "fleet-vault", "port": 876, "openssl": "/usr/bin/openssl"}
+
+    def setUp(self):
+        super().setUp()
+        hub.TEAM["logins"] = {}
+        self.addCleanup(hub.TEAM.pop, "logins", None)
+        hub.TEAM["agents"]["vps"]["secrets"] = {}
+        self.addCleanup(hub.TEAM["agents"]["vps"].pop, "secrets", None)
+
+    # ---- helpers
+    def given(self, env, item, site=None):
+        """One more key in the store, in the catalog with this variable (and site), which vps reads. Its reference."""
+        ref = self.put(env, item, vault.DELIVERED)
+        hub.TEAM["logins"][ref] = dict({"title": env, "kind": "api_key", "env": env},
+                                       **({"site": site} if site else {}))
+        hub.TEAM["agents"]["vps"]["secrets"][ref] = "read"
+        return ref
+
+    def swapping(self):
+        """vps's broker, started again with the part "swap", as test_key_swap's BrokerPart starts it: the machine's
+        users are stand-ins, and this test's own user is the proxy's user and the agent's (fleet-vps)."""
+        self.stop_broker()
+        self.swap_sock = str(self.dir / "swap.sock")
+        part = dict(self.PART, uid=os.getuid(), vault_uid=os.getuid(), group="fleet-agents", broker=self.swap_sock)
+        real = vault.swap_user
+        for p in (patch.object(vault, "swap_part", lambda conf: dict(part)),
+                  patch.object(vault, "swap_user", lambda uid: "fleet-vps" if uid == os.getuid() else real(uid))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.conf = dict(self.conf, swap=dict(self.PART))
+        self.broker = vault.Broker(self.conf).open()
+        threading.Thread(target=self.broker.serve, daemon=True).start()
+        self.addCleanup(self.stop_broker, self.broker)
+
+    def swap(self, name, host):
+        """The swap proxy's question for the value of a placeholder, for a request to this host: the broker's answer."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(self.swap_sock)
+            s.sendall((json.dumps({"op": "swap", "uid": os.getuid(), "host": host, "port": 443, "name": name,
+                                   "form": "bearer"}) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        said = json.loads(data)
+        said.pop("program", None)
+        return said
+
+    # ---- the session's read
+    def test_a_broker_that_does_not_swap_gives_a_made_key_to_no_session_and_no_check(self):
+        """Bugs: read gives a made key as a variable, as each key on a broker that does not swap (or each key that the
+        hub names with no site); read takes the mark for none when the value has an address; the answer does not say
+        why the key is missing. A key without the mark, also one with an address, is given as before."""
+        self.given("ROUTE_KEY", MADE_ITEM, "https://" + ROUTE)
+        self.given("PLAIN_KEY", {"password": API_KEY, "url": "https://" + ROUTE, "username": ""}, "https://" + ROUTE)
+        for request in ({"op": "read"}, {"op": "read", "for": "session"}, {"op": "read", "for": "check"}):
+            with self.subTest(request):
+                raw = fleet.vault_call(request)
+                self.assertEqual(raw, {"ok": True, "v": 2, "env": {"PLAIN_KEY": API_KEY}, "missing": ["ROUTE_KEY"],
+                                       "made": ["ROUTE_KEY"]})
+
+    def test_a_broker_that_swaps_gives_a_made_key_as_a_placeholder_for_its_own_site_only(self):
+        """Bugs: read gives a made key a placeholder for each site that the hub names, so a hub that names another site
+        (a hub that is broken into, or a catalog entry that changed) has the proxy put the key into a request there;
+        the proxy's own value path (swap_value) does not read the mark, so a delivery that puts a made key under the
+        reference of a placeholder for another site sends it there."""
+        self.swapping()
+        made = self.given("ROUTE_KEY", MADE_ITEM, f"https://{ROUTE}/api/v1/query")
+        raw = fleet.vault_call({"op": "read"})
+        name = raw["env"]["ROUTE_KEY"]
+        self.assertRegex(name, vault.PLACEHOLDER)
+        self.assertEqual((raw["missing"], raw["swap"]["names"]), ([], {"ROUTE_KEY": ROUTE}))
+        self.assertNotIn(MADE_KEY, json.dumps(raw))
+        self.assertEqual(fleet.vault_call({"op": "read", "for": "check"})["env"], {"ROUTE_KEY": name})
+        self.assertEqual(self.swap(name, ROUTE), {"ok": True, "value": MADE_KEY})      # the proxy, for its own site
+        self.assertEqual(self.swap(name, OTHER_SITE), {"ok": False, "code": "refused"})
+        # the hub names another site for it: no placeholder, and the one of before opens nothing any more
+        hub.TEAM["logins"][made]["site"] = "https://" + OTHER_SITE
+        self.assertEqual(fleet.vault_call({"op": "read"}),
+                         {"ok": True, "v": 2, "env": {}, "missing": ["ROUTE_KEY"], "made": ["ROUTE_KEY"]})
+        for host in (ROUTE, OTHER_SITE):
+            self.assertEqual(self.swap(name, host), {"ok": False, "code": "refused"}, host)
+        # the second wall: a placeholder of a key for another site, whose value a delivery replaces with this made key
+        hub.TEAM["logins"][made]["site"] = "https://" + ROUTE
+        other = self.given("OTHER_KEY", {"password": API_KEY, "username": ""}, "https://" + OTHER_SITE)
+        placeholder = fleet.vault_call({"op": "read"})["env"]["OTHER_KEY"]
+        self.assertEqual(self.swap(placeholder, OTHER_SITE), {"ok": True, "value": API_KEY})
+        self.item(other[6:], MADE_ITEM, key="OTHER_KEY")
+        self.assertEqual(self.swap(placeholder, OTHER_SITE), {"ok": False, "code": "refused"})
+
+    def test_the_hubs_site_names_the_keys_own_site_in_each_form_of_one_origin(self):
+        """2a-S4. The key's own site and the hub's are compared as one origin, (host, port). Bugs: read compares them
+        as text, so a site with ":443", one trailing dot or capital letters, which is the same origin, gets no
+        placeholder; or it compares the host alone, or the start of a name, so another port or another host gets
+        one."""
+        self.swapping()
+        self.given("ROUTE_KEY", MADE_ITEM, "https://" + ROUTE)
+        real, said = vault.hub, {}
+
+        def hub(conf, method, path, body=None):     # the hub's answer to a read, with the key's site in another form
+            code, data = real(conf, method, path, body)
+            if path.endswith("/read") and code == 200:
+                data = dict(data, secrets=[dict(x, site=said["site"]) if said["site"] else
+                                           {k: v for k, v in x.items() if k not in ("site", "swap", "form")}
+                                           for x in data["secrets"]])
+            return code, data
+        with patch.object(vault, "hub", hub):
+            for site, same in ((f"https://{ROUTE}:443", True), (f"https://{ROUTE}.", True),
+                               ("https://Route.EXAMPLE.com/api/v1", True), (f"https://{ROUTE}:8443", False),
+                               (f"https://{ROUTE}.other.example", False), ("https://example.com", False),
+                               (None, False)):     # the hub names no site: a key that would be a value elsewhere
+                said["site"] = site
+                raw = fleet.vault_call({"op": "read"})
+                with self.subTest(site):
+                    self.assertNotIn(MADE_KEY, json.dumps(raw))
+                    self.assertEqual(bool(vault.PLACEHOLDER.fullmatch(raw["env"].get("ROUTE_KEY", ""))), same, raw)
+                    self.assertEqual(raw.get("made"), None if same else ["ROUTE_KEY"])
+
+    def test_one_key_under_two_names_keeps_the_placeholder_that_one_name_got(self):
+        """The Door area's read of 2a. Bugs: a read that leaves a made key out under one name (another site) takes its
+        reference out of the names that keep a placeholder, so Swaps.only switches off the placeholder that the same
+        read gave under the other name, and each request of the session through it fails."""
+        self.swapping()
+        self.given("ROUTE_KEY", MADE_ITEM, "https://" + ROUTE)
+        real = vault.hub
+
+        def hub(conf, method, path, body=None):     # the hub names the key twice: at its own site, and at another one
+            code, data = real(conf, method, path, body)
+            if path.endswith("/read") and code == 200:
+                (x,) = data["secrets"]
+                data = dict(data, secrets=[x, dict(x, env="ROUTE_KEY_TOO", site="https://" + OTHER_SITE)])
+            return code, data
+        with patch.object(vault, "hub", hub):
+            raw = fleet.vault_call({"op": "read"})
+        self.assertEqual((raw["missing"], raw["made"]), (["ROUTE_KEY_TOO"], ["ROUTE_KEY_TOO"]))
+        self.assertEqual(self.swap(raw["env"]["ROUTE_KEY"], ROUTE), {"ok": True, "value": MADE_KEY})
+
+    # ---- no other way out
+    def test_no_handover_and_no_sign_in_takes_a_made_key_out_of_the_broker(self):
+        """Bugs: a handover seals a made key again for another machine's vault, which can be of a program from before
+        the rule (or Fleet Vault on a Mac) and gives it to a session there as a value; a sign-in types it into a page
+        of the agent's own browser, which the agent's own programs read. A key without the mark goes on as before."""
+        made = self.given("ROUTE_KEY", MADE_ITEM, "https://" + ROUTE)
+        with self.profiled(made), self.assertRaisesRegex(fleet.Refused, "so it is not handed over"):
+            fleet.vault_call({"op": "handover", "job": self.job(login=made)})
+        self.assertEqual(hub.q("SELECT * FROM sealed"), [])
+        plain = self.given("PLAIN_KEY", {"password": API_KEY, "url": "https://" + ROUTE, "username": ""})
+        done = []
+
+        class Browser:                          # the agent's own Chrome: never reached for a made key
+            def __init__(self, *_a, **_k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+        conf = {k: v for k, v in self.broker.conf.items() if k != "_lock"}
+        for ref, typed in ((made, False), (plain, True)):
+            done.clear()
+            with patch.object(vault, "signin_port", lambda user, path=None: 9312), \
+                    patch.object(vault, "SigninCdp", Browser), patch.object(vault, "protect", lambda *a, **k: None), \
+                    patch.object(vault, "confirm_job", lambda c, job, kind, ref=ref: {"login": ref, "job": job}), \
+                    patch.object(vault, "hub", lambda *a, **k: done.append("kept") or (200, {"ok": True, "job": 5})), \
+                    patch.object(vault, "signin_page", lambda *a, **k: done.append("typed") or (True, False)):
+                if typed:
+                    self.assertEqual(vault.signin(conf, 5, os.getuid())["origin"], "https://" + ROUTE)
+                    self.assertEqual(done, ["kept", "typed"])     # its origin at the hub, then the page
+                else:
+                    with self.assertRaisesRegex(vault.Refused, "so it is not typed into a page"):
+                        vault.signin(conf, 5, os.getuid())
+                    self.assertEqual(done, [])      # no origin kept at the hub, and nothing typed
+
+
+for _name in dir(MadeKeys):          # each test that MadeKeys inherits expects the setUp of its own class
+    if _name.startswith("test_") and _name not in MadeKeys.__dict__:
+        setattr(MadeKeys, _name, None)
 
 
 class StoreSetup(unittest.TestCase):

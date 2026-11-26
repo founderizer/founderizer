@@ -59,13 +59,20 @@ class Deliveries(OwnerAPI):
                   (agent, hashlib.sha256(agent.encode()).hexdigest(), hub.now(), "test"))
         self.report("vps", STORE_A)
         self.report("studio", STORE_B)
+        # the central vault's status that the reconciler read before its seal: it holds LOGIN, and it made no key, so
+        # a vault that does not say made_keys takes the copy (hub.central_deliver)
+        status = patch.dict(hub.CENTRAL, status={"makes": True, "made": {}, "stored": [LOGIN]})
+        status.start()
+        self.addCleanup(status.stop)
 
     # ---- helpers
-    def report(self, agent, key, deposits=True, callers=True, features=("secret_deposits",), at=None):
-        """One helper status, as a machine reports its vault (`broker_report`)."""
+    def report(self, agent, key, deposits=True, callers=True, features=("secret_deposits",), at=None, made_keys=None):
+        """One helper status, as a machine reports its vault (`broker_report`). made_keys: its vault's word that it
+        keeps a key that the fleet made out of sessions; None, as a vault program from before that word."""
         data = {"features": list(features),
-                "security": {"vault": {"broker_recipient": key, "callers": callers, "deposits": deposits,
-                                       "broker_read_at": at or hub.now(), "mode": "broker"}}}
+                "security": {"vault": dict({"broker_recipient": key, "callers": callers, "deposits": deposits,
+                                            "broker_read_at": at or hub.now(), "mode": "broker"},
+                                           **({"made_keys": made_keys} if made_keys is not None else {}))}}
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), at or hub.now()))
 
@@ -93,6 +100,24 @@ class Deliveries(OwnerAPI):
         self.assertEqual((row["agent"], row["recipient"]), ("vps", STORE_A))
         self.assertTrue(row["request_id"].startswith(hub.CENTRAL_REQUEST))
         self.assertIsNone(self.deliver())                                     # it still waits: no second copy
+
+    def test_with_no_central_status_a_copy_goes_only_to_a_vault_that_keeps_made_keys_out_of_sessions(self):
+        """2a-S4. With no status of the central vault the hub cannot tell a key that the central vault made from
+        another value, so it counts each reference as a made key (central_unmade). Bugs: a missing status counts as
+        that of a program that makes no key, so the copy of a made key goes to a vault that gives it to a session as a
+        value; or the copy goes with no mark, so the hub gives it to a request in which the vault says no word."""
+        for status in (None, {"makes": True}, {"makes": True, "made": [], "stored": "LOGIN"},    # none, damaged ones,
+                       {"makes": True, "made": {LOGIN: {}}, "stored": [LOGIN]}):              # and a made key
+            with self.subTest(status=status), patch.dict(hub.CENTRAL, status=status):
+                self.report("vps", STORE_A)                             # a vault program from before the word
+                self.assertIsNone(self.deliver())
+                self.report("vps", STORE_A, made_keys=True)
+                did = self.deliver()
+                self.assertTrue(hub.q1("SELECT request_id FROM deposits WHERE id=?", (did,))["request_id"]
+                                .startswith(hub.CENTRAL_MADE))
+                code, body = self.request("/helper/vault/vps", {"job": did, "kind": "deposit"})
+                self.assertEqual(code, 409, body)
+                hub.q("DELETE FROM deposits")
 
     def test_a_machine_whose_agents_do_not_hold_the_secret_gets_no_copy(self):
         self.assertIsNone(self.deliver(machine="studio", pin=STORE_B))

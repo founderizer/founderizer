@@ -1026,6 +1026,7 @@ class HelperSide(unittest.TestCase):
                     "deposits": None,       # owner feature secret_deliveries
                     "withdrawals": None,    # owner feature central_vault
                     "replaces": None,       # owner feature secret_replace
+                    "made_keys": None,      # a key that the fleet made: never a value in a session
                     "places": None, "place_key": None,      # secret_targets
                     "key_generation": None,                 # package 7: a Mac's vault only
                     "read_missing": None})                  # C11: before the first read

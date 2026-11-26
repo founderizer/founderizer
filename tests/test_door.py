@@ -2750,6 +2750,19 @@ class HubRights(Served):
                                "owners": ["one-org"]})
         self.assertIn(("GET", "https://api.github.com/installation/repositories?per_page=100&page=1",
                        "Bearer ghs_" + "x" * 36), self.github)
+        # A page that GitHub does not give is an error of the whole reading, never a short list: else the hub marks
+        # the repositories of the pages after it as unreached, and closes the owner's right cards (the coordinator's
+        # validator of 26 November 2026).
+        def cut(method, url, headers, data, **more):
+            if url.endswith("per_page=100&page=1"):
+                return 200, {"repositories": [{"full_name": f"One-Org/r{n}"} for n in range(100)]}
+            if url.endswith("per_page=100&page=2"):
+                return 503, {"message": "Service unavailable"}
+            return http(method, url, headers, data)
+        self.door.http = cut
+        self.assertEqual(self.get("/github/reach", self.secrets["token"]),
+                         (502, {"error": "GitHub gave no list of One-Org's repositories (503)"}))
+        self.door.http = http
         self.assertEqual(self.get("/github/reach", self.secrets["record"])[0], 403)
         self.assertEqual(self.get("/github/reach", self.secrets["token"], source=ONE)[0], 403)
 

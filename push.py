@@ -11,6 +11,11 @@ What a ping says goes sealed. The phone gives the hub a key of its own with its 
 agent's name, the item's title and its options with it (ChaCha20-Poly1305, RFC 8439, which the phone opens with
 CryptoKit). Our side and Apple carry the item's number and the sealed bytes, and never a word of the item. The cipher
 is atrest.py's, the one copy of it in the hub (its own copy here went on 20 November 2026).
+
+**A ping to a member's phone** (Founderizer for Teams, B9: the iPhone app of a company's people) goes by a route of its
+own, `POST <channel>/api/push/member` (send_member), with the fleet's licence as the bearer and its own counts at our
+side, so that the pings of a company's people never take the room of the owner's, and a 429 there names the count that
+is full (PushError.full). The Teams part person_links calls it from a thread of its own; the owner's pings never do.
 """
 import base64
 import json
@@ -27,6 +32,8 @@ SEAL_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")    # 32 bytes in base64
 TIMEOUT = 45            # seconds for one ping: our side waits up to 15 for Apple's connection and 15 for its answer
 RETRY_DEFAULT = 60      # seconds before a ping that our side held back (429) goes again, when it named no time
 RETRY_MOST = 1200       # the longest wait for one, whatever our side said: two of its windows of 10 minutes
+MEMBER_ROUTE = "/api/push/member"       # B9: the route of a member ping (the website's docs/CONTRACTS.md)
+FULL_COUNTS = ("fleet", "phone", "members")     # the counts that a 429 of that route names in `full`
 
 
 class PushError(Exception):
@@ -38,12 +45,20 @@ class PushError(Exception):
     the hub sends no ping before that time.
 
     `status` is our side's own HTTP status when it answered with a refusal (400 for a shape that it does not take),
-    and None when it could not be reached."""
+    and None when it could not be reached.
 
-    def __init__(self, says, retry_after=None, status=None):
+    `full` is the count that is full, for a 429 of the member route (send_member): "fleet" (the requests of this
+    fleet's licence), "phone" (the member pings to that device token, of all fleets) or "members" (all member pings).
+    A value that the hub does not know, or none, is "fleet", as the website's docs/CONTRACTS.md says. None for each
+    other answer, and for each answer of the owner's route, whose 429 names no count. On the member route a 503 with a
+    Retry-After gives `retry_after` too (the switch is off, the shop is closed, a fault of our side): the same ping
+    may go again after it."""
+
+    def __init__(self, says, retry_after=None, status=None, full=None):
         super().__init__(says)
         self.retry_after = retry_after
         self.status = status
+        self.full = full
 
 
 def _retry_after(headers):
@@ -114,11 +129,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _full(text):
+    """The count that a 429 of the member route names: one of FULL_COUNTS, and "fleet" for any other value or none."""
+    try:
+        full = json.loads(text).get("full")
+    except (ValueError, AttributeError):
+        full = None
+    return full if full in FULL_COUNTS else "fleet"
+
+
 def send(channel, entitlement, device_token, payload, environment, collapse=None, expires=None, timeout=None):
     """One ping through our side. (status, reason): Apple's HTTP status and its reason, or (0, why) when no answer
     came, so that the ping may or may not have arrived. PushError when nothing left: our side refused the ping or
     could not be reached. `entitlement` goes as the bearer when this fleet holds one, as before; with none, the ping
     goes with no Authorization header."""
+    return _post(channel, "/api/push", entitlement, device_token, payload, environment, collapse, expires, timeout)
+
+
+def send_member(channel, licence, device_token, payload, environment, collapse=None, expires=None, timeout=None):
+    """One member ping (B9) through our side's member route, with the fleet's licence as the bearer: as send, and a 429
+    names its full count (PushError.full), and a 503 with a Retry-After gives its time. With no licence nothing goes:
+    the route takes no ping without one."""
+    if not licence:
+        raise PushError("a member ping goes only with the fleet's licence")
+    return _post(channel, MEMBER_ROUTE, licence, device_token, payload, environment, collapse, expires, timeout,
+                 member=True)
+
+
+def _post(channel, path, bearer, device_token, payload, environment, collapse, expires, timeout, member=False):
     if not isinstance(device_token, str) or not DEVICE_TOKEN.fullmatch(device_token):
         raise PushError("that is not a device token")
     if environment not in ENVIRONMENTS:
@@ -129,9 +167,9 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
     if expires is not None:
         body["expires"] = int(expires)
     headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "founderizer-hub"}
-    if entitlement:
-        headers["Authorization"] = "Bearer " + entitlement
-    request = urllib.request.Request(channel.rstrip("/") + "/api/push", data=json.dumps(body).encode(), method="POST",
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
+    request = urllib.request.Request(channel.rstrip("/") + path, data=json.dumps(body).encode(), method="POST",
                                      headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
@@ -139,9 +177,11 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
             text = answer.read(65536).decode("utf-8", "replace")
     except urllib.error.HTTPError as answer:
         with answer:
-            says = _refusal(answer.code, answer.read(65536).decode("utf-8", "replace"), _side(channel))
-            raise PushError(says, retry_after=_retry_after(answer.headers) if answer.code == 429 else None,
-                            status=answer.code) from None
+            said = answer.read(65536).decode("utf-8", "replace")
+            says = _refusal(answer.code, said, _side(channel))
+            held = answer.code == 429 or (member and answer.code == 503 and answer.headers.get("Retry-After"))
+            raise PushError(says, retry_after=_retry_after(answer.headers) if held else None, status=answer.code,
+                            full=_full(said) if member and answer.code == 429 else None) from None
     except urllib.error.URLError as e:          # the request did not get out: no connection, no name, no TLS
         raise PushError(f"{_side(channel)} cannot be reached: {str(e.reason)[:200]}") from None
     except (OSError, ValueError):               # it went, and the answer did not come back

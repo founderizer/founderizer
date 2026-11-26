@@ -85,6 +85,11 @@ SID, KEY_SID, OTHER_SID = ("6f1c2a4e-8b3d-4e5f-9a7b-1c2d3e4f5a6b", "7a2b3c4d-5e6
                            "8b3c4d5e-6f7a-4b2c-9d3e-4f5a6b7c8d9e")
 REF, KEY_REF, OTHER_REF = ("bws://" + s for s in (SID, KEY_SID, OTHER_SID))
 API_KEY = "sk-fake-only-central-20261024"
+# a key that the vault makes itself, and the requests for it (make)
+MADE_SID, NEXT_SID = "a1b2c3d4-0e1f-4a2b-8c3d-4e5f6a7b8c9d", "b2c3d4e5-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
+MADE_REF, NEXT_REF = "bws://" + MADE_SID, "bws://" + NEXT_SID
+ASKS = [f"c0ffee0{n}-5d6e-4f70-8a9b-0c1d2e3f4a5b" for n in range(6)]
+ROUTE = "https://metrics.example.org"
 SALTS = {"password": "0f" * 16, "totp": "a5" * 16}
 AKEY = "vps-central-agent-key-".ljust(43, "k")          # the agent key that a machine broker's caller fields carry
 HUB_UID = os.getuid() + 1                               # the hub's user; this process is the vault's own user
@@ -645,8 +650,8 @@ class CentralVault(CentralFixture, unittest.TestCase):
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
                                               "money": [], "stored": [REF], "unpooled": [], "default_pools": True,
                                               "removes": True, "replaces": True, "key_addresses": True,
-                                              "hub_keys": True, "hub_key_ids": {}, "values": {}, "lists": True,
-                                              "clients": None, "source": None})
+                                              "hub_keys": True, "hub_key_ids": {}, "values": {}, "makes": True,
+                                              "made": {}, "lists": True, "clients": None, "source": None})
         self.signed("pin", PIN_1, SIG_PIN_1)
         self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
         status = self.ask("status")
@@ -1330,9 +1335,15 @@ class CentralVault(CentralFixture, unittest.TestCase):
         self.ask("seal", login=REF, machine="vps")
         self.ask("export")
         self.refused("pin", statement=PIN_STALE, signature=SIG_PIN_STALE)
+        made = []                                               # the values of a made key: the first, and a new one
+        for fields in ({"site": ROUTE}, {"replaces": True}):
+            self.ask("make", login=MADE_REF, salts=SALTS, request_id=ASKS[len(made)], **fields)
+            made.append(json.loads(self.items()[MADE_SID]["value"])["made"]["password"])     # inside the mark (2a-R2)
+        self.granted(pooled(MADE_REF, T1, kind="default_pool"))
+        self.ask("seal", login=MADE_REF, machine="vps", made_keys=True)     # the word of a vault that keeps the rule
         self.assertTrue(self.logged)
         for line in self.logged:
-            for secret in (LOGIN["password"], LOGIN["totp"], "AGE-SECRET-KEY", R1, RR, FLEET, PIN_1, SIG_PIN_1):
+            for secret in (LOGIN["password"], LOGIN["totp"], "AGE-SECRET-KEY", R1, RR, FLEET, PIN_1, SIG_PIN_1, *made):
                 self.assertNotIn(secret, line)
 
     def test_a_vault_with_no_list_of_devices_is_as_it_was_and_takes_no_change_of_one(self):
@@ -1349,6 +1360,288 @@ class CentralVault(CentralFixture, unittest.TestCase):
         self.assertIn("valid signature of the owner", self.refused("pin", statement=PIN_1, signature=SIG_PIN_1))
         self.assertEqual(self.signed("pin", PIN_2, SIG_PIN_2)["saved"], "new")
         self.assertFalse(self.beside("clients.json").exists())
+
+
+class MadeKeys(CentralFixture, unittest.TestCase):
+    """make: a key that the central vault makes itself for a route that an agent of the fleet built."""
+
+    def made(self, request=ASKS[0], ref=MADE_REF, site=ROUTE, **fields):
+        return self.ask("make", login=ref, site=site, salts=SALTS, request_id=request, **fields)
+
+    def again(self, request=ASKS[1], ref=MADE_REF, **fields):
+        return self.ask("make", login=ref, salts=SALTS, request_id=request, replaces=True, **fields)
+
+    def no(self, call, *args, **fields):
+        with self.assertRaises(vault.Refused) as refused:
+            call(*args, **fields)
+        return str(refused.exception)
+
+    def value(self, sid=MADE_SID):
+        return json.loads(self.items()[sid]["value"])["made"]["password"]
+
+    def sealed(self, ref=MADE_REF, **fields):
+        """What the sealed copy of this value holds for the machine vps, as a hub asks for it for a vault that keeps a
+        made key out of sessions (made_keys)."""
+        return self.opened(self.ask("seal", **dict({"login": ref, "machine": "vps", "made_keys": True}, **fields))
+                           ["ciphertext"], R1)
+
+    @staticmethod
+    def hash_of(secret):
+        """{SHA} as nginx reads it (ngx_crypt_sha): the standard base64 of the SHA-1, written out here."""
+        return "{SHA}" + base64.b64encode(hashlib.sha1(secret.encode()).digest()).decode()
+
+    def test_the_answer_has_the_hash_and_the_fingerprints_and_never_the_value(self):
+        """The hub gets what a route's checker and the check of a delivery need, and nothing that opens the route. Bugs:
+        an answer, the status or a file holds the value; the hash is not the one that nginx reads, so the route takes
+        no reader; two keys are one; the item has no address, so call_api cannot send it, or has the shape of a login,
+        so no session gets it."""
+        answer = self.made()
+        secret, item = self.value(), self.items()[MADE_SID]
+        self.assertRegex(secret, r"\A[A-Za-z0-9_-]{43}\Z")
+        self.assertEqual(len(base64.urlsafe_b64decode(secret + "=")), 32)
+        self.assertEqual(answer, {"ok": True, "login": MADE_REF, "saved": "new", "hash": self.hash_of(secret),
+                                  "fingerprints": registered({"password": secret})})
+        self.assertEqual(vault.sha_form("password"), "{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=")      # htpasswd -s
+        self.assertEqual(vault.sha_form("a"), "{SHA}hvfkN/qlp/zhXR3cuerq6jd2Z7g=")     # "+" or "/": no urlsafe form
+        self.assertEqual((item["note"], vault.login_shaped(item["value"])), ("made", False))
+        self.assertEqual(vault.made_key(item), {"password": secret, "url": ROUTE, "requests": json.loads(
+            item["value"])["requests"]})
+        # the store keeps the key inside the mark (2a-R2): a program that is put back over this store finds no key at
+        # the top of the item, so the one from before make seals a copy that no older broker opens, and the one of the
+        # first made keys (which reads the password at the top) seals nothing
+        self.assertEqual(set(json.loads(item["value"])), {"made", "requests"})
+        for read in (vault.check_value, vault.check_login):
+            with self.assertRaises(vault.Refused):
+                read(item["value"])
+        other = self.made(ASKS[1], NEXT_REF, ROUTE + ":8443")
+        self.assertNotEqual(self.value(NEXT_SID), secret)
+        status = self.ask("status")
+        self.assertIs(status["makes"], True)
+        self.assertEqual(status["made"], {MADE_REF: {"hash": answer["hash"], "request_id": ASKS[0]},
+                                          NEXT_REF: {"hash": other["hash"], "request_id": ASKS[1]}})
+        self.assertEqual((status["stored"], status["money"]), (sorted([MADE_REF, NEXT_REF]), []))
+        said = json.dumps([answer, other, status, self.ask("inventory"), self.ask("key_addresses")])
+        files = "".join(path.read_text() for path in Path(self.conf["state"]).parent.iterdir())
+        for value in (secret, self.value(NEXT_SID)):
+            self.assertNotIn(value, said + files)
+
+    def test_one_request_id_gives_one_answer(self):
+        """A hub that lost the answer asks again, also with another new reference. Bugs: the retry makes a second key or
+        a second value, so the hash that the checker has is no reader's; another request gets the key's reference; the
+        answer of a request goes to another one that has its id by mistake."""
+        first, items = self.made(), self.items()
+        for ref in (MADE_REF, NEXT_REF):
+            self.assertEqual(self.made(ref=ref), dict(first, saved="same"))
+        self.assertIn("holds a value under this reference", self.no(self.made, ASKS[1]))
+        for call in (lambda: self.made(site=ROUTE + ":8443"), lambda: self.again(ASKS[0])):     # the same request id
+            self.assertIn("made something else", self.no(call))
+        self.assertEqual(self.items(), items)                   # nothing made, and nothing written
+        second, items = self.again(ASKS[1]), self.items()
+        self.assertEqual(self.again(ASKS[1]), dict(second, saved="same"))
+        for call in (lambda: self.made(ASKS[1]), lambda: self.again(ASKS[1], NEXT_REF)):
+            self.assertIn("made something else", self.no(call))
+        self.assertEqual(self.items(), items)
+        # a store that cannot be written keeps nothing of a request, and the same request makes its key then
+        with patch.object(vault.LocalStore, "keep", side_effect=vault.Refused("the vault store could not be saved")):
+            self.assertIn("could not be saved", self.no(self.made, ASKS[2], NEXT_REF))
+        self.assertEqual(self.items(), items)
+        self.assertEqual(self.made(ASKS[2], NEXT_REF)["saved"], "new")
+
+    def test_a_key_keeps_its_birth_and_its_newest_requests(self):
+        """A made key keeps MADE_REQUESTS records: its birth and the newest after it. Bugs: an item that grows with each
+        new value for ever; and a cut that drops the birth record, after which the hub's own retry of the oldest kept
+        replace is taken for a birth and refused as "made something else", where it must answer "old"."""
+        self.made()
+        asks = [f"d0ffee{n:02d}-5d6e-4f70-8a9b-0c1d2e3f4a5b" for n in range(1, vault.MADE_REQUESTS + 1)]
+        for request in asks:
+            self.again(request)
+        records = json.loads(self.items()[MADE_SID]["value"])["requests"]
+        self.assertEqual([r["request_id"] for r in records], [ASKS[0]] + asks[-(vault.MADE_REQUESTS - 1):])
+        self.assertEqual(self.made()["saved"], "old")                       # the birth, asked again
+        self.assertEqual(self.again(asks[1])["saved"], "old")               # the oldest replace that it keeps
+        self.assertEqual(self.again(asks[-1])["saved"], "same")
+
+    def test_a_key_needs_a_reference_that_is_new_and_the_site_of_a_route(self):
+        """Bugs: a hub that is broken into makes a key under a name of the owner's, which their grant would send or an
+        old unpool would let go; a site that no vault sends a key to, or that a vault sends it to in the clear."""
+        self.intake()
+        self.assertIn("holds a value under this reference", self.no(self.made, ref=REF))
+        self.ask("remove", login=REF)
+        self.assertIn("was removed from the fleet", self.no(self.made, ref=REF))
+        self.granted(grant(KEY_REF, "vps", "vps", T1))
+        self.granted(pooled(OTHER_REF, T1, kind="unpool"))
+        upper = self.made(ASKS[3], "bws://" + "A1B2C3D4-0000-4000-8000-0000000000AB", site=ROUTE)
+        self.assertEqual(upper["login"], upper["login"].lower())     # one reference in any case: the store's id
+        self.assertIn(upper["login"][len("bws://"):], self.items())
+        state = vault.central_state(self.conf)         # the owner's replace statement of a value (its record)
+        state["values"][NEXT_REF] = {"sha256": "0" * 64, "at": T1}
+        vault.keep_state(self.conf, state)
+        for ref in (KEY_REF, OTHER_REF, NEXT_REF):
+            self.assertIn("the owner signed a statement about this reference", self.no(self.made, ref=ref))
+        for site in ("http://metrics.example.org", "https://localhost", "https://100.80.1.2", "https://[fd00::1]",
+                     "https://u@metrics.example.org", ROUTE + "/", ROUTE + "/api", ROUTE + "?a=1", ROUTE + "#a",
+                     ROUTE + ".", ROUTE + ":443", ROUTE + ":0", ROUTE + ":99999", ROUTE + "\n", " " + ROUTE,
+                     "https://Metrics.example.org", "https://m_x.example.org", "https://", "", None, 7, [ROUTE],
+                     "https://0x7f.0.0.1", "https://0x7f.1", "https://localhost.localdomain", "https://a.0x0a.example",
+                     "https://app.localhost"):
+            self.assertIn("must be https://<host>", self.no(self.made, site=site), site)
+        self.assertIn("model provider's own site", self.no(self.made, site="https://claude.ai"))
+        for fields in ({"login": "sealed:4"}, {"login": None}, {"salts": {"password": "0f" * 16}}, {"salts": None},
+                       {"request_id": "1"}, {"request_id": None}, {"replaces": True}, {"replaces": 1}):
+            asked = dict({"login": MADE_REF, "site": ROUTE, "salts": SALTS, "request_id": ASKS[0]}, **fields)
+            self.assertEqual(self.refused("make", **asked), "the make request is not valid", fields)
+        self.assertEqual(list(self.items()), [upper["login"][len("bws://"):]])    # the one key, in small letters
+
+    def test_a_new_value_comes_only_for_a_made_key_and_the_old_one_cannot_come_back(self):
+        """Bugs: an agent types over a value of the owner's; the new value loses the key's address; an earlier request,
+        a copy of the old value or the owner's replace of a made key puts another value in its place."""
+        self.intake()
+        before = self.items()[SID]
+        for ref in (REF, MADE_REF):                             # a value of the owner's, and no value at all
+            self.assertIn("made no key under this reference", self.no(self.again, ref=ref))
+        self.assertEqual((self.items()[SID], len(self.items())), (before, 1))
+        first, old = self.made(), self.value()
+        second = self.again(ASKS[1])
+        secret = self.value()
+        self.assertNotEqual(secret, old)
+        self.assertEqual(second, {"ok": True, "login": MADE_REF, "saved": "replaced", "hash": self.hash_of(secret),
+                                  "fingerprints": registered({"password": secret})})
+        item = self.items()[MADE_SID]
+        self.assertEqual((item["note"], vault.made_key(item)["url"]), ("made", ROUTE))
+        self.assertNotIn(old, json.dumps(self.items()))         # the old value left the store
+        self.assertEqual(self.ask("status")["made"], {MADE_REF: {"hash": second["hash"], "request_id": ASKS[1]}})
+        # an earlier request gives its one answer, says that its value is old, and makes nothing
+        items = self.items()
+        self.assertEqual(self.made(), dict(first, saved="old"))
+        # a copy of the old value, as the hub could keep one, with no statement and with the owner's own
+        copy = {"password": old, "url": ROUTE}
+        for fields in (self.intake_fields(value=copy, ref=MADE_REF, title="metrics", item="api_key"),
+                       CentralVault.replace_fields(self, copy, T2, ref=MADE_REF, title="metrics", item="api_key")):
+            self.assertIn("this vault made the key under this reference", self.refused("intake", **fields))
+        self.assertEqual(self.items(), items)
+        self.assertFalse(Path(self.conf["state"]).exists())     # nor the record of that replace, which stays its newest
+
+    def test_the_mark_is_in_each_sealed_copy_of_a_made_key_and_in_no_other(self):
+        """A vault that opens a copy reads from it that the fleet made the key, and a vault program from before the
+        form finds no key in it. Bugs: the mark follows the hub's request, so a hub that is broken into leaves it off a
+        made key or puts it on a key of the owner's; a copy tells a machine the key's requests; the key is beside the
+        mark, where an older broker (check_value, check_login, unchanged since before make) reads it as a key."""
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        self.made()
+        self.ask("intake", **self.intake_fields(value=dict(LOGIN, made=True)))      # the owner's copy says it too
+        for ref in (REF, MADE_REF):
+            self.granted(pooled(ref, T1, kind="default_pool"))
+        for fields in ({}, {"made": True}, {"made": False}, {"note": "made"}, {"note": "taken from the owner"}):
+            self.assertEqual(self.sealed(**fields), canon({"made": {"password": self.value(), "url": ROUTE}}))
+            self.assertEqual(self.sealed(REF, **fields), canon(LOGIN))
+        self.again(ASKS[1], made=False, note="taken from the owner")
+        copy = self.sealed()
+        self.assertEqual(copy, canon({"made": {"password": self.value(), "url": ROUTE}}))
+        # only for a vault that keeps a made key out of sessions: a hub from before the word asks with none, and a hub
+        # asks with none for the door (piece 2a, the Door area's read); a key of the owner's needs no word
+        for word in ({}, {"made_keys": False}, {"made_keys": "yes"}):
+            self.assertIn("so it is not sealed", self.refused("seal", login=MADE_REF, machine="vps", **word))
+        self.assertEqual(self.opened(self.ask("seal", login=REF, machine="vps")["ciphertext"], R1), canon(LOGIN))
+        self.assertIs(vault.opened(copy)[vault.MADE], True)     # what open_login gives handover and signin
+        self.assertEqual(vault.made_login(copy)["password"], self.value())              # a broker opens it
+        for item in ("api_key", "login"):           # what an older broker's deposit reads: no key in it
+            with self.assertRaises(vault.Refused):
+                vault.delivered(copy, item)
+        for read in (vault.check_value, vault.check_login):     # and its read, swap and call_api of a stored one
+            with self.assertRaises(vault.Refused):
+                read(copy)
+        # the program from before make seals the stored text as it is: that copy has the key inside the mark too
+        self.assertEqual(json.loads(self.items()[MADE_SID]["value"])["made"], {"password": self.value(), "url": ROUTE})
+        # never for the door, also with the word (2a-R1): the door would take the whole text as one key
+        door = canon({"v": 1, "kind": "pin", "fleet": FLEET, "machine": "door", "recipient": R2, "at": T1})
+        self.signed("pin", door, owner_sign(door))
+        self.assertIn("the door takes no such key",
+                      self.refused("seal", login=MADE_REF, machine="door", made_keys=True))
+        self.assertEqual(self.ask("seal", login=REF, machine="door")["recipient"], R2)     # a pooled key of the owner's
+
+    def test_a_made_key_is_sealed_by_the_pool_or_a_grant_as_each_secret_and_never_moves_money(self):
+        """Bugs: a made key needs a signature of another kind, or none; a key whose random text has the shape of a
+        payment provider's key, which no default_pool takes, so that the manager can give it to nobody."""
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        money = base64.urlsafe_b64decode("sk_" + "live_" + "A" * 35 + "=")      # no key's shape in this file
+        drawn = [money, b"\x07" * 32]
+        with patch.object(vault.secrets, "token_bytes", lambda n: drawn.pop(0)):
+            self.made()
+        self.assertEqual((drawn, self.ask("status")["money"]), ([], []))
+        self.assertIn("has signed no grant of this secret", self.refused("seal", login=MADE_REF, machine="vps"))
+        self.granted(pooled(MADE_REF, T1, kind="default_pool"))
+        self.assertEqual(json.loads(self.sealed())["made"]["password"], self.value())
+        self.granted(pooled(MADE_REF, T2, kind="unpool"))
+        self.assertIn("has signed no grant of this secret", self.refused("seal", login=MADE_REF, machine="vps"))
+        self.granted(grant(MADE_REF, "vps", "vps", T1))
+        self.assertEqual(json.loads(self.sealed())["made"]["password"], self.value())
+
+    def test_a_made_key_is_removed_only_after_the_owners_signed_unpool_of_it(self):
+        """Nobody can save a made key again, so a hub that is broken into must not take one away. Bugs: a key that no
+        pool names yet, or whose grant ended, goes with no word of the owner's; after the removal the reference or the
+        request gives a key again."""
+        self.made()
+        for statement in (None, grant(MADE_REF, "vps", "vps", T1), grant(MADE_REF, "vps", None, T2, kind="ungrant"),
+                          pooled(MADE_REF, T1, kind="default_pool")):
+            if statement:
+                self.granted(statement)
+            self.assertRegex(self.refused("remove", login=MADE_REF), "signed unpool of it|still names this login")
+        self.granted(pooled(MADE_REF, T2, kind="unpool"))
+        self.assertEqual(list(self.items()), [MADE_SID])
+        with patch.object(vault.LocalStore, "keep", side_effect=vault.Refused("the vault store could not be saved")):
+            self.assertIn("could not be saved", self.refused("remove", login=MADE_REF))
+        for halfway in (True, False):                           # the value is still there, and then it is gone
+            for call in (self.made, self.again, lambda: self.made(ASKS[2])):
+                self.assertIn("removed from the fleet", self.no(call))
+            if halfway:
+                self.assertEqual(self.ask("remove", login=MADE_REF)["removed"], "removed")
+        self.assertEqual((self.ask("remove", login=MADE_REF)["removed"], self.items()), ("absent", {}))
+        key = self.intake_fields(value={"password": API_KEY}, ref=MADE_REF, title="K", item="api_key")
+        self.assertIn("removed from the fleet", self.refused("intake", **key))
+        self.assertEqual(self.ask("status")["made"], {})
+        # a key that no pool ever named: the owner's unpool alone is enough
+        self.made(ASKS[3], NEXT_REF)
+        self.granted(pooled(NEXT_REF, T1, kind="unpool"))
+        self.assertEqual(self.ask("remove", login=NEXT_REF)["removed"], "removed")
+
+    def test_a_restored_store_keeps_each_made_key_a_made_key(self):
+        """Bugs: a backup leaves the made keys out, or a vault that root makes from it takes them for keys of the
+        owner's: a copy with no mark, a removal with no unpool, or one request with two answers."""
+        first, second, secret = self.made(), self.again(ASKS[1]), self.value()
+        self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
+        backup = self.ask("export")
+        place = self.dir / "restored"
+        place.mkdir(mode=0o700)
+        for name, text in (("store.age", backup["store"]), ("store.key", self.opened(backup["key"], RR))):
+            (place / name).write_text(text)
+            (place / name).chmod(0o600)
+        self.conf = dict(self.conf, store=str(place / "store.age"), store_key=str(place / "store.key"),
+                         state=str(place / "central.json"))     # the store and its key alone: no state
+        self.assertEqual(self.ask("status")["made"], {MADE_REF: {"hash": second["hash"], "request_id": ASKS[1]}})
+        self.assertIn("signed unpool of it", self.refused("remove", login=MADE_REF))
+        self.assertEqual((self.made(), self.again(ASKS[1])), (dict(first, saved="old"), dict(second, saved="same")))
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        self.granted(pooled(MADE_REF, T1, kind="default_pool"))
+        self.assertEqual(self.sealed(), canon({"made": {"password": secret, "url": ROUTE}}))
+        self.assertEqual(self.again(ASKS[2])["saved"], "replaced")
+
+    def test_a_state_and_a_store_from_before_open_and_the_program_from_before_reads_what_this_one_writes(self):
+        """The rule of the files beside the state (F17): an update that fails puts the program from before back, and it
+        refuses a state or an item with a member that it does not know. Bug: after the first made key, such a put-back
+        stops each agent's secrets."""
+        self.intake()
+        state = Path(self.conf["state"])
+        state.write_text(json.dumps({"v": 1, "pins": {}, "recovery": None}))       # the oldest form that still opens
+        state.chmod(0o600)
+        self.assertEqual(self.ask("status")["made"], {})
+        self.made()
+        self.again()
+        self.granted(pooled(MADE_REF, T1, kind="default_pool"))
+        self.assertEqual(set(self.state()), {"v", "pins", "recovery", "grants", "pool", "removed"})
+        for item in self.items().values():
+            self.assertEqual(set(item), {"key", "value", "note", "made_at"})
+        self.assertEqual(sorted(path.name for path in state.parent.iterdir() if path.suffix == ".json"),
+                         ["central.json", "signers.json"])
 
 
 class Signers(CentralFixture, unittest.TestCase):
@@ -2101,6 +2394,62 @@ class Replacing(unittest.TestCase):
         self.assertEqual(self.held(), {"password": API_KEY})
         self.assertEqual(self.deposit()["saved"], "replaced")
         self.assertEqual(self.held(), self.value)
+
+
+class MadeDeposit(unittest.TestCase):
+    """deposit on a machine's own broker of a copy of a key that the central vault made (piece 2a of the read routes):
+    the broker keeps the key in its own form {"made": {"password", "url"}} in its store, from the copy's own text
+    alone, and says to the hub in each request of a copy that it keeps such a key out of sessions."""
+
+    def setUp(self):
+        Withdrawals.setUp(self)
+        self.copy, self.beside = None, {}
+
+        def hub(conf, method, path, body=None):     # the hub's two helper routes of a delivery
+            self.asked.append((path, body))
+            if path.endswith("/fingerprints"):
+                return 200, {"ok": True, "deposit": body["deposit"]}
+            copy = subprocess.run([self.conf["age"], "-a", "-r", VPS_STORE], input=self.copy, capture_output=True,
+                                  text=True, check=True).stdout
+            return 200, dict({"ok": True, "job": body["job"], "kind": "deposit", "login": KEY_REF, "title": "ROUTE_KEY",
+                              "item": "api_key", "ciphertext": copy, "fingerprint_salts": SALTS}, **self.beside)
+        p = patch.object(vault, "hub", hub)
+        p.start()
+        self.addCleanup(p.stop)
+
+    deposit = Replacing.deposit
+
+    def held(self):
+        item = vault.LocalStore(self.conf).opened().get(KEY_SID)
+        return (json.loads(item["value"]), item["note"]) if item else None
+
+    def test_a_made_copy_keeps_its_form_from_its_own_text_and_the_vault_says_its_word(self):
+        """Bugs: deposit keeps only the members of a login (delivered, check_login), so the form is lost and the key
+        reaches a session as a value later (read); it stores the key beside the mark, where a broker put back to an
+        older program reads it as a key; the mark comes from the hub's answer beside the copy, so a hub puts it on
+        another key or takes it off; a member "made" in another form counts as a made key, or as none; the broker
+        asks for a copy without its word, so the hub keeps each made key from it."""
+        key = {"password": "made-only-in-this-test-" + "m" * 20, "url": ROUTE}
+        self.copy = vault.canonical({"made": key})          # a copy as the central vault seals it (copy_text)
+        self.assertEqual(self.deposit()["saved"], "new")
+        self.assertEqual(self.held(), ({"made": key}, vault.DELIVERED))
+        self.assertEqual(self.asked[0], ("/helper/vault/vps", {"job": 9, "kind": "deposit", "made_keys": True}))
+        vault.LocalStore(self.conf).remove(KEY_SID, vault.DELIVERED)
+        plain = {"password": "plain-only-in-this-test-" + "p" * 20, "url": ROUTE}
+        self.copy, self.beside = json.dumps(plain), {"made": True}      # no mark in the copy: the hub's word is none
+        self.assertEqual(self.deposit()["saved"], "new")
+        self.assertEqual(self.held(), (dict(plain, username=""), vault.DELIVERED))
+        vault.LocalStore(self.conf).remove(KEY_SID, vault.DELIVERED)
+        self.beside = {}
+        for wrong in ({"made": True, **key}, {"made": key, "password": key["password"]},      # no copy of the
+                      {"made": {"password": key["password"]}}, {"made": dict(key, username="pilot-b")},   # central
+                      {"made": "yes"}, {"made": None}, {"made": [key]},                            # vault's
+                      *({"made": dict(key, url=url)} for url in ("http://metrics.example.org", "https://100.80.1.2",
+                                                                 ROUTE + ":0", ROUTE + ":443", ROUTE + "/api"))):
+            self.copy = json.dumps(wrong)
+            with self.subTest(wrong), self.assertRaisesRegex(vault.Refused, 'that is not a key that the fleet made'):
+                self.deposit()
+        self.assertIsNone(self.held())                       # nothing is saved
 
 
 class CentralSetup(unittest.TestCase):

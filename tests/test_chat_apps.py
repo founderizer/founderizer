@@ -650,30 +650,49 @@ class ChatApps(OwnerAPI):
         self.assertEqual(self.texts(), ["That message held a saved secret. It was not stored."])
         self.assertEqual(hub.leak_scan(), [])
 
-    def test_more_than_500_inbound_messages_a_day_are_ignored(self):
+    def test_the_days_count_of_people_grows_with_the_counted_people_and_the_owner_is_outside_it(self):
+        """B9's piece 0d (the coordinator's D124, 26 November 2026): the day's count of people's messages over all
+        chat apps' accounts has room for 100 for each person whom the licence counts, and never less than 500; the
+        owner's own messages and files are in no such count. A customer (a role with tools off) is no counted person:
+        their messages count in it, and they add no room. A file of a person's message past the count is not taken,
+        as the message is not. Bugs: a company's people who used up the day stop the owner's own chat; a company of
+        20 colleagues gets the 500 of a fleet of one; each customer buys room; the owner's messages use the people's
+        room."""
         self.own()
-        with hub.LOCK, hub.transaction():
-            hub.chat_count("*", "inbound", hub.now(), 499)
-        self.assertEqual(self.inbound()[0], "stored")
-        self.assertEqual(self.inbound()[0], "ignored")
-        self.assertEqual(self.inbound("/whoami")[0], "stored")         # a command is no inbound message to an agent
-        self.assertEqual(self.request("/ui/chat-apps?db=test-generation")[1]["inbound_today"], 500)
-        self.assertEqual(self.count("events"), 1)
+        self.day(600)
+        self.assertEqual(self.inbound()[0], "stored")                  # the owner, past the 500 of the people
+        self.assertEqual(self.bridge_upload(PICTURE, "m-own")[0], 200)
+        self.assertEqual(self.inbound("See it.", kind="image", id="m-own")[0], "stored")
+        self.assertEqual(self.request("/ui/chat-apps?db=test-generation")[1]["inbound_today"], 600)
+        self.assertEqual(self.count("events"), 2)
         # a person's message counts in the same count of all accounts, and its number stops it too (person_route), also
         # when the account's entry names a count of its own, which only the built-in account may (a team.json written
         # by hand that does not validate, Teams design 4, S4)
         hub.TEAM["agents"]["studio"]["can"] = []        # an outsider reaches only an agent whose Shell box is off
-        hub.TEAM["chat_apps"]["discord-studio"].update(day_count="discord-studio", day_most=10 ** 6)
+        hub.TEAM["chat_apps"]["discord-studio"].update(day_count="discord-studio", day_least=10 ** 6)
         self.assertEqual(self.post("/ui/people", name="Ana Ruiz", role="customer", agents=["studio"],
                                    handles=[{"app": "discord", "handle": "500600700"}])[0], 200)
-        self.assertEqual(self.inbound("Hello", sender="500600700", chat="dm-ana")[0], "ignored")
-        self.assertEqual((self.count("conversations"), self.count("events")), (0, 1))
-        # and a stored one adds one to it: with room for one more, it is stored, and the next one is ignored
-        with hub.LOCK, hub.transaction():
-            hub.chat_count("*", "inbound", hub.now(), -1)
+        self.day(-101)
         self.assertEqual(self.inbound("Hello", sender="500600700", chat="dm-ana")[0], "stored")
         self.assertEqual((self.count("conversations"), hub.chat_count("*", "inbound", hub.now())), (1, 500))
         self.assertEqual(self.inbound("Hello again", sender="500600700", chat="dm-ana")[0], "ignored")
+        code, refused = self.bridge_upload(PICTURE, "m-ana", sender="500600700")
+        self.assertEqual((code, refused.get("error")), (403, "not taken: the day's inbound messages are all in"))
+        # five colleagues are counted, room for 500, and a sixth gives room for 600; the customer gives none
+        for n in range(6):
+            if n == 5:
+                self.assertEqual(self.inbound("Still full?", sender="500600700", chat="dm-ana")[0], "ignored")
+            self.assertEqual(self.post("/ui/people", name=f"Colleague {n}", role="employee", agents=["studio"],
+                                       handles=[{"app": "discord", "handle": f"50060080{n}"}])[0], 200)
+        self.assertEqual(self.inbound("Hello again", sender="500600700", chat="dm-ana")[0], "stored")
+        self.assertEqual(self.bridge_upload(PICTURE, "m-ana-2", sender="500600700")[0], 200)
+        self.day(600 - 501)
+        self.assertEqual(self.inbound("And now?", sender="500600700", chat="dm-ana")[0], "ignored")
+
+    def day(self, n):
+        """Add n to today's count of the people's messages of all accounts."""
+        with hub.LOCK, hub.transaction():
+            hub.chat_count("*", "inbound", hub.now(), n)
 
     # ---- link codes and handles
     def test_link_codes_bind_the_owner_once_and_refuse_wrong_expired_and_repeated_codes(self):
@@ -1615,7 +1634,7 @@ class ChatApps(OwnerAPI):
         self.inbound()
         code, data = self.request("/ui/chat-apps?db=test-generation")
         self.assertEqual(code, 200, data)
-        self.assertEqual((data["paused"], data["inbound_today"]), (False, 1))
+        self.assertEqual((data["paused"], data["inbound_today"]), (False, 0))     # the owner's are in no count (B9 0d)
         self.assertIsNotNone(data["bridge_seen"])
         discord, wa = data["accounts"]
         self.assertEqual({k: discord[k] for k in ("id", "app", "label", "agents", "default", "unknown", "enabled", "state",

@@ -25,7 +25,7 @@ ENTITLEMENT = "eyJmbGVldCI6IjBmMWUyZDNjNGI1YTY5NzgifQ.c2lnbmVk"
 def load_tests(loader, _tests, _pattern):
     """Only this file's checks: the harness comes from test_mobile, whose own tests stay in their own file."""
     suite = unittest.TestSuite()
-    for cls in (Seal, Token, Queue, Sender, Present, Badge):
+    for cls in (Seal, Token, Queue, Sender, Present, Badge, MemberRoute):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -867,6 +867,51 @@ class Badge(PushCase):
         hub.PING_WAKE.clear()
         self.raise_item()
         self.assertTrue(hub.PING_WAKE.is_set())
+
+
+
+class MemberRoute(PushCase):
+    """B9: a ping to a member's phone goes by our side's member route (push.send_member), with the fleet's licence, and
+    a 429 there names the count that is full (the website's docs/CONTRACTS.md, "Pings to a phone of a company's
+    people"). The owner's route stays as it was."""
+
+    PAYLOAD = {"aps": {"alert": {"loc-key": "shared-reply"}, "mutable-content": 1}, "sealed": "AAAA"}
+
+    def member(self, **extra):
+        return push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD, "production", **extra)
+
+    def refusal(self, call):
+        with self.assertRaises(push.PushError) as refused:
+            call()
+        return refused.exception
+
+    def test_push_gives_the_name_of_the_full_count_of_a_429_and_a_member_ping_goes_by_its_own_route(self):
+        """Bugs: the hub reads no count from a 429, so a full count of one phone holds back the member pings of every
+        phone of the fleet, or a full count of the fleet holds back none; a member ping goes to /api/push, which
+        refuses the member form, or with no licence; a 503 of the member route (its switch, a closed shop) gives no
+        time, so its ping is lost or sent again at once."""
+        self.assertEqual(self.member(collapse="c" * 32, expires=123), (200, ""))
+        got = self.side.got[-1]
+        self.assertEqual((got["path"], got["headers"]["authorization"]), ("/api/push/member", "Bearer " + ENTITLEMENT))
+        self.assertEqual(got["body"], {"token": TOKEN, "environment": "production", "payload": self.PAYLOAD,
+                                       "collapse": "c" * 32, "expires": 123})
+        for full, named in (("phone", "phone"), ("members", "members"), ("fleet", "fleet"), ("galaxy", "fleet"),
+                            (None, "fleet")):
+            with self.subTest(full=full):
+                body = dict({"error": "too_many", "says": "a count is full"}, **({"full": full} if full else {}))
+                self.side.answer = (429, body, {"Retry-After": "45"})
+                e = self.refusal(self.member)
+                self.assertEqual((e.full, e.retry_after, e.status), (named, 45, 429))
+        self.side.answer = (429, {"error": "busy", "full": "phone"}, {"Retry-After": "45"})
+        e = self.refusal(lambda: push.send(hub.CFG["release_channel"], None, TOKEN, {"aps": {}}, "production"))
+        self.assertEqual((e.full, e.retry_after), (None, 45))               # the owner's route names no count
+        self.side.answer = (503, {"error": "unavailable"}, {"Retry-After": "600"})
+        self.assertEqual((self.refusal(self.member).retry_after, self.refusal(self.member).full), (600, None))
+        self.side.answer = (503, {"error": "unavailable"})                  # no APNs key at our side: no time
+        self.assertIsNone(self.refusal(self.member).retry_after)
+        before = len(self.side.got)
+        e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], None, TOKEN, self.PAYLOAD, "production"))
+        self.assertEqual((len(self.side.got), e.status), (before, None))
 
 
 if __name__ == "__main__":

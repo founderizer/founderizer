@@ -323,8 +323,11 @@ class VaultBroker(OwnerAPI):
         self.assertIsNone(self.released(job))                               # refused before the hub was asked
         status = fleet.vault_call({"op": "status"})
         self.assertEqual(set(status), {"ok", "v", "agent", "store", "user", "recipient", "callers", "backend", "source",
-                                       "creates", "deposits", "withdrawals", "replaces"})
+                                       "creates", "deposits", "withdrawals", "replaces", "made_keys"})
         self.assertEqual(status["backend"], "store")            # the one store a broker opens (P5)
+        # the word that this program keeps a key that the fleet made out of sessions: the hub plans such a key only
+        # for a vault that says it (a status with no word sends a made key to a broker that gives it as a value)
+        self.assertIs(status["made_keys"], True)
         self.assertEqual((status["recipient"], status["callers"]), (VPS_KEY, True))
         self.assertEqual(self.reads(), [])
 
@@ -590,6 +593,19 @@ class VaultBroker(OwnerAPI):
         hub.record_status("vps", hub.validate_status({"security": {"vault": {"mode": "broker", "read_missing": {
             "missing": ["SHOP_API_KEY"], "logins": ["SHOP_API_KEY"]}}}}))
         self.assertEqual((hub.vault_missing("vps"), len(said())), ({"SHOP_API_KEY": "login"}, before + 4))
+        # a key that the fleet made (the vault's `made`): its own reason and words, and not "could not read or protect";
+        # only for a key that the central vault's status names as made, because the helper's list is the word of a
+        # process of the agent (a bug: an agent names SHOP_API_KEY in it, and the manager reads untrue words)
+        with patch.dict(hub.CENTRAL, status={"makes": True, "made": {refs["PLAIN_KEY"]: {}},
+                                             "stored": sorted(refs.values())}):
+            hub.record_status("vps", hub.validate_status({"security": {"vault": {"mode": "broker", "read_missing": {
+                "missing": ["PLAIN_KEY", "SHOP_API_KEY"], "logins": [],
+                "made": ["PLAIN_KEY", "SHOP_API_KEY", "NOT_MISSING"]}}}}))
+        self.assertEqual((hub.vault_missing("vps"), len(said())),
+                         ({"PLAIN_KEY": "made", "SHOP_API_KEY": "other"}, before + 5))
+        self.assertIn("left PLAIN_KEY out of the sessions of", said()[-1])
+        self.assertIn("the fleet made that key for a route", said()[-1])
+        self.assertNotIn("could not read or protect", said()[-1])
 
     def test_a_sealed_handover_is_opened_only_inside_the_broker(self):
         # A copy names its source login (owner API 1.10), and a handover needs its receiver to hold that login
@@ -607,6 +623,14 @@ class VaultBroker(OwnerAPI):
         self.assertEqual(self.opens(raw["ciphertext"], "studio"), LOGIN)
         self.assertEqual(self.made(raw["ciphertext"], "studio"), {"v": 1, "job": job, "source": REF})
         self.assertEqual(self.reads(), [])                  # a sealed copy is opened with the handover key only
+        # a sealed copy of a key that the fleet made (made_login): open_login reads its form, and the handover refuses
+        # it, so no copy of it goes on with no form (piece 2a)
+        made = hub.ins("INSERT INTO sealed(sender,recipient,task,label,ciphertext,created,login,job) "
+                       "VALUES(?,?,?,?,?,?,?,?)", ("studio", "vps", "T-1", "route", lock(VPS_KEY, {"made": {
+                           "password": "made-only-in-this-test-" + "s" * 20, "url": "https://route.example.com"}}),
+                                                   hub.now(), REF, 8))
+        with self.assertRaisesRegex(fleet.Refused, "so it is not handed over"):
+            fleet.vault_call({"op": "handover", "job": self.job(login=f"sealed:{made}")})
 
     def test_a_copy_says_which_job_made_it_and_one_sent_again_under_another_job_is_refused(self):
         other = hub.ins("INSERT INTO tasks(title,owner,state,created) VALUES('Other','vps','working',?)", (hub.now(),))
@@ -979,12 +1003,19 @@ class VaultBroker(OwnerAPI):
         self.assertIs(kept["replaces"], True)
         with self.assertRaises(ValueError):
             hub.validate_status({"security": {"vault": dict(public, replaces="yes")}})
+        # and its word that it keeps a key that the fleet made out of sessions: the hub plans a made key only for a
+        # vault whose report says it (hub.keeps_made_keys), so a helper or a hub that drops the word sends none
+        self.assertIs(public["made_keys"], True)
+        self.assertIs(kept["made_keys"], True)
+        with self.assertRaises(ValueError):
+            hub.validate_status({"security": {"vault": dict(public, made_keys="yes")}})
         self.assertIsInstance(public["broker_read_at"], float)
         self.stop_broker()
         unread = {"callers": None, "creates": None, "captures": None, "requests": None, "broker_recipient": None,
                   "broker_source": None, "broker_read_at": None, "deposits": None,     # deposits: secret_deliveries
                   "withdrawals": None,                                                 # withdrawals: central_vault
                   "replaces": None,                                                    # replaces: secret_replace
+                  "made_keys": None,                                                   # a made key: no word, none
                   "key_generation": None,                                              # package 7: a Mac's vault only
                   "read_missing": None,                                                # C11: before the first read
                   "places": None, "place_key": None}                                   # places: secret_targets

@@ -247,6 +247,19 @@ class BrokerRequests(VaultBroker):
         basic = base64.b64encode(f"{LOGIN['username']}:{LOGIN['password']}".encode()).decode()
         self.assertEqual(self.service.seen[-1]["headers"].get_all("Authorization"), ["Basic " + basic])
 
+    def test_a_key_that_the_fleet_made_still_goes_out_in_a_request_to_its_own_address(self):
+        """A made key is never a value in a session, and no handover or sign-in takes it (test_vault_store MadeKeys).
+        With "Uses it", call_api still sends it to the address in its value, as each key: a rule that refused each use
+        of a made key in open_login would break the maker's own test of its route and each reader that uses it."""
+        key = {"password": "made-only-in-this-test-" + "k" * 20, "url": self.site}
+        self.item(SECRET_ID, {"made": key})                 # as a deposit keeps a made key
+        real = vault.made_site                              # the local service stands in for a route's https site
+        with patch.object(vault, "made_site", lambda site: site == self.site or real(site)):
+            self.assertEqual(self.ask(self.request_job(path="/v1/orders"))["status"], 200)
+        got = self.service.seen[-1]
+        self.assertEqual((got["path"], got["headers"].get_all("Authorization")), ("/v1/orders",
+                                                                                  ["Bearer " + key["password"]]))
+
     def test_the_key_is_in_no_argument_no_environment_and_no_log_line(self):
         sent, started, real = '{"note": "body-marker-13579"}', [], subprocess.Popen
 
@@ -538,8 +551,9 @@ class BrokerRequests(VaultBroker):
         self.assertNotIn("requests", self.call({"op": "status"}, to=self.conf))
         status = self.call({"op": "status"})
         self.assertEqual(set(status), {"ok", "v", "agent", "store", "user", "recipient", "callers", "requests",
-                                       "backend", "source", "deposits", "withdrawals", "replaces"})
-        # no journal ("creates"): the first broker has it; "replaces" is in every broker's status since 015ad2a2
+                                       "backend", "source", "deposits", "withdrawals", "replaces", "made_keys"})
+        # no journal ("creates"): the first broker has it; "replaces" is in every broker's status since 015ad2a2, and
+        # "made_keys" since a key that the fleet made is never a value in a session
         self.assertIs(status["requests"], True)
         job = self.request_job()
         self.assertEqual(self.call({"op": "request", "job": job, "agent": "vps", "agent_key": KEY}, to=self.conf),

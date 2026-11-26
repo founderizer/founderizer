@@ -1099,7 +1099,9 @@ QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bri
               # the health block of the error report (W15): its records, counts, holds and marks of a start
               "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
               "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-              "error_reports_restart", "error_reports_warnings", "error_reports_took")
+              "error_reports_restart", "error_reports_warnings", "error_reports_took",
+              # the funnel's steps that our side took, and its hold (the SMB audit's Q8: error_report_funnel)
+              "error_reports_funnel", "error_reports_funnel_hold")
 
 
 def kv_set(k, v):
@@ -1114,6 +1116,7 @@ def kv_set(k, v):
 
 def kv_set_rows(k, v):
     """kv_set inside a transaction(): its write, which commits with the block (kv_set commits at once)."""
+    in_transaction("kv_set_rows")
     if v is None:
         DB.execute("DELETE FROM kv WHERE k=?", (k,))
     else:
@@ -3466,6 +3469,21 @@ def ping_wait():
     return min([PING_EVERY] + ends)
 
 
+def owner_pings_now():
+    """The count of the owner's pings that may go now, by send_ping's own conditions: the queued Needs-you pings and
+    replies and the one in flight, none while our side holds the owner's pings back (_ping_hold) or while the owner is
+    at a Mac app, and no badge-only push. It commits nothing.
+
+    The one read of the Teams part person_links in this region (B9, b9-phone-members.md, section 5): the part's own
+    thread sends no ping to a member's phone while this count is above 0, so the owner's pings go first, and a ping of
+    his that waits for him at the Mac or for our side's hold stops no member ping. A member ping never sets
+    _ping_hold, and the part never reads or writes the table pings: it holds its own pings, in memory."""
+    if now() < _ping_hold["until"] or owner_present_until() > 0:
+        return 0
+    return read_row("SELECT COUNT(*) n FROM pings WHERE state IN ('queued','sending') AND kind IN ('needs','talk')")[
+        "n"]
+
+
 def send_ping():
     """Sends the oldest queued ping, through our side (push.py): with this fleet's entitlement as the bearer when it
     holds one, and with no Authorization header when it does not, because our side's route asks for no account. False
@@ -4214,6 +4232,22 @@ def need_view(row, reads=None):
     return view
 
 
+def default_held(details, default):
+    """Whether a card's `details` name the default of its question (owner API 1.341): each run of the default's words
+    between its codes (NEED_CODES), as whole words, in any case and with any spaces, quotes or Markdown marks, and the
+    whole default, not only its start. A card says a code in plain words (need_words), so the words around a code are
+    what the details hold. The validation of 25 November 2026, round 3: R3-M1 (21% of the live defaults hold a code,
+    and no card of theirs could go up), and R3-S1 ("No" is no part of "now", and the end of a long default can hold a
+    send). Each piece is cut at its first and its last letter or digit, and a piece with none is no words: two codes
+    with "/", "&", "+" or a bracket between them ask for no mark in the details (round 4, R4-M1: 11 of 38 live defaults
+    with a code have such a piece)."""
+    def plain(value):
+        return " ".join(re.sub(r"[\"'“”‘’*_`>#]", " ", str(value or "")).casefold().split())
+    text = plain(details)
+    parts = [re.sub(r"^[\W_]+|[\W_]+$", "", plain(part)) for part in NEED_CODES.split(str(default or ""))]
+    return all(re.search(rf"(?<![^\W_]){re.escape(part)}(?![^\W_])", text) for part in parts if part)
+
+
 def words_held(text, words, head=160):
     """Whether `text` already holds `words`, or their first `head` characters, as words: in any case, with any spaces
     and line breaks, and with no quote or Markdown mark between them. A card's details that quote a question hold it."""
@@ -4221,6 +4255,164 @@ def words_held(text, words, head=160):
         return " ".join(re.sub(r"[\"'“”‘’*_`>#]", " ", str(value or "")).casefold().split())
     key = plain(words)[:head]
     return bool(key) and key in plain(text)
+
+
+# The asker's words that the card of a question quotes behind Details (raise_needs_you). The owner reads names and what
+# a thing is about, never a code (RULES.md, "People read words, not codes"), and need_words refuses a code in the
+# manager's own words. On 25 November 2026, 42 of the 85 newest question cards of a fleet quoted the asker's codes
+# (T-2707, Q-524, N-321, AM-1853, I-133). The question's own row keeps its codes: agents and tools read them.
+# One code of such words: a case in its full form R-<duty>/C-<case> (cref), or a code of NEED_CODES that no letter, "@"
+# or "/" touches, and that no "-" or "." with a letter or a digit follows: "C-3PO", "T-61.5", "T-61@example.com" and
+# "outputs/T-61/plan.md" hold none (the validation of 26 November 2026, M1).
+NEED_QUOTE_CODE = re.compile(r"(?<![A-Za-z0-9@/-])(?:R-(?P<duty>[0-9]+)/C-(?P<case>[0-9]+)|"
+                             r"(?P<kind>AM|UP|OR|[CGIMNPQRT])-(?P<n>[0-9]+))(?![A-Za-z0-9@/]|[-.][A-Za-z0-9])")
+# What a quote keeps as it is written: a code block (NEED_FENCED, as need_words reads it), code in a line, a web address
+# and an email address. An address starts a word, or follows an opening mark, so that each long word is read once.
+NEED_QUOTE_KEEP = re.compile(NEED_FENCED.pattern + r"|`[^`\n]*`|(?<![^\s(<\[\"'“‘])(?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)"
+                             r"\S+|(?<!\S)[^\s@]+@[^\s@]+", re.M | re.S)
+NEED_QUOTE_NAME_CHARS = 70      # characters of a name that a quote shows in the place of a code, with its "..."
+NEED_QUOTE_NAMES = 40           # codes of one quote that the hub reads: each later one stays as it is written
+NEED_QUOTE_WALK = 20            # tasks of one walk up the links of a task (need_quote_chain)
+# The words in the place of a code of the asker's own things that have no name of their own, and the noun after which
+# the code goes with no words, as the noun says what it is ("the message AM-14" is "the message")
+NEED_QUOTE_KINDS = {"AM": ("an agent's message", "message"), "P": ("a permission request", "request"),
+                    "UP": ("a report", "report"), "OR": ("a message to you", "message")}
+NEED_QUOTE_MARKS = str.maketrans({c: " " for c in "`*_[]<>"})     # Markdown marks that a name does not keep
+
+
+def need_quote_chain(task_id):
+    """The ids of a task and of the tasks above it on its links (follows, job, parent), at most NEED_QUOTE_WALK of
+    them. read_row only."""
+    found, todo = set(), [task_id]
+    while todo and len(found) < NEED_QUOTE_WALK:
+        tid = todo.pop(0)
+        row = read_row("SELECT follows, job, parent FROM tasks WHERE id=?", (tid,)) \
+            if tid is not None and tid not in found else None
+        if row is not None:
+            found.add(tid)
+            todo += [row["follows"], row["job"], row["parent"]]
+    return found
+
+
+def need_quote_work(t, asking, above):
+    """Whether task row `t` is part of the work of the asking task (row `asking`, and `above` its need_quote_chain):
+    that task, a task above it or below it on its links, or a task of its goal, of the owner's message that it comes
+    from, or of its case."""
+    if t is None or asking is None:
+        return False
+    if t["id"] in above:
+        return True
+    if any(asking[column] is not None and t[column] == asking[column] for column in ("goal_id", "ask", "duty_case")):
+        return True
+    return asking["id"] in need_quote_chain(t["id"])
+
+
+def need_quote_named(name):
+    """A name in a quote: one line of printing characters with no Markdown mark (a link is its words), at most
+    NEED_QUOTE_NAME_CHARS with its "...", in quotation marks. None for no name, and for a name that holds a code
+    itself: then the code that it stands for stays as it is written. Only the start of a long text is read."""
+    head = CARD_LINK.sub(r"\1", str(name or "")[:NEED_QUOTE_NAME_CHARS * 4]).translate(NEED_QUOTE_MARKS)
+    line = " ".join("".join(c if c.isprintable() else " " for c in head).split())
+    words = line if len(line) <= NEED_QUOTE_NAME_CHARS else clip(line, NEED_QUOTE_NAME_CHARS - 3)
+    return f"“{words}”" if words.strip(" .:;,-") and NEED_CODES.search(words) is None else None
+
+
+def need_quote_name(m, qu, asking, above, raiser):
+    """The words in the place of one code (NEED_QUOTE_CODE) of the words of question row `qu`, or None, and the code
+    stays as it is written. A code gets words only where the question can mean that thing, because small numbers name
+    rows of all kinds and words can look like codes ("the N-340 road", "the T-800 figure"): a task of the asking
+    task's work (need_quote_work; `asking` is that task's row, `above` its need_quote_chain) by its title; a question
+    of the asker by the start of its words; a card that `raiser` raised about that work, by its title; the asking
+    task's goal by its title; a case of the asker's duty, only as R-<duty>/C-<case> (a conversation counts from 1 too),
+    by its title; a standing item of the asker by its words; a duty of the asker by its name (duty_name); a message of
+    the owner's to the asker or that the asking task comes from by the start of its words; and a message, a permission
+    request, a report or a word to the owner of the asker's by NEED_QUOTE_KINDS. A task of a narrowed pair and its
+    question, a card of a conversation and a standing item of a person get no words: the manager that raised the card
+    reads its details too, and no session outside that pair learns of the task (narrowed_from)."""
+    if any(len(d) > 18 for d in (m["duty"], m["case"], m["n"]) if d is not None):    # no row has such a number
+        return None
+    asker = qu["asker"]
+    if m["case"] is not None:
+        row = read_row("SELECT c.title FROM duty_cases c JOIN responsibilities r ON r.id=c.responsibility WHERE c.id=? "
+                       "AND r.id=? AND r.agent=?", (int(m["case"]), int(m["duty"]), asker))
+        return need_quote_named(row["title"] if row else None)
+    kind, number = m["kind"], int(m["n"])
+    if kind == "T":
+        row = read_row("SELECT * FROM tasks WHERE id=?", (number,))
+        meant = row is not None and task_scope(row) is None and need_quote_work(row, asking, above)
+        return need_quote_named(row["title"] if meant else None)
+    if kind == "Q":
+        row = read_row("SELECT task, text FROM questions WHERE id=? AND asker=?", (number, asker))
+        task = read_row("SELECT * FROM tasks WHERE id=?", (row["task"],)) if row else None
+        return need_quote_named(row["text"] if row and task_scope(task) is None else None)
+    if kind == "N":
+        row = read_row("SELECT * FROM needs WHERE id=? AND by=? AND conversation IS NULL", (number, raiser))
+        if row is None:
+            return None
+        asked = read_row("SELECT task FROM questions WHERE id=?", (row["question"],)) if row["question"] else None
+        tasks = [x for x in (asked["task"] if asked else None, row["door_task_id"], row["takeover_task"]) if x]
+        meant = bool(row["ask"] and asking and row["ask"] == asking["ask"]) or any(
+            need_quote_work(read_row("SELECT * FROM tasks WHERE id=?", (x,)), asking, above) for x in tasks)
+        return need_quote_named(row["title"] if meant else None)
+    if kind == "G":
+        row = read_row("SELECT title FROM goals WHERE id=?", (number,)) \
+            if asking is not None and asking["goal_id"] == number else None
+        return need_quote_named(row["title"] if row else None)
+    if kind == "I":
+        row = read_row("SELECT words FROM standing WHERE id=? AND agent=? AND conversation IS NULL AND "
+                       "author_kind<>'person'", (number, asker))
+        return need_quote_named(row["words"] if row else None)
+    if kind == "R":
+        row = read_row("SELECT text FROM responsibilities WHERE id=? AND agent=?", (number, asker))
+        return need_quote_named(duty_name(row["text"]) if row else None)
+    if kind == "M":
+        row = read_row("SELECT text FROM ui_requests WHERE event_id=? AND (recipient=? OR request_id=?)",
+                       (number, asker, asking["ask"] if asking is not None else None))
+        return need_quote_named(row["text"] if row else None)
+    mine = {"AM": "SELECT 1 FROM agent_messages WHERE id=? AND ? IN (sender, recipient)",
+            "P": "SELECT 1 FROM prompts WHERE id=? AND agent=?",
+            "UP": "SELECT 1 FROM reports WHERE id=? AND ? IN (from_agent, to_agent)",
+            "OR": "SELECT 1 FROM owner_reports WHERE id=? AND agent=?"}.get(kind)
+    return NEED_QUOTE_KINDS[kind][0] if mine and read_row(mine, (number, asker)) else None
+
+
+def need_quote_words(qu, raiser):
+    """The words of question row `qu` as the card that `raiser` raises for it quotes them for the owner: each code
+    (NEED_QUOTE_CODE) that the question can mean is words in its place (need_quote_name), and every other code stays
+    as it is written. What NEED_QUOTE_KEEP finds stays as it is written: a command in a code block, a path in code, a
+    web address and an email address are exact. At most NEED_QUOTE_NAMES codes, each read once, and one pass: the time
+    grows with the length of the words, under the lock of the raise. A question's name follows "the question", as the
+    words of a question read as a statement ("The manager's answer (Q-421)"), and a kind word goes where the noun
+    before the code says what it is."""
+    text = str(qu["text"] or "")
+    asking = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu["task"] is not None else None
+    above = need_quote_chain(asking["id"]) if asking is not None else set()
+    said = {}
+
+    def words(m):
+        code = m.group(0)
+        if code not in said and len(said) < NEED_QUOTE_NAMES:
+            said[code] = need_quote_name(m, qu, asking, above, raiser)
+        if not said.get(code):
+            return code
+        where = at + m.start()          # in the whole text: a part starts after a code block or an address
+        before = text[max(0, where - 16):where]
+        if m["kind"] == "Q" and not re.search(r"(?i)\bquestions?\s*$", before):
+            first = (where <= 16 and not before.strip()) or re.search(r"(?:[.!?][ \t]+|\n[ \t]*)$", before)
+            return ("The" if first else "the") + " question " + said[code]
+        if m["kind"] in NEED_QUOTE_KINDS and re.search(rf"(?i)\b{NEED_QUOTE_KINDS[m['kind']][1]}s?\s+$", before):
+            return "\x00"         # it goes with the spaces before it: "the message AM-14." is "the message."
+        return said[code]
+
+    text = text.replace("\x00", "")
+    parts, at = [], 0
+    for kept in [*NEED_QUOTE_KEEP.finditer(text), None]:
+        end = kept.start() if kept else len(text)
+        parts.append(re.sub(r"[ \t]*\x00", "", NEED_QUOTE_CODE.sub(words, text[at:end])))
+        if kept:
+            parts.append(kept.group(0))
+            at = kept.end()
+    return "".join(parts)
 
 
 def need_recommended(given, options, give=False):
@@ -7368,8 +7560,62 @@ def error_report_body(since, version=None, taken=None, restarting=False):
     except Exception:
         print_fault()
         health = None
+    try:
+        funnel = error_report_funnel(now(), taken)
+    except Exception:           # a fault of the funnel is a fault of the hub, and the report goes without it
+        print_fault()
+        funnel = None
     return errorreports.report(fleet_id(), version, errorreports.system_words(), diagnostics.code_id(),
-                               len(TEAM.get("agents") or {}), len(server_names()), view, since, health=health)
+                               len(TEAM.get("agents") or {}), len(server_names()), view, since, health=health,
+                               funnel=funnel)
+
+
+# ---- the funnel in the report (the SMB audit's Q8, the owner's "Go ahead" of 25 November 2026: "Five funnel counts
+# under the existing usage switch: first page, servers built, first message, first finished job, second person")
+#
+# The hub's four steps, each the UTC day of its first time, read from the records that the hub keeps anyway, so the
+# days of steps from before the owner's yes go once after it, and nothing new is kept while reports are off. The Mac's
+# report carries the first page. Design: ~/dev/founderizer-plans/smb-x100-audit-2026-11-25/q8-funnel-design.md.
+
+# The first time of three steps, from the hub's own records, each by an index (ui_request_owner_message,
+# task_delivered). The owner's first message is one of his own words (OWNER_FORCE_HANDS: an app's screen, an enrolled
+# device, a chat app), with no Needs-you item: never a connected app's (ChatGPT that tells the manager something), an AI
+# session's or a program's (the validator of 26 November 2026, M2). A row of before the hand was kept (21 November 2026)
+# is his by the marks that request_hand reads for those hands (a chat app's origin, the labels of his devices' apps).
+FIRST_STEPS = {"message": "SELECT MIN(created) AS t FROM ui_requests WHERE kind='message' AND need_id IS NULL AND "
+                          f"(hand IN ({', '.join(repr(hand) for hand in OWNER_FORCE_HANDS)}) OR (hand IS NULL AND "
+                          "(origin != '' OR "
+                          + " OR ".join(f"client GLOB '{label}*'" for label in OWNER_DEVICE_LABELS) + ")))",
+               "job": "SELECT MIN(delivered) AS t FROM tasks WHERE state='completed' AND delivered IS NOT NULL",
+               "person": "SELECT MIN(added) AS t FROM people"}
+
+
+def error_report_funnel(t0, taken=None):
+    """Inside LOCK: the report's `funnel` block (errorreports.funnel), or None: until our side takes it
+    (errorreports.FUNNEL), for a DAY after our side refused a report with it (error_report_send), and when no step
+    waits. A step that a report that our side took carried (error_reports_funnel) goes no more, and its record is not
+    read again. `built` is the owner's Mac's claim of this hub (hub_claimed), which ends the setup's build. `taken`,
+    when given, gets the steps of the block ("funnel"), which error_report_send keeps once our side took them."""
+    if not errorreports.FUNNEL:
+        return None
+    hold = kv_time("error_reports_funnel_hold")
+    if hold and t0 < hold <= t0 + errorreports.DAY:     # a hold from a clock that was ahead counts as none
+        return None
+    went = kv_json("error_reports_funnel", dict) or {}
+    firsts = {step: q1(sql)["t"] for step, sql in FIRST_STEPS.items() if step not in went}
+    if "built" not in went:
+        firsts["built"] = hub_claimed(t0)
+    block = errorreports.funnel(firsts, went, t0)
+    if block is not None and taken is not None:
+        taken["funnel"] = dict(block)
+    return block
+
+
+def error_reports_funnel_went(steps):
+    """Inside LOCK, when our side took a report with the funnel: its steps go no more (error_report_funnel)."""
+    went = kv_json("error_reports_funnel", dict) or {}
+    went.update({step: day for step, day in steps.items() if step not in went})
+    kv_set("error_reports_funnel", json.dumps(went, sort_keys=True))
 
 
 def error_report_since(sent, t0):
@@ -7433,7 +7679,11 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
     (error_reports_health_hold). When our side took a report with the block, the block's counts start again from what
     it carried (`taken`, error_reports_counted); a report that went without it resets none of them, and neither does
     one whose body was made before a new yes of the owner during the send (an off and an on: `taken`'s `on_at` is not
-    error_reports_on_at), whose counts error_reports_counts_start began again at that yes."""
+    error_reports_on_at), whose counts error_reports_counts_start began again at that yes.
+
+    The funnel (error_report_funnel) is the newest block, so a 400 to a report with it takes it out first, in the same
+    way: the report goes again at once without it, the funnel waits a DAY from the stamp (error_reports_funnel_hold),
+    and its steps wait. When our side took a report with it, its steps go no more (error_reports_funnel_went)."""
     with LOCK:
         if not error_reports_on():
             return
@@ -7442,6 +7692,15 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
             errorreports.send(url, body, timeout=timeout)
             break
         except errorreports.ReportError as e:
+            if e.status == 400 and "funnel" in body:
+                body = {key: value for key, value in body.items() if key != "funnel"}
+                with LOCK:
+                    kv_set("error_reports_funnel_hold", repr(float(stamp) + errorreports.DAY))
+                    log("hub", f"{e} to the error report with the funnel: it goes again now without the funnel, "
+                               f"and the funnel goes again in a day")
+                    if not error_reports_on():      # the owner turned reports off during the first send
+                        return
+                continue
             if e.status == 400 and "health" in body:
                 body = {key: value for key, value in body.items() if key != "health"}
                 with LOCK:
@@ -7463,6 +7722,8 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
         kv_set("error_reports_sent", stamp)
         if "health" in body and taken and taken.get("on_at") == kv_get("error_reports_on_at"):
             error_reports_counted(taken)
+        if "funnel" in body and taken and taken.get("funnel"):
+            error_reports_funnel_went(taken["funnel"])
         if early and not past:
             error_report_earlies(add=float(stamp))
         error_report_took(add={"at": float(stamp), "kinds": errorreports.kinds(body), "past": bool(past)})
@@ -7471,7 +7732,8 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
         which = ("the error report before a restart, past the day's early ones" if past else
                  "an early error report" if early else "the day's error report")
         log("hub", f"sent {which}: {len(body['faults'])} errors, {len(body['refusals'])} refused calls"
-                   + (", and the fleet's health" if "health" in body else ""))
+                   + (", and the fleet's health" if "health" in body else "")
+                   + (f", and {len(body['funnel'])} first steps" if "funnel" in body else ""))
 
 
 # ---- W15: the fleet's health in the report (the reliability plan of 21 November 2026, 3.3; the website's
@@ -9798,6 +10060,9 @@ def migrate():
         # an agent's owner messages, newest last: the timer's chat_late (every 5 seconds under LOCK, for each worker
         # and lead) and turn_ended_after read them; with no index each read went through every message of the fleet
         "CREATE INDEX IF NOT EXISTS ui_request_recipient ON ui_requests(recipient, created)",
+        # the funnel's first message of the owner's (FIRST_STEPS): the owner's messages in time, with no scan of the rest
+        "CREATE INDEX IF NOT EXISTS ui_request_owner_message ON ui_requests(created) WHERE kind='message' AND "
+        "need_id IS NULL",
         # The reads that the hub's lock holds and that went through tables which grow with the fleet's history (the
         # review of 20 November 2026). The helper's delivery poll reads an agent's newest owner chat credential at
         # each round, twice a second for each worker and lead (chat_session_ready), its newest chat and standing
@@ -13218,6 +13483,12 @@ def restart_continue(hold_id):
        f"Attempt {h['attempt']} was stopped for a restart ({r['reason']}): check what its last {did} did", t0))
     settled = [x for x in access_asks(t) if x["enough"]]    # the access it asked for, which the new session has
     asked = [x["id"] for x in q("SELECT id FROM questions WHERE task=? AND answer IS NULL ORDER BY id", (tid,))]
+    # owner API 1.341: a question with a default on an open card of the owner's stays open, and the new session gets
+    # the owner's answer (the validation of 25 November 2026, R2-S2: told to ask again, it raised a second card)
+    kept = [x["id"] for x in q("SELECT DISTINCT qu.id FROM questions qu JOIN needs n ON n.question=qu.id WHERE "
+                               "qu.task=? AND qu.answer IS NULL AND qu.assumed IS NOT NULL AND n.answer IS NULL "
+                               "ORDER BY qu.id", (tid,))]
+    asked = [x for x in asked if x not in kept]
     # A refused permission request stays refused: the new session is told, so that a restart is no way around it.
     refused = q("SELECT id, tool, input FROM prompts WHERE task=? AND kind<>'code' AND decision IN ('deny','expired') "
                 "AND NOT (COALESCE(by,'')='hub' AND COALESCE(reason,'') LIKE '% is held.') ORDER BY id DESC LIMIT 8", (tid,))
@@ -13230,6 +13501,10 @@ def restart_continue(hold_id):
     if asked:
         parts.append(f"Your question{'s' if len(asked) > 1 else ''} {', '.join(f'Q-{x}' for x in asked)} ended with "
                      f"the earlier session: ask again if you still need an answer.")
+    for x in kept:          # the new session never read the raise's notice (the validation, round 3, R3-S2)
+        held = q1("SELECT assumed FROM questions WHERE id=?", (x,))["assumed"]
+        parts.append(f"Your question Q-{x} stays on the owner's card: do not ask again. The owner's answer comes to "
+                     f"this session. " + default_hold(held, "the earlier session's"))
     if refused:
         parts.append("These permission requests of this task were refused, and each refusal still holds in this "
                      "session: " +
@@ -21055,7 +21330,15 @@ def t_raise_needs_you(agent, a):
             raise ToolError(f"Not raised: {NEED_GIVE_OPEN} items with Give wait for the owner already. Raise this one "
                             f"once the owner answered one of them or you withdrew one that is not needed "
                             f"(withdraw_need), or in the place of one, with replaces.")
-        qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
+        qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None, reason=reason)
+        # the owner sees what goes on while they decide only in the manager's own details, and a refusal rings
+        # nothing, where a second card rings twice for one decision (the validation of 25 November 2026, R2-M2)
+        if qu and qu["assumed"] is not None and not default_held(details, qu["assumed"]):
+            coded = NEED_CODES.search(qu["assumed"]) is not None
+            words = NEED_CODES.sub(lambda m: f"<{m.group(0)} in plain words>", qu["assumed"])
+            raise ToolError(f"Not raised: details name what {qu['asker']} goes on with until the owner answers, so "
+                            f"that the owner sees it while they decide. Add it to details in these words"
+                            f"{', with each code in plain words' if coded else ''}: \"{words}\"")
         # owner API 1.285: each picture, checked under the lock that the item's own write holds, so that no message
         # and no other item takes one between this check and the take (need_takes_pictures)
         t0 = now()
@@ -21063,9 +21346,12 @@ def t_raise_needs_you(agent, a):
         # the asker's own words, which the owner answers: behind Details, with no code, and once: not where the
         # agent's details quote them already (the owner, 20 November 2026: "why is the text like repeated ... I need
         # more brevity and clarity"). Not on a card of a runtime's sign-in, whose words are the hub's alone: an asker's
-        # text, which can hold any address and any code, would stand beside the hub's step (F6, piece 1)
-        if qu and door_script is None and not sign_in and not words_held(details, qu["text"]):
-            words = clip_lines(qu["text"], 1000)
+        # text, which can hold any address and any code, would stand beside the hub's step (F6, piece 1). A code of
+        # the asker's that the question can mean is words (need_quote_words), and the details that quote the question
+        # already hold those words, as need_words keeps codes out of them
+        shown = need_quote_words(qu, agent) if qu and door_script is None and not sign_in else None
+        if shown is not None and not words_held(details, shown):
+            words = clip_lines(shown, 1000)
             gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
             details = (details + "\n\n" if details else "") + \
                 f"{shown_role(qu['asker'])}'s question, in its own words:{gap}\"{words}\""
@@ -21108,6 +21394,12 @@ def t_raise_needs_you(agent, a):
         log(agent, f"raised N-{nid} for the reason {reason}")      # what each card was for, to count them later
     emit("owner", "notify", f"Needs you: {title}" + (f" · {door_task}" if door_task else ""))
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
+    if qu and qu["assumed"] is not None and not (old and old["question"] == qu["id"]) and \
+            q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (qu["task"],)):
+        # owner API 1.341, the validation of 25 November 2026 (R2-S1): the asker's running session reads it, with no
+        # turn of the manager and no message to route; its default ran from the ask, and rule 4 holds it now
+        emit(qu["asker"], "say", f"[hub] Your question Q-{qu['id']} is on the owner's card now, and their answer "
+                                 f"comes to this session. " + default_hold(qu["assumed"], "your"), task=qu["task"])
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". The owner's answer is the words of the one they press, or anything else they write "
              "instead.") if options else ""
@@ -21117,7 +21409,21 @@ def t_raise_needs_you(agent, a):
     linked = (f" It is for Q-{qu['id']}: the owner's answer goes to {qu['asker']} as the answer of Q-{qu['id']} by "
               f"itself, and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} "
               f"closes by itself. If an agent does the work first, answer Q-{qu['id']} yourself with what was done, "
-              f"so that the owner does not do it again." if qu else "")
+              f"so that the owner does not do it again." if qu and qu["assumed"] is None else "")
+    if qu and qu["assumed"] is not None:
+        # owner API 1.341: the asker does not wait, so its task often ends first, and the card stays for the decision
+        # (end_waits, restart_continue); the hub told the asker itself above what rule 4 asks of its default
+        ask, who, ref = f"Q-{qu['id']}", qu["asker"], tref(qu["task"])
+        linked = (f" It is for {ask}: while {ref} runs, the owner's answer goes to {who} as the answer of {ask} by "
+                  f"itself, and the hub told {who} that its default waits for that answer when it sends, posts, pays "
+                  f"or acts outside the fleet. If {ref} ends first, N-{nid} stays open, and the owner's answer comes "
+                  f"to you with the question and the default. The decision is the owner's: do not answer {ask} "
+                  f"yourself, also when the work is done, because an answer closes N-{nid}, unless the owner decided "
+                  f"it another way: then answer {ask} with their decision.")
+        if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (qu["task"],)) is None:
+            linked = (f" It is for {ask}, and {ref} has ended: the owner's answer comes to you with the question and "
+                      f"the default, for the follow-up work. N-{nid} closes by itself when {ask} is answered another "
+                      f"way.")
     door = (" When the owner answers yes, their app signs that yes to the door call, and the door lets that exact "
             "call through once: the agent sends the same call again." if door_call else "")
     if door_host:
@@ -21224,11 +21530,17 @@ def door_card_open(call, host, asking, old):
                         f"parts of a script as several cards.{question}")
 
 
-def need_question(agent, ref, ignore=None):
+def need_question(agent, ref, ignore=None, reason=None):
     """The question that a Needs-you item takes to the owner (raise_needs_you question_id), checked, or None without
     one. The manager's last step for a question that came up its line (the owner, 28 October 2026: "Agent -> Lead ->
-    Manager -> Me"): only one that it holds, or holds for a lead that cannot act on it, that blocks its asker, whose
-    task is open, and that no other open item asks already."""
+    Manager -> Me"): only one that it holds, or holds for a lead that cannot act on it, that has no answer, and that no
+    other open item asks already. It blocks its asker and its task is open, or it has a default and its item's reason
+    is decision (owner API 1.341), whose owner_words card_reason found in the owner's own words: then the asker's
+    default holds until the owner answers, and the owner's answer replaces it, or goes to the raiser when the task
+    ended first (need_kept_words), also when the task ended before the raise. 24 November 2026: a lead asked the manager with a default that only waited for
+    the owner's decision ("Leave the older listings as they are, and send nothing, until" the owner decides); the hub
+    refused its card, and the manager sent the decision with its options to the owner chat, with no card and no
+    buttons."""
     if ref in (None, ""):
         return None
     qid = parse_id(ref, "question")
@@ -21240,10 +21552,14 @@ def need_question(agent, ref, ignore=None):
         raise ToolError(f"Q-{qid} is with {qu['requester']}, which answers it or passes it up to you.")
     if qu["answer"] is not None:
         raise ToolError(f"Q-{qid} is already answered.")
-    if qu["assumed"] is not None:
+    if qu["assumed"] is not None and reason != "decision":
         raise ToolError(f"Q-{qid} blocks nobody: {qu['asker']} goes on with \"{qu['assumed']}\", so the owner is not "
-                        f"needed for it. Answer it only if that reading is wrong.")
-    if not t or t["state"] in TERMINAL:
+                        f"needed for it, unless the owner's own words keep this decision: then raise it with reason "
+                        f"decision and those words in owner_words; the default holds until they answer. Else answer "
+                        f"it only if that reading is wrong.")
+    # its decision still waits for the owner when the task that asked it ended first (a quarter of such tasks end
+    # within 9 minutes): the card then takes the late-answer path to its raiser (need_kept_words)
+    if not t or (t["state"] in TERMINAL and qu["assumed"] is None):
         raise ToolError(f"{tref(qu['task'])} has ended, so nothing waits for Q-{qid} any more.")
     other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL AND id IS NOT ?", (qid, ignore))
     if other:
@@ -21265,7 +21581,9 @@ def t_withdraw_need(agent, a):
     owner, 22 November 2026, "Yes" to his phone ringing when the agent closes a card after his message): the reason is
     also the agent's reply under the card, which rings and notifies as discuss_need's reply does. An item that takes a
     question to the owner closes when the question is answered, an item of a conversation is that person's answer, and
-    a secret request that tasks wait on closes with them or with the owner's answer: those three are refused here.
+    a secret request that tasks wait on closes with them or with the owner's answer: those three are refused here, but
+    for the card of a question with a default (owner API 1.341): its task does not wait for the owner, and the owner
+    can decide it another way, in their chat, while the task runs (the validation of 25 November 2026, round 4).
 
     Another agent's item is refused too, but for one kind (the owner, 17 November 2026, after a key request from an
     agent's chat waited ten days for nothing): the manager closes another agent's key or login request that no task
@@ -21287,7 +21605,11 @@ def t_withdraw_need(agent, a):
                             f"exception is another agent's key or login request that no task waits on.")
         if need["answer"] is not None:
             raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
-        if need["question"]:
+        # the card of a question with a default is the owner's decision, and the asker does not wait for it: when the
+        # owner decided it another way, its raiser closes it with that in why, and the question stays (round 4)
+        asked = read_row("SELECT * FROM questions WHERE id=?", (need["question"],)) if need["question"] else None
+        kept = asked is not None and asked["assumed"] is not None and asked["answer"] is None
+        if need["question"] and not kept and not question_session_ended(need["question"]):
             raise ToolError(f"N-{nid} takes Q-{need['question']} to the owner. Answer Q-{need['question']} with "
                             f"answer instead, and N-{nid} closes by itself.")
         if need["conversation"]:
@@ -21331,6 +21653,9 @@ def t_withdraw_need(agent, a):
                                      "It left the owner's Needs you with no notification, and its record keeps your "
                                      "reason. ")
             + (f"{theirs} is not told: tell it with message_agent when its work should know. " if theirs else "") +
+            (f"Q-{asked['id']} of {asked['asker']} stays open: when the owner decided it, answer Q-{asked['id']} with "
+             f"their decision, so that {asked['asker']} reads it. " if kept and read_row(
+                f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (asked["task"],)) else "") +
             "Raise a new item only when the owner must do or decide something now.")
 
 
@@ -21562,12 +21887,15 @@ def open_items_line(agent, t):
     scripts as root on a server: "why can't devops agent do that? that is the point of having it!" The business's DevOps
     agent had installed them through the door four hours before, and the manager had accepted that result, but it
     never answered the question that the card took to him: the card stayed on his screen, and the task that asked
-    waited for him. An item with no question names no goal, so only the manager's rules close it (withdraw_need)."""
+    waited for him. An item with no question names no goal, so only the manager's rules close it (withdraw_need).
+    Not the card of a question with a default (owner API 1.341): its decision waits for the owner when the work is done,
+    and a result that did what one of its options says is the asker's default, not the owner's answer (the validation
+    of 25 November 2026, round 2, R2-M1)."""
     if not t["goal_id"]:
         return ""
     rows = q("SELECT n.id, n.title, n.question FROM needs n JOIN questions qu ON qu.id=n.question "
              "JOIN tasks k ON k.id=qu.task WHERE n.by=? AND n.answer IS NULL AND qu.answer IS NULL AND k.goal_id=? "
-             "ORDER BY n.id", (agent, t["goal_id"]))
+             "AND qu.assumed IS NULL ORDER BY n.id", (agent, t["goal_id"]))
     if not rows:
         return ""
     named = "; ".join(f"N-{r['id']} \"{clip(r['title'] or '', 80)}\", which takes Q-{r['question']} to the owner"
@@ -21725,7 +22053,16 @@ def need_look_hints(r):
             if r["question"]:
                 hint += f", as answering Q-{r['question']} closes the card with no word to them"
         hints.append(hint)
-    if r["question"]:
+    kept = r["question"] and (read_row("SELECT assumed FROM questions WHERE id=?", (r["question"],)) or
+                              {"assumed": None})["assumed"] is not None
+    if kept and question_session_ended(r["question"]):
+        hints.append(f"the task that asked Q-{r['question']} ended: the owner's answer comes to you for the "
+                     f"follow-up work, and withdraw_need closes it when nothing needs it")
+    elif kept:              # owner API 1.341: the decision is the owner's, also when the work is done
+        hints.append(f"it takes Q-{r['question']}, a question with a default, to the owner: the decision is theirs, "
+                     f"so do not answer Q-{r['question']} yourself, also when the work is done, unless the owner "
+                     f"decided it another way, and the card stays open when that work ends")
+    elif r["question"]:
         hints.append(f"it takes Q-{r['question']} to the owner: when the work has settled it, answer Q-{r['question']} "
                      f"and the card closes")
     if spec is not None:
@@ -24254,6 +24591,15 @@ def central_signatures(status):
     return granted, pooled
 
 
+def central_granted(status):
+    """central_signatures' grants for what is taken away or told: None when the status is not there or its `grants`
+    does not read, so that a damaged status takes no copy away (door_sealed's keep, door_reconcile), as central_named
+    does for the made keys."""
+    if not isinstance(status, dict) or not isinstance(status.get("grants"), list):
+        return None
+    return central_signatures(status)[0]
+
+
 def central_standing(status):
     """`standing` of GET /ui/vault (owner API 1.219, choice C50): beside each grant that the owner signed and has not
     taken back, and each secret that the owner signed into the grantable pool, whether the hub's own records still hold
@@ -24504,6 +24850,55 @@ def can_replace(carrier, t0=None):
     return (broker_report(carrier, t0) or {}).get("replaces") is True
 
 
+CENTRAL_MADE = CENTRAL_REQUEST + "made:"    # the request_id of a delivery of a key that may be a made key: below
+
+
+def keeps_made_keys(carrier, t0=None):
+    """True when the vault of this carrier's machine keeps a key that the fleet made out of each session and check:
+    its status says made_keys: true (vault.py read and swap_value), and the helper reports the word in security.vault.
+    An older broker program, a server before its root step and Fleet Vault on a Mac say nothing, so the hub plans no
+    made key for them (central_plan). The report is the helper's: a process of the agent can forge it. So the hub
+    gives the copy of such a key only to a request of the vault itself that says the same word (helper_deposit)."""
+    return (broker_report(carrier, t0) or {}).get("made_keys") is True
+
+
+def central_unmade(status):
+    """The references that this status of the central vault names as values that it holds and did not make itself:
+    its `stored` less its `made` (vault.py central_status). None when its program makes no key (its status does not
+    say `makes`), so that it holds none either. Each other reference counts as a made key: a key that the central
+    vault made after this status was read is in no list of it, so only a newer status says what it is. A status that
+    is not there names none."""
+    if not isinstance(status, dict):
+        return frozenset()
+    if status.get("makes") is not True:
+        return None
+    made, stored = status.get("made"), status.get("stored")
+    if not (isinstance(made, dict) and isinstance(stored, list)):
+        return frozenset()
+    return frozenset(str(ref).lower() for ref in stored) - {str(ref).lower() for ref in made}
+
+
+def not_made(ref, unmade):
+    """True when this reference is surely no key that the central vault made, by central_unmade's answer."""
+    return unmade is None or ref in unmade
+
+
+def central_named(status):
+    """The references that this status of the central vault names as keys that it made (`made`): an empty set for a
+    program that makes none, and None when the status cannot say (no status, or lists that do not read). central_unmade
+    is the strict reading, for what goes out (a delivery, a seal for the door); this one is for what is taken away or
+    told (a withdrawal, the door's keep list, the reason of a key that a read left out): a status that cannot say takes
+    nothing away, so a damaged status does not empty each vault of an older program, nor the door."""
+    if not isinstance(status, dict):
+        return None
+    if status.get("makes") is not True:
+        return frozenset()
+    made, stored = status.get("made"), status.get("stored")
+    if not (isinstance(made, dict) and isinstance(stored, list)):
+        return None
+    return frozenset(str(ref).lower() for ref in made)
+
+
 def secret_value(ref):
     """The record of the value that the owner replaced under this reference, or None when he replaced none:
     {login, at, sha256, prints}. read_row: the reconciler and a vault's routes read it under LOCK."""
@@ -24578,7 +24973,7 @@ def machine_secrets(m):
     return {str(ref).lower() for agent in m["agents"] for ref in secret_grants(agent)}
 
 
-def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
+def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset()), status=None):
     """What one pass of the reconciler does: ([(machine, ref, carrier)] to seal and deliver, [(machine, ref, carrier)]
     to withdraw). It writes nothing; called with LOCK held.
 
@@ -24594,9 +24989,21 @@ def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
 
     A copy that the vault took before the owner replaced the value of its reference is old (value_old): the vault
     gets the new value in a delivery that it puts in the place of the old one, when its broker says that it does so
-    (can_replace); until then it keeps the old value. A delivery that failed before the replace waits for nothing."""
+    (can_replace); until then it keeps the old value. A delivery that failed before the replace waits for nothing.
+
+    A key that the central vault made (vault.py make) goes only to a machine whose vault keeps it out of each session
+    and check (keeps_made_keys). For each other machine, the vault should hold only what this central status names as
+    a value that the central vault did not make (central_unmade; status: the one that the pins and the signatures came
+    from, else the one that the hub read last), so a key that was made after that read goes there in no case. A made
+    key that such a machine holds from before (its vault was put back to an older program) goes back, as each secret
+    that the vault should not hold, but only when the status names it as made (central_named): a reference that it
+    cannot say of stays where it is, neither sent nor taken back."""
     holdings, catalog, deliver, withdraw = central_holdings(), logins(), [], []
     granted, pooled = signed
+    if status is None:
+        with CENTRAL_LOCK:
+            status = CENTRAL["status"]
+    unmade, named = central_unmade(status), central_named(status)
     values = {r["login"]: r for r in read_rows("SELECT * FROM secret_values")}
     # the newest delivery of each secret to each machine that failed: what waits CENTRAL_RETRY, when it is newer than
     # the delivery of the holding and was sealed from the value of now
@@ -24606,7 +25013,11 @@ def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
         pin = pins.get(name)
         if not m["carrier"] or not pin or pin != m["recipient"]:
             continue
-        desired = {ref for ref in machine_secrets(m) if ref in inventory and ((ref, name) in granted or ref in pooled)}
+        keeps = keeps_made_keys(m["carrier"], t0)
+        signed_here = {ref for ref in machine_secrets(m)
+                       if ref in inventory and ((ref, name) in granted or ref in pooled)}
+        desired = {ref for ref in signed_here if keeps or not_made(ref, unmade)}
+        unknown = {ref for ref in signed_here - desired if named is None or ref not in named}
         withdraws, replaces = can_withdraw(m["carrier"], t0), can_replace(m["carrier"], t0)
         for ref in sorted(desired | {ref for machine, ref in holdings if machine == name}):
             d, w = holdings.get((name, ref), (None, None))
@@ -24620,7 +25031,7 @@ def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
             if ref in desired and (not held or (old and replaces)):
                 if ref in catalog and not lately:
                     deliver.append((name, ref, m["carrier"]))
-            elif held and ref not in desired and ref in inventory and withdraws:
+            elif held and ref not in desired and ref not in unknown and ref in inventory and withdraws:
                 if not (w is not None and w["ok"] == 0 and w["created"] > d["created"]
                         and t0 - w["finished"] < CENTRAL_RETRY):
                     withdraw.append((name, ref, m["carrier"]))
@@ -24646,22 +25057,30 @@ def central_deliver(machine, ref, text, pin, t0):
     app, if the machine still takes it now: a carrier, the pin still its broker's key, the secret still in the catalog
     and held by one of its agents, and nothing of it held or waiting there, except a copy of a value that the owner
     replaced since (value_old). The seal came from the socket outside LOCK, so each of those is read again here.
-    Called with LOCK held; returns the delivery's id, or None."""
+    Called with LOCK held; returns the delivery's id, or None.
+
+    A copy of a key that may be a made key (the central status that the hub read last does not name it as another
+    value: central_unmade) goes only to a machine whose vault keeps such a key out of sessions (keeps_made_keys), and
+    its request_id starts with CENTRAL_MADE: the hub gives that copy only to a request of a vault that says so itself
+    (helper_deposit). Whether a reference is a made key never changes, so that word of the row stays true."""
     m, entry = deposit_machines(None, t0).get(machine), logins().get(ref)
     d, w = newest_holding(machine, ref)
     held, waiting = vault_holds(d, w, pin)
     value = secret_value(ref)
+    with CENTRAL_LOCK:
+        made = not not_made(ref, central_unmade(CENTRAL["status"]))
     # A copy that the vault holds stops a new one, but not a copy of the value that the owner replaced since. And a
     # pass that started before the replace can carry a seal of the old value: it makes no delivery, the next one does.
     if not m or not m["carrier"] or m["recipient"] != pin or entry is None or \
-            ref not in machine_secrets(m) or \
+            ref not in machine_secrets(m) or (made and not keeps_made_keys(m["carrier"], t0)) or \
             waiting or (held and not value_old(d, value)) or (value is not None and t0 < value["at"]):
         return None
     with transaction():
         did = DB.execute("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created) "
                          "VALUES(?,?,?,?,?,?,?,?)", (ref, machine, m["carrier"], pin,
                                                      hashlib.sha256(text.encode()).hexdigest(), text,
-                                                     CENTRAL_REQUEST + str(uuid.uuid4()), t0)).lastrowid
+                                                     (CENTRAL_MADE if made else CENTRAL_REQUEST) + str(uuid.uuid4()),
+                                                     t0)).lastrowid
         event_rows([(m["carrier"], "deposit", None, f"deliver {entry.get('env') or entry['title']} into this "
                                                     f"machine's vault", {"deposit": did, "login": ref})], t0)
     log("hub", f"sealed {ref} for the vault of {machine} from the central vault ({m['carrier']} carries it)")
@@ -24731,21 +25150,26 @@ def central_reconcile(t0=None):
     nothing. Returns {"delivered": [ids of deliveries], "withdrawn": [ids of withdrawals], "removed": [references]}."""
     t0 = t0 or now()
     with CENTRAL_LOCK:
-        pins, signed = central_pins(CENTRAL["status"]), central_signatures(CENTRAL["status"])
-        removes = (CENTRAL["status"] or {}).get("removes") is True
+        status = CENTRAL["status"]
+        pins, signed = central_pins(status), central_signatures(status)
+        removes = (status or {}).get("removes") is True
     listed = central_call("inventory").get("logins")
     inventory = {ref.lower() for ref in (listed if isinstance(listed, list) else [])
                  if isinstance(ref, str) and BWS_REF.fullmatch(ref)}
     with LOCK:
-        deliver, withdraw = central_plan(pins, inventory, t0, signed)
+        deliver, withdraw = central_plan(pins, inventory, t0, signed, status)
+        # the word that the central vault needs to seal a key that it made (vault.py seal): only for a machine whose
+        # vault keeps such a key out of sessions, as the plan and central_deliver read it
+        keeps = {machine: keeps_made_keys(carrier, t0) for machine, _ref, carrier in deliver}
         withdrawn = central_withdraw(withdraw, t0) if withdraw else []
         removals = central_removals(inventory, signed) if removes else []
     removed = central_remove(removals)          # before the seals: the catalog was read under LOCK just now
     delivered = []
     for machine, ref, _carrier in deliver[:CENTRAL_BATCH]:
         try:
-            text = central_sealed(central_call("seal", {"login": ref, "machine": machine}), ref, machine,
-                                  pins[machine])
+            text = central_sealed(central_call("seal", dict({"login": ref, "machine": machine},
+                                                            **({"made_keys": True} if keeps[machine] else {}))),
+                                  ref, machine, pins[machine])
         except Refusal as e:
             central_said(f"the central vault did not seal {ref} for the vault of {machine}: {e}")
             continue
@@ -25183,12 +25607,14 @@ def pin_end_sweep(t0):
 
 
 READ_TOLD_FOR = 86400       # C11: at most one message a day for each read key of an agent (vault_read_missing)
+READ_REASONS = ("login", "made", "other")       # why a read key was not given (vault_missing)
 
 
 def vault_missing(agent):
-    """C11: {variable: "login" or "other"} for each read key that this agent's vault did not give at its last session
-    read, as the agent's helper reported it: "login" for a value with the shape of a login, "other" for each other
-    reason. {} when none, before such a report, or for a damaged row.
+    """C11: {variable: "login", "made" or "other"} for each read key that this agent's vault did not give at its last
+    session read, as the agent's helper reported it: "login" for a value with the shape of a login, "made" for a key
+    that the fleet made, which a session gets only as a placeholder for its own site, "other" for each other reason.
+    {} when none, before such a report, or for a damaged row.
 
     A start text reads it, and the hub writes a task's start text and a duty's watch task inside a transaction
     (admit_task, duty_save), so it reads with read_row: kv_get commits, and the hub's guard refuses a commit there."""
@@ -25197,7 +25623,7 @@ def vault_missing(agent):
         kept = json.loads((row["v"] if row else None) or "{}")
     except ValueError:
         return {}
-    return {k: v for k, v in kept.items() if isinstance(k, str) and v in ("login", "other")} \
+    return {k: v for k, v in kept.items() if isinstance(k, str) and v in READ_REASONS} \
         if isinstance(kept, dict) else {}
 
 
@@ -25211,7 +25637,7 @@ def vault_told(agent):
     except ValueError:
         return {}
     return {k: v for k, v in kept.items() if isinstance(k, str) and isinstance(v, dict) and v.get("why") in
-            ("login", "other") and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)} \
+            READ_REASONS and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)} \
         if isinstance(kept, dict) else {}
 
 
@@ -25223,6 +25649,11 @@ def missing_words(name, why, machine, who):
                 f"service needs the user name, the owner takes \"Reads it\" back and gives \"Uses it\". Only if it is "
                 f"a key that was saved with a user name by mistake, the owner saves it again under the same name in "
                 f"Settings › Secrets (Add secret), which replaces it with a key that has no user name.")
+    if why == "made":
+        return (f"[hub] The vault of {machine} left {name} out of the sessions of {who}: the fleet made that key for a "
+                f"route, and a session gets such a key only as a placeholder for the key's own site, on a server whose "
+                f"vault swaps keys, for an agent that runs Claude Code or Codex. Elsewhere give {who} \"Uses it\" in "
+                f"place of \"Reads it\": call_api then sends the key to its site.")
     return (f"[hub] The vault of {machine} did not give {name} to the sessions of {who}: it could not read or protect "
             f"that key there. Look at the key's delivery to {machine} in Settings › Secrets.")
 
@@ -25241,7 +25672,12 @@ def vault_read_missing(agent, data, t0=None):
     granted = {env: ref for ref, env in read_secrets(agent)}
     missing = [n for n in report.get("missing") or [] if isinstance(n, str) and n in granted]
     logins = {n for n in report.get("logins") or [] if isinstance(n, str) and n in missing}
-    now_missing = {n: "login" if n in logins else "other" for n in missing}
+    with CENTRAL_LOCK:
+        named = central_named(CENTRAL["status"]) or frozenset()
+    # the reason "made" only for a key that the central vault's status names as made: the helper's list is the word of a
+    # process of the agent, which can say it of any key
+    made = {n for n in report.get("made") or [] if isinstance(n, str) and n in missing and granted[n].lower() in named}
+    now_missing = {n: "login" if n in logins else "made" if n in made else "other" for n in missing}
     told = vault_told(agent)
     told_now = {n: e for n, e in told.items() if n in now_missing or t0 - e["at"] < READ_TOLD_FOR}
     machine = (agents().get(agent) or {}).get("machine") or "its server"
@@ -25796,7 +26232,11 @@ CHAT_TOO_LONG = "This message is too long. The limit is 4,000 characters."
 CHAT_SECRET_HELD = "That message held a saved secret. It was not stored."
 PERSON_DAY_LIMIT = "You reached today's limit. Try again tomorrow."
 PERSON_NO_ACCESS = "You have no access to {agent}. Ask {owner}."     # a person of the org, an agent not on their list
-CHAT_INBOUND_DAY = 500          # inbound messages a day over all accounts
+# B9's piece 0d (the coordinator's D124, 26 November 2026; ~/dev/founderizer-plans/smb-x100-audit-2026-11-25/
+# designs/b9-phone-members.md, section 4): the messages a day of people over all chat apps' accounts grow with the
+# people whom the licence counts (people_day_most), and the owner's own messages are in no such count (chat_route).
+CHAT_INBOUND_DAY = 500          # the least of the people's messages in a day over all accounts
+CHAT_INBOUND_PERSON = 100       # the room in a day's count that each counted person adds, here and for the links
 WHATSAPP_PARTS_DAY = 200        # sent WhatsApp parts a day for each account
 CHAT_IGNORED_KEEP = 20          # ignored messages kept for each account
 LINK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -26268,6 +26708,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
         if asker:
             text += (f" The hub gave it to {asker}" + (", with its files," if files else "") +
                      f" as the answer to Q-{need['question']}: do not pass it on again.")
+        else:                   # a card of a question with a default whose asker no longer reads an answer
+            text += need_kept_words(need)
         text += need_door_task_rows(need, chosen, value, t0)       # and the task that a door's card is for
     # owner feature need_takeover: his answer to a step on an agent's screen goes to the session of the task that
     # asked and waits for it, and that wait ends with it (secret_wait_moved)
@@ -26951,13 +27393,58 @@ def need_question_rows(need, value, t0, files=(), more="", via=None):
     files: the rows of the files of his answer, which go with his words (the owner, 20 November 2026, to "a worker
     that asks for a file does not get it": "Yes, fix both"). Until then the asker read his words alone, and the
     files stayed with the manager, whom read_attachment let open them, and the asker not.
-    more: which picture the owner's choice has (need_picture_note), which the asker reads after the answer."""
+    more: which picture the owner's choice has (need_picture_note), which the asker reads after the answer.
+    None too for a question whose task ended, whose card stays open only when it has a default (end_waits, owner API
+    1.341): no session of the asker reads an answer any more, so the question keeps the owner's answer as its record,
+    and the agent that raised the card reads it with the question and the default (need_kept_words)."""
+    in_transaction("need_question_rows")
     qid = need["question"] if "question" in need.keys() else None
     qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
     t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
     if not qu or not t or qu["answer"] is not None:
         return None
+    if t["state"] in TERMINAL:
+        DB.execute("UPDATE questions SET answer=?, answered=?, answered_by='owner' WHERE id=? AND answer IS NULL",
+                   (value, t0, qid))
+        return None
     return qu["asker"] if answer_rows(qu, t, value, "owner", t0, files, more, via) else None
+
+
+def question_session_ended(qid):
+    """Whether the task that asked question Q-<qid> ended, so that no session of it reads an answer. Only the card of a
+    question with a default stays open then (end_waits, owner API 1.341; a restart keeps its question open for the new
+    session, restart_continue), and only the owner's answer or withdraw_need closes it. False for a question that the
+    record does not hold. read_row only."""
+    return bool(read_row(f"SELECT 1 FROM questions q JOIN tasks t ON t.id=q.task WHERE q.id=? AND NOT t.{OPEN_TASK}",
+                         (qid,)))
+
+
+def default_hold(default, whose):
+    """The words to an asker whose question with a default is on the owner's card (owner API 1.341): its default holds,
+    which fits a session that waits on another question too (the validation of 25 November 2026, round 3, R3-S3), and
+    rule 4 holds a default that leaves the building until the owner's answer comes."""
+    return (f"Until then {whose} default holds: \"{default}\". Never a default for access, money or anything that "
+            f"leaves the building: if it sends, posts, pays or acts outside the fleet, do none of it until the owner's "
+            f"answer comes.")
+
+
+def need_kept_words(need):
+    """The words for the agent that raised a card of a question with a default, with the owner's answer that reached no
+    session of the asker (owner API 1.341; the validation of 25 November 2026, M1): the task that asked ended, before
+    the raise or after it, and the card stayed open for the owner's decision (end_waits; a restart keeps the question
+    open, restart_continue). So the raiser gives the follow-up work: the question, the default that the asker went on
+    with, and the answer above; to the asker while it is on the team, else to the agent that does that work now
+    (R2-S3: an agent with no open task can be removed). "" for each other card. read_row only."""
+    qid = need["question"] if "question" in need.keys() else None
+    qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
+    if not qu or qu["assumed"] is None:
+        return ""
+    who = qu["asker"]
+    follow = (f"give {who} the follow-up work with it" if who in agents() else
+              f"give the follow-up work to the agent that does that work now: {who} is no longer on the team")
+    return (f" It was for Q-{qid} of {who}, and {tref(qu['task'])} ended before this answer, so no session of {who} "
+            f"reads it. {who} went on with its default: \"{qu['assumed']}\". The question: "
+            f"\"{clip(qu['text'], 300)}\". When this answer changes what {who} did, {follow}.")
 
 
 def need_door_task_rows(need, chosen, value, t0):
@@ -27230,8 +27717,8 @@ def chat_file_welcome(account, acc, sender, sender_alt, t0):
         daily = person_daily(person, agent)
         if daily is not None and person_today(person["id"], t0) >= daily:
             return "the sender sent the day's messages"
-    if chat_count("*", "inbound", t0) >= CHAT_INBOUND_DAY:
-        return "the day's inbound messages are all in"
+        if people_day_full("*", CHAT_INBOUND_DAY, t0):      # the owner's own are in no day's count (B9 0d)
+            return "the day's inbound messages are all in"
     return None
 
 
@@ -27660,6 +28147,23 @@ def bridge_file_rows(account, msg_id):
     return sorted((r for r in rows if attachment_on_disk(r)), key=lambda r: int(r["request_id"].rsplit(":", 1)[1]))
 
 
+def people_day_most(least):
+    """The most messages in one day's count of people (B9 0d, CHAT-APPS.md 8.7): CHAT_INBOUND_PERSON for each person
+    whom the licence counts (licence_users, less its 1 for the owner: a role with tools on, and a way to an agent that
+    takes their messages), and never less than `least`: CHAT_INBOUND_DAY for all chat apps' accounts, the Teams part's
+    LINKS_DAY for the members' app. A person outside the org (a customer, a role with tools off) adds no room, and
+    their messages count in it. Plain reads: safe inside chat_route's transaction."""
+    return max(least, CHAT_INBOUND_PERSON * (licence_users() - 1))
+
+
+def people_day_full(count, least, t0):
+    """True when today's count `count` of messages in (chat_count) has reached people_day_most(least): the one test of
+    person_route, of the check of a chat app's file (chat_file_welcome) and of the Teams part's code busy. The people
+    are counted only past `least`, so a day below it costs one read."""
+    n = chat_count(count, "inbound", t0)
+    return n >= least and n >= people_day_most(least)
+
+
 def chat_route(account, acc, m, t0, hit, preview):
     """Inside a transaction: the rules of 15.5 after the duplicate check, in order. Returns (result, request ID)."""
     in_transaction("chat_route")
@@ -27691,9 +28195,8 @@ def chat_route(account, acc, m, t0, hit, preview):
     if reply is not None:
         chat_reply(account, m["chat"], reply, t0)
         return "stored", None
-    if chat_count("*", "inbound", t0) >= CHAT_INBOUND_DAY:
-        return "ignored", None
-    chat_count("*", "inbound", t0, 1)
+    # the owner's own message is in no day's count of people (B9 0d): until 26 November 2026 it counted in the 500 of
+    # all accounts, so a company's people who used up the day's count stopped the owner's own chat too
     agent = acc["agents"][0]
     a = agents().get(agent) or {}
     if not a or not agent_active(agent) or not owner_chat(a):
@@ -28752,9 +29255,12 @@ def end_waits(task_id):
         if open_ or role_of(m["sender"]) == "manager":
             emit(m["sender"], "say", f"[hub] AM-{m['id']} reached {tref(task_id)}, which ended before it read it.",
                  task=m["sender_task"] if open_ else None)
-    with transaction():                 # a Needs-you item raised for one of its questions asks the owner nothing now
-        question_needs_close("task=? AND answer IS NULL", (task_id,), "Closed: the work that asked it ended before "
-                             "an answer came, so nothing waits for it.", now())
+    # a Needs-you item raised for one of its questions asks the owner nothing now, but the card of a question with a
+    # default (owner API 1.341): its decision still waits, and the owner's answer goes to the agent that raised it
+    # (need_kept_words). Its task did not wait, so it often ends first (the validation of 25 November 2026, M1)
+    with transaction():
+        question_needs_close("task=? AND answer IS NULL AND assumed IS NULL", (task_id,), "Closed: the work that asked "
+                             "it ended before an answer came, so nothing waits for it.", now())
     conversation_result(task_id)        # AUTONOMY.md P2: a task that a conversation opened tells it its result
     secret_waits_end(task_id)           # owner feature secret_requests: its waits on the owner's secrets end with it
     chat_result(task_id)                # and one that an owner chat opened (start_task) tells that chat
@@ -30091,12 +30597,13 @@ def person_route(account, acc, person, m, t0, hit):
         DB.execute("UPDATE person_handles SET alias=? WHERE app=? AND person=? AND alias IS NULL AND handle<>? AND "
                    "(handle=? OR handle=?)",
                    (m["sender_alt"], acc["app"], person["id"], m["sender_alt"], m["sender"], m["sender_alt"]))
-    # the day's count of messages in and its number: all chat apps' together, or, for the built-in account that the
-    # hub makes itself, the count that its entry names. An account of team.json never names one: validate_chat_apps
-    # refuses these keys, and a team.json written by hand that does not validate must not move the count of all.
-    day_count, most = (acc.get("day_count", "*"), acc.get("day_most", CHAT_INBOUND_DAY)) \
+    # the day's count of messages in and its least number (people_day_most gives the room of the counted people):
+    # all chat apps' together, or, for the built-in account that the hub makes itself, the count that its entry names.
+    # An account of team.json never names one: validate_chat_apps refuses these keys, and a team.json written by hand
+    # that does not validate must not move the count of all.
+    day_count, least = (acc.get("day_count", "*"), acc.get("day_least", CHAT_INBOUND_DAY)) \
         if account == BUILT_IN_ACCOUNT else ("*", CHAT_INBOUND_DAY)
-    if chat_count(day_count, "inbound", t0) >= most:
+    if people_day_full(day_count, least, t0):
         return "ignored"
     daily = person_daily(person, agent)     # None: no limit, which only contacts.v2 gives (staff, plan P1)
     # a limit of 0 (person_reaches' no_day) is the same answer as a day's count that reached its limit, here
@@ -57250,10 +57757,10 @@ TOOLS = [
      "or their own message; or person, for a step that only a person can do: the owner's sign-in to an AI provider's "
      "own account or to an MCP server in their app, their phone, or a hand at a machine, to switch it on or to change a setting that it takes only "
      "from its own keyboard or mouse. A card never gives fleet work to the owner's Mac or to the owner: no command "
-     "for them to run, no session on their Mac, no run, release or push of theirs. When access is missing, ask for "
-     "that access, and the agent does the work after it. A sign-in to a website is the agent's work, with the login "
-     "from the vault. A card is never for a warning, a status, a risk or an FYI, and never for something you will go "
-     "on with by default when they say nothing: news that they must have now (a customer, money, security) goes to "
+     "for them to run, no session on their Mac, no run, release or push of theirs. A sign-in to a website is the "
+     "agent's work, with the login from the vault. A card is never for a warning, a status, a risk or an FYI, and "
+     "never for something you will go on with by default when they say nothing (a decision that their own words keep "
+     "still gets its card): news that they must have now (a customer, money, security) goes to "
      "message_owner, and the rest waits for the next message that they need, or goes nowhere. "
      "The hub refuses an item whose own words say nothing is needed. When you ask the owner to choose, give the "
      "choices in options: they press one, and its words come back as the answer. Never ask for a key, a password or "
@@ -57348,7 +57855,8 @@ TOOLS = [
                                     f"door_call, door_host, github_app, add_device, github_key or key_swap_server."},
         "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
                         "for example Q-4: the item quotes its asker behind Details, the owner's answer and its files go back to it as the answer, "
-                        "and the item closes by itself when the question is answered another way or its task ends"},
+                        "and the item closes by itself when the question is answered another way or, with no default, "
+                        "its task ends"},
         "ask": {"type": "string", "description": "When work that the owner asked for waits for this item: a task "
                 "of that work, for example T-12, or the owner's message M-<n> itself when a task names it already. "
                 "The owner's apps then show that the thing they asked for waits for them. An item with a "
@@ -58175,11 +58683,12 @@ TOOLS = [
                                                           "message"}},
        ["text"])),
     ("all", "message_owner", t_message_owner,
-     "Write to the owner first, only when it changes what they do: a decision or a step that is theirs, the result of "
+     "Write to the owner first, only when it changes what they do: a decision or a step that is theirs (the manager "
+     "raises those as cards), the result of "
      "work they asked you for, or news they must have now (a customer, money, security). Never to say that nothing is "
      "needed from them, never for progress (the end of a problem you told them about, or that it did not end as you "
      "said, is news), and never to correct a message that needed nothing from them: what can wait goes into the next "
-     "message they need. Say it once, with the answer first, and short. It goes where the owner last wrote to you (the "
+     "message they need. It goes where the owner last wrote to you (the "
      "app, or a chat app), else to your own WhatsApp number, Discord bot or Telegram bot; without one it stays in the "
      "app. The first one after a task's result came back into your owner chat answers the owner's message that opened "
      "that task, where they wrote it. Answer an owner message with tell_owner instead. One request_id is one message: "
@@ -66355,10 +66864,13 @@ def validate_status(data):
         # the whole report, which would take the machine's broker and its deliveries with it.
         read_missing, names = vault.get("read_missing"), lambda v: isinstance(v, list) and len(v) <= 256 and all(
             isinstance(n, str) and ENV_NAME.fullmatch(n) for n in v)
-        read_missing = {"missing": list(read_missing["missing"]),
-                        "logins": [n for n in read_missing.get("logins") or [] if n in read_missing["missing"]]} \
+        read_missing = dict({"missing": list(read_missing["missing"]),
+                             "logins": [n for n in read_missing.get("logins") or [] if n in read_missing["missing"]]},
+                            # the keys that the fleet made, which the vault gives only as a placeholder (vault.py read)
+                            **({"made": [n for n in read_missing["made"] if n in read_missing["missing"]]}
+                               if read_missing.get("made") else {})) \
             if isinstance(read_missing, dict) and names(read_missing.get("missing")) \
-            and names(read_missing.get("logins") or []) else None
+            and names(read_missing.get("logins") or []) and names(read_missing.get("made") or []) else None
         vault = {"mode": mode, "isolated": _optional(vault.get("isolated"), bool),       # shared broker callers:
                  "callers": _optional(vault.get("callers"), bool), "broker_recipient": recipient,
                  "broker_read_at": read_at, "creates": _optional(vault.get("creates"), bool),      # create_login
@@ -66367,6 +66879,7 @@ def validate_status(data):
                  "deposits": _optional(vault.get("deposits"), bool),        # owner feature central_vault
                  "withdrawals": _optional(vault.get("withdrawals"), bool),  # owner feature central_vault
                  "replaces": _optional(vault.get("replaces"), bool),        # owner feature secret_replace
+                 "made_keys": _optional(vault.get("made_keys"), bool),      # a made key only as a placeholder
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
                  "place_key": place_key, "broker_source": source, "read_missing": read_missing,
                  # package 7: a Mac vault's key generation; another value is null, never a refusal of the report
@@ -76803,16 +77316,28 @@ def door_reconcile():
     """Each secret that the door holds, that the owner signed for the door (a grant to the machine "door", as for an
     agent's machine: central_signatures) and that the door has no copy of yet, sealed by the central vault to the key
     that the owner pinned for the door, waits for the door to fetch it. Only while the central vault is ok, never
-    under LOCK."""
+    under LOCK.
+
+    A key that the central vault made (or one that its status of now does not name as another value: central_unmade)
+    goes to the door in no case. The door keeps the value of each copy in its file and writes it into an app's setting
+    on a host. It refuses a copy with a `made` member (door.py item_secret), and this filter and the central vault's own
+    refusal (vault.py seal) keep such a copy from being sealed for it at all (VAULT.md, limit 35). A copy of such a key is dropped, as the copy of a grant that ended. What goes out reads the
+    strict list, and what is taken away the lenient one (central_named, central_granted): a status whose lists do not
+    read takes no copy away, also none that the door fetched, so the door does not seal each key again after it."""
     if not central_ok():
         return []
     with CENTRAL_LOCK:
         pin = central_pins(CENTRAL["status"]).get(DOOR_PIN)
         granted, _pooled = central_signatures(CENTRAL["status"])
-    held = [ref for ref in ((TEAM.get("door") or {}).get("secrets")) or [] if (ref.lower(), DOOR_PIN) in granted]
+        unmade, named = central_unmade(CENTRAL["status"]), central_named(CENTRAL["status"])
+        known = central_granted(CENTRAL["status"]) is not None
+    signed = [ref for ref in ((TEAM.get("door") or {}).get("secrets")) or [] if (ref.lower(), DOOR_PIN) in granted]
+    held = [ref for ref in signed if not_made(ref.lower(), unmade)]
+    keep = None if not known else signed if named is None else [ref for ref in signed if ref.lower() not in named]
     with transaction():         # a copy that waited too long, and every copy of a grant that ended, go
         DB.execute("DELETE FROM door_copies WHERE fetched IS NULL AND created<?", (now() - DOOR_COPY_WAIT,))
-        DB.execute(f"DELETE FROM door_copies WHERE login NOT IN ({','.join('?' * len(held))})", held)
+        if keep is not None:
+            DB.execute(f"DELETE FROM door_copies WHERE login NOT IN ({','.join('?' * len(keep))})", keep)
     made = []
     for ref in held if pin else []:
         if q1("SELECT 1 FROM door_copies WHERE login=?", (ref,)):
@@ -76905,14 +77430,18 @@ def save_door_grant(team, rev, current, ref, grant, by):
 
 
 def door_sealed(src):
-    """GET /door/sealed: the copies that wait for the door, answered only to the door's own address."""
+    """GET /door/sealed: the copies that wait for the door, answered only to the door's own address. `keep` names no
+    key that the central vault's status names as made (door_reconcile), so the door drops one that it holds from
+    before; while the status cannot say (central_named), it is None, as while the vault does not answer: the door then
+    keeps all."""
     door = TEAM.get("door") or {}
     if not door.get("address") or src != door["address"]:
         raise Refusal(403, "this is the door's route")
     with CENTRAL_LOCK:
-        granted = central_signatures(CENTRAL["status"])[0] if CENTRAL["status"] is not None else None
-    keep = None if granted is None else sorted(      # unknown while the vault does not answer: the door keeps all
-        ref for ref in door.get("secrets") or [] if (ref.lower(), DOOR_PIN) in granted)
+        granted = central_granted(CENTRAL["status"])
+        named = central_named(CENTRAL["status"])
+    keep = None if granted is None or named is None else sorted(   # unknown: the door keeps all
+        ref for ref in door.get("secrets") or [] if (ref.lower(), DOOR_PIN) in granted and ref.lower() not in named)
     return {"copies": [{"id": r["id"], "login": r["login"], "sealed": r["sealed"]}
                        for r in q("SELECT id, login, sealed FROM door_copies WHERE fetched IS NULL ORDER BY id")],
             "keep": keep}
@@ -92327,7 +92856,7 @@ class Handler(BaseHTTPRequestHandler):
                         pictured = need_picture_note(row, chosen)   # owner API 1.285: the picture of that option
                         asker = need_question_rows(row, answer, t0, more=pictured, via=request_via(board_hand()))
                         passed = pictured + (f" The hub gave it to {asker} as the answer to Q-{row['question']}: do "
-                                             f"not pass it on again." if asker else "") + \
+                                             f"not pass it on again." if asker else need_kept_words(row)) + \
                             need_door_task_rows(row, chosen, answer, t0)
                         # owner feature need_takeover: the answer to a step on an agent's screen goes to the task that
                         # waits for it, and ends that wait, as owner_message_rows does it
@@ -93464,7 +93993,7 @@ class Handler(BaseHTTPRequestHandler):
                                             "deposit or withdraw) are required"})
         with LOCK:
             if kind == "deposit":           # owner feature central_vault: job is the delivery's number
-                return self.helper_deposit(agent, job)
+                return self.helper_deposit(agent, job, f.get("made_keys") is True)
             if kind == "withdraw":          # owner feature central_vault: job is the withdrawal's number
                 return self.helper_withdraw(agent, job)
             row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (job, agent))
@@ -93542,13 +94071,18 @@ class Handler(BaseHTTPRequestHandler):
             (f" (made by {made['kind']} job {made['id']})" if made else ""))
         return self.json(200, answer)
 
-    def helper_deposit(self, agent, did):
+    def helper_deposit(self, agent, did, made_keys=False):
         """The vault asks for the sealed copy of a delivery that this agent's helper carries (owner feature
         central_vault), and gets it with the secret's reference, title and kind and the salts of its fingerprints.
         It can ask again while the delivery waits: a copy that only this machine's vault opens can be given twice, and
         a save under the same reference is the same save. The grant is read again here, as when the copy was sealed:
         a copy whose secret no agent of this machine holds any more is never given (deposit_refusal), and neither is
-        a copy that was sealed before the owner replaced the value (value_old). Called with LOCK held."""
+        a copy that was sealed before the owner replaced the value (value_old). Called with LOCK held.
+
+        made_keys: the vault's own word in this request that it keeps a key that the fleet made out of sessions
+        (vault.py deposit). The copy of a delivery that may be such a key (CENTRAL_MADE) is given only with it, also
+        when the helper's report says it: a report that a process of the agent forged does not get the copy into a
+        vault program from before that rule."""
         row = deposit_waiting(did, agent)
         if not row:
             return self.json(404, {"error": "no such delivery waits for this agent"})
@@ -93560,6 +94094,8 @@ class Handler(BaseHTTPRequestHandler):
                    if store_key(TEAM, row["machine"]) != row["recipient"] else
                    "no agent of this machine holds this secret any more" if not held_on(row["machine"], row["login"])
                    else "the owner replaced this value after this copy was sealed" if value_old(row, value)
+                   else "this can be a key that the fleet made, and this vault does not say that it keeps such a key "
+                        "out of sessions" if str(row["request_id"]).startswith(CENTRAL_MADE) and not made_keys
                    else None)
         if refused:
             return self.json(409, {"error": refused})
@@ -94695,9 +95231,9 @@ def teams_part(feature, need=False):
 
 
 def links_start():
-    """main()'s one line of the Teams part person_links (design 4, S1): the part read now, never a copy, starts its two
-    daemon threads and returns at once; with no part, nothing. Each fault of it goes to print_fault() and one line, so
-    the hub's start never stops or waits for a part."""
+    """main()'s one line of the Teams part person_links (design 4, S1): the part read now, never a copy, starts its
+    three daemon threads (B9 added the one of member pings) and returns at once; with no part, nothing. Each fault of
+    it goes to print_fault() and one line, so the hub's start never stops or waits for a part."""
     try:
         links = teams_part("person_links")
         if links:

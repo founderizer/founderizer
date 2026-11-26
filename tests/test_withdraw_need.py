@@ -272,8 +272,30 @@ class AcceptNamesItems(Withdraw):
         mine, other = self.goal("Deploy with the App's login"), self.goal("Retire the test copies")
         self.blocked(other)
         self.raise_item()                                         # no question, so no goal: the rules close it
+        # nor the card of a question with a default whose task ended (bug: the accept tells the manager to answer its
+        # question with what was done, and that answer closes the card that still waits for the owner's decision: the
+        # validation of 25 November 2026, R2-M1)
+        asked = self.task(mine, "Keep the old listings")
+        attempt = hub.q1("SELECT attempt FROM tasks WHERE id=?", (asked,))["attempt"]
+        default = "Leave the old listings as they are until the owner decides"
+        said, error = hub.call_tool("vps", "ask_my_requester", {"question": "Email each store its list?",
+                                                                "default": default},
+                                    ("test-generation", f"T-{asked}", str(attempt)))
+        self.assertFalse(error, said)
+        qid = hub.q1("SELECT MAX(id) id FROM questions")["id"]
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('manager','team',"
+              "'instruction','Mail to the stores stays my decision.','owner','owner',?)", (hub.now(),))
+        said, error = hub.call_tool("manager", "raise_needs_you", {
+            "title": "Email the stores or leave the listings?", "why": "Mail to the stores is yours to decide.",
+            "what_to_do": "Press one", "options": ["Email them", "Leave them"], "question_id": f"Q-{qid}",
+            "reason": "decision", "owner_words": "Mail to the stores stays my decision.",
+            "details": f"Until you answer, vps goes on with: {default}."})
+        self.assertFalse(error, said)
+        kept = hub.q1("SELECT MAX(id) id FROM needs")["id"]
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (asked,))     # its owner delivered it
         done = self.task(mine)
         self.assertEqual(self.accept(done), f"T-{done} accepted.")
+        self.assertIn(kept, self.open_ids())
         loose = self.task()                                       # a task with no goal names nothing
         self.assertEqual(self.accept(loose), f"T-{loose} accepted.")
         theirs = self.task(other)                                 # a refusal in the goal that has the item
