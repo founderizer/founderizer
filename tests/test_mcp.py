@@ -94,8 +94,8 @@ class HubSide(OwnerAPI):
         for key, value in (("team_path", str(self.root / "kit" / "team.json")), ("mcp_file", str(self.file))):
             hub.CFG[key] = value
             self.addCleanup(hub.CFG.pop, key, None)
-        hub.MCP.update(tokens={}, problems={}, pending=None, probes={})
-        self.addCleanup(hub.MCP.update, tokens={}, problems={}, pending=None, probes={})
+        hub.MCP.update(tokens={}, problems={}, pending=None, probes={}, kinds={})
+        self.addCleanup(hub.MCP.update, tokens={}, problems={}, pending=None, probes={}, kinds={})
         allowed = patch.object(hub.Handler, "allowed", lambda handler, who, broker=False: True)
         allowed.start()
         self.addCleanup(allowed.stop)
@@ -374,6 +374,28 @@ class HubSide(OwnerAPI):
         for text in (json.dumps([dict(r) for r in hub.q("SELECT * FROM log")]),):
             for secret in (ACCESS, ACCESS2, REFRESH, SECRET):
                 self.assertNotIn(secret, text)
+        # a hold that the manager gave gets no token whose own form is the owner's GitHub account, also for a
+        # connection whose Connect kept no kind (the Door area's read, M1'), and a new Connect keeps the kind. Bug:
+        # each session of the worker gets the owner's GitHub user token
+        with hub.transaction():
+            hub.resource_record("tool:crm", "dev", "use", "manager", "0" * 40)
+        hub.MCP["tokens"].clear()
+        github = "gho_" + "a" * 36
+        self.stand.on("POST", "/oauth/token", {"access_token": github, "refresh_token": REFRESH, "expires_in": 3600})
+        code, kept = self.request("/helper/integrations/dev", {})
+        self.assertEqual((code, kept["mcp"]), (200, {}))
+        self.assertEqual(kept["mcp_problems"], ["The MCP server crm is not loaded: its access is the owner's own "
+                                                "account, and the owner did not give it to this agent."])
+        self.assertEqual(hub.resource_kept("tool:crm"), "code")         # the hand-out's reading counts from now
+        # the owner's own tick counts over the manager's older row, and opens the token (the validator's SHOULD)
+        self.save("/ui/team/tools", tool="crm", agents=[])
+        self.save("/ui/team/tools", tool="crm", agents=["dev"])
+        hub.MCP["tokens"].clear()
+        code, given = self.request("/helper/integrations/dev", {})
+        self.assertEqual((code, given["mcp"]), (200, {TOKEN: github}))
+        self.connect_server()
+        self.assertEqual(json.loads(self.file.read_text())["servers"]["crm"]["token_kind"], "code")
+        self.assertNotIn(github, json.dumps([dict(r) for r in hub.q("SELECT * FROM log")]))
 
     def test_a_refused_refresh_is_a_note_for_the_session_and_a_problem_for_the_owner(self):
         self.oauth()

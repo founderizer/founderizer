@@ -6,7 +6,8 @@ headers, over HTTP on the hub's Unix socket. Everything else gets an answer of t
 
 What it is not allowed to have, so that a fault in it gives away nothing:
 
-- no state: no database, no file of the hub, no key, no token logic, nothing kept from one request to the next;
+- no state: no database, no file of the hub, no key, no token logic, nothing kept from one request to the next (it
+  counts the open requests of each address, and the count of a request ends with it);
 - no TCP client connection: it listens on 127.0.0.1 and connects only to the hub's Unix socket (test_connect_gate.py
   reads this file's syntax tree for that), and its systemd unit allows no other address;
 - no other module than the standard library.
@@ -15,8 +16,20 @@ It runs as the system user founderizer-connect, from a root-owned copy in /usr/l
 `hubsetup.py connect on` installs, so a hub release cannot change the code that faces the Internet.
 
 The limits: a request line of 4 KiB (414), headers of 16 KiB (431), a body of 64 KiB on /mcp and 8 KiB elsewhere (413),
-32 connections at a time (503), and 10 seconds to read one request (408). One request on each connection: the answer
-closes it. A slow, cut or malformed request ends only its own connection.
+128 connections at a time and 8 open requests from one address or IPv6 /64 (503), 2 seconds to read the request line
+and the headers, and a body that has 2 seconds and then as much more time as its bytes take at 8 KiB a second, up to
+its own size's (408). One request on each connection: the answer closes it. A slow, cut or malformed request ends only
+its own connection. Funnel sends the gate a request's whole head at once, so a request whose body never comes ends
+after 2 seconds, and one address holds at most 8 places while its bodies come. A 503 says Retry-After, and the log
+says when all places are full.
+
+What the limits do not do: 16 addresses (or 16 IPv6 /64s, which one person with a /48 of their own has) that each
+open about 4 requests a second with no body still keep all 128 places full, and the gate cannot tell the owner's own
+calls from theirs, because it holds no token logic, by design. A process on the hub's machine can connect to
+127.0.0.1:8767 itself and write any X-Forwarded-For. A process of another user there can listen on that port while the
+gate is stopped and so keep it from its bind, but it completes no handshake (ports.py drops its SYN-ACK), so it reads
+nothing; the gate's unit ends it before each start (ports.py's holder). A form that a phone sends at a sign-in (POST /authorize) has 2
+seconds of slack beside its bytes, where the gate gave 10 seconds before.
 
     python3 -I gate.py --name hub-1.tail0000.ts.net [--port 8767] [--socket /var/lib/founderizer-connect/hub.sock]
 """
@@ -37,8 +50,17 @@ LINE_MAX = 4096                 # bytes of the request line, and of any one head
 HEAD_MAX = 16384                # bytes of all the header lines together
 BODY_MAX = 8192                 # bytes of a body, except on /mcp
 MCP_BODY_MAX = 65536            # bytes of a body on /mcp
-CONNECTIONS = 32                # connections at a time; one more gets 503
-READ_TIME = 10                  # seconds to read one whole request
+CONNECTIONS = 128               # connections at a time; one more gets 503. A connection that waits for its client holds
+#                                 only a thread, and the hub gets whole requests only
+HEAD_TIME = 2                   # seconds to read the request line and the headers
+BODY_TIME = 2                   # seconds that a body may wait before its bytes and between them
+BODY_RATE = 8192                # each byte of a body that came gives it 1/BODY_RATE seconds more, up to its size's
+PER_SOURCE = 8                  # open requests from one address or IPv6 /64 (X-Forwarded-For's last); one more: 503. Every
+#                                 request of an owner's AI client comes from its provider's few addresses, some of them
+#                                 side by side, so one address has room for more than one call at a time
+RETRY_AFTER = 2                 # seconds, in a 503: the time of a body that never comes
+FULL_EVERY = 60                 # seconds between two log lines that say that all places are full
+TRAILERS_MAX = HEAD_MAX         # bytes of a chunked body's trailers, which the gate drops (431 over it)
 HUB_TIME = 60                   # seconds of silence from the hub, or from a client that reads the answer, before the
 #                                 gate gives up on that connection
 # The only routes that reach the hub, and their methods. A path is compared exactly: no trailing slash, no case, no
@@ -75,16 +97,27 @@ class Answer(Exception):
 
 
 def plain(status, text):
-    """The bytes of one of the gate's own answers."""
+    """The bytes of one of the gate's own answers. A 503 says when to try again."""
     body = (text + "\n").encode("ascii", "replace")
+    later = f"Retry-After: {RETRY_AFTER}\r\n" if status == 503 else ""
     return (f"HTTP/1.1 {status} {REASONS.get(status, 'Error')}\r\nContent-Type: text/plain; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").encode() + body
+            f"Content-Length: {len(body)}\r\nCache-Control: no-store\r\n{later}Connection: close\r\n\r\n").encode() + body
 
 
 class Reader:
-    """The bytes of one connection, read against one deadline. Every wait is a socket timeout of what is left."""
+    """The bytes of one connection, read against one deadline. Every wait is a socket timeout of what is left. After
+    `budget`, each chunk that comes moves the deadline on by its own time at the rate, up to the cap."""
     def __init__(self, conn, deadline):
         self.conn, self.deadline, self.data = conn, deadline, bytearray()
+        self.rate, self.cap = None, None
+
+    def budget(self, start, size, rate):
+        """The body's deadline: `start` seconds from now, and each byte that is here or comes 1/rate seconds more, up to
+        the time of `size` bytes. So a body that stalls ends after `start`, and a whole one never takes longer than
+        start + size/rate."""
+        now = time.monotonic()
+        self.rate, self.cap = rate, now + start + size / rate
+        self.deadline = min(self.cap, now + start + len(self.data) / rate)
 
     def more(self):
         left = self.deadline - time.monotonic()
@@ -98,6 +131,8 @@ class Reader:
         if not chunk:
             raise ConnectionResetError("the client went away")
         self.data += chunk
+        if self.rate:
+            self.deadline = min(self.cap, self.deadline + len(chunk) / self.rate)
 
     def take(self, size):
         while len(self.data) < size:
@@ -159,8 +194,9 @@ def one_value(headers, name):
 
 
 def source(headers):
-    """The last address of X-Forwarded-For, for the hub's logs, or None when it is not one address. Tailscale writes
-    this header itself, from the connection's own source."""
+    """The last address of X-Forwarded-For, for the hub's logs and the count of each address, or None when it is not
+    one address. Tailscale Funnel's proxy (tailscaled's ReverseProxy Rewrite) deletes the client's own header and sets
+    the connection's source, so a client from the Internet never chooses it; the last address is taken all the same."""
     found = [v for k, v in headers if k == "x-forwarded-for"]
     if not found:
         return None
@@ -187,9 +223,14 @@ def read_body(reader, headers, limit):
                 raise Answer(400, "a chunk of the body is malformed")
             size = int(size_line, 16)
             if size == 0:
-                while reader.line(LINE_MAX, 431):    # the trailers, which are dropped
-                    pass
-                return bytes(body)
+                total = 0
+                while True:                         # the trailers, which are dropped, and no more of them than headers
+                    trailer = reader.line(LINE_MAX, 431)
+                    if not trailer:
+                        return bytes(body)
+                    total += len(trailer) + 2
+                    if total > TRAILERS_MAX:
+                        raise Answer(431, "the body's trailers are too large")
             if len(body) + size > limit:
                 raise Answer(413, f"the body is larger than {limit} bytes")
             body += reader.take(size)
@@ -202,6 +243,27 @@ def read_body(reader, headers, limit):
     if int(length) > limit:
         raise Answer(413, f"the body is larger than {limit} bytes")
     return reader.take(int(length))
+
+
+def source_key(came_from):
+    """What the count of open requests is by: an IPv4 address, or the /64 of an IPv6 one, which one host holds whole."""
+    if came_from is None:
+        return "-"
+    address = ipaddress.ip_address(came_from)
+    if address.version == 6:
+        if address.ipv4_mapped:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return came_from
+
+
+def body_size(headers, limit):
+    """The bytes that a body's deadline allows for: its Content-Length when that is one number within the limit, else
+    the limit (a chunked body, or a length that read_body refuses)."""
+    found = [v for k, v in headers if k == "content-length"]
+    if len(found) == 1 and re.fullmatch(r"[0-9]{1,10}", found[0]) and int(found[0]) <= limit:
+        return int(found[0])
+    return limit
 
 
 def hub_connection(path, timeout):
@@ -238,13 +300,15 @@ class Gate:
     """The listener and its connections. Gate(name).serve_forever() runs it; close() stops it. port 0 takes a free
     port, which .port then holds (for a test)."""
 
-    def __init__(self, name, socket_path=SOCKET, port=PORT, connections=CONNECTIONS, read_time=READ_TIME,
-                 hub_time=HUB_TIME, log=None):
+    def __init__(self, name, socket_path=SOCKET, port=PORT, connections=CONNECTIONS, head_time=HEAD_TIME,
+                 body_time=BODY_TIME, body_rate=BODY_RATE, per_source=PER_SOURCE, hub_time=HUB_TIME, log=None):
         if not isinstance(name, str) or len(name) > 253 or not NAME.fullmatch(name):
             raise ValueError("--name must be the hub's full lowercase DNS name")
         self.name, self.socket_path = name, socket_path
-        self.read_time, self.hub_time = read_time, hub_time
+        self.head_time, self.body_time, self.body_rate, self.hub_time = head_time, body_time, body_rate, hub_time
         self.slots = threading.BoundedSemaphore(connections)
+        self.per_source, self.sources, self.counting = per_source, {}, threading.Lock()
+        self.full_said = -FULL_EVERY
         self.log = log if log is not None else (lambda line: print("gate: " + line, file=sys.stderr, flush=True))
         self.stopped = False
         self.sock = listening_socket(port)
@@ -267,17 +331,21 @@ class Gate:
                 time.sleep(0.05)            # out of files for a moment: never a loop that spins
                 continue
             if not self.slots.acquire(blocking=False):
-                self.busy(conn)
+                self.busy(conn, "all places are full")
                 continue
             try:
                 threading.Thread(target=self.one, args=(conn,), daemon=True).start()
             except RuntimeError:
                 self.slots.release()
-                self.busy(conn)
+                self.busy(conn, "a thread could not start")
 
-    @staticmethod
-    def busy(conn):
-        """503 to one connection over the limit, without a wait: the accept loop never blocks on a client."""
+    def busy(self, conn, why):
+        """503 to one connection over the limit, without a wait: the accept loop never blocks on a client. The log says
+        why once a minute at most, while it lasts."""
+        now = time.monotonic()
+        if now >= self.full_said + FULL_EVERY:
+            self.full_said = now
+            self.log(f"{why}: a connection got 503")
         try:
             conn.setblocking(False)
             conn.send(plain(503, "the gate is busy; try again"))
@@ -286,13 +354,32 @@ class Gate:
         finally:
             conn.close()
 
+    def take_source(self, came_from):
+        """One more open request of this address, or 503 when it has as many as one address may."""
+        key = source_key(came_from)
+        with self.counting:
+            if self.sources.get(key, 0) >= self.per_source:
+                raise Answer(503, "this address has as many requests open as the gate takes from one; try again")
+            self.sources[key] = self.sources.get(key, 0) + 1
+        return key
+
+    def give_source(self, key):
+        with self.counting:
+            left = self.sources[key] - 1
+            if left:
+                self.sources[key] = left
+            else:
+                del self.sources[key]
+
     def one(self, conn):
-        status, method, path = 0, "-", "-"
+        status, method, path, held = 0, "-", "-", None
         try:
             try:
-                reader = Reader(conn, time.monotonic() + self.read_time)
+                reader = Reader(conn, time.monotonic() + self.head_time)
                 method, target, headers = read_head(reader)
                 path = target.split("?", 1)[0]
+                came_from = source(headers)
+                held = self.take_source(came_from)  # counted as soon as its head says where it is from
                 hosts = [v for k, v in headers if k == "host"]
                 if len(hosts) != 1:
                     raise Answer(400, "a request has one Host header")
@@ -300,10 +387,15 @@ class Gate:
                     raise Answer(421, "this address serves another name")
                 if method not in ROUTES.get(path, ()):
                     raise Answer(404, "not found")
-                body = read_body(reader, headers, MCP_BODY_MAX if path == "/mcp" else BODY_MAX)
-                request = forwarded(method, target, headers, body, source(headers))
+                limit = MCP_BODY_MAX if path == "/mcp" else BODY_MAX
+                reader.budget(self.body_time, body_size(headers, limit), self.body_rate)
+                body = read_body(reader, headers, limit)
+                request = forwarded(method, target, headers, body, came_from)
             except Answer as e:
                 status = e.status
+                if held is not None:                # the count ends with the request, before the linger
+                    self.give_source(held)
+                    held = None
                 conn.settimeout(5)
                 conn.sendall(plain(e.status, e.text))
                 linger(conn)
@@ -315,12 +407,14 @@ class Gate:
             self.log(f"fault {type(e).__name__} on {method} {path}")
         finally:
             self.slots.release()
+            if held is not None:
+                self.give_source(held)
             try:
                 conn.close()
             except OSError:
                 pass
             if status:
-                self.log(f"{status} {method} {path}")
+                self.log(f"{status} {method} {path[:200]}")     # a path's first 200 characters
 
     def forward(self, conn, request):
         """The request to the hub, and the hub's answer back, byte for byte, until the hub closes. 502 when the hub's

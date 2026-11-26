@@ -1852,15 +1852,16 @@ class HubThatStarts(unittest.TestCase):
         self.addCleanup(started.terminate)
         base = f"http://127.0.0.1:{port}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(200):
+        deadline = time.monotonic() + 120  # until it answers or ends: a start on a loaded sandbox takes long
+        while True:
             self.assertIsNone(started.poll(), f"the hub did not start: {(root / 'out.txt').read_text()}")
             try:
                 with opener.open(base + "/health", timeout=5):
                     break
             except OSError:
-                time.sleep(0.1)
-        else:
-            self.fail(f"the hub never answered /health: {(root / 'out.txt').read_text()}")
+                if time.monotonic() > deadline:
+                    self.fail(f"the hub never answered /health in 120 s: {(root / 'out.txt').read_text()}")
+                time.sleep(0.2)
         return base, root
 
     def read(self, base, path="/ui/state", token=None):

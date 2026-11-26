@@ -1388,22 +1388,87 @@ host.
     What stays out of the default: a secret whose variable is one of Fleet's own keys (`FLEET_KEYS`) or a GitHub App's
     key (`GITHUB_APP_<X>_KEY`), a secret that an account names, a key of the door's (`door.secrets`: its providers and
     the settings of production apps), a Stripe secret key, live or test, which the vault finds by its value (`vault.py`
-    `MONEY_KEYS`), an MCP server with an OAuth sign-in, a repository that an Operator holds or that the door syncs
-    (`door.gitops`), and each resource that the owner keeps with "Only you" (`resource_kept`). Against a hub that is
-    broken into, the vault itself keeps out what the owner took out of the pool, a key that moves money, a key that they
-    gave the door, and a name with no value: it refuses a `default_pool` of each, and only their own `pool` puts one back;
-    a key that they gave the door it seals only by a grant, never by the pool. The rest of that list the hub reads from
-    its catalog, so it holds against the manager, not against such a hub.
+    `MONEY_KEYS`), an MCP server with an OAuth sign-in of a payment, code, cloud, DNS or gateway host (`kept_app`,
+    `KEPT_APP_HOSTS`: the host or a subdomain of its url, or of the issuer or the token endpoint that its connection
+    named at Connect, or the form of the token that its Connect got, as GitHub's `gho_` and Stripe's `sk_live_`; Stripe,
+    PayPal, the exchanges and brokers of the list, Plaid and Shopify move money, GitHub, GitLab and Bitbucket give the
+    owner's own user token with write to each repository of the account, and GitHub Enterprise Cloud at `ghe.com` too, a
+    cloud, hosting or DNS provider reaches their servers and domains, and a hosted MCP gateway (Zapier, Composio,
+    Pipedream, Smithery, Make, n8n) reaches GitHub, Stripe and the rest through the owner's connections there, and a
+    secrets manager's app (Doppler, Infisical, 1Password) reads their secrets) or one connected with an administrator's
+    or an organization-wide scope (`ADMIN_SCOPE`: Slack's `admin.*`, GitHub's `admin:*`, Google Workspace's
+    `admin.directory.*`, Microsoft's tenant-wide scopes (of its directory, roles, applications, policies, groups and
+    their members, Teams channel messages, reports and security events, `User.Read.All`, and each `.ReadWrite.All`,
+    `.FullControl.All` and `.Manage.All`) and its `.default`, Atlassian's `manage:*`, Okta's `okta.*.manage`; not a
+    one-user reader such as `Files.Read.All`), a repository that an Operator holds or that
+    the door syncs (`door.gitops`), and each resource that the owner keeps with "Only you" (`resource_kept`). Against a
+    hub that is broken into, the vault itself keeps out what the owner took out of the pool, a key that moves money, a
+    key that they gave the door, and a name with no value: it refuses a `default_pool` of each, and only their own
+    `pool` puts one back; a key that they gave the door it seals only by a grant, never by the pool. The rest of that
+    list the hub reads from its catalog, so it holds against the manager, not against such a hub.
 
     What the default still reaches, at read: each other key that moves money (a restricted Stripe key with write rights,
     another payment provider's key, a login to a bank, a broker or the Stripe dashboard), each account or deploy token
     under another name (a GitHub token saved as `GITHUB_TOKEN`, as limit 31 suggests; cloud, DNS, registrar and deploy
-    keys, which reach the kept repositories and deployments), and a key of a service that sends (SMTP, SendGrid,
-    Twilio). Keep such a key with "Only you" on its row. Only a repository's `deploy` and a Gmail's `send` wait for the
-    owner's own level; each other kind goes to its top. A repository's default write still changes, and starts, what its
-    existing jobs run (a push to their branch, a tag, a pull request or a comment that a job takes), so a repository
-    whose job runs with its secrets or on a self-hosted runner stays with "Only you" until the door reads the workflows
-    at the grant. The hub reads the door's targets from `team.json`, not from the door's file, so a target that the file
+    keys, which reach the kept repositories and deployments), a key of a service that sends (SMTP, SendGrid,
+    Twilio), and, since 26 November 2026, an MCP server with an OAuth sign-in that can send or post as the owner (a mail
+    or an automation app: its one level `use` gives what a Gmail's `send` would), one at a host that the list cannot
+    match (a self-managed GitLab or a GitHub Enterprise Server at a company's own host), and a gateway or any other app
+    at a host that the list does not name, which can reach a payment, code or cloud account for the owner. The hub sees
+    an app's host and the scopes that its connection names, not what the provider lets those scopes do, so an admin's
+    scope of another name is in the default too. An app is judged again at each read and at each session's start: a hold
+    that the default gave before its Connect named a kept issuer, scope or token, or before a new Connect, gives no
+    session its token while the app is kept (`mcp_hold_kept`); no session of a hold that the owner did not give gets a
+    token whose own form is GitHub's or Stripe's, also of a connection from before; such a hold counts as no hold for a
+    card or a question, so the agent's ask goes up and the owner's Give, or their own tick on the Tools page, opens it.
+    A running session keeps a token that it got before, and a GitHub token does not expire: after a new Connect makes an
+    app kept, the owner revokes the old token at GitHub. While the hub cannot read its file of connections each app is
+    kept. A server address is ASCII only, with no backslash, so the host that the hub judges is the one that a session
+    connects to. Every app at `googleapis.com` is kept, so a Google sign-in app comes to the owner as a card. Keep such
+    a key or app with "Only you" on its row.
+
+    A repository goes by the default at `read` only (`DEFAULT_TOP`, the supervisor's decision of 26 November 2026,
+    after the Door area's read A4); a Gmail goes up to `write`, each other kind to its top. A write token pushes a
+    branch, a tag or a commit, and what the repository already runs takes that code beside its own secrets and runners:
+    its GitHub Actions workflows (on a push, a tag, a pull request, a schedule, and those of any older commit that a new
+    branch or tag points at), Dependabot with its own secrets for the registries that a file of the repository names,
+    and builders and servers that the fleet's GitHub App cannot see (Vercel, Netlify, Cloudflare, Argo CD, a server
+    with a deploy key or a webhook). No read of the App shows that none of them is there, so a door that read the
+    workflows at each grant would still leave a hole, and it would close nearly every repository of a fleet anyway. A
+    repository's `write` and `deploy`, and a Gmail's `send`, come only with the owner's own level on its row: to trust
+    one repository, the owner sets its row's "At most" from Read (the default, with "You and the fleet manager") to
+    Write in Settings, one choice, and the manager then gives write of it with no card for each grant. That level is
+    the owner's own risk, as above. Two limits of that choice: a repository that only the App reaches and that no
+    agent holds has no row until the manager's first grant of it (`resource_ids`), so the owner cannot set its level
+    before; and once an agent that holds a server through the door holds a repository, it is kept as `fleet` for every
+    other agent, whatever the row says. A repository counts as one that the fleet holds also when the newest reading of
+    the fleet's GitHub App reaches it (`github_reaches`: by its name, or by an account whose installation has all of its
+    repositories; since 26 November 2026), and one that an agent holds counts with no reading of the App too. So with an
+    installation of all of an account's repositories, each private repository of that account is in the pool at read
+    from the start (it has no row before its first grant, above): the owner narrows one with "Only you" on its row after
+    that grant, or leaves it out of the App on GitHub's own page. A repository of such an account counts only when the
+    hub's list of the last minute names it (`github_repo_list`), so a name that does not exist is not in the pool, and
+    an account with more repositories than the hub reads counts only by those that it read. The product's private source
+    (`product_source`: `founderizer-source` under any account, also after a transfer) is in no default, ever: developer
+    agents get it through the agents' own App, and it is kept as the owner's (`source`), so the owner's own level on its
+    row, or their Give on a card, gives it. A plan of `change_team` is refused a repository of an all-repositories
+    account that the hub's list of the last minute does not name; with no list it passes, while the default gives such a
+    repository only once the list names it. The hub reads that list before a lock in a thread of its own, waits for it
+    at most 4 seconds, and reads it at most once a minute, also after a failed read (`github_repo_list_ahead`).
+    A repository that the door made keeps new-projects plan N3: the manager
+    gives it up to write to an agent that holds no server, and its workflow files go through the door. An agent that
+    holds a server through the door gets any other repository only under the owner's own level of write or deploy,
+    because the door commits for it to each repository that it holds, at any level. That check is at the grant only:
+    the owner's app gives each tagged server to its DevOps agent by itself, and nothing checks then the repositories
+    that the agent already holds, so a read that the default gave before becomes the door's commits once the agent
+    has a server. The check reads the agent's servers in `team.json`, which an Operator whose business has no ready
+    host does not have yet, though the door already treats it as an Operator; and an owner's Give at read to an
+    Operator gives the door's commits too. These known limits close in the Door area's next piece (the hub names to the
+    Mac app the holds that may be commit targets); on 26 November 2026 the one such hold of the owner's fleet, a read
+    of a repository that another agent holds at deploy, was no commit target. Holds at write or deploy that the
+    default gave from hub 2026.11.812 to this release stay as they are (none on the owner's fleet). On 26 November
+    2026 the default had given no repository at write or deploy since it came (hub 2026.11.812), so nothing was taken
+    back. The hub reads the door's targets from `team.json`, not from the door's file, so a target that the file
     holds with no such grant (an Operator with no ready host, a target with fields of its own after its grant ended, a
     hand-written one) is not kept (none on 24 November 2026).
 

@@ -1495,9 +1495,13 @@ def mcp_left_out(tool, runtime=None, bearer=None):
 
 def mcp_address(value):
     """One url server's address, or None: https anywhere, http on 127.0.0.1 only, with a host, no user part and no
-    fragment, at most 300 characters."""
+    fragment, at most 300 characters, and no backslash: Python reads https://a.example\\b.example/ with the
+    backslash in its host, where a runtime's own url reader (Node, WHATWG) reads it as a slash and connects to
+    a.example, so the two would name two hosts (the coordinator's validator, 26 November 2026: hub.kept_app reads
+    the host). ASCII only, for the same reason: a host in Unicode (fullwidth letters) matches no host of
+    hub.KEPT_APP_HOSTS, where IDNA connects to the real one (the Door area's read); an IDN host goes in its xn-- form."""
     if not isinstance(value, str) or not 1 <= len(value) <= 300 or value.strip() != value or \
-            any(c.isspace() for c in value):
+            any(c.isspace() for c in value) or "\\" in value or not value.isascii():
         return None
     try:
         parts = urllib.parse.urlsplit(value)

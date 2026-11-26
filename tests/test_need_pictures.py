@@ -649,11 +649,16 @@ class Items(PicturesCase):
         words = "pictures go on a plain choice: leave them out of this item. Nothing was raised."
         for kind in ({"door_call": "0" * 64}, {"door_call": "0" * 64, "door_host": "web-1"},
                      {"github_app": "Acme"}, {"add_device": True}, {"github_key": "Acme"},
-                     {"key_swap_server": "web-1"},
-                     {"reason": "access", "needs_agent": "wes", "needs_access": "repo:acme/web",
-                      "needs_level": "write", "title": "Give Wes write on acme/web?"}):
+                     {"key_swap_server": "web-1"}):
             with self.subTest(kind=kind):
                 self.nothing_was_raised(words, [a, b], OPTIONS[:2], **kind)
+        # Give, of a repository that the fleet's GitHub App reaches, so that it comes to this check (need_give_reach)
+        with patch.object(hub, "github_app", lambda: ("7", "key")), patch.dict(hub.GITHUB_REACH, {
+                "at": hub.now(), "reading": False, "reach": {"pages": {}, "all": set(), "repos": {"acme/web"},
+                                                             "install": None}}):
+            self.nothing_was_raised(words, [a, b], OPTIONS[:2], reason="access", needs_agent="wes",
+                                    needs_access="repo:acme/web", needs_level="write",
+                                    title="Give Wes write on acme/web?")
 
     def test_a_device_reads_the_picture_of_an_item_and_no_loose_upload(self):
         """The believable bugs: each tile on the phone is empty, because a device reads only a file that a message

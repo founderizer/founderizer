@@ -15176,7 +15176,7 @@ def access_route(asker, rid, requester, want=None, restarts=None):
                          (f" at {want}" if want else "") + ".", hold_words] +
                         ([] if role_of(requester) == "manager" else
                          ["Pass the question up with answer(..., pass_up=true): only the manager ends the hold."]))
-    held = resource_holders(kind, what)
+    held = live_holders(kind, what, resource_holders(kind, what))
     mine = next((h["level"] for h in held if h["agent"] == asker), None)
     enough = level_at_least(kind, mine, want)
     others = [h for h in held if h["agent"] != asker]
@@ -15304,6 +15304,8 @@ def t_ask_my_requester(agent, a):
     if not question:
         raise ToolError("Ask one clear question.")
     rid, want = access_needed(a.get("needs_access"), a.get("needs_level"))
+    if rid and rid.lower().startswith("repo:"):
+        github_repo_ahead(rid[5:])      # its words (access_route) read the App's reading and list, before LOCK
     assumed = str(a.get("default") or "").strip()
     if assumed and rid:
         # An ask for access cannot be answered by a default at all: the agent does not hold the thing, so there is
@@ -17963,8 +17965,10 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
         if default:         # owner feature pool_default: every resource that the fleet holds, as one rule
             top = ", ".join(f"{RESOURCE_WORDS[k]} {lvl}" for k, lvl in default["top"].items())
             out.append(f"  By default: each resource that the fleet holds, to any worker or lead, up to {top}. Give it "
-                       f"yourself: the owner is asked only for what stays the owner's below, and for deploy of a "
-                       f"repository or send of a Gmail, which come only with their own level on its row.")
+                       f"yourself: the owner is asked only for what stays the owner's below, for write or deploy of a "
+                       f"repository and send of a Gmail, which come only with their own level on its row, and for any "
+                       f"repository of an agent that holds a server through the door, which needs their own level of "
+                       f"write on its row.")
         for p in pool:
             held = ", ".join(f"{n} {lvl}" for n, lvl in p["held_by"].items()) or "no agent"
             out.append(f"  {p['resource']} ({p['title']}): the owner's own level, up to {p['max']}, to " +
@@ -19322,7 +19326,7 @@ def need_is_yours(agent, *texts, level=None, checked=()):
             continue
         levels = RESOURCE_LEVELS[kind]
         if level in levels and levels.index(level) > levels.index(entry["max"]):
-            continue        # deploy or send above the default: the owner's own level, so the card is theirs
+            continue        # above the default (a repository's write and deploy, a Gmail's send): the owner's card
         if kind == "repo" and door_targets.vendor(what):
             continue        # a standing from before: grant_check refuses each grant of it (vendor_repo_check)
         if kind == "repo" and team_repo_owner_step(what):
@@ -19341,7 +19345,8 @@ def need_is_yours(agent, *texts, level=None, checked=()):
                 # Agents hold some folders of this Drive: an item about this Drive can be about one of them, by name or
                 # by role, and grant_check refuses the whole Drive to it. The owner decides.
                 continue
-        who = [n for n in agents() if grant_fits(n, entry) and agent_active(n)]
+        who = [n for n in agents() if grant_fits(n, entry) and agent_active(n) and
+               not operator_needs_owner(agents().get(n), kind, entry)]
         if not who:
             continue
         give = level if level in RESOURCE_LEVELS[kind] and grant_check(who[0], rid, level) is None else \
@@ -19807,8 +19812,16 @@ def card_holders(kind, what):
         held = [{"agent": n, "level": lv} for n, a in sorted(agents().items())
                 for r, lv in (a.get("repos") or {}).items() if str(r).lower() == what]
     else:
-        held = resource_holders(kind, what)
+        held = live_holders(kind, what, resource_holders(kind, what))
     return [h for h in held if agent_active(h["agent"]) and role_of(h["agent"]) in ("worker", "lead")]
+
+
+def live_holders(kind, what, held):
+    """The holds of an OAuth app that give a session its token: one that mcp_hold_kept stops is no hold for a card or
+    a question, so the agent's ask goes up as a card, whose Give writes the owner's record and opens the token again
+    (the coordinator's validator, K1: else the question says restart_task, the card is refused as held, and the
+    agent asks again and again)."""
+    return [h for h in held if not mcp_hold_kept(h["agent"], what)] if kind == "tool" else held
 
 
 def card_dead(kind, what):
@@ -19986,7 +19999,9 @@ def card_access(words, level, agent=None):
     """The refusal of an item for access that the fleet already holds, else None. The thing is <kind>:<what> as
     grant_access names it, which the hub reads, or a few plain words for what the fleet's record does not name (a role
     in a cloud account, a database login, a new agent), which only the owner settles. So are a thing that no holder can
-    use now (card_dead). A secret's value, which the hub cannot see, has its own route (value_route).
+    use now (card_dead). A repository that the hub knows does not exist (github_repo_known), and a server that is no
+    machine of the fleet and that no agent holds, are refused. A secret's value, which the hub cannot see, has its own
+    route (value_route).
 
     agent: the agent that needs it (needs_agent), whose card carries Give (owner feature pool_default, the Needs-you
     area). A hold at the needed level refuses the card, the agent's own or another agent's, which then does that part
@@ -20020,6 +20035,21 @@ def card_access(words, level, agent=None):
         return (f"needs_access {text} is not one thing that the fleet's record names. Give <kind>:<what> exactly as "
                 f"grant_access takes it (repo:acme/web), or a few plain words for what the record does not name. A key "
                 f"or a login that the fleet does not hold goes through request_secret.")
+    state, why = github_repo_known(what) if kind == "repo" else (None, None)
+    if state == "missing":
+        # the owner's card N-327 (26 November 2026): a name that an agent made up is no step of the owner's
+        return (f"Not raised: {repo_missing_fact(what)}. Check the name with the agent that gave it, and raise no card "
+                f"for this name: the owner is not needed.")
+    # no plain card on a guess while a read that can tell is still to come; after a read that failed ("failed"),
+    # which can last, the card keeps the checks below, as a plan's does (team_repo_owner_step)
+    if kind == "repo" and state is None:
+        return f"Not raised: {repo_untold(what, why)}"
+    if kind == "server" and what not in {str(s).lower() for s in {*server_names(TEAM), *held_servers(TEAM)}}:
+        # the Setup area, 26 November 2026: resource_known reads only the form of a host's name. The record only:
+        # tailnet_status() can take seconds, and this runs under LOCK
+        return (f"Not raised: server:{what} is no server of the fleet's record: no agent holds it, and it is no "
+                f"machine of the fleet. Check the name with see_capacity. The owner's app gives a business's own "
+                f"server once it carries that business's Tailscale tag.")
     said = str(level or "").strip().lower()
     if said in ("value", "placeholder"):
         entry = logins().get(what) if kind == "secret" else None
@@ -20363,8 +20393,9 @@ def need_give(a):
     one MCP server (resources, F6 piece 2). None when it names none. A ToolError for a grant that one press cannot
     give: an agent that is not an active worker or lead (the manager holds none: validate_team), a level that the thing
     does not take, a thing of another kind, one of the product's own repositories, which the door refuses in every
-    fleet, a repository whose commits the door checks (need_give_door), a key or a login, whose grant the owner's
-    Mac signs, or what need_give_refusal refuses. card_reason checks each thing against the fleet's record after this
+    fleet, a repository whose commits the door checks (need_give_door), a repository that the hub does not read in
+    what its GitHub App reaches (need_give_reach), a key or a login, whose grant the owner's Mac signs, or what
+    need_give_refusal refuses. card_reason checks each thing against the fleet's record after this
     (card_access): no agent holds it at that level, and the manager may not give it to that agent (resource_standing,
     grant_check)."""
     things = need_give_things(a)
@@ -20426,6 +20457,9 @@ def need_give(a):
         door = need_give_door(agent, what, level)
         if door:
             raise ToolError(door)
+        reach = need_give_reach(what)
+        if reach:
+            raise ToolError(reach)
         repos.append(what)
     return {"agent": agent, "level": level, "repos": sorted(repos), "resources": []}
 
@@ -20569,12 +20603,51 @@ def need_give_door(agent, repo, level):
     return None
 
 
+def repo_untold(repo, why):
+    """The one refusal of a card for this repository while a read that can tell whether it exists is still to come
+    (github_repo_known None), the Give and the plain card alike, with what the hub lacks."""
+    return (f"the hub cannot tell yet whether {repo} exists ({why}): try again in a minute, and raise no card for this "
+            f"name until it can tell.")
+
+
+def need_give_reach(repo, sure=False):
+    """Why Give cannot give this repository, in words for the manager, or None: Give goes up only for a repository
+    that the hub reads in what its GitHub App reaches (github_repo_known), because a grant of another one gives no
+    token, and a name that does not exist gives nothing (the owner's card N-327 of 26 November 2026, a Give of a name
+    that an agent made up). While a read that can tell is still to come, the raise refuses with repo_untold; after
+    a read that failed, it names the fault, and the plain card keeps its checks. sure: the press and the
+    sweep, which close a card from before only on "missing" and "no_app": a door's reading can leave out a page that
+    GitHub did not give (door.py installation_repos), so "unreached" is no fact enough to close the owner's card."""
+    state, why = github_repo_known(repo)
+    if state == "reached" or sure and state in (None, "unreached", "failed"):
+        return None
+    if state == "missing":
+        said = f"{repo_missing_fact(repo)}, so Give gives nothing."
+        return said if sure else f"{said} Check the name with the agent that gave it, and raise no card for this name."
+    if state is None:
+        untold = repo_untold(repo, why)
+        return untold[0].upper() + untold[1:]
+    if state == "failed":       # it can last: the plain card keeps its checks (card_access), and Give waits for none
+        return (f"The hub cannot tell whether {repo} exists ({why}), so Give does not give it. Check the name with the "
+                f"agent that gave it, and leave needs_agent out.")
+    if state == "no_app":
+        said, step = (f"The fleet has no GitHub App, so Give gives no token for {repo}.",
+                      f"connect GitHub in Founderizer and choose {repo}")
+    else:
+        page = github_unreached([repo]).get(repo)
+        said, step = (f"The fleet's GitHub App does not reach {repo}, so Give gives no token for it: it may not exist, "
+                      f"or the owner did not add it to the App.", "add it to the App" + (f" at {page}" if page else ""))
+    return said if sure else (f"{said} Ask the agent where it saw that name, and check it first. A card for it goes up "
+                              f"only as the owner's step to {step}, without Give: leave needs_agent out.")
+
+
 def need_give_gone(give):
     """The words that close an item whose Give has nobody to give to any more: an item of a kind that this hub cannot
     read (no repository and no thing that it knows: a secret of a later code, or a row of this piece after a revert of
     it), its agent left the fleet, or holds no repositories now (it is no worker or lead), or the item names one of the
-    product's own repositories, which no grant gives (a card from before it was one: need_give refuses a new one); else
-    None. An agent that is paused or in setup keeps its card: a grant to it still works."""
+    product's own repositories, which no grant gives (a card from before it was one: need_give refuses a new one), or
+    a repository that the hub knows does not exist, or a fleet with no GitHub App (need_give_reach, sure); else None.
+    An agent that is paused or in setup keeps its card: a grant to it still works."""
     import door_targets
     agent = give["agent"]
     # a kind that this code does not read (a secret, of a later or an earlier code): its press would give nothing
@@ -20586,6 +20659,10 @@ def need_give_gone(give):
     door = next((w for w in (need_give_door(agent, r, give["level"]) for r in give["repos"]) if w), None)
     if door:
         return f"Closed by the hub: {door}"
+    # a card from before need_give_reach: a name that does not exist, or a fleet with no GitHub App
+    reach = next((w for w in (need_give_reach(r, sure=True) for r in give["repos"]) if w), None)
+    if reach:
+        return f"Closed by the hub: {reach}"
     if agent in agents() and role_of(agent) in ("worker", "lead"):
         return None
     return f"Closed by the hub: {shown_role(agent)} cannot take this access any more, so Give gives nothing."
@@ -20707,7 +20784,9 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
              f"{level} access to {need_give_thing(rid)} ({rid}) now. An agent gets the change in its next task "
              f"session.")
         return {"repos": [], "resources": [rid]}
-    if rid and given_before[0] == level and not level_at_least(kind, resource_recorded(rid, agent), level):
+    if rid and given_before[0] == level and (not level_at_least(kind, resource_recorded(rid, agent), level) or
+                                             kind == "tool" and mcp_hold_kept(agent, thing)):
+        # (and a hold of a kept app that the default gave: the owner's record opens its token, K1)
         # The hub stopped after this card's commit and before its record (a release's restart), and the Mac sends the
         # same press again: the agent holds exactly the card's level, and no record says so. The repeat rule of
         # grant_access: the record now, at this press's revision, and the manager's line; the commit itself names the
@@ -49611,21 +49690,42 @@ def resource_pool():
 # files and Keychain items, never secrets of the catalog, so no grant reaches them.
 RESOURCE_KEPT = {"fleet": "the fleet runs on it, so only the owner gives it",
                  "owner": "the owner keeps it, so only the owner gives it",
+                 # the product's own private source (product_source): in no default, ever
+                 "source": "it is the product's own private source, which developer agents get through the agents' "
+                           "own GitHub App, so only the owner gives it",
                  # a key whose value moves money, as the central vault reads it (vault.py MONEY_KEYS; the supervisor's
                  # decision of 24 November 2026: RULES.md keeps money with the owner): kept like their "Only you", which
                  # their own level on its row opens
                  "money": "it moves money, so only the owner gives it",
-                 # an MCP server with an OAuth sign-in acts as one of the owner's own accounts, and can send as it
-                 # (a mail or an automation server), which the default's Gmail write keeps from the manager
-                 "account": "it acts as an account of the owner's, so only the owner gives it"}
+                 # an OAuth app of a code host gives the owner's own user token: write to every repository of the
+                 # account, which the default gives at read only (DEFAULT_TOP)
+                 "code": "it reaches the owner's own repositories at the owner's own level, so only the owner gives it",
+                 # an OAuth app of a cloud, hosting or DNS provider reaches the owner's servers, deployments and domains
+                 "cloud": "it reaches the owner's servers, deployments, databases or domains at the owner's own level, so "
+                          "only the owner gives it",
+                 # an OAuth app that the owner connected with an administrator's scope (ADMIN_SCOPE)
+                 "admin": "it was connected with an administrator's scope over a whole organization, so only the owner "
+                          "gives it",
+                 # a hosted MCP gateway that reaches the owner's other accounts through their connections there
+                 "gateway": "it reaches the owner's other accounts through their connections there, so only the owner "
+                            "gives it",
+                 # a secrets manager's OAuth app (KEPT_APP_HOSTS)
+                 "secrets": "it reads the owner's secrets at the owner's own level, so only the owner gives it"}
+# An MCP server with an OAuth sign-in is in the default too since 26 November 2026 (the owner: "it should be the same
+# for apps and other resources!", the supervisor's yes): it acts as one of the owner's own accounts, so one that can
+# send as the owner (a mail or an automation app) gives its holder what Gmail send would (VAULT.md limit 32). The
+# owner's "Only you" on its row keeps such an app.
 
 
-# The default's top of the two kinds that act outward, one level below their own top (the supervisor's choice (B) of
-# 24 November 2026, after the Door area's read): a repository up to write, whose token has no workflows or actions
-# right, so GitHub refuses a change of .github/workflows; a Gmail up to write, drafts and labels, no send. The owner's
-# own level on a row opens deploy or send. A write still changes, and starts, what the repository's existing jobs run
-# (a push to their branch, a tag, a pull request or a comment that a job takes): VAULT.md limit 32.
-DEFAULT_TOP = {"repo": "write", "gmail": "write"}
+# The default's top of the two kinds that act outward: a repository up to read (the supervisor's decision of 26 November
+# 2026, after the Door area's read A4); a Gmail up to write, drafts and labels, no send (the supervisor's choice (B) of
+# 24 November 2026). A write token pushes a branch, a tag or a commit, and the repository's existing jobs run that code
+# beside their secrets and runners: GitHub Actions on a push, a tag or a pull request, Dependabot with its own secrets,
+# and builders and servers that the fleet's GitHub App cannot see (Vercel, Netlify, Argo CD, a deploy key). No read
+# of the App can show that none of them is there, so a repository's write and deploy, and a Gmail's send, come only
+# with the owner's own level on its row, which opens it for the manager in one choice: VAULT.md limit 32. A repository
+# that the door made keeps new-projects plan N3 (grant_check): its workflow files go through the door.
+DEFAULT_TOP = {"repo": "read", "gmail": "write"}
 
 
 def default_top(kind):
@@ -49633,10 +49733,119 @@ def default_top(kind):
     return DEFAULT_TOP.get(kind) or RESOURCE_LEVELS[kind][-1]
 
 
+# The OAuth apps that the default keeps the owner's (the Door area's read and the supervisor's choice of 26 November
+# 2026): a session gets the app's access token itself (lifecycle.mcp_variable), so it reaches the provider's whole API
+# with the token's scopes, and the app's own tools do not bound it. A payment, exchange or broker app moves money; a
+# code host's app gives the owner's own user token, with write to each repository of the account, around the read
+# default and the door; a cloud, hosting or DNS app reaches their servers, deployments and domains. One list, a host
+# and its subdomains, read from what the hub wrote itself: the app's url in team.json, and the issuer and the token
+# endpoint that its connection named at Connect (ui_mcp_finish), so an app that signs in through GitHub is a code
+# host's app at any url. An app at another host is in the default (VAULT.md limit 32 names the rest that stays a
+# risk: a code host at a company's own host, a gateway that the list does not name, a mail app).
+KEPT_APP_HOSTS = {
+    "money": ("stripe.com", "paypal.com", "squareup.com", "square.com", "adyen.com", "mollie.com",
+              "braintreegateway.com", "checkout.com", "gocardless.com", "wise.com", "revolut.com", "paddle.com",
+              "lemonsqueezy.com", "razorpay.com", "plaid.com", "coinbase.com", "kraken.com", "binance.com",
+              "alpaca.markets", "robinhood.com", "interactivebrokers.com", "ibkr.com", "schwabapi.com", "mercury.com",
+              "ramp.com", "brex.com", "gemini.com", "okx.com", "shopify.com"),
+    "code": ("github.com", "githubcopilot.com", "githubusercontent.com", "ghe.com", "gitlab.com", "bitbucket.org",
+             "visualstudio.com", "codeberg.org", "huggingface.co", "npmjs.com", "npmjs.org", "pypi.org", "docker.com"),
+    # a secrets manager's app reads each secret of the owner's there
+    "secrets": ("doppler.com", "infisical.com", "1password.com"),
+    "cloud": ("amazonaws.com", "aws.amazon.com", "googleapis.com", "cloud.google.com", "azure.com", "hetzner.com",
+              "hetzner.cloud", "digitalocean.com", "vultr.com", "linode.com", "akamai.com", "ovh.com", "ovhcloud.com",
+              "scaleway.com", "oraclecloud.com", "cloudflare.com", "vercel.com", "netlify.com", "fly.io", "render.com",
+              "railway.app", "railway.com", "heroku.com", "supabase.com", "neon.tech", "namecheap.com",
+              "godaddy.com", "porkbun.com", "gandi.net", "dnsimple.com", "name.com", "dynadot.com"),
+    # a hosted gateway whose one app reaches GitHub, Stripe and the rest through the owner's connections there
+    "gateway": ("zapier.com", "composio.dev", "composio.io", "pipedream.net", "pipedream.com", "smithery.ai", "make.com",
+                "n8n.cloud", "arcade.dev", "klavis.ai", "merge.dev")}
+# The form of an access token that names its provider (ui_mcp_finish keeps it as the connection's token_kind): an app
+# whose own authorization server passes GitHub's or Stripe's token back is that provider's app at any host.
+ACCESS_TOKEN_KINDS = (("code", ("gho_", "ghu_", "ghp_", "ghs_", "github_pat_")), ("money", ("sk_live_", "rk_live_")))
+# An administrator's scope, or a scope over a whole organization, that the connection holds: the word admin of its
+# own (Slack's admin.users:write, GitHub's admin:org, Google Workspace's .../auth/admin.directory.user), Microsoft's
+# tenant-wide scopes (each scope of its directory, roles, applications, policies, domains, audit log, groups, Teams
+# channel messages, reports and security events, User.Read.All, and each
+# .ReadWrite.All, .FullControl.All and .Manage.All, such as Directory.ReadWrite.All and Sites.FullControl.All, but not
+# a one-user reader such as Files.Read.All or User.ReadBasic.All) and its .default, which names every permission of the
+# app's registration, Atlassian's manage: scopes (manage:jira-configuration) and Okta's okta.<thing>.manage (the
+# coordinator's validator, 26 November 2026). Such an app reaches a whole organization.
+ADMIN_SCOPE = re.compile(r"(?:^|[^A-Za-z0-9])admin(?:$|[^A-Za-z0-9])"
+                         r"|(?:^|/)(?:Directory|RoleManagement|Application|Policy|Domain|Organization|AuditLog|Group"
+                         r"|GroupMember|ChannelMessage|Reports|SecurityEvents)\.|(?:^|/)User\.Read\.All$"
+                         r"|\.(?:ReadWrite|FullControl|Manage)\.All$|(?:^|/)\.default$"
+                         r"|(?:^|[^A-Za-z0-9])manage:|^okta\.[A-Za-z]+\.manage$", re.IGNORECASE)
+
+
+def kept_app_host(url):
+    """The RESOURCE_KEPT key of a url at one of KEPT_APP_HOSTS (its host, or a subdomain of it), or None."""
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    try:            # an issuer or an endpoint from a server's own metadata can be Unicode: IDNA's own form, as DNS reads it
+        host = host.encode("idna").decode("ascii").lower() if not host.isascii() else host
+    except UnicodeError:
+        return None
+    for why, hosts in KEPT_APP_HOSTS.items():
+        if any(host == h or host.endswith("." + h) for h in hosts):
+            return why
+    return None
+
+
+def kept_app(name, team):
+    """The RESOURCE_KEPT key of an OAuth app that stays the owner's, or None: by the form of the access token that its
+    Connect got (ACCESS_TOKEN_KINDS), by the host of its url, of the issuer or of the token endpoint of its
+    connection (KEPT_APP_HOSTS), else "admin" when its connection holds an administrator's scope (ADMIN_SCOPE); "owner"
+    while the hub cannot read its file of connections. An app that is not connected yet is judged by its url alone; its
+    Connect writes the rest, and a hold that the default gave before it gets no token once the app is kept
+    (mcp_hold_kept)."""
+    app = tool_catalog(team).get(name) or {}
+    if app.get("auth") != "oauth":
+        return None
+    saved, bad = mcp_saved()
+    if bad:
+        return "owner"          # the hub cannot read what its Connect wrote: kept until it can (the Door area's S1)
+    conn = mcp_connection(saved, name) or {}
+    seen = conn.get("token_kind") or dict(MCP.get("kinds") or {}).get(name)
+    if seen in KEPT_APP_HOSTS:
+        return seen         # its token's own form (ACCESS_TOKEN_KINDS), whatever host gave it, also one that a session's
+        # hand-out saw for a connection from before the Connect kept it
+    for url in (app.get("url"), conn.get("issuer"), conn.get("token_endpoint")):
+        why = kept_app_host(url)
+        if why:
+            return why
+    if any(isinstance(scope, str) and ADMIN_SCOPE.search(scope) for scope in conn.get("scopes") or []):
+        return "admin"
+    return None
+
+
+def token_kind(access):
+    """The KEPT_APP_HOSTS key that an access token's own form names (ACCESS_TOKEN_KINDS), or None."""
+    for why, heads in ACCESS_TOKEN_KINDS:
+        if isinstance(access, str) and access.startswith(heads):
+            return why
+    return None
+
+
+def mcp_hold_kept(agent, name):
+    """Why a session of this agent gets no access token of this OAuth app now, or None: the app is the owner's to give
+    (resource_kept), and this agent's hold of it was no grant of the owner's (owner_gave), so a hold that the default
+    gave before the app's Connect showed whose account it reaches, or before a new Connect, scope or address, gives no
+    token (the Door area's read, M1)."""
+    why = resource_kept(f"tool:{name}")
+    if why and not owner_gave(agent, name):
+        return f"it is the owner's to give ({RESOURCE_KEPT[why]}), and the owner did not give it to this agent"
+    return None
+
+
 def kept_word(why):
-    """The `kept` that the owner's page and the manager read: a key that moves money and an OAuth server are kept as
+    """The `kept` that the owner's page and the manager read: a key or an app that moves money, the product's private
+    source, and an app of a code, cloud, DNS or gateway host or with an administrator's scope (kept_app), are kept as
     the owner's."""
-    return "owner" if why in ("money", "account") else why
+    return "owner" if why in ("money", "source", "code", "cloud", "admin", "gateway", "secrets") else why
 
 
 def vault_unpooled():
@@ -49656,6 +49865,19 @@ def money_secrets():
         status = CENTRAL.get("status")
     refs = status.get("money") if isinstance(status, dict) else None
     return {ref.lower() for ref in refs or [] if isinstance(ref, str)}
+
+
+# The product's own private source: in the default of no fleet, ever (the supervisor's decision of 26 November 2026),
+# so that the read default cannot open it when the fleet's GitHub App comes to reach its account (the migration's step
+# M5), by its name under any account, so that the migration's row 6, a transfer or a rename of the account keeps it.
+# Developer agents get it through the agents' own App. Unlike door_targets.VENDOR_REPOS, which every route refuses,
+# it is kept as the owner's ("source"): their own level on its row, and their Give on a card, still give it.
+PRODUCT_SOURCE_NAME = "founderizer-source"
+
+
+def product_source(what):
+    """True for the product's own private source (PRODUCT_SOURCE_NAME) under any account."""
+    return str(what or "").lower().rsplit("/", 1)[-1] == PRODUCT_SOURCE_NAME
 
 
 def resource_kept(rid, team=None):
@@ -49700,8 +49922,12 @@ def resource_kept(rid, team=None):
         if kind == "secret" and what.lower() in money_secrets() and what.lower() in vault_unpooled():
             return "money"
         return None
-    if kind == "tool" and (tool_catalog(team).get(what) or {}).get("auth") == "oauth":
-        return "account"
+    if kind == "repo" and product_source(what):
+        return "source"
+    if kind == "tool":
+        why = kept_app(what, team)
+        if why:
+            return why          # a payment, code, cloud or DNS host's app, or an admin's (kept_app): their level opens it
     if kind == "secret" and what.lower() in money_secrets():
         return "money"
     if kind == "secret" and what.lower() in vault_unpooled():
@@ -49711,8 +49937,10 @@ def resource_kept(rid, team=None):
 
 def resource_held(kind, what, team=None):
     """True when the hub's own record shows that the fleet holds this resource, so the default can cover it: a secret
-    or an MCP server of the catalog, a repository that an agent holds or that the door made, a Google account that is
-    connected. An id that no record names stays the owner's to give, as before."""
+    or an MCP server of the catalog, a repository that an agent holds, that the door made or that the fleet's GitHub
+    App reaches (github_reaches), a Google account that is connected. An id that no record names stays the owner's to
+    give, as before. A repository's default stops at read (DEFAULT_TOP) however it is held, so a hold that the manager
+    gave, with no reading of the App, keeps it in the pool and lifts no level (the coordinator's validator, M2)."""
     team = TEAM if team is None else team
     if kind == "secret":
         return what in (team.get("logins") or {})
@@ -49721,7 +49949,8 @@ def resource_held(kind, what, team=None):
         return what in tool_catalog(team) or what in servers
     if kind == "repo":
         return any(what.lower() == str(repo).lower() for a in (team.get("agents") or {}).values()
-                   for repo in (a.get("repos") or {})) or door_made(what)
+                   if isinstance(a, dict) for repo in (a.get("repos") or {})) or door_made(what) or \
+            github_reaches(what)
     if kind in ("drive", "gmail"):
         return what in google_services_now()[0]
     return False
@@ -49730,8 +49959,8 @@ def resource_held(kind, what, team=None):
 def resource_standing(rid, team=None):
     """The standing that counts for one resource (owner feature pool_default): None where it is the owner's alone to
     give (resource_kept); the owner's own entry {"max", "to", "by": "owner"}; else, for a resource that the fleet holds
-    (resource_held), the default {"max": default_top(kind), "to", "by": "default"}: a repository and a Gmail up to
-    write, each other kind up to its own top level."""
+    (resource_held), the default {"max": default_top(kind), "to", "by": "default"}: a repository up to read, a Gmail
+    up to write, each other kind up to its own top level."""
     team = TEAM if team is None else team
     kind, what = resource_parts(rid)
     if not kind or resource_kept(rid, team):
@@ -49742,6 +49971,33 @@ def resource_standing(rid, team=None):
     if not resource_held(kind, what, team):
         return None
     return {"max": default_top(kind), "to": RESOURCE_AUDIENCE, "by": "default"}
+
+
+def owner_level_route(agent, rid, kind, what, level):
+    """The one route of a grant that needs the owner's own level, in the words of a refusal: the agent that holds it at
+    that level already does that part of the work (card_access refuses the owner's card then, the owner, 29 October
+    2026: asked only for what no agent holds), else the owner's card names the agent, which their Give settles (the
+    coordinator's validator of 26 November 2026: a refusal that sends the manager to a card that card_access refuses
+    asks the owner nothing)."""
+    held = [h["agent"] for h in card_holders(kind, what.lower() if kind == "repo" else what)
+            if h["agent"] != agent and level_at_least(kind, h["level"], level if level in RESOURCE_LEVELS[kind]
+                                                      else None)]
+    if held and not card_dead(kind, what):
+        return (f"{', '.join(held)} {'holds' if len(held) == 1 else 'hold'} it at that level: give that part of the "
+                f"work to {held[0]} with create_task.")
+    return (f'Ask the owner with raise_needs_you(needs_access="{rid}", needs_level="{level}", needs_agent="{agent}"): '
+            f"their Give gives it.")
+
+
+def operator_needs_owner(conf, kind, entry):
+    """True when this agent's grant of this repository needs the owner's own level of write or deploy on its row: the
+    door commits for an Operator (an agent that holds a server through the door) to each repository that it holds, at
+    any level (DoorAccess.operatorGitHub), so a read of it is a write by the door's own token, whose push the
+    repository's jobs run beside their secrets (the Door area's read of 26 November 2026, after the default's
+    repository top became read). grant_check refuses such a grant, and grant_pool and need_is_yours name no such
+    agent for it. A server that the agent gets after its grant is not checked here (VAULT.md limit 32)."""
+    return kind == "repo" and bool((conf or {}).get("servers")) and not (
+        (entry or {}).get("by") == "owner" and (entry or {}).get("max") in ("write", "deploy"))
 
 
 def resource_top(rid, team=None):
@@ -50104,7 +50360,9 @@ def grant_pool(names, team=None):
                      "max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE), "by": "owner",
                      "levels": list(RESOURCE_LEVELS[kind]),
                      "eligible": [n for n in names if grant_fits(n, entry, team) and
-                                  not (kind == "drive" and drive_grant(n, team)[2])],
+                                  not (kind == "drive" and drive_grant(n, team)[2]) and
+                                  not operator_needs_owner(((TEAM if team is None else team).get("agents") or {})
+                                                           .get(n), kind, dict(entry, by="owner"))],
                      "held_by": {h["agent"]: h["level"] for h in resource_holders(kind, what, team)}})
     return pool
 
@@ -50124,7 +50382,8 @@ def grant_default(team=None):
     return {"to": RESOURCE_AUDIENCE, "top": {kind: default_top(kind) for kind in RESOURCE_LEVELS if kind != "server"},
             "words": "You may give each resource that the fleet holds to a worker or a lead with grant_access, up to "
                      "the default's top of its kind (top), unless resources gives the owner's own level for it or kept "
-                     "names it. Deploy of a repository and send of a Gmail come only with the owner's own level.",
+                     "names it. Write and deploy of a repository, and send of a Gmail, come only with the owner's own "
+                     "level.",
             "kept": kept}
 
 
@@ -50176,6 +50435,10 @@ def grant_check(agent, rid, level, folder=False):
         if levels.index(level) > levels.index("write"):
             return f"The door made {what}: give it at write at most, because nobody gets deploy there."
         return None
+    if entry.get("max") and operator_needs_owner(a, kind, entry):
+        return (f"{agent} holds a server through the door, and the door commits for it to each repository that it "
+                f"holds, at any level: that is a write, so only the owner's own level of write or deploy on the row of "
+                f"{what} lets you give it. " + owner_level_route(agent, rid, kind, what, level))
     if not entry.get("max"):
         phrase = resource_phrase(kind, what)        # only its first letter: capitalize() would unmake MCP and a name
         # the owner is asked only for what no agent holds (the owner, 29 October 2026), so an agent that holds it and
@@ -50211,8 +50474,13 @@ def grant_check(agent, rid, level, folder=False):
     if level not in levels:
         raise ToolError(f"level must be one of {', '.join(levels)} for a {RESOURCE_WORDS[kind]}.")
     if levels.index(level) > levels.index(entry["max"]):
-        return (f"{'The owner allows' if entry.get('by') == 'owner' else 'The default gives'} at most {entry['max']} of "
-                f"{resource_phrase(kind, what)}, and you asked for {level}. "
+        if entry.get("by") != "owner":
+            # a level above the default is the owner's own (a repository's write and deploy, a Gmail's send): the card
+            # comes first, because a lower give does not do the work that the task named (the Door area's read)
+            return (f"The default gives at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for "
+                    f"{level}, which is the owner's own level. " + owner_level_route(agent, rid, kind, what, level) +
+                    f" Give {entry['max']} only if the work needs no more.")
+        return (f"The owner allows at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for {level}. "
                 f"Give {entry['max']}, or ask the owner for {level}.")
     account, whole, _ = drive_grant(agent) if folder else (None, -1, {})
     if folder and account == what and whole >= levels.index(level):
@@ -50685,8 +50953,16 @@ def team_repo_refusal(what):
         raise TeamPassing(f"The hub has no reading yet of what its GitHub App reaches, so it cannot tell that it "
                           f"reaches {what}. Try again in a minute. {later}", "the hub has not read its GitHub App yet")
     owner = what.split("/")[0]
-    if what in reach["repos"] or owner in reach["all"]:
+    if github_reaches(what):
         return None
+    if owner.lower() in reach["all"] and owner.lower() not in (reach.get("many") or ()):
+        if github_repo_known(what)[0] != "missing":
+            return None     # no list of the last minute (a door that cannot list): only a name that is missing is
+            # refused, as the Needs-you area's rule says, so a plan never waits for a list that may not come
+        return (f"GitHub lists no repository {what} of {owner}, whose every repository the fleet's GitHub App reaches: "
+                f"it does not exist, or it is archived. Check its name, then write the plan again.")
+    if owner.lower() in (reach.get("many") or ()):
+        return None         # more than the hub reads: it cannot tell, and the token says it at the grant
     page = reach["pages"].get(owner) or reach["install"]
     return (f"The fleet's GitHub App does not reach {what}. Ask the owner with raise_needs_you (needs_access "
             f"repo:{what}) to add it{f' at {page}' if page else ' on GitHub'}, then write the plan again.")
@@ -50701,13 +50977,31 @@ def team_repo_owner_step(what):
         return False
 
 
-def team_plan_repos(args):
-    """True when a change_team call's add names a repository in its access: the hub reads its GitHub App for it before
-    LOCK, so that the plan's check sees what the owner added a moment ago."""
-    changes = args.get("changes") if isinstance(args, dict) else None
-    return any(isinstance(c, dict) and isinstance(c.get("access"), list) and
-               any(isinstance(x, dict) and str(x.get("resource") or "").strip().lower().startswith("repo:")
-                   for x in c["access"]) for c in changes) if isinstance(changes, list) else False
+def call_repos(name, args):
+    """The repositories that a tool call names where the hub decides by the App's reading (github_repo_ahead, before
+    LOCK): a plan's access (change_team), grant_access's resource, raise_needs_you's needs_access."""
+    if name == "change_team":
+        changes = args.get("changes") if isinstance(args, dict) else None
+        return [str(x["resource"]).strip()[5:] for c in (changes if isinstance(changes, list) else [])
+                if isinstance(c, dict) and isinstance(c.get("access"), list)
+                for x in c["access"] if isinstance(x, dict) and isinstance(x.get("resource"), str)
+                and x["resource"].strip().lower().startswith("repo:")]
+    if name == "raise_needs_you":       # each repository of a Give, which names up to NEED_GIVE_MOST
+        return [t[5:] for t in re.split(r"[\s,]+", str(args.get("needs_access") or "").strip())
+                if t.lower().startswith("repo:")]
+    if name == "grant_access":
+        rid = str(args.get("resource") or "").strip()
+        return [rid[5:]] if rid.lower().startswith("repo:") else []
+    return []
+
+
+def team_plan_ahead(nid):
+    """Before the lock of an owner's press of a team card (phone_submit) and of a pass of team_plans_pressed:
+    github_repo_ahead for each repository of the plan's access, so that its second check (team_repo_refusal) reads a
+    list of the last minute where only the list decides (the coordinator's validator, P2: else each press after a quiet
+    minute waits again, and nothing lists the repositories). Never under LOCK."""
+    plan = team_card(read_row("SELECT team_plan FROM needs WHERE id=?", (nid,)))
+    github_repos_ahead(call_repos("change_team", {"changes": (plan or {}).get("changes") or []}))
 
 
 def team_tool_keyed(name, team=None):
@@ -52206,6 +52500,8 @@ def team_plans_pressed():
     the manager hears it at the first failed pass and again at the TEAM_PLAN_TRIES-th. A plan that git says has no
     commit on the ref stops after TEAM_PLAN_TRIES passes (team_plan_droppable); one whose commit is, or may be, on the
     ref never does, and the hub says it again then. The card of a plan that stops says so (team_plan_end)."""
+    for row in read_rows("SELECT k FROM kv WHERE k>=? AND k<? ORDER BY k", (TEAM_PLAN_MARK, TEAM_PLAN_MARK[:-1] + ";")):
+        team_plan_ahead(int(row["k"][len(TEAM_PLAN_MARK):]))      # its repositories' reading and list, before the lock
     with kit_lock():
         for row in read_rows("SELECT k, v FROM kv WHERE k>=? AND k<? ORDER BY k",
                              (TEAM_PLAN_MARK, TEAM_PLAN_MARK[:-1] + ";")):
@@ -58454,8 +58750,8 @@ TOOLS = [
         "task_id": TASK_ID}, ["request_id"])),
     ("manager", "grant_access", t_grant_access,
      "Give one agent one thing that the owner already brought into the fleet: a repository, a secret, a Google "
-     "service or an MCP server. By default each resource that the fleet holds, up to write for a repository or a "
-     "Gmail; the owner's own level on a row is its ceiling, and only it gives deploy or send. Never what "
+     "service or an MCP server. By default each resource that the fleet holds, a repository up to read and a Gmail "
+     "up to write; the owner's own level on its row sets another top. Never what "
      "see_capacity lists as kept. Give the level that the work needs: a key of a sending service (SMTP, Twilio) "
      "sends. The grant is a commit of team.json, so the owner sees it and can take it back. A credential that the "
      "fleet does not hold is the owner's to bring: request_secret for a key or a login, else raise_needs_you. A "
@@ -59967,9 +60263,7 @@ def call_tool(agent, name, args, context=None):
                 else:
                     tool_reads_ahead(name, args)        # its git reads, before LOCK
                     CALL.folder = grant_folder_ahead(args) if name == "grant_access" else None    # Google, before LOCK
-                    if name == "change_team" and team_plan_repos(args) or name == "raise_needs_you" and \
-                            str(args.get("needs_access") or "").strip().lower().startswith("repo:"):
-                        github_reach(GITHUB_REACH_WAIT)     # a repository's App reading, before LOCK
+                    github_repos_ahead(call_repos(name, args))      # the App's reading, and its list where it decides
                     # A tool that commits team.json takes the turn of the hub's writes first (KIT_TOOLS), so that it
                     # waits for an owner's write that runs its git now instead of being refused (kit_flying).
                     with kit_lock() if name in KIT_TOOLS else LOCK:
@@ -74416,7 +74710,7 @@ GITHUB_REACH_WAIT = 4           # seconds that a repository grant waits for a re
 GITHUB_REACH_PAGES = 30         # pages of 100 repositories that the hub reads of one installation, at most
 GITHUB_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 GITHUB_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,99}")
-GITHUB_REACH = {"at": None, "reach": None, "reading": False}
+GITHUB_REACH = {"at": None, "reach": None, "reading": False, "error": None}     # error: of the last reading
 GITHUB_REACH_DONE = threading.Condition()
 
 
@@ -74434,7 +74728,7 @@ def github_reach_read():
     installs = github_call("GET", "/app/installations?per_page=100", jwt)
     if not isinstance(installs, list):
         raise GitHubError("GitHub gave no list of the App's installations")
-    reach = {"pages": {}, "all": set(), "repos": set(),
+    reach = {"pages": {}, "all": set(), "repos": set(), "many": set(),
              "install": f"https://github.com/apps/{slug}/installations/new"
              if isinstance(slug, str) and GITHUB_SLUG.fullmatch(slug) else None}
     for one in installs:
@@ -74463,6 +74757,7 @@ def github_reach_read():
                 break
         else:
             reach["all"].add(login.lower())     # more than the hub reads: it marks none of this account's
+            reach["many"].add(login.lower())    # but the pool reaches only those that it read (github_reaches)
     return reach
 
 
@@ -74497,13 +74792,14 @@ def door_reach_read(conf=None):
             "repos": {r.lower() for r in answer.get("repos") or [] if isinstance(r, str) and
                       GITHUB_FULL_NAME.fullmatch(r.lower())},
             "install": install if isinstance(install, str) and GITHUB_INSTALL_PAGE.fullmatch(install) else None,
-            "owners": {o.lower() for o in answer.get("owners") or [] if isinstance(o, str) and GITHUB_LOGIN.fullmatch(o)}}
+            "owners": {o.lower() for o in answer.get("owners") or [] if isinstance(o, str) and GITHUB_LOGIN.fullmatch(o)},
+            "many": {a.lower() for a in answer.get("many") or [] if isinstance(a, str) and GITHUB_LOGIN.fullmatch(a)}}
 
 
 # Every repository that the fleet's GitHub Apps reach, for the app's list that gives an agent its repositories (owner
 # feature repo_picker; the owner, 9 November 2026: "ok yes" to that list). Unlike the reading above, it names the
 # repositories of an installation that has all its account's repositories too. Only in the hub's memory.
-GITHUB_REPOS = {"at": 0.0, "list": None}
+GITHUB_REPOS = {"at": 0.0, "list": None, "failed": 0.0, "reading": None, "part": None, "again": 0.0, "told": None}
 GITHUB_REPOS_LOCK = threading.Lock()
 
 
@@ -74511,47 +74807,58 @@ def github_repos_read():
     """({account: {"name": the account as GitHub writes it, "repos": [owner/name in lower case]}}, problems): the
     repositories of every installation of the hub's own App and of the door's Apps, archived ones and suspended
     installations left out. A source that cannot be read is a problem, and the other still counts. The product's own
-    repositories are left out too, which no grant gives (vendor_repo_check), and an account that has only those."""
+    repositories are left out too, which no grant gives (vendor_repo_check). An account that has only those is kept
+    with no repositories and "product": the app's list leaves it out (ui_github_repos), and github_repo_known reads it
+    as an account read whole, where a name does not exist (the owner's card N-327)."""
     import door_targets
     found, problems = {}, []
 
     def keep(login, name, repos):
         mine = {r for r in repos if REPO_NAME.fullmatch(r) and r.split("/")[0] == login.lower()}
         own = {r for r in mine if not door_targets.vendor(r)}
-        if mine and not own:
-            return
-        entry = found.setdefault(login.lower(), {"name": name, "repos": set()})
+        entry = found.setdefault(login.lower(), {"name": name, "repos": set(), "product": True})
         entry["repos"] |= own
+        if own or not mine:
+            entry.pop("product", None)
     app = github_app()
+    installs, jwt = [], None
     if app is not None:
         try:
             jwt = github_jwt(*app)
             installs = github_call("GET", "/app/installations?per_page=100", jwt)
             if not isinstance(installs, list):
                 raise GitHubError("GitHub gave no list of the App's installations")
-            for one in installs:
-                account = one.get("account") or {}
-                iid, login = one.get("id"), account.get("login")
-                if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
-                        not GITHUB_LOGIN.fullmatch(login) or one.get("suspended_at"):
-                    continue
-                token = github_call("POST", f"/app/installations/{iid}/access_tokens", jwt,
-                                    {"permissions": {"metadata": "read"}}).get("token")
-                if not isinstance(token, str) or not GITHUB_TOKEN.fullmatch(token):
-                    raise GitHubError("GitHub gave no valid token")
-                repos = set()
-                for page in range(1, GITHUB_REACH_PAGES + 1):
-                    rows = [r for r in github_call("GET", f"/installation/repositories?per_page=100&page={page}",
-                                                   token).get("repositories") or [] if isinstance(r, dict)]
-                    repos |= {r["full_name"].lower() for r in rows
-                              if isinstance(r.get("full_name"), str) and not r.get("archived")}
-                    if len(rows) < 100:
-                        break
-                else:
-                    raise GitHubError(f"{login} has more repositories than the hub reads")
-                keep(login, login, repos)
         except GitHubError as e:
             problems.append(str(e))
+            installs = []
+    for one in installs:
+        account = (one.get("account") or {}) if isinstance(one, dict) else {}
+        iid, login = one.get("id") if isinstance(one, dict) else None, account.get("login")
+        if isinstance(iid, bool) or not isinstance(iid, int) or not isinstance(login, str) or \
+                not GITHUB_LOGIN.fullmatch(login) or one.get("suspended_at"):
+            continue
+        try:        # one installation that fails stops no other (github_repo_known reads the accounts read whole)
+            token = github_call("POST", f"/app/installations/{iid}/access_tokens", jwt,
+                                {"permissions": {"metadata": "read"}}).get("token")
+            if not isinstance(token, str) or not GITHUB_TOKEN.fullmatch(token):
+                raise GitHubError("GitHub gave no valid token")
+            repos = set()
+            for page in range(1, GITHUB_REACH_PAGES + 1):
+                rows = github_call("GET", f"/installation/repositories?per_page=100&page={page}",
+                                   token).get("repositories")
+                if not isinstance(rows, list):      # no short list: a name after it would read as one that is not
+                    raise GitHubError(f"GitHub gave no list of the repositories of {login}")    # there
+                rows = [r for r in rows if isinstance(r, dict)]
+                repos |= {r["full_name"].lower() for r in rows
+                          if isinstance(r.get("full_name"), str) and not r.get("archived")}
+                if len(rows) < 100:
+                    break
+            else:
+                raise GitHubError(f"{login} has more repositories than the hub reads")
+        except GitHubError as e:
+            problems.append(str(e))
+            continue
+        keep(login, login, repos)
     conf = door_conf()
     if conf is not None:
         status, answer = door_call(conf, "GET", "/github/repos", conf["token"])
@@ -74565,25 +74872,31 @@ def github_repos_read():
             problems.append("the door's code does not list repositories yet" if status == 404 else
                             "the door gave no list of repositories" + (f": {answer['error']}" if isinstance(answer, dict)
                                                                       and isinstance(answer.get("error"), str) else ""))
-    return {a: {"name": e["name"], "repos": sorted(e["repos"])} for a, e in sorted(found.items())}, problems
+    return {a: dict({"name": e["name"], "repos": sorted(e["repos"])}, **({"product": True} if e.get("product") else {}))
+            for a, e in sorted(found.items())}, problems
 
 
-def github_repo_list():
+def github_repo_list(again=False):
     """(the newest github_repos_read, its problem in words or None): a reading counts GITHUB_REACH_FRESH seconds, so
-    the list opens at once the second time. Never under LOCK: it calls GitHub and the door."""
+    the list opens at once the second time, unless again. Never under LOCK: it calls GitHub and the door. A reading
+    with a problem is read again next time, and its accounts are kept apart (GITHUB_REPOS "part"), for
+    github_repo_known: a problem in one source does not stop the list of an account that a source read whole."""
     with GITHUB_REPOS_LOCK:
-        if GITHUB_REPOS["list"] is not None and now() - GITHUB_REPOS["at"] < GITHUB_REACH_FRESH:
+        if not again and GITHUB_REPOS["list"] is not None and now() - GITHUB_REPOS["at"] < GITHUB_REACH_FRESH:
             return GITHUB_REPOS["list"], None
     try:
         found, problems = github_repos_read()
     except (OSError, ValueError, GitHubError) as e:
-        return {}, str(e)[:300] or "GitHub did not answer"
+        found, problems = {}, [str(e)[:300] or "GitHub did not answer"]
     if problems:
-        return found, "; ".join(problems)[:300]
+        problem = "; ".join(problems)[:300]
+        with GITHUB_REPOS_LOCK:
+            GITHUB_REPOS["part"] = {"at": now(), "list": found, "problem": problem}
+        return found, problem
     if not found and github_app() is None and door_conf() is None:
         return {}, "Founderizer holds no GitHub App yet."
     with GITHUB_REPOS_LOCK:
-        GITHUB_REPOS.update(at=now(), list=found)
+        GITHUB_REPOS.update(at=now(), list=found, part=None)
     return found, None
 
 
@@ -74634,18 +74947,129 @@ def github_reach(wait=0):
 
 
 def github_reach_refresh():
-    reach = None
+    reach, error = None, None
     try:
         reach = github_reach_read()
-    except (GitHubError, AttributeError, TypeError):
-        pass            # GitHub did not answer, or gave an answer of another shape: no reading, so no mark
+    except (GitHubError, AttributeError, TypeError) as e:
+        # GitHub did not answer, or gave an answer of another shape: no reading, so no mark. Its error stays for
+        # github_repo_known, which names it, and the hub's log says it once for each reading that fails
+        error = clip(str(e) or type(e).__name__, 200)
     finally:
         with GITHUB_REACH_DONE:
-            GITHUB_REACH.update(at=now(), reach=reach, reading=False)
+            GITHUB_REACH.update(at=now(), reach=reach, reading=False, error=error)
             GITHUB_REACH_DONE.notify_all()
+    if error:       # after the end is signalled: log() takes LOCK, which a caller that waits for this read can hold
+        log("hub", f"the reading of what the GitHub App reaches failed: {error}")
     if reach:
         with LOCK:
             github_app_asks(reach)
+
+
+def github_reaches(repo):
+    """Whether the newest reading of what the fleet's GitHub App reaches (github_reach, with no wait) names this
+    repository: by its name, or by its account, whose installation has all of that account's repositories, when the
+    hub's list of the last minute names it (not one of an account with more repositories than the hub reads, "many":
+    only those that it read). The owner
+    gave the fleet that reach on GitHub's own page, so the pool default covers such a repository as one that the
+    fleet holds (the owner's card N-327 of 26 November 2026: a repository that the App reaches and no agent holds
+    still went to the owner). False with no reading: then the owner gives it, as before."""
+    reach = github_reach()
+    if not reach or not isinstance(repo, str) or "/" not in repo:
+        return False
+    account = repo.split("/")[0].lower()
+    if repo.lower() in reach["repos"]:
+        return True
+    if account not in reach["all"] or account in (reach.get("many") or ()):
+        return False
+    # an account whose installation has all of its repositories names none in the reading, so only the hub's list
+    # of the last minute (github_repo_list) says that this one exists: an invented name would get the agent's read
+    # tokens of that account refused at GitHub (the coordinator's validator, P1). No list then: not held
+    return github_listed(repo) is True
+
+
+def github_listed(repo):
+    """Whether the hub's list of the last minute (github_repo_list) names this repository: True or False, or None with
+    no fresh list. It reads memory only, so LOCK may be held."""
+    with GITHUB_REPOS_LOCK:
+        listed = GITHUB_REPOS["list"] if now() - GITHUB_REPOS["at"] < GITHUB_REACH_FRESH else None
+    if listed is None:
+        return None
+    return repo.lower() in ((listed.get(repo.split("/")[0].lower()) or {}).get("repos") or ())
+
+
+def github_repo_list_ahead(wait=None, again=False):
+    """Before a lock: the hub's list of the last minute (github_repo_list), read in a thread of its own that this call
+    waits for at most GITHUB_REACH_WAIT seconds, and that keeps the list when it comes later. One read runs at a time.
+    A read that failed is not tried again for GITHUB_REACH_FRESH seconds, so an outage of GitHub or of the door costs
+    one read a minute, and a press waits no longer than the app does (the coordinator's validator and the Door area's
+    S5); github_repo_known reads such a failure as "failed", not as a read to come. again: read a list of the last
+    minute again (github_repo_ahead)."""
+    with GITHUB_REPOS_LOCK:
+        if not again and GITHUB_REPOS["list"] is not None and now() - GITHUB_REPOS["at"] < GITHUB_REACH_FRESH:
+            return
+        done = GITHUB_REPOS.get("reading")
+        if done is None:
+            if now() - (GITHUB_REPOS.get("failed") or 0.0) < GITHUB_REACH_FRESH:
+                return
+            done = GITHUB_REPOS["reading"] = threading.Event()
+            threading.Thread(target=github_repo_list_refresh, args=(done, again), name="github-repos",
+                             daemon=True).start()
+    done.wait(GITHUB_REACH_WAIT if wait is None else wait)
+
+
+def github_repo_list_refresh(done, again=False):
+    """github_repo_list_ahead's thread: one read, and its failure kept for a minute."""
+    problem = "the read stopped"
+    try:
+        problem = (github_repo_list(again=True) if again else github_repo_list())[1]
+    except Exception as e:      # a failure of any kind is a failed read: the next one comes after a minute
+        problem = f"{type(e).__name__}: {e}"
+    finally:
+        with GITHUB_REPOS_LOCK:
+            GITHUB_REPOS["reading"] = None
+            if problem:
+                GITHUB_REPOS["failed"] = now()
+            tell = bool(problem) and GITHUB_REPOS.get("told") != problem    # once for each new problem
+            GITHUB_REPOS["told"] = problem
+        done.set()
+    if tell:        # after done.set(): log() takes LOCK, which a caller that waits for this read can hold
+        log("hub", f"the list of the repositories that the GitHub Apps reach had a problem: {clip(problem, 200)}")
+
+
+def github_repo_ahead(repo):
+    """github_repos_ahead for one repository."""
+    github_repos_ahead([repo])
+
+
+def github_repos_ahead(repos):
+    """Before LOCK, for a call that names these repositories (grant_access, raise_needs_you, ask_my_requester, a plan
+    of change_team): the App's reading, waiting up to GITHUB_REACH_WAIT for one, and the hub's list too when only the
+    list can decide, for a repository that the reading does not name, of an account whose installation has all of its
+    repositories (github_reaches, team_repo_refusal), which waits at most GITHUB_REACH_WAIT (github_repo_list_ahead).
+    One wait of each for the whole set, so a Give of NEED_GIVE_MOST repositories waits no longer than one of one. A
+    saved list that does not hold a name is read again, at most once a minute. A thread that holds LOCK (the tick's
+    pass of pressed plans, team_plans_retry) waits for neither: it starts the reads for the next pass and goes on with
+    what the hub has (the Needs-you area's validator: else every call and read of the hub stopped for up to 8 s each
+    minute while a pressed plan waited)."""
+    repos = [r for r in repos if isinstance(r, str) and "/" in r]
+    locked = LOCK._is_owned()
+    reach = github_reach(0 if locked else GITHUB_REACH_WAIT) if repos else None
+    if not reach:
+        return
+    listed = [r for r in repos if r.lower() not in reach["repos"] and r.split("/")[0].lower() in reach["all"] and
+              r.split("/")[0].lower() not in (reach.get("many") or ())]
+    if not listed:
+        return
+    github_repo_list_ahead(0 if locked else None)
+    # a saved list that does not hold one is read again, so that a repository made a moment ago counts: at most once
+    # a minute, and never after a read that failed (the throttle of github_repo_list_ahead)
+    if any(github_listed(r) is False for r in listed):
+        with GITHUB_REPOS_LOCK:
+            due = now() - (GITHUB_REPOS.get("again") or 0.0) >= GITHUB_REACH_FRESH
+            if due:
+                GITHUB_REPOS["again"] = now()
+        if due:
+            github_repo_list_ahead(0 if locked else None, again=True)
 
 
 def github_unreached(repos):
@@ -74660,6 +75084,74 @@ def github_unreached(repos):
     pages = {repo: reach["pages"].get(repo.split("/")[0]) or reach["install"] for repo in repos
              if repo not in reach["repos"] and repo.split("/")[0] not in reach["all"]}
     return {repo: page for repo, page in pages.items() if page}
+
+
+def github_repo_known(repo):
+    """(state, why) of one repository (owner/name in lower case), from the hub's newest readings, which a card's raise
+    and a plan read before LOCK (github_repo_ahead), and a press of Give for the App's reading only. state: "reached"
+    when they name it in what the GitHub App reaches; "missing" when the App reaches every repository of its account
+    (github_reach "all") and the hub's list of them from the last minute (github_listed) does not name it, so it does
+    not exist or is archived; "unreached" when a reading from the last minute does not name it and does not reach its
+    account whole, where the hub cannot tell whether it exists; "no_app" in a fleet with no GitHub App and no door;
+    None while a read that can tell is still to come (no reading yet, a reading older than a minute, a list that is read
+    now with no failed one before it); "failed" when the read ended with a fault, which can last (a file of the hub's
+    own that it cannot read, a reading or a list that failed, more repositories than the hub reads). why says what the
+    hub lacks, in words for the manager. The product's own repositories are not in the list (github_repos_read), so
+    each caller refuses them first."""
+    owner = repo.split("/")[0]
+    try:
+        app = github_app()
+    except GitHubError:
+        return "failed", "it cannot read its GitHub App file now"
+    door = door_conf()
+    if app is None and door is None:
+        if isinstance(TEAM.get("door"), dict) and TEAM["door"].get("address"):
+            return "failed", "it cannot read its door's file now"
+        return "no_app", None
+    reach = github_reach()
+    if not reach:
+        error = None if GITHUB_REACH["reading"] else GITHUB_REACH.get("error")
+        return ("failed", f"its last reading of what its GitHub App reaches failed: {error}") if error else \
+            (None, "it has no reading yet of what its GitHub App reaches")
+    if repo in reach["repos"]:
+        return "reached", None
+    if owner in reach["all"]:
+        if owner in (reach.get("many") or ()):      # more than the hub reads: never "missing"
+            return "failed", f"its GitHub App reaches more repositories of {owner} than it reads"
+        listed = github_listed(repo)            # the list of the last minute, read whole
+        if listed:
+            return "reached", None
+        with GITHUB_REPOS_LOCK:
+            whole, part, reading = GITHUB_REPOS["list"] or {}, GITHUB_REPOS.get("part"), GITHUB_REPOS.get("reading")
+            failed = GITHUB_REPOS.get("failed") or 0.0
+        if listed is False and owner in whole:
+            return "missing", None          # also in an account that holds only the product's own repositories
+        if part:
+            # A problem in one source: an account that a source listed, that source read whole. With one source, a name
+            # that is not in its list does not exist; with two, the other source can hold more of the account.
+            age = now() - part["at"]
+            if age < GITHUB_REACH_FRESH and repo in (part["list"].get(owner) or {}).get("repos", ()):
+                return "reached", None
+            if age < GITHUB_REACH_FRESH and owner in part["list"] and (app is None or door is None):
+                return "missing", None
+            # a read that failed, also while the next one runs (a door that times out: each read is slower than a
+            # call's wait, and none would ever end under LOCK)
+            if age < GITHUB_REACH_FRESH or reading is not None and age < 2 * GITHUB_REACH_FRESH:
+                return "failed", f"its last list of the repositories of {owner} had a problem: {part['problem']}"
+        if now() - failed < GITHUB_REACH_FRESH:     # a read that stopped before it wrote its part
+            return "failed", f"its last read of the list of the repositories of {owner} failed"
+        return None, f"it has no list from the last minute of the repositories of {owner}, all of which its GitHub " \
+                     f"App reaches"
+    at = GITHUB_REACH["at"]
+    if at is None or now() - at >= GITHUB_REACH_FRESH:
+        return None, "its newest reading of what its GitHub App reaches is older than a minute"
+    return "unreached", None
+
+
+def repo_missing_fact(repo):
+    """The words that say that this repository does not exist (github_repo_known "missing"), with no full stop."""
+    return (f"{repo} does not exist: the fleet's GitHub App reaches each repository of {repo.split('/')[0]}, and "
+            f"{repo} is not one of them, or it is archived")
 
 
 def save_repo_reached(body, _waited):
@@ -74703,7 +75195,7 @@ MCP_DEFINITE_ENDS = ("invalid_grant", "invalid_client", "unauthorized_client")  
 # Only in the hub's memory: each server's access token (with the SHA-256 of the refresh token that it came from), the
 # problem of each server whose refresh the server refused, the pending Connect, and the program checks of
 # POST /ui/mcp/check that wait for a machine's answer. A restart ends them all.
-MCP = {"tokens": {}, "problems": {}, "pending": None, "probes": {}}
+MCP = {"tokens": {}, "problems": {}, "pending": None, "probes": {}, "kinds": {}}
 MCP_LOCK = threading.Lock()
 
 
@@ -75439,6 +75931,7 @@ def save_mcp(body):
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
                 MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
+                MCP.setdefault("kinds", {}).pop(name, None)       # and no token's kind of before (the Connect keeps its own)
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
         emit(manager_name(), "say", f"[hub] The owner {what}. An agent gets it in its next task session." +
@@ -75594,23 +76087,33 @@ def save_agent_repos(body):
 
 
 def save_tool(body):
-    """Which agents get one tool of the catalog in their task sessions."""
+    """Which agents get one tool of the catalog in their task sessions. Each agent that the owner's tick adds gets the
+    owner's record of that hold, so a newer tick of theirs counts over an older grant of the manager's (owner_gave:
+    a kept OAuth app's token goes only to a hold that the owner gave, mcp_hold_kept)."""
     tool, chosen = body["tool"], body["agents"]
+    gained = []
 
     def change(team):
         known_agents(team, chosen)
         changed = False
+        gained[:] = []
         for name, a in team["agents"].items():
             old = list(a.get("tools") or [])
             new = sorted({t for t in old if t != tool} | ({tool} if name in chosen else set()))
             if set(new) != set(old):
                 changed = True
+                if tool in new and tool not in old:
+                    gained.append(name)
                 if new:
                     a["tools"] = new
                 else:
                     a.pop("tools", None)
         return changed
     result = save_integration(body["base_sha256"], change, f"Owner changed the agents of the tool {tool}")
+    if result["changed"] and gained and result.get("revision"):
+        with transaction():
+            for name in gained:
+                resource_record(f"tool:{tool}", name, "use", "owner", result["revision"])
     if result["changed"]:
         emit(manager_name(), "say", f"[hub] The owner changed who has the tool {tool}: {', '.join(chosen) or 'no agent'}. "
              f"An agent gets it in its next task session.")
@@ -83520,6 +84023,8 @@ CAPP_NO_FOLDER = (f"the folder {CONNECT_DIR} is not on the hub's machine, so its
                   f"closed: `hubsetup.py connect on` as root makes it")
 CAPP_NO_GATE = ("the gate of the connected apps does not forward to the hub's socket on this machine: `hubsetup.py "
                 "connect on` as root puts it right")
+CAPP_GATE_FULL = ("all places of the gate of the connected apps are taken, so connected apps cannot reach the hub now; "
+                  "the hub asks the gate again every few seconds")
 
 
 def capp_stopped(on=None):
@@ -84301,6 +84806,9 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         if ahead is not None:
             phone_signed(ahead, yes, signed)
     if need_id is not None and choice == 0 and not getattr(GIVE_TURN, "on", False) and need_gives(need_id):
+        # what the App reaches, for the press's check of its repositories (need_give_gone), before LOCK
+        if (need_give_view(q1("SELECT * FROM needs WHERE id=?", (need_id,))) or {}).get("repos"):
+            github_reach(GITHUB_REACH_WAIT)     # no list: the sweep closes a card whose repository was deleted since
         GIVE_TURN.on = True
         try:
             with kit_lock():
@@ -84316,6 +84824,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
     # hub checkout, and the gifts, which commit before the message is written (message_gifts). Under LOCK the message is
     # written as before, with them, or its replay answers
     use = skill_use_kept(value, skills, recipient, hand) if need_id is None else None
+    if need_id is not None:
+        team_plan_ahead(need_id)        # a team card's repositories: the App's reading and list, before LOCK
     gifted = None
     if gives:
         gifted, refused = message_gifts(request_id, client, hand, recipient, gives, data.get("db"), files, about,
@@ -85507,7 +86017,9 @@ def capp_gate_ask():
     under CAPP_SYNC, because the answer comes through the hub's own socket thread. Returns the status of the gate's
     answer (200: it forwarded, and its version is kept), or None when nothing answered or there is nothing to ask.
     Another program on that port can set no version: the hub takes one only from a request on its own socket, which
-    only the gate's group reaches."""
+    only the gate's group reaches. A program that answers on that port with a 503 and Retry-After (only root and the
+    gate's user can answer there, ports.py) reads as a busy gate: it keeps the version that the hub holds, and takes
+    the words of `connect on` away."""
     name, where = capp_name(), capp_gate_address()
     if CONNECT["server"] is None or name is None or where is None:
         return None
@@ -85517,6 +86029,8 @@ def capp_gate_ask():
             conn.request("GET", "/.well-known/oauth-protected-resource", headers={"Host": name})
             answer = conn.getresponse()
             answer.read()
+            if answer.status == 503 and answer.getheader("Retry-After") is not None:
+                return CAPP_GATE_BUSY       # the gate's own 503 (gate.py plain), not one of the hub's
             return answer.status
         finally:
             conn.close()
@@ -85525,6 +86039,7 @@ def capp_gate_ask():
 
 
 CAPP_GATE_EVERY = 5                 # seconds between two asks while no gate answers (it may start after the hub)
+CAPP_GATE_BUSY = "busy"             # capp_gate_ask: the gate answered its own 503, with Retry-After
 CAPP_GATE_MISSES = 3                # asks in a row with no good answer, after which the hub takes the gate as gone
 CAPP_GATE_LOOK = 30                 # seconds in which a second read of GET /ui/connect asks nothing again
 CAPP_GATE_NUDGE = threading.Event()         # set: ask the gate now (a reload, a read of GET /ui/connect)
@@ -85548,8 +86063,13 @@ def capp_gate_watch(server):
     writes nothing anywhere. Any other status: a gate is there and cannot forward (502: it cannot reach this socket;
     421: it serves another name), which is a fault of the install and no race, so the hub says it once in its log
     and waits for an event, because each ask is a line in the gate's journal. After CAPP_GATE_MISSES asks in a row
-    with no 200, a version that the hub held goes: connected_apps leaves ui_features until the gate forwards again."""
-    misses, said = 0, None
+    with no 200, a version that the hub held goes: connected_apps leaves ui_features until the gate forwards again.
+    CAPP_GATE_BUSY (the gate's own 503, which says Retry-After): the gate runs and its places are full (gate.py's
+    limits, as in a flood): no miss and never the words that send the owner to `connect on`; a hub that knows the
+    gate's version keeps it, one that does not says CAPP_GATE_FULL after CAPP_GATE_MISSES of them; one log line for
+    each run of such answers, and the thread asks again each CAPP_GATE_EVERY seconds. A 503 with no Retry-After (the
+    hub's own, while connected apps turn off) is a status as any other."""
+    misses, busy, said = 0, 0, None
     while CONNECT["server"] is server:
         if capp_gate_address() is None:
             return
@@ -85559,22 +86079,45 @@ def capp_gate_watch(server):
         if CONNECT["server"] is not server:
             return
         if status == 200:
-            misses, said = 0, None
+            misses, busy, said = 0, 0, None
             if CONNECT["gate_why"] is not None:
                 CONNECT["gate_why"] = None
                 changed()
+        elif status == CAPP_GATE_BUSY:
+            # A gate that is busy is there: its places are full, which says nothing of the install, and never the words
+            # that send the owner to `connect on`. A hub that knows the gate's version keeps it, and the owner his
+            # groups. A hub that never saw the gate since its start says why after CAPP_GATE_MISSES such answers in a
+            # row (CAPP_GATE_FULL: the owner's app then shows its stop with Try again and Turn off), and at once where
+            # it said CAPP_NO_GATE. The log says it once for each run of such answers.
+            misses, busy = 0, busy + 1
+            if CONNECT["gate"] is not None:
+                why = None
+            elif busy >= CAPP_GATE_MISSES or CONNECT["gate_why"] == CAPP_NO_GATE:
+                why = CAPP_GATE_FULL
+            else:
+                why = CONNECT["gate_why"]
+            if CONNECT["gate_why"] != why:
+                CONNECT["gate_why"] = why
+                changed()
+            if said != CAPP_GATE_BUSY:
+                said = CAPP_GATE_BUSY
+                log("hub", "the gate of the connected apps answers 503 to the hub's own request: all its places are "
+                           "full, or it cannot start a thread, so calls from outside wait or fail; the hub asks again "
+                           f"every {CAPP_GATE_EVERY} seconds.")
         else:
-            misses += 1
-            if misses >= CAPP_GATE_MISSES and (CONNECT["gate"] is not None or CONNECT["gate_why"] is None):
+            misses, busy = misses + 1, 0
+            if misses >= CAPP_GATE_MISSES and (CONNECT["gate"] is not None or CONNECT["gate_why"] != CAPP_NO_GATE):
                 # the owner's app shows this while the feature is on and no gate forwards (capp_stopped)
                 CONNECT["gate"], CONNECT["gate_why"] = None, CAPP_NO_GATE
                 changed()
-            if status is not None and status != said:
+            if status is None:
+                said = None                 # no answer ends a run: the next run of 503s or of a status is said again
+            elif status != said:
                 said = status
                 log("hub", f"the gate of the connected apps answers {status} to the hub's own request, so it does "
                            f"not forward to the hub's socket (502: it cannot reach {capp_socket_path()}; 421: its "
                            f"--name is not this hub's name). `hubsetup.py connect on` as root puts it right.")
-        retry = status is None or (status != 200 and misses < CAPP_GATE_MISSES)
+        retry = status is None or status == CAPP_GATE_BUSY or (status != 200 and misses < CAPP_GATE_MISSES)
         CAPP_GATE_NUDGE.wait(CAPP_GATE_EVERY if retry else None)
 
 
@@ -88653,6 +89196,7 @@ class Handler(BaseHTTPRequestHandler):
                              "refresh_token": got["refresh_token"], "token_endpoint": found["token_endpoint"],
                              "issuer": found["issuer"], "resource": found["resource"] or entry["url"],
                              "scopes": list(got["scopes"] or found["scopes"]), "connected_at": int(now()),
+                             "token_kind": token_kind(got["access_token"]),
                              "server": about.get("server"), "tools": list(about.get("tools") or [])}
             if not got["refresh_token"]:    # this server keeps no refresh token: its access token is the connection
                 servers[name].update(access_token=got["access_token"], access_expires_at=int(got["expires_at"]))
@@ -88663,6 +89207,7 @@ class Handler(BaseHTTPRequestHandler):
                     MCP["tokens"][name] = {"access_token": got["access_token"], "expires_at": got["expires_at"],
                                            "refresh_sha256": hashlib.sha256(got["refresh_token"].encode()).hexdigest()}
                 MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
+                MCP.setdefault("kinds", {}).pop(name, None)       # and no token's kind of before (the Connect keeps its own)
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
             log("owner", f"connected the MCP server {name}" + (" again" if replaced else "") +
@@ -88694,6 +89239,7 @@ class Handler(BaseHTTPRequestHandler):
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
                 MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
+                MCP.setdefault("kinds", {}).pop(name, None)       # and no token's kind of before (the Connect keeps its own)
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
             log("owner", f"disconnected the MCP server {name}")
@@ -89665,7 +90211,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, refusal_words.answer("hub_changed"))
         found, problem = github_repo_list()
         return self.json(200, {"db": generation, "problem": problem,
-                               "accounts": [{"account": e["name"], "repos": e["repos"]} for e in found.values()]},
+                               "accounts": [{"account": e["name"], "repos": e["repos"]} for e in found.values()
+                                            if not e.get("product")]},
                          {"Cache-Control": "no-store"})
 
     def ui_resources(self, query):
@@ -93399,12 +93946,27 @@ class Handler(BaseHTTPRequestHandler):
         for name in list(tools):
             if (catalog.get(name) or {}).get("auth") != "oauth":
                 continue
+            kept = mcp_hold_kept(agent, name)
+            if kept:
+                problems.append(f"The MCP server {name} is not loaded: {kept}.")
+                tools.remove(name)
+                continue
             try:
                 access, ends = mcp_access(name)
             except Refusal as e:            # Fleet's own words, or fixed words: a server's text reaches no session
                 why = str(e) if str(e) in (MCP_UNCONNECTED, MCP_ENDED, mcp.TOKEN_FORM_SAYS) else \
                     "the server did not give an access now; the owner can sign in again in Settings, Apps"
                 problems.append(f"The MCP server {name} is not loaded: {why}.")
+                continue
+            seen = token_kind(access)
+            if seen:            # kept in memory, so kept_app reads it for a connection whose Connect wrote no kind
+                MCP.setdefault("kinds", {})[name] = seen
+            if seen and not owner_gave(agent, name):
+                # the token's own form names GitHub or Stripe (ACCESS_TOKEN_KINDS), also for a connection from before
+                # token_kind was kept, or one whose Connect wrote none (the Door area's read, M1')
+                problems.append(f"The MCP server {name} is not loaded: its access is the owner's own account, and the "
+                                f"owner did not give it to this agent.")
+                tools.remove(name)
                 continue
             why = lifecycle.mcp_left_out(catalog[name], a.get("runtime"), access)
             if why:         # an access token that the hub saved before mcp._tokens refused a $ in one

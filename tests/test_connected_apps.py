@@ -8,6 +8,7 @@ feature on with that one switch, for its own test only (switched_on)."""
 import ast
 import hashlib
 import http.client
+import http.server
 import json
 import os
 import re
@@ -743,6 +744,108 @@ class Opening(Socket):
             self.assertEqual(len(asked), hub.CAPP_GATE_MISSES + 1)
         said = hub.q("SELECT what FROM log WHERE what LIKE '%answers 421%'")
         self.assertEqual(len(said), 1, [r["what"] for r in said])       # said once, not at each ask
+
+    def test_the_gates_own_503_reads_as_busy_and_another_503_as_it_is(self):
+        """The gate's own 503 says Retry-After: only it means that the gate runs with its places full. A bug here reads
+        another program's 503 (the hub's own, while connected apps turn off) as a gate that runs."""
+        import gate
+        full = gate.Gate(NAME, socket_path=self.sock, port=0, per_source=0, log=lambda line: None)   # each request: 503
+        none = gate.Gate(NAME, socket_path=self.sock, port=0, connections=0, log=lambda line: None)  # no place at all
+        for one in (full, none):
+            thread = threading.Thread(target=one.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(self.stop, one, thread)
+
+        class Plain(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+        other = http.server.HTTPServer(("127.0.0.1", 0), Plain)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        self.opened()
+        for one in (full, none):
+            with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", one.port)):
+                self.assertEqual(hub.capp_gate_ask(), hub.CAPP_GATE_BUSY)
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", other.server_address[1])):
+            self.assertEqual(hub.capp_gate_ask(), 503)
+
+    def test_a_gate_that_is_busy_is_no_gate_that_is_gone(self):
+        """A hub that never saw its gate since its start (each release starts it again) and then meets a busy gate says
+        so after a few answers, with words of their own: a bug here leaves the owner's app on "Turning on" with no Turn
+        off during a flood, keeps the words that send him to `connect on`, stops asking, or says nothing in the log."""
+        state, asked = {"answer": None}, []
+
+        def ask():                                  # a gate that starts after the hub, then meets a flood, then is free
+            asked.append(state["answer"] if len(asked) >= hub.CAPP_GATE_MISSES else None)
+            return asked[-1]
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", 1)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05), patch.object(hub, "capp_gate_ask", ask):
+            self.opened()
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_NO_GATE))
+            state["answer"] = hub.CAPP_GATE_BUSY
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_GATE_FULL))
+            count = len(asked)
+            self.assertTrue(self.until(lambda: len(asked) > count + 2))                      # it asks on
+            self.assertEqual(hub.CONNECT["gate_why"], hub.CAPP_GATE_FULL)
+            self.assertNotIn("connect on", hub.CAPP_GATE_FULL)
+            state["answer"] = None                  # the gate stops: its own words come back after the misses
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_NO_GATE))
+            state["answer"] = 200
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] is None))
+        said = hub.q("SELECT what FROM log WHERE what LIKE '%answers 503 to the hub''s own request%'")
+        self.assertEqual(len(said), 1, [r["what"] for r in said])       # one run of 503s, one line
+        self.assertNotIn("connect on", said[0]["what"])
+
+    def test_each_run_of_busy_answers_is_one_log_line(self):
+        """A run of 503s is one line, and a no-answer between two runs ends the first: a bug here says each ask, or
+        says nothing of a second flood."""
+        answers = [hub.CAPP_GATE_BUSY] * 3 + [None] + [hub.CAPP_GATE_BUSY] * 3
+        asked = []
+
+        def ask():
+            asked.append(answers[min(len(asked), len(answers) - 1)])
+            return asked[-1]
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", 1)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05), patch.object(hub, "capp_gate_ask", ask):
+            self.opened()
+            self.assertTrue(self.until(lambda: len(asked) > len(answers) + 2))
+        said = hub.q("SELECT what FROM log WHERE what LIKE '%answers 503 to the hub''s own request%'")
+        self.assertEqual(len(said), 2, [r["what"] for r in said])
+
+    def test_a_hub_that_never_saw_its_gate_says_a_busy_one_after_its_misses(self):
+        """Busy from the first ask: the words come after CAPP_GATE_MISSES answers, not at the first one."""
+        asked = []
+
+        def ask():
+            asked.append(hub.CAPP_GATE_BUSY)
+            return asked[-1]
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", 1)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05), patch.object(hub, "capp_gate_ask", ask):
+            self.opened()
+            self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_GATE_FULL))
+            self.assertGreaterEqual(len(asked), hub.CAPP_GATE_MISSES)
+
+    def test_a_hub_that_knows_its_gate_keeps_it_while_it_is_busy(self):
+        """A flood leaves the owner his groups and Turn off: the hub keeps the gate's version and says no stop."""
+        asked = []
+
+        def ask():
+            hub.CONNECT["gate"] = hub.GATE_VERSION      # as a request through the gate gave it before the flood
+            asked.append(hub.CAPP_GATE_BUSY)
+            return asked[-1]
+        with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", 1)), \
+                patch.object(hub, "CAPP_GATE_EVERY", 0.05), patch.object(hub, "capp_gate_ask", ask):
+            self.opened()
+            self.assertTrue(self.until(lambda: len(asked) > hub.CAPP_GATE_MISSES + 2))
+            self.assertIsNone(hub.CONNECT["gate_why"])
+            self.assertEqual(hub.CONNECT["gate"], hub.GATE_VERSION)
+            self.assertIn("connected_apps", hub.ui_features())
 
     def test_a_look_asks_the_gate_again_at_most_once_in_a_while(self):
         self.opened()

@@ -571,39 +571,104 @@ class Reasons(OwnerAPI):
         """The coordinator's validator on the pool default, 25 November 2026: the default makes each held repository the
         manager's to give, but a grant of one that no GitHub App reaches gives no token, so its card is the owner's
         step (connect GitHub, or add it to the App). Bug: the card is refused as "yours to give", the manager grants a
-        hold that GitHub gives no token for, the worker fails again, and the owner is never asked."""
+        hold that GitHub gives no token for, the worker fails again, and the owner is never asked. And that card goes
+        up only without Give (need_give_reach): bug, a Give card whose press gives a hold with no token."""
         self.assertEqual(hub.resource_standing("repo:acme/web")["by"], "default")      # dev holds it
         with patch.object(hub, "team_repo_owner_step", lambda what: what == "acme/web"):
-            nid = self.card(reason="access", needs_access="repo:acme/web", needs_level="write",
-                            title="Let Dev push to acme/web", why="No GitHub App of the fleet reaches acme/web.",
+            nid = self.card(reason="access", needs_access="repo:acme/web", needs_level="read",
+                            title="Let Dev read acme/web", why="No GitHub App of the fleet reaches acme/web.",
                             what_to_do="Add acme/web to the GitHub App.")
+            self.refused("The fleet has no GitHub App, so Give gives no token for acme/web. Ask the agent where it saw "
+                         "that name, and check it first. A card for it goes up only as the owner's step to connect "
+                         "GitHub in Founderizer and choose acme/web, without Give: leave needs_agent out.",
+                         reason="access", needs_access="repo:acme/web", needs_level="write", needs_agent="ivy",
+                         title="Let Ivy push to acme/web", why="No GitHub App of the fleet reaches acme/web.",
+                         what_to_do=None, options=None)
         self.assertIsInstance(nid, int, nid)
 
     def test_access_that_an_agent_holds_or_the_manager_can_grant_never_reaches_the_owner(self):
-        # the fleet's GitHub App reaches acme's repositories, so dev can use acme/web: with no App, a repository's
-        # card goes to the owner, who connects GitHub first (team_repo_owner_step)
+        # the fleet's GitHub App reaches each of acme's repositories, so dev can use acme/web: with no App, a
+        # repository's card goes to the owner, who connects GitHub first (team_repo_owner_step). The hub's list of them
+        # from a moment ago (github_repo_known) names what exists
         for held in (patch.object(hub, "github_app", lambda: ("7", "key")),
                      patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
-                         "pages": {}, "all": {"acme"}, "repos": set(), "install": None}})):
+                         "pages": {}, "all": {"acme"}, "repos": set(), "install": None}}),
+                     patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "failed": 0.0, "reading": None, "part": None,
+                                                   "again": 0.0, "list": {
+                         "acme": {"name": "acme", "repos": ["acme/docs", "acme/web"]}}})):
             held.start()
             self.addCleanup(held.stop)
         said = self.refused("dev (write) holds the GitHub repository acme/web", reason="access",
                             needs_access="repo:acme/web")
         self.assertIn("create_task", said)
-        # owner feature pool_default: the default gives a repository up to write, so deploy stays the owner's
+        # A name that is not in that list does not exist (the owner's card N-327, 26 November 2026). Bug: its card
+        # goes up as the owner's step, for a repository that nobody can add.
+        self.refused("Not raised: acme/private does not exist: the fleet's GitHub App reaches each repository of acme, "
+                     "and acme/private is not one of them, or it is archived. Check the name with the agent that gave "
+                     "it, and raise no card for this name: the owner is not needed.", reason="access",
+                     needs_access="repo:acme/private", needs_level="read")
+        # N-327's own case: an App that reaches each repository of founderizer, where the hub's list leaves the account
+        # out because it holds only the product's own repositories. Bug: the hub cannot tell for ever, and the card goes
+        # up, plain or with Give.
+        private = dict(reason="access", needs_access="repo:founderizer/founderizer-private", needs_level="read")
+        gone = ("founderizer/founderizer-private does not exist: the fleet's GitHub App reaches each repository of "
+                "founderizer, and founderizer/founderizer-private is not one of them, or it is archived")
+        product = {"name": "founderizer", "repos": [], "product": True}       # as github_repos_read keeps it
+        with patch.dict(hub.GITHUB_REACH["reach"], {"all": {"acme", "founderizer"}}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": dict(hub.GITHUB_REPOS["list"],
+                                                                            founderizer=product)}):
+            self.refused(f"Not raised: {gone}. Check the name with the agent that gave it, and raise no card for this "
+                         f"name: the owner is not needed.", **private)
+            self.refused(f"{gone}, so Give gives nothing.", **private, needs_agent="ivy", what_to_do=None, options=None,
+                         title="Give Ivy read access to founderizer/founderizer-private?")
+        # While a read that can tell is still to come, no plain card goes up either. Bug: a card "add it to the App"
+        # for a name that may not exist, in an account that the App reaches whole, where no owner's step adds one.
+        reading = type("Reading", (), {"wait": lambda self, timeout=None: False})()     # Vault's Event, still running
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "part": None, "reading": reading, "failed": 0.0}):
+            self.refused("Not raised: the hub cannot tell yet whether acme/new exists (it has no list from the last "
+                         "minute of the repositories of acme, all of which its GitHub App reaches): try again in a "
+                         "minute, and raise no card for this name until it can tell.",
+                         reason="access", needs_access="repo:acme/new", needs_level="read")
+        # After a read that failed, which can last (an IP allow list), the plain card keeps today's checks. Bug: the
+        # manager tries again for ever, and the owner is never asked.
+        refused, seen, real_log = hub.GitHubError("an IP allow list refuses the App"), [], hub.log
+
+        def logged(agent, what):        # the end of the read is signalled before its log line, which takes LOCK (M5)
+            if "the reading of what the GitHub App reaches failed" in what:
+                seen.append(hub.GITHUB_REACH["reading"])
+            return real_log(agent, what)
+        with patch.dict(hub.GITHUB_REACH, {"reading": True}), \
+                patch.object(hub, "github_reach_read", side_effect=refused):
+            with patch.object(hub, "log", logged):
+                hub.github_reach_refresh()      # the reading fails, its error stays, and the log says it once
+            self.assertEqual(seen, [False])
+            failed = self.card(reason="access", needs_access="repo:acme/new", needs_level="read")
+            self.refused("The hub cannot tell whether acme/new exists (its last reading of what its GitHub App reaches "
+                         "failed: an IP allow list refuses the App), so Give does not give it. Check the name with the "
+                         "agent that gave it, and leave needs_agent out.", reason="access",
+                         needs_access="repo:acme/new", needs_level="read", needs_agent="ivy", what_to_do=None,
+                         options=None, title="Let Ivy read acme/new")
+        self.assertIsInstance(failed, int, failed)
+        hub.q("DELETE FROM needs WHERE id=?", (failed,))
+        # owner feature pool_default: the default gives a repository up to read, so write and deploy stay the owner's
+        # (the supervisor's decision of 26 November 2026, after the Door area's read A4)
         self.assertIsInstance(self.card(reason="access", needs_access="repo:acme/web", needs_level="deploy"), int)
         give = dict(title="Let Ivy deploy acme/web", why="Its release deploys acme/web.", what_to_do=None,
                     options=None, reason="access", needs_access="repo:acme/web", needs_agent="ivy")
-        # A Give card at a level that stays the owner's: deploy, above the default's write, whose name the card's words
-        # carry as Give asks.
-        nid = self.card(**give, needs_level="deploy")
-        self.assertIsInstance(nid, int, nid)
-        hub.q("DELETE FROM needs WHERE id=?", (nid,))
-        # What the default gives is the manager's own give, to the agent that the card names (dev holds read here).
-        # Bug: the refusal names no agent, and the manager guesses one.
+        # A Give card at a level that stays the owner's: deploy, and write, above the default's read (dev holds read
+        # here), whose name the card's words carry as Give asks. Bug: the manager is told that a repository's write is
+        # its own to give, grant_access refuses it, and the owner is never asked.
         hub.TEAM["agents"]["dev"]["repos"] = {"acme/web": "read"}
+        for level in ("deploy", "write"):
+            nid = self.card(**give, needs_level=level)
+            self.assertIsInstance(nid, int, nid)
+            hub.q("DELETE FROM needs WHERE id=?", (nid,))
+        # What the pool gives (here the owner's own level, up to write) is the manager's own give, to the agent that
+        # the card names. Bug: the refusal names no agent, and the manager guesses one.
+        hub.TEAM["resources"] = {"repo:acme/web": {"max": "write"}}
         self.refused('is yours to give: grant_access(agent="ivy", resource="repo:acme/web", level="write")', **give,
                      needs_level="write")
+        hub.TEAM["resources"] = {}
         hub.TEAM["agents"]["dev"]["repos"] = {"acme/web": "write"}
         # What the owner keeps: the named agent's own lower hold is no refusal, so its level change is one Give at the
         # higher level. Another agent's hold at the needed level refuses the card, with or without needs_agent, and
@@ -622,6 +687,35 @@ class Reasons(OwnerAPI):
         self.refused("holds the GitHub repository", reason="access", needs_access="repo:acme/web")
         self.refused("not one thing that the fleet's record names", reason="access",
                      needs_access="repo:acme/web for dev")
+        # Each other kind, on both routes, that the fleet's record does not hold or that no session reaches (the owner,
+        # 26 November 2026: "the same for apps and other resources"). Bug: a card goes up for an MCP server, a key, a
+        # mailbox or a Drive that the fleet cannot give. The owner's own step to bring one in stays: a key through
+        # request_secret, and a plain card for an account to connect (card_dead).
+        unknown, give = "bws://99999999-2222-4333-8444-55555555555b", dict(needs_agent="ivy", options=None,
+                                                                         what_to_do=None)
+        for fields, words in (
+                (dict(needs_access="tool:nosuch"), "is not one thing that the fleet's record names"),
+                (dict(give, needs_access="tool:nosuch"), "The fleet does not hold"),
+                (dict(needs_access=f"secret:{unknown}"), "goes through request_secret"),
+                (dict(give, needs_access=f"secret:{unknown}", needs_level="use"), "goes through request_secret"),
+                (dict(give, needs_access="gmail:nobody@acme.com", needs_level="read"), "only the owner can connect"),
+                (dict(give, needs_access="drive:nobody@acme.com", needs_level="read"), "only the owner can connect"),
+                (dict(needs_access="server:web-9"),
+                 "Not raised: server:web-9 is no server of the fleet's record: no agent holds it, and it is no machine "
+                 "of the fleet. Check the name with see_capacity. The owner's app gives a business's own server once "
+                 "it carries that business's Tailscale tag.")):
+            with self.subTest(fields=fields):
+                self.refused(words, reason="access", **fields)
+        # a server of the fleet's record goes on as before: a machine of the fleet, and one that an agent holds through
+        # the door (the Setup area, 26 November 2026). Bug: a real server's card is refused as a name of nothing
+        hub.TEAM["agents"]["ivy"]["servers"] = {"web-1": "fix"}
+        machine = self.card(reason="access", needs_access="server:hub")
+        self.assertIsInstance(machine, int, machine)
+        hub.q("DELETE FROM needs WHERE id=?", (machine,))
+        held = self.card(reason="access", needs_access="server:web-1")
+        self.assertNotIn("is no server of the fleet's record", str(held))
+        hub.q("DELETE FROM needs WHERE id=?", (held if isinstance(held, int) else 0,))
+        del hub.TEAM["agents"]["ivy"]["servers"]
         self.refused("Give it as repo:acme/web", reason="access", needs_access="write access to acme/web.")
         hub.TEAM["agents"]["ivy"]["google"] = {"gmail": {"account": "sales@acme.com", "level": "read"}}
         self.refused("Give it as gmail:sales@acme.com", reason="access", needs_access="the sales@acme.com mailbox")

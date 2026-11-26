@@ -609,6 +609,11 @@ class Access(Chain):
         qid = self.ask(question="May I push?", needs_access="repo:acme/web", needs_level="write")
         self.pass_up("mid", qid, self.t2)
         self.pass_up("top", qid, self.t1)
+        for held in (patch.object(hub, "github_app", lambda: ("7", "key")),     # the App reaches it (need_give_reach)
+                     patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
+                         "pages": {}, "all": set(), "repos": {"acme/web"}, "install": None}})):
+            held.start()
+            self.addCleanup(held.stop)
         self.ok("manager", "raise_needs_you", {"title": "Let W push to acme/web", "why": "Its fix is a push to acme/web.",
                                                "reason": "access", "needs_access": "repo:acme/web",
                                                "needs_level": "write", "needs_agent": "w", "question_id": f"Q-{qid}"})

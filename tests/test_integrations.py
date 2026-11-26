@@ -313,7 +313,8 @@ class HubSide(OwnerAPI):
         what could not be read is a problem in words and is read again next time."""
         hub.GITHUB_REPOS.update(at=0.0, list=None)
         self.addCleanup(hub.GITHUB_REPOS.update, at=0.0, list=None)
-        found = {"acme": {"name": "Acme", "repos": ["acme/lib", "acme/web"]}}
+        found = {"acme": {"name": "Acme", "repos": ["acme/lib", "acme/web"]},
+                 "core": {"name": "Core", "repos": [], "product": True}}     # only the product's own: left out
         with patch.object(hub, "github_repos_read", return_value=(found, [])) as read:
             code, data = self.request("/ui/github/repos?db=test-generation")
             self.assertEqual((code, data["accounts"], data["problem"]),
@@ -331,7 +332,9 @@ class HubSide(OwnerAPI):
 
     def test_the_door_s_list_keeps_only_each_account_s_own_repositories(self):
         """The list to choose from has no product repository either (door_targets.VENDOR_REPOS), which no grant gives
-        (20 November 2026), and no account that has only those: the owner never picks a grant that is refused."""
+        (20 November 2026), and no account that has only those: the owner never picks a grant that is refused. Such an
+        account stays in the hub's list with "product" (the route leaves it out), so github_repo_known reads it whole:
+        a name there does not exist (the owner's card N-327)."""
         import door_targets
         door = {"address": "100.64.0.9", "port": 8766, "token": "t" * 43}
         answer = {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop", "Other/stray", "bad name",
@@ -341,11 +344,37 @@ class HubSide(OwnerAPI):
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \
                 patch.object(hub, "door_call", return_value=(200, answer)) as call, \
                 patch.object(door_targets, "VENDOR_REPOS", ("one-org/core", "two-org/core")):
-            self.assertEqual(hub.github_repos_read(), ({"one-org": {"name": "One-Org", "repos": ["one-org/shop"]}}, []))
+            self.assertEqual(hub.github_repos_read(), ({"one-org": {"name": "One-Org", "repos": ["one-org/shop"]},
+                                                        "two-org": {"name": "Two-Org", "repos": [], "product": True}},
+                                                       []))
         self.assertEqual(call.call_args.args[1:4], ("GET", "/github/repos", "t" * 43))
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \
                 patch.object(hub, "door_call", return_value=(404, {"error": "no such route"})):
             self.assertEqual(hub.github_repos_read(), ({}, ["the door's code does not list repositories yet"]))
+
+    def test_the_app_s_list_reads_each_installation_alone_and_a_page_with_no_list_is_a_problem(self):
+        """github_repo_known reads an account of this list as one that its source read whole. Bugs: one installation
+        that fails (an org with an IP allow list) leaves out each account after it, so a card for one of their
+        repositories waits for ever; or a page that GitHub gave with no list ends the list, and a repository after it
+        reads as one that does not exist."""
+        installs, pages = [{"id": 1, "account": {"login": "One-Org"}}, {"id": 2, "account": {"login": "Two-Org"}}], [1]
+
+        def call(method, path, jwt, body=None):
+            if path.startswith("/app/installations?"):
+                return installs
+            if path == "/app/installations/1/access_tokens":
+                raise hub.GitHubError("an IP allow list refuses the App")
+            if path.endswith("/access_tokens"):
+                return {"token": READ}
+            return {"repositories": [{"full_name": "Two-Org/Shop"}]} if pages[0] else {}
+        with patch.object(hub, "github_app", return_value=(APP_ID, "key")), \
+                patch.object(hub, "github_jwt", return_value="jwt"), \
+                patch.object(hub, "door_conf", return_value=None), patch.object(hub, "github_call", call):
+            self.assertEqual(hub.github_repos_read(), ({"two-org": {"name": "Two-Org", "repos": ["two-org/shop"]}},
+                                                       ["an IP allow list refuses the App"]))
+            pages[0] = 0
+            self.assertEqual(hub.github_repos_read(), ({}, ["an IP allow list refuses the App",
+                                                            "GitHub gave no list of the repositories of Two-Org"]))
 
     def test_one_change_gives_many_repositories_with_one_message_to_the_manager(self):
         """9 November 2026: an agent may hold up to hub.REPOS_MOST repositories, so repo may be a list: one commit and

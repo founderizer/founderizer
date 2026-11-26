@@ -189,17 +189,20 @@ Claude Code's own "always allow" button in its window, and Codex, which has no r
 `readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
 door's card after the table's). 58 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
-`Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Sixteen are written
+`Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Seventeen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
 `search_history` and `see_costs`, since 14 November 2026 the nine that write: `save_profile`,
 `attach_file`, `read_attachment`, `take_backup`, `grant_access`, `share_resource`, `send_message`,
 `answer_needs_you` and `decline_secret_request`, and since 22 November 2026 the three tools of a server
 at a cloud, `cloud_look`, `cloud_step` and `cloud_remove` (design 9, piece B2; below, "A server at
-AWS, Azure or Google Cloud"). Each makes the same requests as its function here,
+AWS, Azure or Google Cloud"), and since 25 November 2026 `save_company` (below, Team). Each makes the same requests as its function here,
 in the same order, with the same refusals and the same result, with one exception since 17 November
 2026: `answer_needs_you` with a `choice` of 0 or 1 reads the hub's state first, and sends a door
 card's yes or Full access to the running app, which signs it (below, "`answer_needs_you` on the
-door's card"); the program's words of that tool have sentences about it after the table's. A table
+door's card"); the program's words of that tool have sentences about it after the table's. A second
+exception since 25 November 2026: a picture that `save_company` draws (any file but a whole PNG of 64 × 64) is scaled
+by macOS's sips here and by CoreGraphics in the program, so its pixels, and then its `png` and the hub's `logo`, can
+differ (the same pixels give the same bytes: both write the PNG one way, with zlib at level 9). A table
 of a newer version of this
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
@@ -209,7 +212,7 @@ program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
-`tools/list` gives 83 tools: the 58 of the table, the sixteen, the three reads of the link and its
+`tools/list` gives 84 tools: the 58 of the table, the seventeen, the three reads of the link and its
 six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
 signed press of a door card.
 
@@ -1394,7 +1397,7 @@ not by the program's code.
 (`app/Tests/FleetOwnerAPITests/Fixtures/owner-tools.json`) to this file's print; `selftest.py`
 section 0 holds the table to `tools()` too, the reads that `call` takes to the marked reads that the
 program wrote, and the media types to the hub's own. The Swift tests (`swift test --filter FleetOwnerAPITests` in `app/`) run each
-kind of tool, the sixteen written in Swift, the two verbs, the refusals, the MCP exchange and the
+kind of tool, the seventeen written in Swift, the two verbs, the refusals, the MCP exchange and the
 link's rules on a stand-in hub that opens no port. `OwnerChannelTests` runs the link to the app on a
 real socket in a temporary folder, with a stand-in check of the peer (and the real check against
 the test process itself), and `OwnerSetupToolsTests` and `OwnerSetupDiagnosisTests` the three
@@ -1619,6 +1622,7 @@ Agents and their settings.
 | `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
 | `start_manager_session` | `/ui/machines/<a>/manager` | Ask the manager's machine to start the standing session. |
 | `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |
+| `save_company` | `/ui/company` | Founderizer for Teams (owner API 1.349): the company's name (a sentence) and its logo (`logo_file`, the path of a picture on this Mac), which a member's app shows over the company's agents from a later release; null removes each, and a field left out stays. The logo goes as a PNG of 64 × 64 px in at most 12,288 bytes, by one rule in both programs (`company_logo` here, `CompanyLogo` in the app, which the app's Settings rows use too, always with `remake`): a whole PNG of that size, by a walk of its chunks (each CRC, IEND last, no other critical chunk, not both sRGB and iCCP), goes as it is, with its colour profile, which the hub keeps (its name and text reach the members); any other picture is fitted whole, centred on a clear ground (scaled up when small, never cut), turned as its EXIF says, in sRGB, with the chunks IHDR, sRGB, IDAT and IEND alone, with fewer colour bits until it fits. The file is checked here as a picture before any byte leaves this Mac: a text, a key file, a PDF, a PostScript file and an SVG are refused, and nothing is sent; a picture of more than 100 million pixels is refused before it is decoded. This server draws with macOS's `sips` (on a copy in a folder of its own, which goes at the end); on a computer without it, only a whole PNG of 64 × 64 goes. The answer: the hub's `name` and `logo`, and in `picture` what went. |
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 
 ### Servers

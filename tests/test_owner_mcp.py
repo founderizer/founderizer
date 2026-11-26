@@ -8,6 +8,7 @@ as a machine does, because no test provisions a server, and `RootThroughSudo` ru
 stand-in server of test_hub_install, also as a user who is not root. `Refusals` and `NoSecret` prove what the server
 must not do.
 """
+import base64
 import contextlib
 import io
 import json
@@ -18,6 +19,7 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from unittest.mock import patch
 
 import hashlib
@@ -55,7 +58,7 @@ def load_tests(loader, _tests, _pattern):
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
                                                     SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect,
-                                                    FolderGrant, Cloud)
+                                                    FolderGrant, Cloud, CompanyLogoFile)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3124,6 +3127,12 @@ class McpServers(WithServer):
         for server, says in (({"title": "Both", "url": "https://a.example.com/mcp", "command": "x"}, "not both"),
                              ({"title": "No place"}, "needs a url"),
                              ({"title": "Bad address", "url": "ftp://a.example.com"}, "must be an https address"),
+                             # Python's url reader puts a backslash in the host, a runtime's reads it as a slash
+                             ({"title": "Two hosts", "url": "https://mcp.stripe.com\\shop.example.com/mcp"},
+                              "must be an https address"),
+                             # a host in fullwidth letters, which IDNA reads as mcp.stripe.com
+                             ({"title": "Wide", "url": "https://mcp.\uff53tripe.com/mcp"},
+                              "must be an https address"),
                              ({"url": "https://a.example.com/mcp"}, "needs a title")):
             with self.assertRaises(Refused) as caught:
                 client.call("save_mcp_server", name="crm", server=server)
@@ -4311,6 +4320,10 @@ def parity_answer(state, req):
             return stale
         if path == "/ui/backups/confirm":
             return parity_json(200, {"ok": True, "backup": {"sha256": body.get("sha256"), "bytes": body.get("bytes")}})
+        if path == "/ui/company":           # the hub's two values (owner API 1.349): the name, and a value of the logo
+            png = body.get("png")
+            return parity_json(200, {"ok": True, "replayed": False, "name": body.get("name"),
+                                     "logo": hashlib.sha256(png.encode()).hexdigest()[:16] if png else None})
         return parity_json(200, {"ok": True, "route": path})
     if path == "/ui/state" and query.get("head") == ["1"]:
         # Owner API 1.256: the read of the generation and the features asks for the head, which holds no list.
@@ -4371,6 +4384,19 @@ def parity_sample(name, schema):
     if kind == "array":
         return [parity_sample(name, schema.get("items") or {"type": "string"})]
     return {"string": f"{name}-1", "integer": 7, "boolean": True, "number": 1.5}.get(kind, f"{name}-1")
+
+
+def png_chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def company_png(red=1, extra=b"", after=b"", size=64):
+    """A PNG of `size` x `size` RGBA pixels, each clear but the first, whose red is `red`: a logo as a picture program
+    writes one, which save_company sends as it is. `extra`: chunks before the data; `after`: bytes after IEND."""
+    rows = bytearray(size * (1 + size * 4))
+    rows[1], rows[4] = red, 255
+    return owner_mcp.PNG_SIGNATURE + png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) + extra + \
+        png_chunk(b"IDAT", zlib.compress(bytes(rows))) + png_chunk(b"IEND", b"") + after
 
 
 def parity_cases():
@@ -4820,6 +4846,35 @@ def parity_cases():
     case("attach_file: the hub refuses the type", "attach_file", {"path": "<tmp>/k.qqq"},
          lambda s, r: parity_json(415, {"error": "this type cannot be attached"}) if r["method"] == "POST" else None,
          files=files)
+    # save_company (owner API 1.349). No case makes a picture, which needs macOS's sips here and the system's picture
+    # code there: those have tests of their own (test_teams_company.Picture with no sips, test_teams_company_sips with
+    # it, OwnerCompanyTests).
+    company = {"logo.png": {"base64": base64.b64encode(company_png()).decode()}}
+    case("save_company: a name", "save_company", {"name": "Example Labs"})
+    case("save_company: no name", "save_company", {"name": None})
+    case("save_company: a logo that is a PNG of 64 x 64 already", "save_company", {"logo_file": "<tmp>/logo.png"},
+         files=company)
+    case("save_company: the name and the logo, with the agent's own request id", "save_company",
+         {"name": " Example Labs ", "logo_file": "<tmp>/logo.png", "request_id": PARITY_RID}, files=company)
+    case("save_company: no logo", "save_company", {"logo_file": None, "name": "Example Labs"})
+    case("save_company: nothing", "save_company", {})
+    case("save_company: a file that is not there", "save_company", {"logo_file": "<tmp>/missing.png"})
+    case("save_company: a folder", "save_company", {"logo_file": "<tmp>/dl"}, folders=["dl"])
+    case("save_company: a path that is no text", "save_company", {"logo_file": 7})
+    case("save_company: an empty path", "save_company", {"logo_file": "  "})
+    case("save_company: a NUL in the path", "save_company", {"logo_file": "<tmp>/logo.png\u0000x"}, files=company)
+    case("save_company: a file too large", "save_company", {"logo_file": "<tmp>/big.bin"},
+         files={"big.bin": {"sparse": owner_mcp.ATTACH_MAX + 1}})
+    case("save_company: a request id that is no UUID", "save_company", {"name": "x", "request_id": "nope"})
+    case("save_company: a hub of an older release", "save_company", {"name": "Example Labs"},
+         lambda s, r: parity_json(404, {"error": "not found"}) if r["method"] == "POST" else None)
+    case("save_company: a fleet with no Teams", "save_company", {"name": "Example Labs"},
+         lambda s, r: parity_json(409, {"error": "This needs Founderizer for Teams, which this fleet does not have.",
+                                        "code": "teams_off"}) if r["method"] == "POST" else None)
+    case("save_company: a new generation, read again once", "save_company", {"logo_file": "<tmp>/logo.png"},
+         lambda s, r: (s.update(db="g2", moved=1), parity_json(409, {"error": "hub generation changed; refresh "
+                                                                              "state"}))[1]
+         if r["method"] == "POST" and not s.get("moved") else None, files=company)
     # read_attachment.
     case("read_attachment: into a file", "read_attachment", {"attachment": 3, "path": "<tmp>/out/a.txt"})
     case("read_attachment: into a folder", "read_attachment", {"attachment": 3, "path": "<tmp>/dl/"}, folders=["dl"])
@@ -5326,7 +5381,9 @@ def parity_fixture():
                     (work / folder).mkdir(parents=True, exist_ok=True)
                 for name, content in c["setup"]["files"].items():
                     (work / name).parent.mkdir(parents=True, exist_ok=True)
-                    if isinstance(content, dict):
+                    if isinstance(content, dict) and "base64" in content:      # a file that is no text: a picture
+                        (work / name).write_bytes(base64.b64decode(content["base64"]))
+                    elif isinstance(content, dict):
                         with open(work / name, "wb") as f:
                             f.truncate(content["sparse"])
                     else:
@@ -5349,6 +5406,13 @@ def parity_fixture():
                         parity_programs(c["programs"], scratch, work) as commands:
                     text, bad = owner_mcp.call_tool(c["tool"], args)
                     called = commands() if commands else None
+                older = sum(parity_older(req["answer"]) for req in hub_.requests
+                            if req["path"] not in PARITY_NO_REFUSAL)
+                if bad and "\n" + owner_mcp.OLDER_HUB in text:
+                    # save_company says the sentence of an older hub itself, as the program inside the app says it
+                    # for each such answer (OwnerHub.olderHub): as many times, and the Swift test takes it out of both
+                    assert text.count("\n" + owner_mcp.OLDER_HUB) == older, (c["name"], text)
+                    text = text.replace("\n" + owner_mcp.OLDER_HUB, "")
                 owner_mcp.GENERATION["db"] = None
                 if c["app_lists"]:
                     # the app's read in place of this server's read of the head, with the hub's answer to it (case())
@@ -5374,8 +5438,7 @@ def parity_fixture():
                        "requests": parity_requests(hub_.requests, c["arguments"].get("request_id")),
                        "outcome": parity_cloud_placed({"refusal": parity_places(text, places)} if bad else
                                                       {"result": parity_places(json.loads(text), places)}),
-                       "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests
-                                        if req["path"] not in PARITY_NO_REFUSAL),
+                       "older_hub": older,
                        "after": parity_after(work, home, places)}
                 if called is not None:      # design 9's tools of a cloud: each command, its files and its answer
                     one["cloud"] = {"proved": c["programs"]["proved"], "missing": c["programs"]["missing"],
@@ -5416,7 +5479,7 @@ class Parity(unittest.TestCase):
         named = {c["tool"] for c in parity_cases()}
         both = {t["name"] for t in owner_mcp.dump_tools()["tools"] if t["kind"] != "absent"}
         self.assertEqual(both - named, set())
-        self.assertEqual(len(both), 58 + 4 + 12)
+        self.assertEqual(len(both), 58 + 4 + 13)
 
     def test_the_older_hub_rule_is_what_hub_py_answers(self):
         """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
@@ -5433,6 +5496,110 @@ class Parity(unittest.TestCase):
         self.assertTrue(parity_older((400, {}, b'{"error": "unknown field foo"}')))
         self.assertFalse(parity_older((404, {}, b'{"error": "no such attachment"}')))
         self.assertFalse(parity_older((409, {}, b'{"error": "unknown field foo"}')))
+
+
+class CompanyLogoFile(unittest.TestCase):
+    """save_company's file (owner API 1.349): what of it leaves this computer, and which PNG goes as it is. No hub: the
+    command is a stand-in that records what would go. Each test here runs the same on every computer: sips is a path
+    that is not there. What sips does (the fit, the turn, a document that it reads) is test_teams_company_sips."""
+
+    def test_a_file_that_is_no_picture_never_leaves_this_computer(self):
+        """A text, a private key, a file that only starts as a PNG, a PNG with bytes after its end and one of more than
+        12,288 bytes are refused before any request with no sips; a PDF, a PostScript file and an SVG are refused as no
+        picture before sips would run (the program inside the app reads none of them); a whole PNG of 64 x 64 goes,
+        as it is. Bug: logo_file names a wrong file, and its bytes go to the hub (the area's rule for both copies)."""
+        folder = pathlib.Path(tempfile.mkdtemp(prefix="fleet-logo-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        start = owner_mcp.PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR" + struct.pack(">IIBBBBB", 32, 32, 8, 6, 0, 0, 0)
+        no_sips = {"plan.txt": b"The launch plan: the price is still open.\n",
+                   # a key file's shape, its marker in two parts so that no scanner takes this file for a key
+                   "id_ed25519": ("-----BEGIN OPENSSH " + "PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n"
+                                  "-----END OPENSSH " + "PRIVATE KEY-----\n").encode(),
+                   "start.png": start + b"not the rest of a picture",
+                   "after.png": company_png(after=b"\x00"),
+                   "large.png": company_png(extra=png_chunk(b"tEXt", b"Comment\x00" + b"x" * 12288))}
+        documents = {"contract.pdf": b"\x00\x01 a header %PDF-1.7\n1 0 obj << >> endobj\n%%EOF\n",
+                     "page.eps": b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n",
+                     "logo.svg": b"\xef\xbb\xbf\n  <svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>"}
+        sent = []
+        tools = {t["name"]: t for t in owner_mcp.tools()}
+        with patch.dict(owner_mcp.TOOLS, tools, clear=True), patch.object(owner_mcp, "SIPS", str(folder / "no-sips")), \
+                patch.object(owner_mcp, "command", lambda *a, **k: sent.append(a) or {"name": None, "logo": None}):
+            for files, words in ((no_sips, owner_mcp.LOGO_NO_SIPS), (documents, owner_mcp.LOGO_NOT_A_PICTURE)):
+                for name, data in files.items():
+                    (folder / name).write_bytes(data)
+                    with self.subTest(file=name):
+                        self.assertEqual(owner_mcp.call_tool("save_company", {"logo_file": str(folder / name)}),
+                                         (words, True))
+            self.assertEqual(sent, [])
+            (folder / "logo.png").write_bytes(company_png())
+            text, bad = owner_mcp.call_tool("save_company", {"logo_file": str(folder / "logo.png")})
+        self.assertFalse(bad, text)
+        self.assertEqual(json.loads(text), {"name": None, "logo": None, "picture": owner_mcp.LOGO_AS_IS})
+        self.assertEqual([(route, base64.b64decode(body["png"])) for route, body, *_ in sent],
+                         [("/ui/company", company_png())])
+
+    def test_a_sips_that_fails_or_a_copy_that_fails_says_so_and_sends_nothing(self):
+        """With a stand-in for the run of sips and for the folder of the copy (no real sips, so this runs everywhere): a
+        sips that takes too long, one that a signal stops, and a copy that the disk refuses each say what happened,
+        in words that name no path of this computer, and nothing is sent. Bug: the catch of a timeout moves under
+        the general one, and a slow sips says "not a picture", or a full disk shows the temporary folder's path."""
+        folder = pathlib.Path(tempfile.mkdtemp(prefix="fleet-logo-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        (folder / "small.png").write_bytes(company_png(size=32))           # no ready logo: it goes to sips
+        sent, place = [], str(folder / "small.png")
+
+        def late(argv, **_kw):
+            raise subprocess.TimeoutExpired(argv, owner_mcp.SIPS_WAIT)
+
+        def stopped(argv, **_kw):
+            return subprocess.CompletedProcess(argv, -9, b"", b"")
+
+        def full(**_kw):
+            raise OSError(28, "No space left on device")
+        tools = {t["name"]: t for t in owner_mcp.tools()}
+        with patch.dict(owner_mcp.TOOLS, tools, clear=True), patch.object(owner_mcp, "SIPS", sys.executable), \
+                patch.object(owner_mcp, "command", lambda *a, **k: sent.append(a) or {"name": None, "logo": None}):
+            for name, stand_in, words in (("late", patch.object(owner_mcp.subprocess, "run", late),
+                                           owner_mcp.LOGO_SIPS_LATE),
+                                          ("stopped", patch.object(owner_mcp.subprocess, "run", stopped),
+                                           owner_mcp.LOGO_SIPS_STOPPED.format(9)),
+                                          ("full", patch.object(owner_mcp.tempfile, "mkdtemp", full),
+                                           owner_mcp.LOGO_NOT_COPIED.format("No space left on device"))):
+                with self.subTest(name), stand_in:
+                    self.assertEqual(owner_mcp.call_tool("save_company", {"logo_file": place}), (words, True))
+        self.assertEqual(sent, [])
+        self.assertEqual(owner_mcp.LOGO_SIPS_LATE, "sips did not finish reading logo_file in 60 seconds. Nothing was "
+                                                   "sent.")
+
+    def test_a_hub_that_does_not_serve_the_route_is_said_to_be_older(self):
+        """A hub of a release before owner API 1.349 answers 404 "not found" to POST /ui/company: the tool says, in the
+        words of the program inside the app (OwnerHub.olderHub, which the table carries), that the hub can be older
+        and gets the route with its next update. Bug: the owner's AI session reads only "not found" and looks for a
+        fault of the tool."""
+        refused = owner_mcp.Refused("The hub refused the company's name and logo (404): not found")
+        with patch.dict(owner_mcp.TOOLS, {t["name"]: t for t in owner_mcp.tools()}, clear=True), \
+                patch.object(owner_mcp, "command", side_effect=refused):
+            self.assertEqual(owner_mcp.call_tool("save_company", {"name": "Example Labs"}),
+                             (f"{refused}\n{owner_mcp.OLDER_HUB}", True))
+        self.assertEqual(owner_mcp.dump_tools()["COMPANY_LOGO"]["older_hub"], owner_mcp.OLDER_HUB)
+
+    def test_only_a_whole_png_that_the_hub_takes_goes_as_it_is(self):
+        """A PNG of 64 x 64 goes as it is only when a walk of its chunks agrees with the hub's own rules: each CRC,
+        IEND last with no byte after it, no critical chunk but IHDR, PLTE, IDAT and IEND, not both sRGB and iCCP, at
+        most 12,288 bytes; a text chunk or a profile alone keeps it whole. Each other one is drawn again. Bugs: the
+        hub refuses with a 400 a file that the tool sent as it is; a large ready PNG goes, and the hub refuses it."""
+        profile = png_chunk(b"iCCP", b"P3\x00\x00" + zlib.compress(b"a profile"))
+        whole = (company_png(), company_png(extra=png_chunk(b"tEXt", b"Author\x00Example Labs")),
+                 company_png(extra=profile))
+        broken = company_png()[:-1] + bytes([company_png()[-1] ^ 1])                    # IEND's CRC is wrong
+        drawn = (company_png(after=b"\x00"), broken, company_png()[:-12],
+                 company_png(extra=png_chunk(b"sRGB", b"\x00") + profile),
+                 company_png(extra=png_chunk(b"ABCD", b"")),                            # a critical chunk of nobody
+                 company_png(extra=png_chunk(b"tEXt", b"Comment\x00" + b"x" * 12288)),
+                 company_png(size=32))
+        self.assertEqual([owner_mcp.logo_as_is(one) for one in whole], [True] * 3)
+        self.assertEqual([owner_mcp.logo_as_is(one) for one in drawn], [False] * 7)
 
 
 class Table(unittest.TestCase):
@@ -5499,7 +5666,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 12, 7, 58))
+                         (4, 13, 7, 58))
         # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
         # it would stand in no line of the map, so a client with tool search would not learn of it.
         stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
@@ -5538,7 +5705,7 @@ class Table(unittest.TestCase):
         self.assertEqual([t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] in self.TABLE_KINDS],
                          [])
         writes = {t["name"] for t in table if not t["annotations"]["readOnlyHint"] and t["kind"] != "absent"}
-        self.assertEqual(len(writes), 58 + 12)
+        self.assertEqual(len(writes), 58 + 13)
         self.assertTrue(set(owner_mcp.SWIFT_WRITES) <= writes)
 
     def test_a_lost_error_answer_says_that_the_request_can_have_arrived(self):

@@ -193,6 +193,83 @@ class Reach(HubSide):
             self.assertLess(time.monotonic() - t0, 3)
             self.assertEqual((receipt["changed"], receipt["unreached"]), (True, OWNER))
 
+    def test_the_list_before_a_lock_waits_a_few_seconds_and_reads_once_a_minute(self):
+        """github_repo_list_ahead, before the lock of a grant, a raise or the owner's press (the coordinator's validator
+        and the Door area's S5). Bugs: a slow GitHub or door holds the press past the app's own time limit; or in an
+        outage each repository of each call reads the whole list again."""
+        reads, slow = [], threading.Event()
+        listed = {"acme": {"name": "acme", "repos": ["acme/web"]}}
+
+        def read():
+            reads.append(1)
+            if not slow.is_set():
+                return {}, "GitHub did not answer"
+            time.sleep(0.6)
+            hub.GITHUB_REPOS.update(at=hub.now(), list=listed)
+            return listed, None
+        with patch.object(hub, "github_repo_list", read), patch.object(hub, "GITHUB_REACH_WAIT", 0.1), \
+                patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None, "failed": 0.0, "reading": None}):
+            for _ in range(3):              # an outage: one read, then none for a minute
+                hub.github_repo_list_ahead()
+            self.assertEqual(len(reads), 1)
+            hub.GITHUB_REPOS["failed"] = 0.0          # a minute later, and GitHub is slow
+            slow.set()
+            t0 = time.monotonic()
+            hub.github_repo_list_ahead()
+            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertIsNone(hub.github_listed("acme/web"))    # not yet
+            time.sleep(1)
+            self.assertTrue(hub.github_listed("acme/web"))       # the read that came late is kept
+            self.assertEqual(len(reads), 2)
+        # and under LOCK (the tick's pass of pressed plans) it waits for nothing: it starts the read and goes on (the
+        # Needs-you area's validator). Bug: every call and read of the hub stops while a pressed plan waits
+        whole = {"pages": {}, "all": {"acme"}, "repos": set(), "install": None}
+        with patch.object(hub, "github_repo_list", read), patch.object(hub, "GITHUB_REACH_WAIT", 2), \
+                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": whole}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None, "failed": 0.0, "reading": None}):
+            with hub.LOCK:
+                t0 = time.monotonic()
+                hub.github_repo_ahead("acme/web")
+                hub.github_repos_ahead(["acme/web", "acme/docs", "acme/api"])      # and a plan's set of them
+                self.assertLess(time.monotonic() - t0, 0.3)
+            time.sleep(1)
+            self.assertEqual(len(reads), 3)                 # its read ran, for the next pass
+
+    def test_the_ticks_pass_of_pressed_plans_waits_for_no_read_under_lock(self):
+        """team_plan_ahead runs under LOCK in the minute's pass of pressed plans (team_plans_pressed), through
+        github_repos_ahead: each read that it starts there (the App's reading, the list, and the second read of a
+        saved list that lacks a name) waits for nothing. Bug: one of the three waits its full time under LOCK, and
+        each call and read of the hub waits with it."""
+        gate = threading.Event()
+        whole = {"pages": {}, "all": {"acme"}, "repos": set(), "install": None}
+        saved = {"acme": {"name": "acme", "repos": ["acme/web"]}}
+
+        def slow_reach():
+            gate.wait(3)
+            return whole
+
+        def slow_list(again=False):
+            gate.wait(3)
+            return saved, None
+        for case, reach_at, repos in (
+                ("a reading and a list that are due", hub.now() - 2 * hub.GITHUB_REACH_FRESH,
+                 {"at": 0.0, "list": None}),
+                ("a saved list that lacks a name", hub.now(), {"at": hub.now(), "list": saved})):
+            with self.subTest(case), patch.object(hub, "github_reach_read", slow_reach), \
+                    patch.object(hub, "github_repo_list", slow_list), patch.object(hub, "GITHUB_REACH_WAIT", 2), \
+                    patch.dict(hub.GITHUB_REACH, {"at": reach_at, "reading": False, "reach": whole}), \
+                    patch.dict(hub.GITHUB_REPOS, dict(repos, failed=0.0, reading=None, again=0.0)):
+                with hub.LOCK:
+                    t0 = time.monotonic()
+                    hub.github_repos_ahead(["acme/web", "acme/new"])        # a plan's repositories
+                    self.assertLess(time.monotonic() - t0, 0.5)
+                gate.set()
+                for _ in range(300):        # the reads end before the patches do
+                    if not hub.GITHUB_REACH["reading"] and hub.GITHUB_REPOS["reading"] is None:
+                        break
+                    time.sleep(0.01)
+                gate.clear()
+
     def test_a_read_that_failed_marks_nothing_and_refuses_nothing(self):
         self.github_at(broken=("/app/installations",))
         receipt = self.grant("acme/hidden", dev="read")

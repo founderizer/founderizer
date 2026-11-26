@@ -96,6 +96,7 @@ def request(method="GET", target="/mcp", host=N, headers=(), body=b"", length=Tr
 
 class WithGate(unittest.TestCase):
     connections = 4
+    gate_limits = {}            # a class's own limits beside the fixture's short times
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="gate-")
@@ -107,8 +108,9 @@ class WithGate(unittest.TestCase):
         self.addCleanup(self.hub.server_close)
         self.addCleanup(self.hub.shutdown)
         self.lines = []
-        self.gate = gate.Gate(N, socket_path=self.sock, port=0, connections=self.connections, read_time=1,
-                              hub_time=5, log=self.lines.append)
+        limits = {"head_time": 1, "body_time": 1, **self.gate_limits}
+        self.gate = gate.Gate(N, socket_path=self.sock, port=0, connections=self.connections, hub_time=5,
+                              log=self.lines.append, **limits)
         self.thread = threading.Thread(target=self.gate.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.thread.join, 5)
@@ -291,7 +293,11 @@ class BadClients(WithGate):
             self.addCleanup(c.close)
             idle.append(c)
         time.sleep(0.2)
+        full = self.send(request())
+        self.assertEqual(status(full), 503)
+        self.assertIn(b"\r\nRetry-After: 2\r\n", full)        # a client that waits for its time comes back in time
         self.assertEqual(status(self.send(request())), 503)
+        self.assertEqual(self.lines.count("all places are full: a connection got 503"), 1, self.lines)   # once a minute
         for c in idle:
             c.close()
         time.sleep(0.3)
@@ -308,6 +314,134 @@ class BadClients(WithGate):
             self.send(raw, wait=3)
         self.assertEqual(status(self.send(request())), 200)
         self.assertTrue(self.thread.is_alive())
+
+
+class SlowAndManyClients(WithGate):
+    """A client that trickles, and an address that opens many requests, keep their own places only (the supervisor's
+    read of 25 November 2026, and Door's): Funnel sends a request's whole head at once, so a body that never comes ends
+    after its own short time, a body's time grows only with the bytes that come, and one address (or IPv6 /64) holds
+    at most its share of the places."""
+    connections = 8
+    gate_limits = {"body_time": 1.5, "body_rate": 2000, "per_source": 2}
+
+    def open_request(self, came_from, size=3000):
+        """A request whose head is in and whose body waits: it holds its place until its body's time ends."""
+        c = socket.create_connection(("127.0.0.1", self.gate.port), timeout=5)
+        self.addCleanup(c.close)
+        c.sendall(request("POST", "/mcp", headers=[f"X-Forwarded-For: {came_from}", f"Content-Length: {size}"]))
+        return c
+
+    def wait_for(self, count):
+        end = time.monotonic() + 6
+        while sum(self.gate.sources.values()) != count and time.monotonic() < end:
+            time.sleep(0.02)
+        self.assertEqual(sum(self.gate.sources.values()), count, self.gate.sources)
+
+    def test_a_body_that_never_comes_ends_at_the_body_time(self):
+        """A head that names the largest body and sends none of it: a bug here lets it hold its place for the time of
+        the whole body (2 + 64 KiB at the rate, the old 10 seconds), so a few addresses keep every place full."""
+        with socket.create_connection(("127.0.0.1", self.gate.port), timeout=8) as c:
+            t0 = time.monotonic()
+            c.sendall(request("POST", "/mcp", headers=[f"Content-Length: {gate.MCP_BODY_MAX}"]))
+            got = c.recv(1000)
+            self.assertEqual(status(got), 408)
+            self.assertGreater(time.monotonic() - t0, 1.2, "the body's time is its own, not what is left of the head's")
+            self.assertLess(time.monotonic() - t0, 3)
+
+    def test_a_body_at_the_rate_passes_and_a_slower_one_gets_408(self):
+        """The bytes that came give a body more time: a bug here cuts a real client's body, or lets a body hold its
+        place for the time of its whole size."""
+        body = b"x" * 3000
+        with socket.create_connection(("127.0.0.1", self.gate.port), timeout=8) as c:
+            c.sendall(request("POST", "/mcp", headers=["Content-Length: 3000"]))
+            time.sleep(1.0)                         # within the body's 1.5 s
+            c.sendall(body[:2000])                  # 2000 bytes at 2000 a second: 1 s more, to 2.5 s
+            time.sleep(1.0)
+            c.sendall(body[2000:])                  # at 2 s: past the 1.5 s that a body has with no bytes
+            self.assertEqual(status(c.recv(1000)), 200)
+        with socket.create_connection(("127.0.0.1", self.gate.port), timeout=8) as c:
+            t0 = time.monotonic()
+            c.sendall(request("POST", "/mcp", body=body)[:-1000])
+            got = c.recv(1000)
+            self.assertEqual(status(got), 408)
+            self.assertLess(time.monotonic() - t0, 4)
+        self.assertEqual(len(self.hub.seen), 1)
+
+    def test_one_address_holds_its_share_and_another_goes_on(self):
+        """A bug here lets one address take all of the gate's places, or refuses a second address, or keeps a place
+        counted after its request ended."""
+        self.open_request("198.51.100.7")
+        self.open_request("198.51.100.7")
+        self.wait_for(2)
+        refused = self.send(request(headers=["X-Forwarded-For: 198.51.100.7"]))
+        self.assertEqual(status(refused), 503)
+        self.assertIn(b"\r\nRetry-After: 2\r\n", refused)
+        # It counts as soon as the head says where it is from: a wrong path from that address is refused as well.
+        self.assertEqual(status(self.send(request(target="/nothing", headers=["X-Forwarded-For: 198.51.100.7"]))), 503)
+        # Only the last address counts, as Funnel sets it.
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 203.0.113.1, 198.51.100.7"]))), 503)
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 198.51.100.7, 203.0.113.1"]))), 200)
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 203.0.113.9"]))), 200)
+        self.wait_for(0)                            # the two bodies' times ended them
+        self.assertEqual(self.gate.sources, {})
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 198.51.100.7"]))), 200)
+        self.assertIn("503 GET /mcp", self.lines)
+
+    def test_trailers_end_at_the_bodys_cap_and_at_their_own_size(self):
+        """Trailers that come a little at a time give the body time, but never past its size's cap: a bug here lets a
+        chunked body hold its place for as long as it trickles, so a few addresses keep the gate full at a few requests
+        a minute. Trailers are dropped, and they are no larger than headers."""
+        head = b"POST /register HTTP/1.1\r\nHost: " + N.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"
+        with socket.create_connection(("127.0.0.1", self.gate.port), timeout=10) as c:
+            t0, got = time.monotonic(), b""
+            c.sendall(head)
+            while time.monotonic() - t0 < 9:                   # 100 bytes each 0.05 s: the rate, 2000 a second
+                try:
+                    c.sendall(b"X-T: " + b"a" * 93 + b"\r\n")
+                except OSError:
+                    break
+                if select.select([c], [], [], 0.05)[0]:
+                    got = c.recv(1000)
+                    break
+            self.assertEqual(status(got), 408, got)            # 1.5 s + 8192 bytes at 2000 a second: 5.6 s
+            self.assertLess(time.monotonic() - t0, 7.5)
+        many = head + (b"X-T: " + b"a" * 93 + b"\r\n") * 200 + b"\r\n"
+        self.assertEqual(status(self.send(many)), 431)
+
+    def test_an_ipv6_host_counts_by_its_64(self):
+        """One cloud host holds a whole /64: a bug here gives it a place for each of its addresses."""
+        self.open_request("2001:db8::1")
+        self.open_request("2001:db8::2")
+        self.wait_for(2)
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 2001:db8::ffff"]))), 503)
+        self.assertEqual(status(self.send(request(headers=["X-Forwarded-For: 2001:db8:0:1::1"]))), 200)
+        self.assertEqual(gate.source_key("::ffff:198.51.100.7"), "198.51.100.7")
+        self.assertEqual(gate.source_key(None), "-")
+
+
+class ReaderCap(unittest.TestCase):
+    """A body's deadline never passes its size's cap, with no clock to wait for: a bug here lets bytes that came with
+    the head, or bytes that come one at a time, give a body more time than its own size."""
+
+    class Conn:
+        def __init__(self, chunks):
+            self.chunks = list(chunks)
+
+        def settimeout(self, _seconds):
+            pass
+
+        def recv(self, _size):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    def test_the_deadline_stays_within_the_cap(self):
+        reader = gate.Reader(self.Conn([b"x"] * 50), time.monotonic() + 100)
+        reader.data += b"y" * 500                   # bytes that came with the head, above the body's size
+        reader.budget(2, 100, 100)                  # 2 s, and 100 bytes at 100 a second: 3 s at most
+        self.assertLessEqual(reader.deadline, reader.cap)
+        self.assertLessEqual(reader.cap - time.monotonic(), 3)
+        for _ in range(50):
+            reader.more()
+            self.assertLessEqual(reader.deadline, reader.cap)
 
 
 class TheGateItself(unittest.TestCase):
@@ -357,10 +491,20 @@ class TheGateItself(unittest.TestCase):
                                           "mcp-protocol-version", "mcp-session-id"})
         self.assertEqual({(m, p) for p, ms in gate.ROUTES.items() for m in ms},
                          {(m, t.split("?")[0]) for m, t in ROUTES})
-        self.assertEqual((gate.PORT, gate.LINE_MAX, gate.HEAD_MAX, gate.BODY_MAX, gate.MCP_BODY_MAX,
-                          gate.CONNECTIONS, gate.READ_TIME), (8767, 4096, 16384, 8192, 65536, 32, 10))
+        self.assertEqual((gate.PORT, gate.LINE_MAX, gate.HEAD_MAX, gate.BODY_MAX, gate.MCP_BODY_MAX, gate.CONNECTIONS,
+                          gate.HEAD_TIME, gate.BODY_TIME, gate.BODY_RATE, gate.PER_SOURCE),
+                         (8767, 4096, 16384, 8192, 65536, 128, 2, 2, 8192, 8))
         self.assertEqual(gate.SOCKET, hubsetup.CONNECT_STATE + "/hub.sock")
         self.assertEqual(hubsetup.CONNECT_TARGET, f"http://{gate.LISTEN}:{gate.PORT}")
+
+    def test_the_gate_takes_the_lists_limits_by_default(self):
+        """The unit starts the gate with no limit of its own: a bug here runs it with other limits than the lists'."""
+        made = gate.Gate(N, port=0)
+        self.addCleanup(made.close)
+        self.assertEqual((made.head_time, made.body_time, made.body_rate, made.per_source, made.hub_time),
+                         (gate.HEAD_TIME, gate.BODY_TIME, gate.BODY_RATE, gate.PER_SOURCE, gate.HUB_TIME))
+        taken = [made.slots.acquire(blocking=False) for _ in range(gate.CONNECTIONS + 1)]
+        self.assertEqual(taken.count(True), gate.CONNECTIONS)
 
     def test_a_name_that_is_not_full_is_refused(self):
         for bad in ("hub-1", "HUB-1.example.com", "", "a b.example.com", None):

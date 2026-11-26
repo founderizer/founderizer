@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -19,6 +21,14 @@ from test_ui_api import OwnerAPI
 LOGIN = "bws://11111111-2222-4333-8444-55555555555b"       # a login: the shop admin, which an agent signs in with
 KEY = "bws://21111111-2222-4333-8444-55555555555b"         # an API key: the deploy route that an agent reads
 SPEND = "bws://31111111-2222-4333-8444-55555555555b"       # the key that pays: grantable like any other
+ACME_PAGE = "https://github.com/organizations/acme/settings/installations/7"    # where the owner adds one to the App
+
+
+class Reading:
+    """A read of the list of repositories that runs now (GITHUB_REPOS "reading", the Event of github_repo_list_ahead):
+    a call waits for it, and it does not end in the test."""
+    def wait(self, timeout=None):
+        return False
 TEAM = {
     "hub": {"machine": "hub", "port": 8765},
     "addresses": {"owner": "127.0.0.1", "hub": "127.0.0.2", "box": "127.0.0.3", "shopbox": "127.0.0.4"},
@@ -127,6 +137,21 @@ class Resources(OwnerAPI):
         self.assertTrue(error, text)
         return text
 
+    def reaches(self, *repos, whole=None):
+        """The fleet's GitHub App, read a moment ago (github_repo_known): it reaches these repositories of acme, and
+        each repository of the accounts of whole ({account: its repositories}), whose list the hub read a moment ago
+        too. Until the test ends, or until the next call."""
+        whole = whole or {}
+        listed = {a: {"name": a, "repos": sorted(r)} for a, r in whole.items()}
+        for held in (patch.object(hub, "github_app", lambda: ("7", "key")),
+                     patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
+                         "pages": {"acme": ACME_PAGE}, "all": set(whole), "repos": set(repos), "install": None}}),
+                     patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": listed, "failed": 0.0, "reading": None,
+                                                   "part": None, "again": 0.0}),
+                     patch.object(hub, "github_repos_read", return_value=(listed, []))):     # no GitHub call
+            held.start()
+            self.addCleanup(held.stop)
+
     # ---- the pool that the owner's page reads
 
     def test_the_page_lists_what_a_duty_can_need_with_its_secrets_and_its_holders(self):
@@ -145,7 +170,7 @@ class Resources(OwnerAPI):
         repo = self.entry("repo:acme/web")
         self.assertEqual((repo["kind"], repo["credential"], repo["uses"]), ("repo", "github_app", []))
         self.assertEqual(repo["holders"], [{"agent": "shopper", "level": "read"}])
-        self.assertEqual(repo["grant"], {"max": "write", "to": "workers", "by": "default"})     # the default (1.328)
+        self.assertEqual(repo["grant"], {"max": "read", "to": "workers", "by": "default"})      # the default (1.328)
         self.assertEqual(repo["history"], [])                   # nothing has been given through this feature yet
         # An MCP server says which secret of the catalog it needs, and Fleet's own tool needs none of the owner's.
         self.assertEqual(self.entry("tool:jobs")["uses"], [KEY])
@@ -164,22 +189,94 @@ class Resources(OwnerAPI):
     def test_each_resource_that_the_fleet_holds_is_grantable_by_default(self):
         """Owner feature pool_default (the owner, 24 November 2026: "I think the manager should be able to do that!",
         "the goal is to minimize Needs you cards"): the manager gives each resource that the fleet holds, up to its
-        kind's top level, and the owner's standing only narrows it. Bugs: a give of a held secret or repository comes
-        to the owner as a card again; the default reaches a repository that no record of the fleet names; or the
-        owner's "Only you" no longer narrows it."""
+        kind's top level, and the owner's standing only narrows it; a repository only up to read (the supervisor's
+        decision of 26 November 2026, after the Door area's read A4: a write token's push runs the repository's jobs
+        beside their secrets). Bugs: a give of a held secret or repository comes to the owner as a card again; the
+        default reaches a repository that no record of the fleet names; the default gives write or deploy of a
+        repository, also one that an agent holds by the owner's own grant; or the owner's "Only you" or own level no
+        longer counts."""
         self.assertIn("pool_default", self.request()[1]["ui_features"])
-        self.assertEqual(self.entry("repo:acme/web")["grant"], {"max": "write", "to": "workers", "by": "default"})
+        self.assertEqual(self.entry("repo:acme/web")["grant"], {"max": "read", "to": "workers", "by": "default"})
         self.assertEqual(self.entry("gmail:support@shop.test")["grant"], {"max": "write", "to": "workers", "by": "default"})
-        # the two outward tops come only with their own level (the supervisor's (B), after the Door area's read): a
-        # deploy token reaches the CI keys and the runners, and send mails as the owner to anyone
-        self.assertIn("The default gives at most write", self.refused("dev", "repo:acme/web", "deploy"))
+        # the outward levels come only with their own level: a repository's write and deploy push code that its jobs
+        # run beside their secrets and runners, and send mails as the owner to anyone
+        for level in ("write", "deploy"):
+            said = self.refused("dev", "repo:acme/web", level)
+            self.assertIn("The default gives at most read", said)
+            # no agent holds it at that level, so the route is the owner's card for dev (the coordinator's validator)
+            self.assertIn(f'raise_needs_you(needs_access="repo:acme/web", needs_level="{level}", needs_agent="dev")',
+                          said)
         self.assertIn("The default gives at most write", self.refused("dev", "gmail:support@shop.test", "send"))
         self.assertEqual(self.entry(f"secret:{LOGIN}")["grant"], {"max": "read", "to": "workers", "by": "default"})
-        self.granted("dev", "repo:acme/web", "write")           # shopper holds it, so the fleet holds it
-        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})
+        self.granted("dev", "repo:acme/web", "read")            # shopper holds it, so the fleet holds it
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "read"})
         self.assertFalse(self.committed().get("resources"))     # no entry of the owner's was needed
         self.assertIn("not in the grantable pool", self.refused("dev", "repo:acme/other", "read"))   # no record names it
-        # the owner narrows it: their own level, then "Only you", then the default again
+        # A repository that the fleet's GitHub App reaches is the fleet's too (the owner's card N-327 of 26 November
+        # 2026, a read of a repository that the App reached and no agent held): by its name, or by an account whose
+        # installation has all of its repositories; never one of the product's own, and none with no reading of the
+        # App. Its default stops at read (DEFAULT_TOP), as every repository's does, and a read that the default gave is
+        # no step to write (the Door area's read). Bugs: such a give comes to the owner as a card; the default reaches
+        # the product's own repositories or its private source (the supervisor, 26 November 2026), a repository of an
+        # account that the App does not reach or that has more repositories than the hub read, a name of an account
+        # with all of its repositories that the hub's list does not name, or write of one that only the App reaches,
+        # at once or after a read that it gave.
+        reach = {"pages": {}, "all": {"wholeorg", "bigorg"}, "many": {"bigorg"}, "install": None,
+                 "repos": {"acme/other", "founderizer/founderizer", "acme/founderizer-source", "bigorg/listed",
+                           "founderizer-gate/founderizer-source"}}
+        listed = {"wholeorg": {"name": "WholeOrg", "repos": ["wholeorg/docs", "wholeorg/site"]},
+                  "bigorg": {"name": "BigOrg", "repos": ["bigorg/site"]}}     # "many": only what the reading holds
+        with patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": reach}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": listed}):
+            self.assertEqual(hub.resource_standing("repo:acme/other"), {"max": "read", "to": "workers", "by": "default"})
+            self.granted("dev", "repo:acme/other", "read")
+            self.granted("dev", "repo:wholeorg/site", "read")
+            # of an account with all of its repositories, only one that the hub's list names: an invented name would
+            # get the agent's read tokens of that account refused at GitHub (the validator's P1)
+            self.assertIn("not in the grantable pool", self.refused("dev", "repo:wholeorg/invented", "read"))
+            with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None}):       # no list of the last minute
+                self.assertIn("not in the grantable pool", self.refused("lead", "repo:wholeorg/docs", "read"))
+            for agent in ("dev", "lead"):            # dev holds it now, by the default's own grant: still read at most
+                self.assertIn("The default gives at most read", self.refused(agent, "repo:acme/other", "write"))
+            self.refused("dev", "repo:founderizer/founderizer", "read")
+            for source in ("acme/founderizer-source", "founderizer-gate/founderizer-source"):
+                self.assertIn("the product's own private source", self.refused("dev", f"repo:{source}", "read"))
+            self.assertIn("not in the grantable pool", self.refused("dev", "repo:elsewhere/app", "read"))
+            self.assertIn("not in the grantable pool", self.refused("dev", "repo:bigorg/site", "read"))
+            self.granted("dev", "repo:bigorg/listed", "read")       # one that the hub read, of that account
+            # one that an agent holds by the owner's own grant: read at most too, for the holder and for another
+            self.assertIn("The default gives at most read", self.refused("lead", "repo:acme/web", "write"))
+            self.assertIn("The default gives at most read", self.refused("shopper", "repo:acme/web", "write"))
+        with patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": None}):
+            self.assertIn("not in the grantable pool", self.refused("lead", "repo:acme/third", "read"))
+            # with no reading, one that an agent holds only by the manager's grant stays the fleet's (the coordinator's
+            # validator, M2). Bug: it leaves the pool, and the next give of it goes to the owner as a card
+            self.granted("lead", "repo:acme/other", "read")
+        # the first grant after a start, before any reading, waits for one before LOCK, as change_team and
+        # raise_needs_you do (the Door area's and the validator's read). Bug: it is refused as not in the pool
+        with patch.dict(hub.GITHUB_REACH, {"at": None, "reading": False, "reach": None}), \
+                patch.object(hub, "github_reach_read", return_value=dict(reach, repos={"acme/fourth"})):
+            self.granted("dev", "repo:acme/fourth", "read")
+        # a raise for read of an all-repositories account's repository reads the hub's list before LOCK too, so no card
+        # goes up for one that the default gives (the validator's S1). Bug: with a list older than a minute, the
+        # manager's card for it goes to the owner
+        def listing():
+            hub.GITHUB_REPOS.update(at=hub.now(), list=listed)
+            return listed, None
+        with patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": reach}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None, "failed": 0.0, "reading": None}), \
+                patch.object(hub, "github_repo_list", listing), \
+                patch.object(hub, "github_app", lambda: ("7", "key")):        # a fleet with its App
+            said, error = hub.call_tool("manager", "raise_needs_you", {
+                "title": "Let Lead read wholeorg/docs", "why": "Its work reads wholeorg/docs.", "reason": "access",
+                "needs_access": "repo:wholeorg/docs", "needs_level": "read",
+                "what_to_do": "Give Lead read access to wholeorg/docs."})
+            self.assertTrue(error, said)
+            self.assertIn("yours to give", said)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"],
+                         {"acme/fourth": "read", "acme/other": "read", "acme/web": "read", "bigorg/listed": "read",
+                          "wholeorg/site": "read"})
+        # the owner's own level opens it (their "At most" on the row), then "Only you", then the default again
         code, receipt = self.stand("repo:acme/web", {"max": "deploy", "to": "workers"})
         self.assertEqual((code, receipt["policy"]), (200, {"max": "deploy", "to": "workers", "by": "owner"}), receipt)
         self.granted("lead", "repo:acme/web", "deploy")         # their own level opens deploy
@@ -191,7 +288,7 @@ class Resources(OwnerAPI):
         code, receipt = self.stand("repo:acme/web", "default")
         self.assertEqual((code, receipt["policy"]["by"]), (200, "default"), receipt)
         self.assertNotIn("resources", self.committed())
-        self.assertEqual(self.entry("repo:acme/web")["holders"], [{"agent": "dev", "level": "write"},
+        self.assertEqual(self.entry("repo:acme/web")["holders"], [{"agent": "dev", "level": "read"},
                                                                   {"agent": "lead", "level": "deploy"},
                                                                   {"agent": "shopper", "level": "read"}])
 
@@ -209,11 +306,14 @@ class Resources(OwnerAPI):
                 self.assertIn("the fleet runs on it, so only the owner gives it",
                               self.refused("dev", f"secret:{ref}", "use"))
         kept = {k["resource"]: k["kept"] for k in hub.capacity_view()["resource_default"]["kept"]}
-        self.assertEqual(kept, {f"secret:{token}": "fleet", f"secret:{SPEND}": "fleet", "tool:crm": "owner"})
+        self.assertEqual(kept, {f"secret:{token}": "fleet", f"secret:{SPEND}": "fleet"})     # an OAuth app is the default's
         text, _ = self.call("manager", "see_capacity", {})
         self.assertIn(f"secret:{token} (GH_TOKEN): the fleet runs on it, so only the owner gives it. Give the work to "
                       f"an agent that holds it, else ask with raise_needs_you", text)
         self.assertIn("By default: each resource that the fleet holds, to any worker or lead", text)
+        # the default's own words say what the owner keeps: a sentence that names deploy alone sends the manager to
+        # grant_access at write, which refuses it (the Door area's read of 26 November 2026)
+        self.assertIn("for write or deploy of a repository and send of a Gmail", text)
         self.assertIsNone(hub.resource_kept(f"secret:{LOGIN}"))
         # a key of the door's (its providers, a production app's settings) and a GitHub App's key: no agent's box
         hub.TEAM["door"] = {"secrets": [LOGIN]}
@@ -257,9 +357,16 @@ class Resources(OwnerAPI):
         self.addCleanup(reached.stop)
         said = hub.need_is_yours("manager", "dev needs repo:acme/web for its work")
         self.assertIn('resource="repo:acme/web", level="read")', said)
+        # a level above the default (a repository's write and deploy) is the owner's own, so the card for it is
+        # raised, not refused as the manager's
+        for level in ("write", "deploy"):
+            self.assertIsNone(hub.need_is_yours("manager", "dev needs repo:acme/web", level=level))
+        # under the owner's own level up to deploy, an ask names its own level, never the top by itself
+        hub.TEAM["resources"] = {"repo:acme/web": {"max": "deploy"}}
+        self.assertIn('resource="repo:acme/web", level="read")',
+                      hub.need_is_yours("manager", "dev needs repo:acme/web for its work"))
         self.assertIn('level="write")', hub.need_is_yours("manager", "dev needs repo:acme/web", level="write"))
-        # a level above the default is the owner's own, so the card for it is raised, not refused as the manager's
-        self.assertIsNone(hub.need_is_yours("manager", "dev needs repo:acme/web", level="deploy"))
+        del hub.TEAM["resources"]
         hub.TEAM["door"] = {"gitops": {"acme/web": {"sync": "argocd", "agents": ["shopper"]}}}
         self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
         hub.TEAM.pop("door")
@@ -281,8 +388,86 @@ class Resources(OwnerAPI):
         self.assertTrue(hub.owner_gave("dev", "jobs"))                  # the owner set its level themselves
         hub.TEAM["agents"]["dev"]["can"] = []                           # the stand read the team file again
         self.assertIn("jobs", hub.closed_extra("dev")["shell_off"]["servers"])
-        # an MCP server with an OAuth sign-in acts as an account of the owner's: theirs to give
-        self.assertEqual((hub.resource_kept("tool:crm"), self.entry("tool:crm")["kept"]), ("account", "owner"))
+        # an MCP server with an OAuth sign-in is in the default too (the owner, 26 November 2026: "it should be the
+        # same for apps and other resources!"), and their "Only you" keeps it. Bug: each connected app goes to the
+        # owner as a card again, or their "Only you" no longer keeps it
+        self.assertEqual((hub.resource_kept("tool:crm"), self.entry("tool:crm")["grant"]),
+                         (None, {"max": "use", "to": "workers", "by": "default"}))
+        self.granted("dev", "tool:crm", "use")
+        # and a hold that the default gave before the app's Connect showed whose account it reaches gives its session no
+        # token once the app is kept (the Door area's read, M1). Bug: the worker's next session gets the owner's
+        # GitHub user token from a hold that the manager gave at once
+        self.assertIsNone(hub.mcp_hold_kept("dev", "crm"))
+        with patch.dict(hub.CFG, {"mcp_file": str(self.root / "mcp-crm" / "servers.json")}):
+            hub.mcp_store({"servers": {"crm": {"client_id": "c", "refresh_token": "r", "scopes": [],
+                                               "token_endpoint": "https://github.com/login/oauth/access_token",
+                                               "issuer": "https://github.com/login/oauth"}}})
+            self.assertIn("the owner did not give it to this agent", hub.mcp_hold_kept("dev", "crm") or "")
+            # and such a hold is no hold for a card or a question, so the ask goes up, and the owner's Give writes the
+            # owner's record, which opens the token (the coordinator's validator, K1). Bug: the question says
+            # restart_task, the card is refused as held, and the agent asks again and again
+            self.assertNotIn("holds the MCP server", hub.card_access("tool:crm", "use", "dev") or "")
+            self.assertNotIn("restart_task starts this task again", hub.access_route("dev", "tool:crm", "manager", "use"))
+            nid = self.give_card(title="Let Dev use the CRM", why="Its work reads the CRM.", needs_access="tool:crm",
+                                 needs_level="use", options=["No: not now"])
+            self.assertIsInstance(nid, int, nid)
+            code, said = self.request(f"/ui/needs/{nid}", self.command(choice=0))
+            self.assertEqual(code, 200, said)
+            self.assertIsNone(hub.mcp_hold_kept("dev", "crm"))
+        code, receipt = self.stand("tool:crm", None)
+        self.assertEqual((code, self.entry("tool:crm")["kept"]), (200, "owner"), receipt)
+        # but some apps stay the owner's (the Door area's read and the supervisor's choice of 26 November 2026): one of
+        # a payment, code, cloud or DNS host, by its url or by the issuer or token endpoint that its connection named at
+        # Connect (a host and its subdomains, never a name that only starts or ends with one), a hosted gateway's, and
+        # one connected with an administrator's scope. Bugs: the manager gives Stripe's, GitHub's, Vercel's or Zapier's
+        # app, an app that signs in through GitHub, or a Slack admin's app at use; or it keeps an app whose host only
+        # looks like one of them
+        hub.TEAM["mcp"].update({
+            "pay": {"title": "Payments", "url": "https://mcp.stripe.com/", "auth": "oauth"},
+            "copilot": {"title": "Code", "url": "https://api.githubcopilot.com/mcp/", "auth": "oauth"},
+            "hosting": {"title": "Hosting", "url": "https://mcp.vercel.com/", "auth": "oauth"},
+            "gateway": {"title": "Gateway", "url": "https://mcp.gateway.test/mcp", "auth": "oauth"},
+            "chat": {"title": "Chat", "url": "https://mcp.chat.test/mcp", "auth": "oauth"},
+            "tenant": {"title": "Office", "url": "https://mcp.office.test/mcp", "auth": "oauth"},
+            "reader": {"title": "Files", "url": "https://mcp.files.test/mcp", "auth": "oauth"},
+            "gateway2": {"title": "Gateway 2", "url": "https://mcp.gateway2.test/mcp", "auth": "oauth"},
+            "proxy": {"title": "Proxy", "url": "https://mcp.proxy.test/mcp", "auth": "oauth"},
+            "keys": {"title": "Keys", "url": "https://mcp.doppler.com/", "auth": "oauth"},
+            "teams": {"title": "Teams", "url": "https://mcp.teams.test/mcp", "auth": "oauth"},
+            "notes": {"title": "Notes", "url": "https://mcp.notes.test/mcp", "auth": "oauth"},
+            "enterprise": {"title": "Enterprise", "url": "https://api.acme.ghe.com/mcp", "auth": "oauth"},
+            "relay": {"title": "Relay", "url": "https://mcp.zapier.com/api/mcp", "auth": "oauth"},
+            "lookalike": {"title": "Look", "url": "https://stripe.com.shop.test/mcp", "auth": "oauth"},
+            "prefix": {"title": "Prefix", "url": "https://evilstripe.com/mcp", "auth": "oauth"}})
+        connection = {"client_id": "c", "refresh_token": "r", "token_endpoint": "https://auth.shop.test/token",
+                      "issuer": "https://auth.shop.test", "scopes": ["notes:read", "notes:write"]}
+        with patch.dict(hub.CFG, {"mcp_file": str(self.root / "mcp" / "servers.json")}):
+            hub.mcp_store({"servers": {
+                "gateway": dict(connection, issuer="https://github.com/login/oauth"),       # each of the two alone
+                "gateway2": dict(connection, token_endpoint="https://github.com/login/oauth/access_token"),
+                "proxy": dict(connection, token_kind="code"),   # its own server passed GitHub's token back
+                "teams": dict(connection, scopes=["ChannelMessage.Read.All"]),     # every channel message of a tenant
+                "chat": dict(connection, scopes=["channels:read", "admin.users:write"]),
+                "tenant": dict(connection, scopes=["User.Read", "https://graph.microsoft.com/Directory.ReadWrite.All"]),
+                "reader": dict(connection, scopes=["Files.Read.All", "User.ReadBasic.All"]),     # one user's own reach
+                "notes": connection, "lookalike": dict(connection, scopes=["admins_list:read"])}})
+            self.assertEqual([hub.resource_kept(f"tool:{t}") for t in ("pay", "copilot", "hosting", "gateway", "chat",
+                                                                        "tenant", "enterprise", "relay", "notes",
+                                                                        "reader", "lookalike", "prefix",
+                                                                        "gateway2", "proxy", "keys", "teams")],
+                             ["money", "code", "cloud", "code", "admin", "admin", "code", "gateway", None, None, None,
+                              None, "code", "code", "secrets", "admin"])
+            self.assertEqual([hub.token_kind(t) for t in ("gho_x", "github_pat_x", "sk_live_x", "sk_test_x", "ya29.x")],
+                             ["code", "code", "money", None, None])
+            with patch.object(hub, "mcp_saved", lambda: ({}, "the MCP file of the hub cannot be read")):
+                self.assertEqual(hub.resource_kept("tool:notes"), "owner")      # kept until the hub can read it
+            self.assertEqual({hub.kept_word(w) for w in ("money", "code", "cloud", "admin", "gateway", "secrets")},
+                             {"owner"})
+            self.assertIn("only the owner", hub.grant_check("dev", "tool:pay", "use") or "")
+            self.assertIn("repositories", hub.grant_check("dev", "tool:gateway", "use") or "")
+            self.assertIn("administrator", hub.grant_check("dev", "tool:chat", "use") or "")
+            self.assertIsNone(hub.grant_check("dev", "tool:notes", "use"))
+            self.assertIsNone(hub.grant_check("dev", "tool:lookalike", "use"))
 
     def test_the_vault_is_owed_a_pool_statement_for_each_secret_of_the_default(self):
         """GET /ui/vault's standing.due (pool_default): the owner's app signs a default_pool for each secret of the
@@ -712,6 +897,7 @@ class Resources(OwnerAPI):
         plain = {"title": "Let Dev read acme/web", "why": "Its work reads acme/web.", "reason": "access",
                  "needs_access": "repo:acme/web", "what_to_do": "Give Dev read access to acme/web."}
         # before acme/web is one of them: a Give card for it, lead holds it beside shopper, and the pool may give it
+        self.reaches("acme/web", "acme/storefront")
         nid = self.give_card()
         self.assertIsInstance(nid, int, nid)
         self.assertEqual(repos(repo="acme/web", agent="lead", level="write")[0], 200)
@@ -808,6 +994,7 @@ class Resources(OwnerAPI):
         reads what it gave. No gives nothing, a replay gives nothing twice, and a level that the agent holds already,
         higher than the card's, stays. Since pool_default a Give card is for what stays the owner's: what he keeps, a
         level above his own, also of a thing that another agent holds; and the manager's own give is no card."""
+        self.reaches("acme/web", "acme/api", "acme/docs")
         nid = self.give_card()
         self.assertIsInstance(nid, int, nid)
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
@@ -841,8 +1028,9 @@ class Resources(OwnerAPI):
         # No: nothing changes, and its words go to the manager as every answer's do
         other = self.give_card(title="Let Lead write to acme/api", why="Its fix needs acme/api.",
                                needs_access="repo:acme/api", needs_agent="lead")
+        kept = self.commits()       # with the owner's "Only you" on acme/api, which the App reaches (github_reaches)
         self.assertEqual(self.request(f"/ui/needs/{other}", self.command(choice=1))[0], 200)
-        self.assertEqual((self.commits(), self.committed()["agents"]["lead"].get("repos")), (before + 1, None))
+        self.assertEqual((self.commits(), self.committed()["agents"]["lead"].get("repos")), (kept, None))
         # deploy that came another way after the card stays deploy at the press of Give write
         third = self.give_card(title="Let Lead write to acme/docs", why="Its fix needs acme/docs.",
                                needs_access="repo:acme/docs", needs_agent="lead")
@@ -893,17 +1081,9 @@ class Resources(OwnerAPI):
         # work (the owner, 29 October 2026: asked only for what no agent holds), and so does the named agent with its
         # own hold. Bug: a Give card goes up while dev holds deploy, a card that the owner need not answer.
         self.keep("repo:acme/web")
-
-        def reached():      # the fleet's GitHub App reaches acme: with none, each card for a repository goes up
-            stack = ExitStack()
-            stack.enter_context(patch.object(hub, "github_app", lambda: ("7", "key")))
-            stack.enter_context(patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
-                "pages": {}, "all": {"acme"}, "repos": set(), "install": None}}))
-            return stack
-        with reached():
-            self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web",
-                          self.give_card(title="Let Shopper write to acme/web", needs_agent="shopper"))
-            self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web", self.give_card())
+        self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web",
+                      self.give_card(title="Let Shopper write to acme/web", needs_agent="shopper"))
+        self.assertIn("Not raised: dev (deploy) holds the GitHub repository acme/web", self.give_card())
         # A repository whose commits the door checks. Bug: Give writes a grant that lets a session commit around the
         # door's checks (.github/**, policy.hujson): of one that an Operator holds (lead, with a server), raised before
         # or after that, or of one that the door made, at deploy or to an Operator (new-projects plan N3).
@@ -923,10 +1103,184 @@ class Resources(OwnerAPI):
             self.assertIn("The door made acme/new: nobody gets deploy there", raw(**new, needs_level="deploy"))
             self.assertIn("Lead holds a server through the door, so Give does not give it",
                           raw(**dict(new, title="Let Lead write to acme/new", needs_agent="lead")))
+        # A repository that the hub does not read in what its GitHub App reaches (the owner's card N-327, 26 November
+        # 2026: Give on a name that an agent made up). Bugs: a Give card goes up that gives no token, or nothing at
+        # all; a card from before for a name that does not exist, which the press or the sweep gives anyway; one that
+        # they close on a reading that can miss a page (a door's); a refusal that guesses while the hub cannot tell; or
+        # a list check that refuses each repository of an account that the App reaches whole.
+        old = dict(title="Let Dev write to acme/old", why="Its fix needs acme/old.", needs_access="repo:acme/old")
+        self.reaches("acme/web", "acme/api", "acme/docs", "acme/old")
+        pressed, swept = raw(**old), raw(**dict(old, needs_agent="lead", title="Let Lead write to acme/old"))
+        self.assertTrue(all(isinstance(x, int) for x in (pressed, swept)), (pressed, swept))
+        self.reaches("acme/web", "acme/api", "acme/docs")      # a reading of a moment ago does not name it
+        gone = ("The fleet's GitHub App does not reach acme/old, so Give gives no token for it: it may not exist, or "
+                "the owner did not add it to the App.")
+        self.assertIn(f"{gone} Ask the agent where it saw that name, and check it first. A card for it goes up only "
+                      f"as the owner's step to add it to the App at {ACME_PAGE}, without Give: leave needs_agent out.",
+                      raw(**old))
+        before = self.commits()             # a card from before: "unreached" can be a page that a door missed
+        code, said = self.request(f"/ui/needs/{pressed}", self.command(choice=0))
+        self.assertEqual((code, self.commits()), (200, before + 1), said)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"].get("acme/old"), "write")
+        answer = lambda nid: hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"]  # noqa: E731
+        t0 = hub.now()
+        for t in (t0, t0 + hub.NEED_GIVE_WAIT + 1):
+            hub.need_look_sweep(t)
+        self.assertIsNone(answer(swept))
+        # the App reaches each repository of acme now, and its list does not hold acme/old: the sweep closes the card
+        self.reaches("acme/web", whole={"acme": ["acme/api", "acme/docs", "acme/web"]})
+        for t in (t0 + 2 * hub.NEED_GIVE_WAIT + 2, t0 + 3 * hub.NEED_GIVE_WAIT + 3):
+            hub.need_look_sweep(t)
+        self.assertEqual(answer(swept), "Closed by the hub: acme/old does not exist: the fleet's GitHub App reaches "
+                                        "each repository of acme, and acme/old is not one of them, or it is archived, "
+                                        "so Give gives nothing.")
+        # an account that the App reaches whole: the hub's list of it names what exists, and the raise reads that list
+        # again first when it is older than a minute (github_repo_ahead). Bugs: each Give for such an account is refused
+        # while nothing else reads the list; a press gives a repository that is gone since
+        self.reaches("acme/web", whole={"beta": ["beta/site"]})
+        typo = dict(title="Let Dev write to beta/sight", why="Its fix needs beta/sight.",
+                    needs_access="repo:beta/sight")
+        missing = ("beta/sight does not exist: the fleet's GitHub App reaches each repository of beta, and beta/sight "
+                   "is not one of them, or it is archived, so Give gives nothing.")
+        self.assertIn(f"{missing} Check the name with the agent that gave it, and raise no card for this name.",
+                      raw(**typo))
+        made = ({"beta": {"name": "beta", "repos": ["beta/sight", "beta/site"]}}, [])      # beta/sight is made now
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "failed": 0.0}), \
+                patch.object(hub, "github_repos_read", return_value=made):
+            sight = raw(**typo)
+        self.assertIsInstance(sight, int, sight)
+        gone = {"beta": {"name": "beta", "repos": ["beta/site"]}}           # and it is gone again: a list that a raise
+        before = self.commits()                                             # read a moment ago (the press reads none)
+        with patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": gone}):
+            code, said = self.request(f"/ui/needs/{sight}", self.command(choice=0))
+        self.assertEqual((code, said.get("code"), self.commits()), (409, "request_answered", before), said)
+        self.assertEqual(answer(sight), f"Closed by the hub: {missing}")
+        site = raw(title="Let Dev write to beta/site", why="Its fix needs beta/site.", needs_access="repo:beta/site")
+        self.assertIsInstance(site, int, site)
+        # a problem in one source does not stop the list of an account that a source read whole. Bug: each Give of
+        # such an account waits while the door does not answer
+        part = ({"beta": {"name": "beta", "repos": ["beta/site"]}}, ["the door does not answer"])
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "failed": 0.0}), \
+                patch.object(hub, "github_repos_read", return_value=part):
+            self.assertIn(missing, raw(**typo))
+            door = {"address": "100.64.0.9", "port": 8766, "token": "t" * 43, "record": "r" * 43}
+            with patch.object(hub, "door_conf", return_value=door):     # two sources: the other can hold more of beta
+                self.assertIn("The hub cannot tell whether beta/sight exists (its last list of the repositories of "
+                              "beta had a problem: the door does not answer)", raw(**typo))
+        # a saved list that does not hold a name is read again once. Bug: a repository made a moment ago is refused
+        # as one that does not exist
+        made = ({"beta": {"name": "beta", "repos": ["beta/new", "beta/site"]}}, [])
+        with patch.dict(hub.GITHUB_REPOS, {"again": 0.0}), patch.object(hub, "github_repos_read", return_value=made):
+            new = raw(title="Let Dev write to beta/new", why="Its fix needs beta/new.", needs_access="repo:beta/new")
+        self.assertIsInstance(new, int, new)
+        hub.q("DELETE FROM needs WHERE id=?", (new,))
+        # a Give of several repositories reads before LOCK for each of them. Bug: only the first, so a second one of an
+        # account that the App reaches whole waits for a list that no call reads
+        self.reaches("acme/web", "acme/free", whole={"beta": ["beta/site"]})
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0}):
+            both = raw(title="Let Dev write to two repositories", why="Its fix needs acme/free and beta/site.",
+                       needs_access="repo:acme/free, repo:beta/site")
+        self.assertIsInstance(both, int, both)
+        hub.q("DELETE FROM needs WHERE id=?", (both,))
+        # While a read that can tell is still to come, the refusal says only to try again; after a read that ended with
+        # a fault, which can last, it names the fault, and the plain card keeps its checks (test_card_reasons). Bugs:
+        # a Give on a guess; a manager that waits for ever for a read that failed
+        web = dict(title="Let Lead write to acme/web", needs_agent="lead")
+        reach = hub.GITHUB_REACH["reach"]
+        untold = "try again in a minute, and raise no card for this name until it can tell."
+        fault = "so Give does not give it. Check the name with the agent that gave it, and leave needs_agent out."
+        for held, words in (
+                ((patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "reading": Reading(), "part": None, "failed": 0.0}),),
+                 "The hub cannot tell yet whether beta/sight exists (it has no list from the last minute of the "
+                 f"repositories of beta, all of which its GitHub App reaches): {untold}"),
+                ((patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "reading": Reading(), "failed": hub.now() - 70, "part": {
+                    "at": hub.now() - 70, "list": {}, "problem": "the door does not answer"}}),),   # the next read runs
+                 "The hub cannot tell whether beta/sight exists (its last list of the repositories of beta had a "
+                 f"problem: the door does not answer), {fault}"),
+                ((patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "reading": None, "part": None, "failed": hub.now()}),),
+                 "The hub cannot tell whether beta/sight exists (its last read of the list of the repositories of beta "
+                 f"failed), {fault}"),
+                ((patch.dict(hub.GITHUB_REACH, {"at": hub.now() - hub.GITHUB_REACH_FRESH}),
+                  patch.object(hub, "github_reach", lambda wait=0: reach)),     # its next read did not come yet
+                 "The hub cannot tell yet whether acme/old exists (its newest reading of what its GitHub App reaches "
+                 f"is older than a minute): {untold}"),
+                ((patch.dict(hub.GITHUB_REACH, {"reach": None, "error": None}),),
+                 "The hub cannot tell yet whether acme/web exists (it has no reading yet of what its GitHub App "
+                 f"reaches): {untold}"),
+                ((patch.dict(hub.GITHUB_REACH, {"reach": None, "error": "GitHub did not answer"}),),
+                 "The hub cannot tell whether acme/web exists (its last reading of what its GitHub App reaches failed: "
+                 f"GitHub did not answer), {fault}"),
+                ((patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "part": None, "failed": 0.0, "reading": None}),
+                  patch.object(hub, "github_repos_read", return_value=({}, ["the door does not answer"]))),
+                 "The hub cannot tell whether beta/sight exists (its last list of the repositories of beta had a "
+                 f"problem: the door does not answer), {fault}"),
+                ((patch.dict(hub.GITHUB_REACH["reach"], {"many": {"beta"}}),),      # more than the hub reads
+                 "The hub cannot tell whether beta/sight exists (its GitHub App reaches more repositories of beta "
+                 f"than it reads), {fault}"),
+                ((patch.object(hub, "github_app", side_effect=hub.GitHubError("mode 644")),),
+                 f"The hub cannot tell whether acme/web exists (it cannot read its GitHub App file now), {fault}"),
+                ((patch.object(hub, "github_app", lambda: None),
+                  patch.dict(hub.TEAM, {"door": {"address": "100.64.0.9"}})),
+                 f"The hub cannot tell whether acme/web exists (it cannot read its door's file now), {fault}"),
+                ((patch.object(hub, "github_app", lambda: None),),
+                 "The fleet has no GitHub App, so Give gives no token for acme/web. Ask the agent where it saw that "
+                 "name, and check it first. A card for it goes up only as the owner's step to connect GitHub in "
+                 "Founderizer and choose acme/web, without Give")):
+            with self.subTest(words=words), ExitStack() as stack:
+                for one in held:
+                    stack.enter_context(one)
+                self.assertIn(words, raw(**(typo if "beta" in words else old if "acme/old" in words else web)))
+        # A list read that ends with a problem after the call's wait (a door that times out): no read starts again for
+        # a minute, so the next raise names the fault. Bug: each raise starts a read, waits, and the manager is told to
+        # try again for ever (M4)
+        # And the read's end is signalled before its log line, which takes LOCK (M5). Bug: a read thread that waits
+        # for LOCK, which the minute's tick holds while it waits for this read, so the tick waits its full time.
+        gate, seen, real_log = threading.Event(), [], hub.log
+
+        def slow():
+            gate.wait(5)
+            return {}, ["the door does not answer"]
+
+        def logged(agent, what):
+            if "the list of the repositories" in what:
+                seen.append((hub.GITHUB_REPOS["reading"] is None, running.is_set()))
+            return real_log(agent, what)
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "part": None, "failed": 0.0, "reading": None, "told": None}), \
+                patch.object(hub, "github_repos_read", slow), patch.object(hub, "GITHUB_REACH_WAIT", 0.2), \
+                patch.object(hub, "log", logged):
+            self.assertIn("The hub cannot tell yet whether beta/sight exists", raw(**typo))
+            running = hub.GITHUB_REPOS["reading"]       # Vault's Event: the read still runs
+            gate.set()
+            self.assertTrue(running.wait(5))
+            self.assertIn("The hub cannot tell whether beta/sight exists (its last list of the repositories of beta "
+                          "had a problem: the door does not answer)", raw(**typo))
+            for _ in range(100):        # the thread writes its log line just after the end that it signalled
+                if seen:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(seen, [(True, True)])
+        # One wait for all the repositories of a Give (S5). Bug: each waits its own GITHUB_REACH_WAIT, so a Give of
+        # 50 repositories waits 200 seconds before LOCK.
+        gate = threading.Event()
+        with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "part": None, "failed": 0.0, "reading": None}), \
+                patch.object(hub, "github_repos_read", slow), patch.object(hub, "GITHUB_REACH_WAIT", 0.3):
+            t0 = time.monotonic()
+            raw(title="Let Dev write to five repositories", why="Its fix needs them.",
+                needs_access=", ".join(f"repo:beta/part{i}" for i in range(5)))
+            self.assertLess(time.monotonic() - t0, 1.2)
+            running = hub.GITHUB_REPOS["reading"]
+            gate.set()
+            self.assertTrue(running is None or running.wait(5))
+        # and a card from before stays while the hub cannot tell: its press gives, as before. Bug: a press that closes
+        # the owner's card on a guess while GitHub does not answer
+        with patch.dict(hub.GITHUB_REACH, {"reach": None}):
+            self.assertEqual(self.request(f"/ui/needs/{site}", self.command(choice=0))[0], 200)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"].get("beta/site"), "write")
 
     def test_a_give_card_for_several_repositories_closes_by_itself_once_given_another_way(self):
         """And a card for a mailbox, once the owner gave it on its own page (F6 piece 2). Believable bug: a card that
         stays open, so that its press gives what the agent holds already, or that closes before the agent holds it."""
+        self.reaches("acme/api", "acme/docs")
         nid = self.give_card(title="Let Lead read the shop's repositories", why="Its review reads them.",
                              needs_access="repo:acme/api, repo:acme/docs", needs_level="read", needs_agent="lead",
                              options=None)
@@ -963,6 +1317,7 @@ class Resources(OwnerAPI):
     def test_only_a_press_of_give_on_the_mac_or_a_pc_gives(self):
         """A phone shows no Details, so its press gives nothing and answers nothing; Give's words typed give nothing
         either; and a card whose agent left the fleet closes, at a press and by itself."""
+        self.reaches("acme/web")
         nid = self.give_card()
         mail = self.give_card(title="Let Lead answer support@shop.test", why="It answers that mail.", options=None,
                               needs_access="gmail:support@shop.test", needs_level="send", needs_agent="lead")
@@ -1004,6 +1359,7 @@ class Resources(OwnerAPI):
         PC's hand and place (UI-API.md 1.351). A second call that drops the device fails here (its device is a required
         keyword, and None would write the computer's hand); one that reads the address again after Remove device is the
         press race of test_only_a_press_of_give_on_the_mac_or_a_pc_gives."""
+        self.reaches("acme/web")    # Give goes up only for a repository that the App reaches (need_give_reach)
         nid = self.give_card()      # first: since the pool default it keeps the repository as the owner's, a commit
         # the PC in team.json by the hub's own save, so that the Give's commit, which reads team.json again, keeps it
         hub.save_owner_device({"device": "pc", "label": "PC", "address": "127.0.0.6", "base_sha256": None})
@@ -1052,7 +1408,7 @@ class Resources(OwnerAPI):
                              "ORDER BY id DESC LIMIT 1")["text"])
         # what one press cannot give makes no item, and no refusal sends the manager to write the owner's steps; the
         # owner keeps what the default gives first (give_card), since that write reads the team file again
-        for rid in ("tool:jobs", "drive:support@shop.test"):
+        for rid in ("tool:jobs", "tool:crm", "drive:support@shop.test"):
             self.keep(rid)
         hub.TEAM["agents"]["shopper"]["google"] = {"drive": {"account": "old@shop.test", "level": "read"}}
         rows = hub.q1("SELECT COUNT(*) n FROM needs")["n"]
@@ -1125,6 +1481,7 @@ class Resources(OwnerAPI):
         self.assertIn("The agent held that access already", hub.q1("SELECT text FROM events WHERE id=?",
                                                                     (receipt["event_id"],))["text"])
         # the hub counts the open items with Give, and one that replaces another takes its place
+        self.reaches("acme/web")
         with patch.object(hub, "NEED_GIVE_OPEN", 1):
             first = self.give_card()
             self.assertIsInstance(first, int, first)

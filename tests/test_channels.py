@@ -146,7 +146,10 @@ class Gateway:
     def __init__(self):
         self.lock = threading.Lock()
         self.peers, self.received = [], []
-        self.interval, self.ack, self.resume_ok, self.on_identify = 100, True, True, None
+        # 2 s between heartbeats: a test that holds one connection across several waits must not lose it to the
+        # bridge's zombie check (no ACK before the next beat: drop and resume) when a loaded machine delays one ACK
+        # by more than the interval (2 failures in a ship batch at 100 ms). The heartbeat test sets its own 100 ms.
+        self.interval, self.ack, self.resume_ok, self.on_identify = 2000, True, True, None
         self.seq = self.sessions = 0
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), GatewayHandler)
         self.server.daemon_threads, self.server.block_on_close = True, False
@@ -827,6 +830,7 @@ class DiscordTests(Base):
         self.wait_for(lambda: len(self.hub.statuses) >= posts + 2, "the status again without a change")
 
     def test_heartbeat_with_ack_check_then_resume(self):
+        self.gw.interval = 100                       # three beats and the zombie check within the waits
         self.ready()
         first = self.gw.peers[0]
         beats = self.wait_for(lambda: len(self.gw.ops(1, first)) >= 3 and self.gw.ops(1, first), "three heartbeats")

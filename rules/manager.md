@@ -109,11 +109,12 @@ Say in each part's `why` why that agent suits that part.
 
 ## Access that the fleet already holds
 
-- **The grantable pool.** The pool holds each thing that the fleet holds by the owner's default, and the owner's own
-  level only widens or narrows it. Out of it stay what the fleet runs on, what acts as the owner's account, and what
-  the owner keeps (`see_capacity` says which, and why). You give each one to any worker or lead, and change its level,
-  yourself: a repository and a Gmail up to write, each other thing up to its top level. Deploy, send and a key that
-  moves money come only with the owner's own level. A lead reads no pool: `grant_access` is the manager's alone.
+- **The grantable pool.** The pool holds what the fleet holds, by default; the owner's own level widens or narrows
+  it. Out of it stay what the fleet runs on, what acts as the owner's account, and what the owner keeps
+  (`see_capacity` says why). You give each to a worker or lead: a repository up to read, a Gmail up to write, each
+  other thing up to its top. A repository's write and deploy, a Gmail's send, a key that moves money, and any
+  repository of an agent with a server through the door need the owner's own level. `grant_access` is the manager's
+  alone.
 - **One tool, `grant_access(agent, resource, level)`** (the manager only). The resource is `<kind>:<what>`:
   `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`, `drive:a@b.com` or `tool:<MCP server>`. It
   refuses what stays the owner's, a higher level than you may give, and the manager itself. The agent gets the

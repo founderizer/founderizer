@@ -1001,13 +1001,17 @@ class TeamChanges(Remove):
         return patch.object(hub, "google_services_now", lambda: ({self.MAIL: tuple(services)}, bad))
 
     @contextlib.contextmanager
-    def reaches(self, *repos, read=True):
+    def reaches(self, *repos, read=True, whole=None):
         """The fleet's GitHub App, and its reading now (none yet, with read False): it reaches these repositories of
-        acme, whose installation page is the one that a refusal names."""
-        reach = {"pages": {"acme": "https://github.com/organizations/acme/settings/installations/7"}, "all": set(),
+        acme, whose installation page is the one that a refusal names, and each repository of the accounts of whole
+        ({account: its repositories}), whose list the hub read a moment ago too (github_repo_known)."""
+        whole = whole or {}
+        reach = {"pages": {"acme": "https://github.com/organizations/acme/settings/installations/7"}, "all": set(whole),
                  "repos": set(repos), "install": "https://github.com/apps/fleet/installations/new"}
         with patch.object(hub, "github_app", lambda: ("7", "key")), \
-                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reach": reach if read else None, "reading": False}):
+                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reach": reach if read else None, "reading": False}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": {
+                    a: {"name": a, "repos": sorted(r)} for a, r in whole.items()}}):
             yield
 
     def mailbox_plan(self):
@@ -1025,6 +1029,30 @@ class TeamChanges(Remove):
                                    {"resource": "tool:crm", "level": "use"},
                                    {"resource": "repo:acme/web", "level": "deploy"}]}],
                       title="Add Support for the mailbox?")
+
+    def test_a_press_reads_the_list_of_an_all_repositories_account_first(self):
+        """The coordinator's validator, P2: a plan's repository of an account whose installation has all of its
+        repositories passes only when the hub's list of the last minute names it, and the owner's press checks it
+        again. Bug: after a quiet minute each press answers that the hub has not listed the repositories yet, and
+        nothing lists them, so the card never goes through."""
+        self.box2()
+        whole = {"pages": {}, "all": {"acme"}, "repos": set(), "install": None}
+        listed = {"acme": {"name": "acme", "repos": ["acme/web"]}}
+
+        def listing():
+            hub.GITHUB_REPOS.update(at=hub.now(), list=listed)
+            return listed, None
+        with patch.object(hub, "github_app", lambda: ("7", "key")), patch.object(hub, "github_repo_list", listing), \
+                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reach": whole, "reading": False}):
+            with patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": listed}):
+                self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                            "runtime": "codex", "profile": SECTIONS,
+                            "access": [{"resource": "repo:acme/web", "level": "read"}]}])
+            with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None, "failed": 0.0, "reading": None}), \
+                    patch.object(hub, "team_plan_end"):
+                status, answer = self.press(0)          # a minute later: the list is old
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(self.origin_team()["agents"]["nova"]["repos"], {"acme/web": "read"})
 
     def test_an_add_gives_its_new_agent_the_access_of_its_plan_with_the_press(self):
         """Bug: the owner presses yes on an agent for a mailbox, and the agent comes without it, so the owner must find
@@ -1125,8 +1153,15 @@ class TeamChanges(Remove):
             with self.assertRaises(hub.ToolError) as refused:
                 hub.grant_check("manager", f"gmail:{self.MAIL}", "read")
             self.assertIn("You never grant to yourself. " + step.format(f"gmail:{self.MAIL}"), str(refused.exception))
-            self.assertIn("Not raised: no agent of the fleet can hold the GitHub repository acme/new (repo:acme/new). "
-                          + step.format("repo:acme/new"), hub.card_access("repo:acme/new", "write") or "")
+            # the App reaches acme/new, so the pool default covers it: the words end in a step only where no agent
+            # could take it, which grant_check says as grant_fits does in a real fleet
+            with patch.object(hub, "grant_check", side_effect=hub.ToolError("no agent can take it")):
+                self.assertIn("Not raised: no agent of the fleet can hold the GitHub repository acme/new "
+                              "(repo:acme/new). " + step.format("repo:acme/new"),
+                              hub.card_access("repo:acme/new", "write") or "")
+            # a repository that only the App reaches: the default gives read (DEFAULT_TOP), so read is the manager's
+            self.assertIn('is yours to give: grant_access(agent="<the agent that needs it>", resource="repo:acme/new", '
+                          'level="read")', hub.card_access("repo:acme/new", "read") or "")
             self.assertIn(f"needs_access names gmail:{self.MAIL} in words. Give it as gmail:{self.MAIL}",
                           hub.card_access(f"Gmail of {self.MAIL} for the support work", None) or "")
             # the service that the words say, though the account allows only the other one: card_dead then sends it
@@ -1472,6 +1507,36 @@ class TeamChanges(Remove):
                           "(needs_access repo:acme/typo) to add it at "
                           "https://github.com/organizations/acme/settings/installations/7",
                           refused_access([{"resource": "repo:acme/typo", "level": "read"}]))
+        # an account whose installation has all of its repositories: only a name that the hub's list holds, so a plan
+        # carries no invented name, whose token request would fail for each repository of the account there (the
+        # coordinator's validator). Bug: acme/typo passes by its account alone
+        whole = {"pages": {}, "all": {"acme"}, "repos": set(), "install": None}
+        with patch.object(hub, "github_app", lambda: ("7", "key")), \
+                patch.object(hub, "github_repo_list", lambda: ({}, "not now")), \
+                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reach": whole, "reading": False}):
+            with patch.dict(hub.GITHUB_REPOS, {"at": hub.now(), "list": {"acme": {"name": "acme", "repos": ["acme/web"]}}}):
+                self.assertIn("GitHub lists no repository acme/typo of acme, whose every repository the fleet's GitHub "
+                              "App reaches: it does not exist, or it is archived",
+                              refused_access([{"resource": "repo:acme/typo", "level": "read"}]))
+            # with no list of the last minute (a door that cannot list), only a missing name is refused: a plan never
+            # waits for a list that may not come (the rule agreed with the Needs-you area)
+            with patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "list": None}):
+                self.assertIsNone(hub.team_repo_refusal("acme/web"))
+        # A name that the list of an account that the App reaches whole does not hold does not exist, and the call reads
+        # that list first (github_repo_ahead). Bug: a guessed name goes up on the owner's plan card (the owner's card
+        # N-327, 26 November 2026), and their Yes grants a repository that does not exist.
+        listed = ({"beta": {"name": "beta", "repos": ["beta/site"]}}, [])
+        with self.reaches(whole={"beta": ["beta/site"]}), \
+                patch.dict(hub.GITHUB_REPOS, {"at": 0.0, "failed": 0.0, "reading": None}), \
+                patch.object(hub, "github_repos_read", return_value=listed):
+            said, error = hub.call_tool("manager", "change_team", {
+                "request_id": str(uuid.uuid4()), "title": "Change the team?", "why": "The records show the need.",
+                "changes": [{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                             "runtime": "codex", "profile": SECTIONS,
+                             "access": [{"resource": "repo:beta/ghost", "level": "read"}]}]})
+        self.assertTrue(error, said)
+        self.assertIn("GitHub lists no repository beta/ghost of beta, whose every repository the fleet's GitHub App "
+                      "reaches: it does not exist, or it is archived. Check its name, then write the plan again.", said)
         with self.reaches(read=False), self.assertRaises(hub.TeamPassing) as waits:     # before its first reading
             self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
                         "runtime": "codex", "profile": SECTIONS,

@@ -197,15 +197,17 @@ class StartingHub(unittest.TestCase):
                                 env=dict(os.environ, HOME=str(self.root)))     # its timer sweeps ~/.fleet/attachments
         self.addCleanup(self.stop, proc)
         base = f"http://127.0.0.1:{port}"
-        for _ in range(100):
+        deadline = time.monotonic() + 120  # until it answers or ends: a start on a loaded sandbox takes long
+        while True:
             if proc.poll() is not None:
                 self.fail("the hub did not start: " + proc.stdout.read())
             try:
                 get(base + "/health")
                 return proc, base
             except (urllib.error.URLError, OSError):
-                time.sleep(0.1)
-        self.fail("the hub never answered")
+                if time.monotonic() > deadline:
+                    self.fail("the hub never answered in 120 s")
+                time.sleep(0.2)
 
     def test_a_hub_whose_database_refuses_a_step_still_answers_and_says_so(self):
         db = old_trigger_runs(fleet_database(self.root / "bad.db"))

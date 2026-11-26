@@ -843,14 +843,14 @@ class DoorTokens(Access):
         StubDoor.answers["/github/reach"] = (200, {
             "pages": {"acme": org, "evil": "https://evil.example/settings", "bob": org.replace("Acme", "other"),
                       "solo": "https://github.com/settings/installations/6"},
-            "all": ["Solo", "not a login!"], "repos": ["acme/web", "ACME/Ops", "acme/x y"],
+            "all": ["Solo", "not a login!"], "repos": ["acme/web", "ACME/Ops", "acme/x y"], "many": ["Solo", 7],
             "install": "https://github.com/apps/fleet-app/installations/new"})
         with patch.object(hub, "github_app", lambda: None):
             reach = hub.github_reach_read()
             self.assertEqual(reach, {"pages": {"acme": org, "solo": "https://github.com/settings/installations/6"},
                                      "all": {"solo"}, "repos": {"acme/web", "acme/ops"},
                                      "install": "https://github.com/apps/fleet-app/installations/new",
-                                     "owners": set()})
+                                     "owners": set(), "many": {"solo"}})
             self.assertEqual(StubDoor.calls[-1][:3], ("GET", "/github/reach", "Bearer token-secret"))
             hub.github_reach_refresh()
             self.assertEqual(hub.github_unreached(["acme/web", "acme/site", "solo/any", "new/y"]),
@@ -1059,6 +1059,35 @@ class DoorTokens(Access):
         self.assertIn("at write at most", hub.grant_check("studio", "repo:acme/newapp", "deploy"))
         self.assertIn("holds a server through the door", hub.grant_check("vps", "repo:acme/newapp", "read"))
         self.assertIn("not in the grantable pool", hub.grant_check("studio", "repo:acme/other", "read"))
+        # A repository that the fleet holds goes by the default at read, but the door commits for an Operator to each
+        # repository that it holds, at any level (DoorAccess.operatorGitHub): only the owner's own level of write
+        # opens it (the Door area's read of 26 November 2026). Bug: a default read to an Operator becomes the door's
+        # commits, whose push the repository's jobs run beside their secrets.
+        team["agents"]["studio"]["repos"] = {"acme/site": "read"}
+        self.write_team(team)
+        self.assertIsNone(hub.grant_check("studio", "repo:acme/site", "read"))
+        said = hub.grant_check("vps", "repo:acme/site", "read")
+        self.assertIn("only the owner's own level of write", said)
+        # and it names the one route that settles it, so the manager does not loop between grant_access and a card:
+        # the agent that holds it at that level does that part (card_access refuses the owner's card then), else the
+        # owner's card for this agent (the coordinator's validator of 26 November 2026)
+        self.assertIn("studio holds it at that level: give that part of the work to studio with create_task", said)
+        self.assertNotIn("raise_needs_you", said)
+        self.assertIsNotNone(hub.card_access("repo:acme/site", "read", agent="vps"))
+        said = hub.grant_check("vps", "repo:acme/site", "write")
+        self.assertIn('raise_needs_you(needs_access="repo:acme/site", needs_level="write", needs_agent="vps")', said)
+        self.assertIsNone(hub.card_access("repo:acme/site", "write", agent="vps"))
+        team["resources"] = {"repo:acme/site": {"max": "read"}}
+        self.write_team(team)
+        self.assertIn("only the owner's own level of write", hub.grant_check("vps", "repo:acme/site", "read"))
+        # the pool that see_capacity shows names no agent that grant_check refuses
+        def eligible():
+            return {p["resource"]: p["eligible"] for p in hub.grant_pool(["studio", "vps"])}["repo:acme/site"]
+        self.assertEqual(eligible(), ["studio"])
+        team["resources"] = {"repo:acme/site": {"max": "write"}}
+        self.write_team(team)
+        self.assertIsNone(hub.grant_check("vps", "repo:acme/site", "read"))
+        self.assertEqual(eligible(), ["studio", "vps"])
 
     def test_the_manager_reads_the_record(self):
         """Since 11 November 2026 the door calls no model: a call outside the rules is the agent's own call, and the

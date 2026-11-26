@@ -136,14 +136,17 @@ class SessionSurvivesRestart(unittest.TestCase):
                                      pass_fds=fds, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=KIT,
                                      # a home of this test's own: ~/.fleet holds the owner's files of this machine
                                      env=dict(os.environ, HOME=self.tmp))
-        for _ in range(100):
+        deadline = time.monotonic() + 120  # until it answers or ends: a start on a loaded sandbox takes long
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                self.fail("the hub ended before it answered")
             try:
                 if self.request("GET", "/health")[0] == 200:
                     return
             except OSError:
                 pass
-            time.sleep(0.1)
-        self.fail("the hub did not start")
+            time.sleep(0.2)
+        self.fail("the hub did not start in 120 s")
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:

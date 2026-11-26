@@ -35,6 +35,7 @@ Standard library only, as `mcp.py` and `hubsetup.py` are. Tests: `test_owner_mcp
 """
 
 import argparse
+import base64
 import collections
 import contextlib
 import fcntl
@@ -51,6 +52,7 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -60,6 +62,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 
 NAME = "founderizer-owner"
 VERSION = "1"
@@ -349,8 +352,6 @@ NOT_TOOLS = {
     "/ui/people/{}/links": "an invite to a member's Founderizer app (Founderizer for Teams), whose one line lets a "
                            "device ask to join: a tool's answer stays in a model's transcript, and an invite must not; "
                            "the owner's app writes it into the file that the owner sends",
-    "/ui/company": "the company's name and logo (Founderizer for Teams): its tool, save_company, comes with the next "
-                   "piece of that build, which takes this line out",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
     "/ui/owner/devices/{}/recovery": "the recovery code, sealed on the owner's own Mac to a phone's own key once that key "
                                      "matches the one-time value of that app's QR",
@@ -1493,6 +1494,290 @@ def read_attachment(args):
     write_here(place, answer.raw, folder)
     return {"attachment": number, "path": str(place), "bytes": len(answer.raw), "sha256": digest,
             "mime": (answer.headers.get("Content-Type") or "").split(";")[0].strip()}
+
+
+# ---- the company's name and logo (Founderizer for Teams; owner API 1.349, decisions D87, D88, D90 and D115)
+#
+# **The logo is a PNG of 64 x 64 pixels in at most 12,288 bytes** (teams_company.PNG_SIDE and PNG_MOST, which
+# test_teams_company holds these two to; the table carries them as COMPANY_LOGO for the program inside the app, with
+# the words that both programs say for a picture that does not go). The one rule of the picture, the same in the
+# program inside the app (`CompanyLogo`, which the app's Settings rows use too):
+# - A whole PNG of that size goes as it is, with its colour profile, which the hub keeps (D115): whole by a walk of its
+#   chunks here (`logo_as_is`). Any other PNG of that size is drawn again, as any other picture.
+# - Each kind of file that the system's picture code of the app does not read is no picture here either, also where
+#   sips reads it: `sips --formats` lists two that ImageIO's CGImageSourceCopyTypeIdentifiers() does not, a PDF and an
+#   SVG (macOS 27.0.1), and a PostScript file (EPS) is turned by sips into a PDF first (`not_a_picture_here`). So a
+#   wrong path to a document sends no picture of its first page.
+# - A picture of more than LOGO_PIXELS_MOST pixels is refused before it is decoded (a few MB of PNG can make sips or
+#   ImageIO take gigabytes).
+# - Any other picture is fitted whole into the square, centred, on a clear ground (scaled up when small, never cut;
+#   `fitted_size`), turned as its EXIF says, in sRGB, with the chunks IHDR, sRGB, IDAT and IEND alone (no profile,
+#   text, EXIF or time), and takes fewer colour bits, step by step, until it fits. The deflate is zlib's at level 9 in
+#   both programs (the app links the system's libz), so the same pixels give the same bytes; the pixels themselves are
+#   scaled by sips here and by CoreGraphics there, and can differ (OWNER-MCP.md says so).
+# Nothing leaves this computer before the file is a picture here.
+LOGO_SIDE = 64
+LOGO_MOST = 12288
+LOGO_PIXELS_MOST = 100_000_000
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_CRITICAL = (b"IHDR", b"PLTE", b"IDAT", b"IEND")
+SIPS = "/usr/bin/sips"          # macOS's own picture program: this file has no picture code of the standard library
+SRGB = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+SIPS_WAIT = 60
+# The words of save_company, the same in the program inside the app (`CompanyLogo`). They name no path of this Mac.
+COMPANY_NOTHING = "Give name, logo_file or both: a field left out stays as it is, so nothing was sent."
+LOGO_FILE = "logo_file must be the path of a picture file on this Mac, or null to remove the logo."
+LOGO_NOT_A_FILE = "logo_file is not a file on this Mac."
+LOGO_NOT_A_PICTURE = ("logo_file is not a picture that this Mac can read: give a PNG, a JPEG or another picture file. "
+                      "Nothing was sent.")
+LOGO_TOO_MANY_PIXELS = ("logo_file is a picture of more than 100 million pixels, too large to read here: give a "
+                        "smaller picture. Nothing was sent.")
+LOGO_TOO_LARGE = ("logo_file does not fit in 12,288 bytes as a PNG of 64 x 64 px, also with the fewest colours: give "
+                  "a simpler picture. Nothing was sent.")
+# The words of this program alone: the program inside the app has macOS's picture code, and no copy or command.
+LOGO_NO_SIPS = ("logo_file is not a PNG of 64 x 64 px in at most 12,288 bytes, and this computer has no sips to make "
+                "one from it: give such a PNG. Nothing was sent.")
+LOGO_NOT_COPIED = "logo_file could not be copied on this Mac to be read: {}. Nothing was sent."
+LOGO_SIPS_LATE = f"sips did not finish reading logo_file in {SIPS_WAIT} seconds. Nothing was sent."
+LOGO_SIPS_STOPPED = "sips stopped while it read logo_file (signal {}). Nothing was sent."
+LOGO_AS_IS = "The picture went as it was: a PNG of 64 x 64 px."
+LOGO_MADE, LOGO_FITTED, LOGO_FEWER = ("The picture went as a PNG of 64 x 64 px", "fitted whole on a clear ground",
+                                      "with fewer colours")
+# OwnerHub.olderHub of the program inside the app, which it adds to each answer of a hub that does not know a route or
+# a field: save_company says it too, for its route (owner API 1.349), which a hub of an older release does not serve.
+OLDER_HUB = ("This hub can be older than the Founderizer app on this Mac: a route or a field that it does not know yet "
+             "comes with its next update.")
+
+
+def save_company(args):
+    """`POST /ui/company` (owner API 1.349): the company's name, its logo, or both, which a member's app shows over the
+    company's agents from a later release. A field left out stays as it is, and null removes it. The logo goes as the
+    PNG that `company_logo` makes from the file, and never as the file's own bytes unless the file is such a PNG. The
+    answer: the hub's two values, and with a file, in words, what went."""
+    if "name" not in args and "logo_file" not in args:
+        raise Refused(COMPANY_NOTHING)
+    body, said = {}, None
+    if "name" in args:
+        body["name"] = args["name"]
+    if "logo_file" in args:
+        if args["logo_file"] is None:
+            body["png"] = None
+        else:
+            png, said = company_logo(args["logo_file"])
+            body["png"] = base64.b64encode(png).decode("ascii")
+    try:
+        answer = command("/ui/company", body, "the company's name and logo", args.get("request_id"))
+    except Refused as e:
+        if str(e).endswith("(404): not found"):     # hub.py's dispatch for a route that it does not serve
+            raise Refused(f"{e}\n{OLDER_HUB}") from None
+        raise
+    data = answer if isinstance(answer, dict) else {}
+    return dict({"name": data.get("name"), "logo": data.get("logo")}, **({"picture": said} if said else {}))
+
+
+def company_logo(where):
+    """**The logo's PNG from a picture file of this Mac**, and the words of what was done. The file is checked here as
+    a picture before any byte leaves: a whole PNG of 64 x 64 in at most LOGO_MOST bytes goes as it is (`logo_as_is`),
+    and every other file goes only as the PNG that this server draws from what sips read in it (`sips_fit`,
+    `logo_made`), so a wrong path (a text, a key, a document) sends nothing of the file."""
+    if not isinstance(where, str) or not where.strip():
+        raise Refused(LOGO_FILE)
+    place = local_place(where)              # a NUL first, before "~" is expanded
+    if not place.is_file():
+        raise Refused(LOGO_NOT_A_FILE)
+    try:                                    # the size first: a file far above the limit is never read whole
+        size = place.stat().st_size
+        if size > ATTACH_MAX:
+            raise Refused(f"logo_file is {size} bytes; a picture for the logo is at most "
+                          f"{ATTACH_MAX // (1024 * 1024)} MiB.")
+        data = place.read_bytes()
+    except OSError as e:
+        raise Refused(f"logo_file could not be read on this Mac: {e.strerror or e}.") from None
+    if len(data) > ATTACH_MAX:              # it grew between the two reads
+        raise Refused(f"logo_file is {len(data)} bytes; a picture for the logo is at most "
+                      f"{ATTACH_MAX // (1024 * 1024)} MiB.")
+    if logo_as_is(data):
+        return data, LOGO_AS_IS
+    if not_a_picture_here(data):
+        raise Refused(LOGO_NOT_A_PICTURE)
+    if not os.path.isfile(SIPS):
+        raise Refused(LOGO_NO_SIPS)
+    return logo_made(*sips_fit(data))
+
+
+def logo_as_is(data):
+    """**A whole PNG of LOGO_SIDE x LOGO_SIDE in at most LOGO_MOST bytes, which the hub takes as it is**: the signature,
+    IHDR first with that size, each chunk whole with its CRC, no critical chunk but those of PNG_CRITICAL, not both
+    sRGB and iCCP, and IEND last with no byte after it. The hub checks the rest (teams_company.png_kept). Any other
+    file is drawn again (`company_logo`), and never refused for this."""
+    if len(data) > LOGO_MOST or data[:16] != PNG_SIGNATURE + b"\x00\x00\x00\x0dIHDR" or \
+            data[16:24] != struct.pack(">II", LOGO_SIDE, LOGO_SIDE):
+        return False
+    at, kinds = len(PNG_SIGNATURE), []
+    while at < len(data) and kinds[-1:] != [b"IEND"]:
+        if at + 12 > len(data):
+            return False
+        length, kind = struct.unpack(">I4s", data[at:at + 8])
+        end = at + 12 + length
+        if end > len(data) or not kind.isalpha() or \
+                zlib.crc32(data[at + 4:end - 4]) != struct.unpack(">I", data[end - 4:end])[0]:
+            return False
+        kinds.append(kind)
+        at = end
+    return at == len(data) and kinds[-1:] == [b"IEND"] and not (b"sRGB" in kinds and b"iCCP" in kinds) and \
+        all(kind in PNG_CRITICAL for kind in kinds if kind[:1].isupper())
+
+
+def not_a_picture_here(data):
+    """A kind of file that sips reads and the app's ImageIO does not, so no picture in either program: a PDF (its
+    `%PDF-` may come after other bytes in its first 1,024), a PostScript or EPS file (`%!`), and a text that starts
+    with `<` after white space or a UTF-8 BOM (an SVG, an XML or HTML file)."""
+    return b"%PDF-" in data[:1024] or data.startswith(b"%!") or \
+        data.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n").startswith(b"<")
+
+
+def fitted_size(width, height):
+    """**The frame of a picture in the square**, the same in both programs (`CompanyLogo.fittedSize`): the longer side
+    is LOGO_SIDE, and the shorter one in proportion, rounded half up in whole numbers, and at least 1 pixel."""
+    long, short = max(width, height), min(width, height)
+    fitted = max(1, (2 * short * LOGO_SIDE + long) // (2 * long))
+    return (LOGO_SIDE, fitted) if width >= height else (fitted, LOGO_SIDE)
+
+
+def sips_run(argv):
+    """One command of sips, with no shell: its answer, or this program's words for a command that did not end."""
+    try:
+        done = subprocess.run([SIPS, *argv], stdin=subprocess.DEVNULL, capture_output=True, timeout=SIPS_WAIT)
+    except subprocess.TimeoutExpired:
+        raise Refused(LOGO_SIPS_LATE) from None
+    except (OSError, subprocess.SubprocessError):
+        raise Refused(LOGO_NOT_A_PICTURE) from None
+    if done.returncode < 0:
+        raise Refused(LOGO_SIPS_STOPPED.format(-done.returncode))
+    return done
+
+
+def sips_fit(data):
+    """**The picture fitted into the square by sips**, turned as its EXIF says, in sRGB, as (width, height, RGBA rows):
+    first its size (`sips -g`), refused above LOGO_PIXELS_MOST before any decode; then the frame of `fitted_size`,
+    which sips takes as it stores the picture and gives turned (`-z`), in a BMP, which has no orientation, so sips
+    turns the picture itself. It reads a copy in a folder of its own, which goes at the end."""
+    try:
+        folder = tempfile.mkdtemp(prefix="founderizer-logo-")
+    except OSError as e:
+        raise Refused(LOGO_NOT_COPIED.format(e.strerror or "an error of the system")) from None
+    try:
+        source, fitted = os.path.join(folder, "picture"), os.path.join(folder, "fitted.bmp")
+        try:
+            with open(source, "xb") as copy:
+                copy.write(data)
+        except OSError as e:
+            raise Refused(LOGO_NOT_COPIED.format(e.strerror or "an error of the system")) from None
+        done = sips_run(["-g", "pixelWidth", "-g", "pixelHeight", source])
+        # A size with a fraction is how sips gives a document's (a PDF of 200 x 100 points: "200.000"): taken as a
+        # size, so that no document stops here by its form, and not_a_picture_here alone keeps documents out.
+        found = {name: round(float(value)) for name, value in re.findall(
+            r"^\s*(pixelWidth|pixelHeight): (\d+(?:\.\d+)?)\s*$", done.stdout.decode("utf-8", "replace"), re.M)}
+        if done.returncode != 0 or len(found) != 2 or not found["pixelWidth"] or not found["pixelHeight"]:
+            raise Refused(LOGO_NOT_A_PICTURE)
+        width, height = found["pixelWidth"], found["pixelHeight"]
+        if width * height > LOGO_PIXELS_MOST:
+            raise Refused(LOGO_TOO_MANY_PIXELS)
+        frame = fitted_size(width, height)
+        done = sips_run(["-s", "format", "bmp", "-z", str(frame[1]), str(frame[0]), "--matchTo", SRGB, source,
+                         "--out", fitted])
+        if done.returncode != 0 or not os.path.isfile(fitted):
+            raise Refused(LOGO_NOT_A_PICTURE)
+        with open(fitted, "rb") as bmp:
+            made = bmp_pixels(bmp.read())
+        if made[:2] not in (frame, frame[::-1]):        # turned, or not, by its EXIF
+            raise Refused(LOGO_NOT_A_PICTURE)
+        return made
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def bmp_pixels(data):
+    """(width, height, RGBA rows from the top) of the BMP that sips writes: 24 bits of BGR, or 32 bits of BGRA with the
+    masks of that order, its rows from the top or from the bottom, each padded to 4 bytes. Any other: not a picture."""
+    try:
+        start, header, width, height, _planes, bits, packing = struct.unpack("<10xIIiiHHI", data[:34])
+        masks = struct.unpack("<IIII", data[54:70]) if bits == 32 else None
+    except struct.error:
+        raise Refused(LOGO_NOT_A_PICTURE) from None
+    down = abs(height)
+    if data[:2] != b"BM" or not 0 < width <= LOGO_SIDE or not 0 < down <= LOGO_SIDE or \
+            (bits, packing) not in ((24, 0), (32, 3)) or \
+            masks not in (None, (0xFF0000, 0xFF00, 0xFF, 0xFF000000)) or header < (108 if masks else 40):
+        raise Refused(LOGO_NOT_A_PICTURE)
+    size, stride = bits // 8, (width * bits // 8 + 3) // 4 * 4
+    if start + down * stride > len(data):
+        raise Refused(LOGO_NOT_A_PICTURE)
+    rows = bytearray()
+    for y in range(down):
+        at = start + (y if height < 0 else down - 1 - y) * stride
+        for x in range(at, at + width * size, size):
+            rows += bytes((data[x + 2], data[x + 1], data[x], data[x + 3] if size == 4 else 255))
+    return width, down, bytes(rows)
+
+
+def logo_made(width, height, pixels):
+    """**The logo's PNG from RGBA rows of at most LOGO_SIDE pixels a side**: centred on a clear square of LOGO_SIDE
+    (left and top rounded down), at 8 bits a sample, then 7, 6, ... 1, until the PNG fits LOGO_MOST bytes; with the
+    words of what was done. Never fits: LOGO_TOO_LARGE."""
+    canvas = bytearray(LOGO_SIDE * LOGO_SIDE * 4)
+    left, top = (LOGO_SIDE - width) // 2, (LOGO_SIDE - height) // 2
+    for y in range(height):
+        at = ((top + y) * LOGO_SIDE + left) * 4
+        canvas[at:at + width * 4] = pixels[y * width * 4:(y + 1) * width * 4]
+    for bits in range(8, 0, -1):
+        png = png_of(fewer_bits(canvas, bits))
+        if len(png) <= LOGO_MOST:
+            said = [LOGO_MADE] + [LOGO_FITTED] * (width != height) + [LOGO_FEWER] * (bits < 8)
+            return png, ", ".join(said) + "."
+    raise Refused(LOGO_TOO_LARGE)
+
+
+def fewer_bits(canvas, bits):
+    """Each sample of the RGBA canvas at 2 ** bits levels from 0 to 255, 0 and 255 among them (8 bits: as it is), and
+    each pixel that is then wholly clear made clear black, so that no colour stays hidden in it."""
+    most = (1 << bits) - 1
+    out = bytearray(canvas).translate(bytes(((v * most + 127) // 255 * 255 + most // 2) // most for v in range(256)))
+    for alpha in range(3, len(out), 4):
+        if not out[alpha]:
+            out[alpha - 3:alpha] = b"\x00\x00\x00"
+    return bytes(out)
+
+
+def png_of(rgba):
+    """A PNG of LOGO_SIDE x LOGO_SIDE RGBA pixels of 8 bits in sRGB: IHDR, sRGB (perceptual), one IDAT and IEND, and no
+    other chunk: no profile, text, EXIF or time. Each row takes the filter whose bytes, read as signed, have the least
+    sum of sizes, the first one on a tie (the PNG book's way)."""
+    stride, raw, prior = LOGO_SIDE * 4, bytearray(), bytes(LOGO_SIDE * 4)
+    for y in range(LOGO_SIDE):
+        row = rgba[y * stride:(y + 1) * stride]
+        left, above_left = bytes(4) + row[:-4], bytes(4) + prior[:-4]
+        made = (row, bytes((r - a) & 255 for r, a in zip(row, left)),
+                bytes((r - b) & 255 for r, b in zip(row, prior)),
+                bytes((r - (a + b) // 2) & 255 for r, a, b in zip(row, left, prior)),
+                bytes((r - paeth(a, b, c)) & 255 for r, a, b, c in zip(row, left, prior, above_left)))
+        sums = [sum(v if v < 128 else 256 - v for v in one) for one in made]
+        kind = sums.index(min(sums))
+        raw += bytes((kind,)) + made[kind]
+        prior = row
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return PNG_SIGNATURE + chunk(b"IHDR", struct.pack(">IIBBBBB", LOGO_SIDE, LOGO_SIDE, 8, 6, 0, 0, 0)) + \
+        chunk(b"sRGB", b"\x00") + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+
+
+def paeth(a, b, c):
+    """The Paeth predictor of PNG's filter 4: of the bytes left, above and above-left, the one nearest to left + above
+    - above-left."""
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    return a if pa <= pb and pa <= pc else b if pb <= pc else c
 
 
 def with_revision(route, read, fields, what):
@@ -5330,6 +5615,16 @@ def tools():
              {"settings": {"type": "object"}, "runtime_facts": {"type": "object"}, "only_unset": S["bool"], **rid}, (),
              plain("/ui/settings", ("settings", "runtime_facts", "only_unset"), "these settings")),
         tool("Team",
+             "save_company", "The company's name and logo, for Founderizer for Teams, which a member's app shows "
+                             "over the company's agents from a later release. name: one line of at most 60 "
+                             "characters, or null to remove it. logo_file: the path of a picture file on this Mac, "
+                             "or null to remove the logo. A whole PNG of 64 x 64 px in at most 12,288 bytes, as the "
+                             "hub takes it, goes as it is, with its colour profile; any other picture goes as such "
+                             "a PNG in sRGB, fitted whole on a clear ground, and the answer's picture says which. A "
+                             "field left out stays as it is.",
+             {"name": {"type": ["string", "null"]}, "logo_file": {"type": ["string", "null"]}, **rid}, (),
+             save_company),
+        tool("Team",
              "reload_team", "Apply team.json from a pushed revision of the configuration ref without restarting the "
                             "hub. The hub refuses to move its checkout past the code it serves, so a revision that "
                             "carries a code change needs a release and not this.",
@@ -5830,7 +6125,8 @@ MAP_HEAD = "Pick a tool by its job. Each tool's words start with its category. S
 # "Let SSH in from my office address to the new AWS server" to machine_access, until cloud_step had its gloss. A gloss
 # has no ", ": the map's readers in test_owner_mcp and in the Swift tests split a line of the map there. It names no
 # check, which the program inside the app does not have (piece B2).
-GLOSSES = {"activate_agent": "on or off", "trigger_state": "a wake-up rule",
+# save_company's name does not say its logo, the word that an owner who sends a picture uses.
+GLOSSES = {"activate_agent": "on or off", "trigger_state": "a wake-up rule", "save_company": "name and logo",
            "cloud_look": "a server at AWS or Azure or Google Cloud",
            "cloud_step": "one step there: its firewall; the server; SSH in or out"}
 
@@ -5873,6 +6169,8 @@ def instructions(listed):
 SWIFT_READS = ("fleet_overview", "fleet_read", "search_history", "see_costs")
 SWIFT_WRITES = ("save_profile", "attach_file", "read_attachment", "take_backup", "grant_access", "share_resource",
                 "send_message", "answer_needs_you", "decline_secret_request",
+                # the company's logo, which the program draws with the system's picture code (`CompanyLogo`)
+                "save_company",
                 # design 9's tools of a cloud (piece B2): written again in Swift from the same recipe
                 # (`cloud_recipes`), in OwnerCloud.swift
                 "cloud_look", "cloud_step", "cloud_remove")
@@ -5945,7 +6243,10 @@ def dump_tools(listed=None):
              "PAGES": {page: list(found) for page, found in PAGES.items()}, "PAGE_QUERY": list(PAGE_QUERY),
              "PAGE_TAKES": {page: list(words) for page, words in PAGE_TAKES.items()},
              "PAGE_WORDS": list(PAGE_WORDS), "PAGE_IN_PATH": list(PAGE_IN_PATH), "HISTORY_WORDS": list(HISTORY_WORDS),
-             "COSTS_WORDS": list(COSTS_WORDS), "MEDIA_TYPES": dict(MEDIA_TYPES), "cloud_recipes": CLOUD_RECIPES}
+             "COSTS_WORDS": list(COSTS_WORDS), "MEDIA_TYPES": dict(MEDIA_TYPES), "cloud_recipes": CLOUD_RECIPES,
+             "COMPANY_LOGO": {"side": LOGO_SIDE, "most": LOGO_MOST, "pixels_most": LOGO_PIXELS_MOST,
+                              "not_a_picture": LOGO_NOT_A_PICTURE, "too_many_pixels": LOGO_TOO_MANY_PIXELS,
+                              "too_large": LOGO_TOO_LARGE, "older_hub": OLDER_HUB}}
     table["version"] = hashlib.sha256(json.dumps(table, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return table
 
