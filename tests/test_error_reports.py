@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import unittest.mock
 import uuid
 
@@ -967,6 +968,34 @@ class HealthOnTheHub(OnTheHub):
         for piece in (host, link, address, "unable to access", "resolve", row["revision"], "f" * 40, "e" * 40, agent,
                       step, why, "Page 7", "duplicate column", "database"):
             self.assertNotIn(piece, text)
+
+    def test_a_central_vault_that_never_answered_is_the_vault_code_of_the_hub(self):
+        """A test fleet's central vault was never installed (23 and 25 November 2026), and our side saw nothing: the
+        hub told nobody, because no central vault ever answered, and the report's code `vault` read only a server's
+        vault that was behind. Now CENTRAL_NEVER_MISSES failed reads in a row, with none that ever answered and the
+        owner's computer's key registered, set `vault` on the hub's own server. Bugs: a hub whose vault answers, or
+        answered once, or that no owner's app reached yet, or a few failed reads at a start, would cry wolf; and a
+        never-answered vault would stay silent, as before."""
+        self.addCleanup(hub.CENTRAL_NEVER.update, misses=0)
+        hub.CENTRAL_NEVER["misses"] = 0
+        key = patch.object(hub, "owner_key", lambda: {"sha256": "a" * 64, "since": 1.0})
+
+        def warned():
+            with hub.LOCK:
+                return hub.error_warnings_now().get("vault")
+        with key:
+            for _ in range(hub.CENTRAL_NEVER_MISSES - 1):
+                hub.central_down_news(hub.now(), "no central vault answers on this hub")
+            self.assertIsNone(warned())                     # a few failed reads are no fault yet
+            hub.central_down_news(hub.now(), "no central vault answers on this hub")
+            self.assertEqual(warned(), {""})
+        self.assertIsNone(warned())                         # no owner's app reached this hub
+        with key:
+            hub.central_down_news(hub.now(), None)          # it answers: the count ends, and it was seen
+            self.assertIsNone(warned())
+            for _ in range(hub.CENTRAL_NEVER_MISSES):
+                hub.central_down_news(hub.now(), "no central vault answers on this hub")
+            self.assertIsNone(warned())                     # once seen, its silence is the manager's news instead
 
     def test_a_refused_block_sends_the_report_again_at_once_without_it(self):
         """The plan's W15 bug (2): our side answers 400 to a report with the block (a site that does not take it yet,

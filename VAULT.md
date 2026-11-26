@@ -78,10 +78,44 @@ The vault protects the value of each secret. The design gives these results:
   reaches at its hub address, by its node ID or its whole name. A first host key is taken only at port 22 or at a port
   that the owner typed (`Sources/FleetCore/MachineInstall.swift`, `Sources/FleetCore/MacNetwork.swift`,
   `Sources/Founderizer/CentralVaultSection.swift`).
+  **The hub's own server, when the Mac keeps no connection to it** (another Mac or an older build installed the hub,
+  the hub moved, or the Mac lost its settings): a root step there, and the trust step of that server, logs in as root,
+  whatever user the hub's record names, at the record's port. It does so only after the Mac's own Tailscale names the
+  record's address and the hub address as one device and gives that device's system as Linux, and it connects to that
+  device's own Tailscale address. It reads the host key from the Mac's `known_hosts` line for that device: the line of
+  its Tailscale address, else the line of its whole MagicDNS name, never the record's string or a first label; the
+  connection that it keeps reads the same line. It offers two
+  keys, each alone and with the strict host key rule above, and only
+  where the key file is there right before the login: first the Mac's own key, `~/.ssh/founderizer_ed25519`; then,
+  only when root refused that key, the fleet's owner access key from the Mac's keychain. That key goes into a file of
+  mode 600, in a folder of mode 700 of its own, for that one login, and the folder is removed after it (one that a
+  crash left goes before the next such login). The owner access key's session adds the Mac's own key to root's
+  `authorized_keys`, and the Mac then logs in with its own key once more. When root answers the Mac's probe, which
+  changes nothing, with the Mac's own key, the Mac keeps the connection, as an install keeps one. Where the route does
+  not reach root, a record of root goes on with the owner's own keys, as before; for a record of another user, the step
+  stops, and where root refused the keys its words give the owner's step: at port 22,
+  `ssh-copy-id -i ~/.ssh/founderizer_ed25519.pub root@<address>` where the owner still has a
+  way in, else that key into `/root/.ssh/authorized_keys` in the server provider's console, on a server that lets root
+  log in with a key. A host key that the Mac does not know yet stops it with the command `ssh root@<address>` at port
+  22, and at another port with the step of the port on the server's page: the words never give a command at the
+  record's port, where a user other than root can listen. A stop
+  holds for 10 minutes for that server, so the other root steps of a round make no more logins that root refuses, and
+  each press of the owner's ends the hold (`Sources/FleetCore/HubRootRoute.swift`,
+  `Sources/Founderizer/CentralVaultSection.swift`).
   **Only the owner's Set up and a first install write the pin.** An install or an update that prints another key
   stops, and the pin stays.
   **A limit:** a hub address that is a name outside the private network is no Tailscale device, so the central vault's
-  install and update stop on such a fleet, until the owner gives the hub's address on the private network.
+  install and update, the hub's TCP step and the root steps of the owner's pages on the hub's server (the connected
+  apps, one server for all) stop on such a fleet, until the owner gives the hub's address on the private network.
+  **A limit:** the root route is for the hub's own Linux server only. On a server that is not the hub, and on a hub's
+  server that is a Mac, a record that names a user other than root, with no connection that the Mac keeps, still stops
+  a root step with the words of no record. On a hub's server whose host key the Mac does not know, the route stops and
+  offers no key there.
+  **A limit:** the hub names the server under which the Mac keeps the route's connection, and the fleet whose owner
+  access key the Mac offers. A hub that is broken into can keep root's connection of its own server under the name of
+  another server: that server's root steps then stop at the Tailscale check of that server's name, and no secret
+  leaves the Mac. It can make the Mac offer the owner access key of another fleet
+  that this Mac runs, to its own server: SSH gives that server no private key, only the attempt.
 - With the sealed copy, the hub gets the secret's name, its catalog entry and salted SHA-256 fingerprints of the value
   (`Sources/Founderizer/SecretEntryView.swift`). An import sends these for all its items in one command, and the hub
   puts them into the catalog with one commit (`Sources/Founderizer/SecretImportView.swift`, `hub.py`). A title that
@@ -1241,10 +1275,10 @@ host.
     with the next keys step (for example a new `vault.py`, a new owner key of the central vault, the pin's weekly
     signature, or a switch that the table wants). So the Mac leaves a gate that root turned off (`--egress off` keeps
     that file), and a first gate step that stopped after it wrote that file (its gate did not start) keeps the file, so
-    there only root's `hubsetup.py egress` makes the gate. A Mac with no root connection to the hub's server counts a
-    try on the hub's row, and after six the Secrets page says "The fleet has no SSH connection to … on record. Record
-    one on its page in Servers.", a page that has no such field for the hub's own server. A fleet with no Mac round
-    keeps that hole. Until then each agent there gets each API key of the pool as a value, and no gate records where it
+    there only root's `hubsetup.py egress` makes the gate. A Mac with no root connection to the hub's server tries the
+    root route of the hub's server (see "Who the Mac logs in as, and where"); where root refuses its keys, it counts a
+    try on the hub's row, and after six the Secrets page says that root refused the Mac's key and that the owner adds
+    that key to root's `authorized_keys`. A fleet with no Mac round keeps that hole. Until then each agent there gets each API key of the pool as a value, and no gate records where it
     connects. For a hub that takes agents and whose own server has its server service, the hub tells the manager that
     the gate's table is not loaded there. Each step also goes on when it stops, as at an install (`hubsetup.py`,
     `hub.py` `egress_troubles`, `KeySwapPlan.swift`, `vault.py` `configure_egress`).
@@ -1318,7 +1352,9 @@ host.
    the root step of `WORKER-INSTALL.md`, "Vault broker (macOS)", gives Fleet Vault the owner's public keys. That step
    turns handovers on for the Mac, which hands no login over without them (limit 6). For a machine whose
    host key the Mac does not know yet, the owner connects to it once with ssh from Terminal
-   (`Sources/Founderizer/CentralVaultSection.swift`).
+   (`Sources/Founderizer/CentralVaultSection.swift`). For a hub's server whose root refuses the Mac's keys, the owner
+   adds `~/.ssh/founderizer_ed25519.pub` to `/root/.ssh/authorized_keys` there, for example in the server provider's
+   console (`Sources/FleetCore/HubRootRoute.swift`).
 3. **Give each secret on purpose.** The app makes the recovery key and the pins of the servers itself
    (`Sources/FleetCore/CentralVaultPlan.swift`). After a real change of a Mac server's vault key (a lost Keychain, a new
    install of Fleet Vault), its row says that the key is not the one that the hub reports, and Try again does not pass:

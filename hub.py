@@ -7823,6 +7823,10 @@ def error_warnings_now():
         if code is not None:
             hub_own = code in WARNING_HUB or (server is not None and server == hub_machine)
             found.setdefault(code, set()).add("" if hub_own else str(server or "?"))
+    # a central vault that never answered (CENTRAL_NEVER_MISSES): the code `vault` on the hub's own server, for our
+    # side only; no row of the owner's System status says it, because the owner's app shows the stop on its own row
+    if CENTRAL_NEVER["misses"] >= CENTRAL_NEVER_MISSES and kv_get(CENTRAL_SEEN) is None and owner_key() is not None:
+        found.setdefault("vault", set()).add("")
     return found
 
 
@@ -24127,6 +24131,13 @@ WITHDRAW_WAIT = DEPOSIT_WAIT    # seconds a withdrawal waits for its machine bef
 CENTRAL_START = {"status": None, "read_at": None, "tried_at": 0.0, "error": None, "due": False, "grants": None,
                  "passed_at": 0.0, "said": None, "signing": 0, "signed_at": None}
 CENTRAL_SEEN = "central_seen"   # kv: a central vault answered this hub once, so its silence is news for the manager
+# A central vault that never answered this hub (its install on the hub's server never ran or stopped): no news for the
+# manager, because nothing was there to start again, but the error report's code `vault` stands for the hub's own server
+# once this process counted CENTRAL_NEVER_MISSES failed reads of its status in a row with none that ever answered,
+# while the owner's computer has registered its key (owner_key), so a hub that no owner's app reached yet is no fault.
+# A count of reads, not a time (about half an hour at CENTRAL_READ_EVERY); a start of the hub counts again from zero.
+CENTRAL_NEVER_MISSES = 30
+CENTRAL_NEVER = {"misses": 0}
 CENTRAL_DOWN = "central_down"   # kv: {since, told} while the central vault that answered once does not answer
 CENTRAL = dict(CENTRAL_START)   # what the timers last read, in this process only; CENTRAL_LOCK guards it
 CENTRAL_LOCK = threading.Lock()     # held only to read or write CENTRAL: nothing that takes LOCK runs under it
@@ -24378,6 +24389,7 @@ def central_down_news(t0, error):
     is told quietly. error: the read's one sentence, or None for an ok read. Never under LOCK: it takes LOCK itself."""
     with LOCK:
         if error is None:
+            CENTRAL_NEVER["misses"] = 0
             if kv_get(CENTRAL_SEEN) is None:        # once: a key written every minute would be news every minute
                 kv_set(CENTRAL_SEEN, t0)
             down = kv_get(CENTRAL_DOWN)
@@ -24388,6 +24400,7 @@ def central_down_news(t0, error):
                                                 "secret, and the grants reach their servers.", extra={"quiet": True})
             return
         if kv_get(CENTRAL_SEEN) is None:
+            CENTRAL_NEVER["misses"] += 1        # only the error report counts it (error_warnings_now)
             return              # no central vault ever answered here: there is nothing to start again
         down = json.loads(kv_get(CENTRAL_DOWN) or "null") or {"since": t0, "told": False}
         if not down["told"] and t0 - down["since"] >= CENTRAL_FRESH:
