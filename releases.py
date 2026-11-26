@@ -484,9 +484,8 @@ def read_entitlement(token, keys=None):
     The hub carries this token and never acts on it: an expired entitlement changes nothing here, because only our
     side refuses (4.2). So an unverifiable token is still kept and still shown; it is marked, not refused.
 
-    The counts are read as the token gives them, each None when it has none: `machines`; `users`, the users that a
-    licence of Founderizer for Teams pays for (the coordinator's D81 and D85, 25 November 2026: the owner, and each
-    person of the fleet's People list who can write to an agent, by the gate that each of their messages passes;
+    The counts are read as the token gives them, each None when it has none: `machines`; `users`, the count of the
+    fleet's users that our side signed (the coordinator's D81, 25 November 2026; who is a user, D85 and D92:
     hub.licence_users); and `agents`, the count of a token that our side signed before D81. Neither name is needed,
     so a token of either form keeps its licence: since its release for D81 the platform signs only `users`, and it
     still verifies a token with `agents` that it signed before that release."""
@@ -573,10 +572,10 @@ def read_ended(raw, fleet, token, keys):
 # ---------------------------------------------------------------- POST /api/entitlement/renew: the licence's poll
 #
 # teams-design-1-shop-and-licence.md, 3.10 (J6). A hub that holds a licence of Founderizer for Teams asks the
-# channel for it one time each hour, with the count of its users (D81 and D85: the owner and each person who can write
-# to an agent, hub.licence_users; no agent is counted), and keeps what comes back only by its
-# signature (hub.licence_take): a token that our key signed, or the signed word "ended". The licence goes only to our
-# own site over HTTPS, by the rule of errorreports.endpoint, and never to the address of a redirect.
+# channel for it one time each hour, with the count of its users (D81, D85 and D92: the owner, and each person whose
+# role has tools on and who can write to an agent, hub.licence_users; no agent is counted), and keeps what comes back
+# only by its signature (hub.licence_take): a token that our key signed, or the signed word "ended". The licence goes
+# only to our own site over HTTPS, by the rule of errorreports.endpoint, and never to the address of a redirect.
 LICENCE_PATH = "/api/entitlement/renew"
 OUR_HOST = re.compile(r"(?:[a-z0-9-]+\.)*founderizer\.com")
 CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
@@ -584,6 +583,12 @@ CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
 # an answer that the hub's log keeps, and only one of these, so that no sender writes a word of its own there.
 ERROR_CODES = frozenset(("ended", "lapsed", "unbound", "no_licence", "unavailable", "too_many"))
 COUNT_MOST = 10000                               # the users that one count may name, as a token's `users`
+# The rule by which the hub counts its users, sent with each count (the coordinator's D101, 25 November 2026): 2 is
+# D92 and D95's, the people whose role has tools on. The platform records a count, and changes a subscription's
+# quantity, only from a poll whose rule it knows (today 2 alone, D103), so a hub of an older release, which sends
+# none, is never billed for its customers, whatever the order in which the releases reach it. A later change of the
+# rule raises this number on both sides together.
+COUNT_RULE = 2
 ANSWER_MOST = 65536                              # bytes of an answer that the poll reads; a token is far less
 
 
@@ -733,9 +738,12 @@ def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
 
 def renew(url, token, users=None, *, timeout=CHANNEL_TIMEOUT):
     """One licence's poll: POST `url` (licence_endpoint of the channel) with `token` as the bearer and the body
-    {"users": <the count of the fleet's users, hub.licence_users>}, or {} with `users` None (the asks after the word
-    "ended"), and nothing else of the fleet. Until D81 (25 November 2026) the body was {"agents": <the count of the
-    fleet's active agents>}; the platform still answers such a body, with a token, and records no count from it.
+    {"users": <the count of the fleet's users, the owner as 1 (hub.licence_users)>, "count_rule": COUNT_RULE}, or {}
+    with `users` None (the asks after the word "ended", or a count that failed), and nothing else of the fleet.
+    count_rule names the rule of the count (D101), so the platform bills only a count of a rule that it knows. What
+    the count costs is the platform's own (D92: the owner is free). Until D81 (25 November 2026) the body was
+    {"agents": <the count of the fleet's active agents>}; the platform still answers such a body, with a token, and
+    records no count from it.
 
     Returns {"status", "token", "renews", "ended", "says"}, and no answer makes it raise. `token`: the token of a 200,
     unchecked (the hub keeps it only if our key signed it for this fleet), with `renews`, what the platform says of it
@@ -747,7 +755,7 @@ def renew(url, token, users=None, *, timeout=CHANNEL_TIMEOUT):
     if users is not None and (isinstance(users, bool) or not isinstance(users, int)
                               or not 0 <= users <= COUNT_MOST):
         raise ValueError("a count of users is a whole number from 0 to 10000")
-    status, text = _post(url, token, {} if users is None else {"users": users}, timeout)
+    status, text = _post(url, token, {} if users is None else {"users": users, "count_rule": COUNT_RULE}, timeout)
     answer = {"status": status, "token": None, "renews": None, "ended": None, "says": None}
     if status == 0:
         return dict(answer, says="the licence's poll got no answer from the release channel: " + text)

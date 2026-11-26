@@ -613,7 +613,19 @@ class Texts(unittest.TestCase):
         self.addCleanup(os.unlink, modules.name)
         modules.write("rxrpc 438272 0 - Live 0x0\nnf_tables 1 0 - Live 0x0\n")
         modules.close()
-        self.assertEqual(vault.egress_open_families(modules.name), ["rxrpc"])
+
+        class NoFamily:
+            """The socket module of a kernel that makes no socket of these families: the families that the kernel of
+            the host opens stay out of this answer (a Linux sandbox of 23 November 2026 named more of them), so the list
+            alone names one."""
+            def __getattr__(self, name):
+                return getattr(socket, name)
+
+            @staticmethod
+            def socket(*args):
+                raise OSError("the kernel of this test has no such family")
+        with patch.object(vault, "socket", NoFamily()):
+            self.assertEqual(vault.egress_open_families(modules.name), ["rxrpc"])
         dropin = vault.egress_files("{}")["/etc/systemd/system/docker.socket.d/founderizer-egress.conf"][0]
         self.assertIn("egress-close --config /etc/founderizer-egress/egress.json daemons", dropin)
 

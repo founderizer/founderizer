@@ -1525,6 +1525,14 @@ class HubSilence(unittest.TestCase):
             vault.hub(conf, "POST", "/json", {})
 
 
+def shut_swaps(broker):
+    """Shut the listener of a broker's key swap, before its stop closes it: on Linux a close alone leaves the accept()
+    of serve_swaps running."""
+    if broker.swap_sock:
+        with contextlib.suppress(OSError):
+            broker.swap_sock.shutdown(socket.SHUT_RDWR)
+
+
 class BrokerPart(test_vault.VaultBroker):
     """The broker's part, with the in-process hub: the fixture's broker of vps, started again with the part "swap" in
     its configuration. The machine's users are stand-ins: the proxy's user and the vault's user are this test's own."""
@@ -1548,9 +1556,13 @@ class BrokerPart(test_vault.VaultBroker):
         named.start()
         self.addCleanup(named.stop)
 
+    def stop_broker(self, broker=None):
+        shut_swaps(broker or self.broker)
+        super().stop_broker(broker)
+
     def started(self, part=None, fault=None):
         """The fixture's broker, started again: with the part swap (or a part whose machine facts are a fault)."""
-        self.broker.close()
+        self.stop_broker()
 
         def facts(conf):
             if fault:
@@ -1562,7 +1574,7 @@ class BrokerPart(test_vault.VaultBroker):
         self.conf = dict(self.conf, swap=dict(self.PART))
         self.broker = vault.Broker(self.conf).open()
         threading.Thread(target=self.broker.serve, daemon=True).start()
-        self.addCleanup(self.broker.close)
+        self.addCleanup(self.stop_broker, self.broker)
         return self.broker
 
     def proxy_asks(self, **request):
@@ -2978,11 +2990,15 @@ class Delivery(test_central_e2e.EndToEnd):
         self.name = self.read()["env"]["SHOP_API_KEY"]
         self.assertRegex(self.name, r"^vaultswap_[0-9a-f]{40}$")
 
+    def stop_broker(self, broker):
+        shut_swaps(broker)
+        super().stop_broker(broker)
+
     def broker(self, machine):
         public = super().broker(machine)
         if machine == "vps":            # the same broker again, with the part "swap"
             conf = dict(self.brokers[machine].conf, swap=dict(BrokerPart.PART))
-            self.brokers[machine].close()
+            self.stop_broker(self.brokers[machine])
             self.brokers[machine] = self.serve(conf)
         return public
 

@@ -7,7 +7,9 @@ caller that has only the address; and a claim of the hub's own server keeps the 
 
 A local hub with a test source address for each caller, the real claim listener of hubsetup.py on the loopback, and
 the claim's own script with a stand-in for the listener. No real network, key, server or AI call."""
+import builtins
 import contextlib
+import errno
 import hashlib
 import http.server
 import io
@@ -49,6 +51,17 @@ OLDER = (("GET", "/", None), ("GET", "/board", None), ("GET", "/board.txt", None
 
 def sha(text):
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def unreadable_at_mode_0(module, path):
+    """module's open, refused by the system for `path` while its mode gives nobody the right to read, as a user with no
+    root meets it: also for root, and for a user who reads every file (a Linux sandbox of 23 November 2026 did)."""
+    def refusing(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and os.fspath(file) == os.fspath(path) and \
+                not os.stat(path).st_mode & 0o444:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(file))
+        return builtins.open(file, *args, **kwargs)
+    return patch.object(module, "open", refusing, create=True)
 
 
 def load_tests(loader, _tests, _pattern):
@@ -246,13 +259,13 @@ class Rule(WithKeyFolder):
         hub.OWNER_KEY.update(stamp=None, value=None)
         self.assertEqual(self.ask()[0], 403)
         path.unlink()
-        if os.geteuid() != 0:
-            path.write_text(json.dumps({"sha256": sha(KEY), "since": 1}))
-            path.chmod(0)
-            hub.OWNER_KEY.update(stamp=None, value=None)
+        path.write_text(json.dumps({"sha256": sha(KEY), "since": 1}))
+        path.chmod(0)
+        hub.OWNER_KEY.update(stamp=None, value=None)
+        with unreadable_at_mode_0(hub, path):
             self.assertEqual(self.ask()[0], 403)
             self.assertEqual(self.ask(token=KEY)[1]["auth"], "owner_key_mismatch")
-            path.chmod(0o600)
+        path.chmod(0o600)
         path.unlink()
         self.assertEqual(self.ask()[0], 200)        # nothing at all at the path: no key was registered
 

@@ -711,7 +711,7 @@ class Channel(unittest.TestCase):
         for code in (301, 302, 303, 307, 308):
             answer = releases.renew(f"{base}/renew/{code}", "tok.en", 3)
             self.assertEqual((answer["status"], answer["token"], answer["ended"]), (code, None, None))
-            self.assertEqual(channel.seen[-1], ("POST", f"/renew/{code}", "Bearer tok.en", b'{"users":3}'))
+            self.assertEqual(channel.seen[-1], ("POST", f"/renew/{code}", "Bearer tok.en", b'{"users":3,"count_rule":2}'))
         self.assertEqual(len(elsewhere.seen), 1)        # the release's GET alone
 
     def test_the_licence_goes_only_to_our_own_site_over_https(self):
@@ -764,7 +764,8 @@ class Channel(unittest.TestCase):
                 got = releases.renew("https://founderizer.com/api/entitlement/renew", "t.k", 7 if status else None)
             self.assertEqual(got, dict({"status": status, "token": None, "renews": None, "ended": None, "says": None},
                                        **want), str(body)[:40])
-        self.assertEqual((sent[0], sent[-1]), ({"users": 7}, {}))
+        self.assertEqual((sent[0], sent[-1]), ({"users": 7, "count_rule": releases.COUNT_RULE}, {}))
+        self.assertEqual(releases.COUNT_RULE, 2)       # D92 and D95's rule: the platform bills by it (D101)
         for count in (-1, True, 10001, 2.5):
             with self.assertRaises(ValueError):
                 releases.renew("https://founderizer.com/api/entitlement/renew", "t.k", count)
@@ -2393,19 +2394,22 @@ class HubRoutes(OwnerAPI):
     def test_the_licence_poll_sends_the_token_and_the_count_of_users_and_nothing_else(self):
         """J6 and the coordinator's D81 (25 November 2026), read on the wire as the platform gets it: POST
         /api/entitlement/renew with the licence as the bearer and {"users": n}, n = 1 for the owner and 1 for each
-        person who can write to an agent (D85): a chat handle whose app has an account that is on, whose agent
-        person_reaches lets the person reach (not blocked, on their list, a daily limit above 0); no agent is
-        counted. For one release a token and an answer that carry `agents`, as our side signs them until its own
-        release, keep the licence as those with `users` do. The bugs: the owner is left off the invoice (0 users for
-        an empty list), a person is not counted, or a person with two handles and two agents counts more than once;
-        a person whom no message path takes is on the invoice: blocked, with no way to write, with no agent, with a
-        handle whose app's account goes to another agent, with a handle on an account that the owner turned off, or
-        with a daily limit of 0, or whose handle became the owner's own; or such a person stays off it after the
-        owner closes that gap; or a person goes off it for what D85 leaves out, because it is no mark of the person
-        (Pause all, an agent that is off, a day's count that reached its limit); a fault of the count stops the poll,
-        and with it the signed word "ended"; the active agents are counted, as before D81; the body still names
-        `agents`, which the platform reads no more after its next release; a person's name, a machine or anything of
-        the work rides along; a renewed token is not kept because of its count's name."""
+        person whose role has tools on (D92: licence_tools) and who can write to an agent (D85): a chat handle whose
+        app has an account that is on, whose agent person_reaches lets the person reach (not blocked, on their list, a
+        daily limit above 0); no agent is counted. For one release a token and an answer that carry `agents`, as our
+        side signs them until its own release, keep the licence as those with `users` do. The bugs: the owner is left
+        off the invoice (0 users for an empty list), a person is not counted, or a person with two handles and two
+        agents counts more than once; a person whom no message path takes is on the invoice: blocked, with no way to
+        write, with no agent, with a handle whose app's account goes to another agent, with a handle on an account that
+        the owner turned off, or with a daily limit of 0, or whose handle became the owner's own; or such a person
+        stays off it after the owner closes that gap; or a person goes off it for what D85 leaves out, because it is no
+        mark of the person (Pause all, an agent that is off, a day's count that reached its limit); a person whose role
+        has tools off is on the invoice, as a customer who writes by a chat app, also when the owner turned the tools of
+        the role off after they were on, or when the table does not hold the role; the staff of a fleet whose
+        contacts.v2 is off are not on it, or come off it or on it when the owner turns the setting on; a fault of the
+        count stops the poll, and with it the signed word "ended"; the active agents are counted, as before D81; the
+        body still names `agents`, which the platform reads no more after its next release; a person's name, a machine
+        or anything of the work rides along; a renewed token is not kept because of its count's name."""
         held = self.token(plan="teams", machines=0, agents=5)       # what a hub holds today: signed before D81
         renewed = self.licence(until=2100000000, users=3)          # our side after its release: `users`
         older = self.token(plan="teams", machines=0, agents=5, until=2200000000)   # and before it: `agents`
@@ -2462,10 +2466,12 @@ class HubRoutes(OwnerAPI):
                       ("Fay Lee", [("whatsapp", "34600111999@s.whatsapp.net")], ["vps"], None),     # turned off
                       ("Gus Roy", [("discord", "1007")], ["vps"], 0),                   # a daily limit of 0
                       ("Hal Kim", [("discord", "1008")], ["vps"], None))                # the owner's own, below
-            ana, _bo, cy, di, _eva, _fay, gus, _hal = (
-                owner("/ui/people", name=name, role="customer", agents=agents, daily=daily,
+            ana, bo, cy, di, _eva, _fay, gus, _hal = (
+                owner("/ui/people", name=name, role="employee", agents=agents, daily=daily,
                       handles=[{"app": app, "handle": handle} for app, handle in handles])
                 for name, handles, agents, daily in listed)
+            owner("/ui/people", name="Ivy Cole", role="customer", agents=["vps"],       # a role with tools off, and
+                  handles=[{"app": "discord", "handle": "1009"}])                       # every way: never counted
             hub.ins("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES(?,?,?,?,?)",
                     ("discord", "1008", None, None, hub.now()))     # as the owner's code link writes it
             polled(1)                                   # Ana once, with two handles and two agents, and Bo
@@ -2489,13 +2495,24 @@ class HubRoutes(OwnerAPI):
                     (conv, hub.now()))
             self.assertEqual(hub.person_today(gus, hub.now()), 1)
             polled(9)                                   # none of the three is a mark of the person: still 8
+            self.assertFalse(hub.contacts_v2())                     # until here the old roles, by ROLES_RENAMED
+            hub.TEAM["settings"] = {"contacts.v2": True}
+            hub.contacts_v2_on()                                    # the employees are peers now, the same people
+            polled(10)
+            for hour, tools in ((11, False), (12, True)):           # the owner turns a role's tools off, then on
+                body = dict({k: v for k, v in self.command().items() if k != "text"}, name="peer", tools=tools)
+                self.assertEqual(self.request("/ui/roles", body)[0], 200)
+                polled(hour)
+            hub.q("UPDATE people SET role='guest' WHERE id=?", (bo,))       # a role that the table does not hold
+            polled(13)
             with patch.object(hub, "licence_users", side_effect=RuntimeError("a fault of the count")):
-                polled(10)                              # the poll still goes, with no count
+                polled(14)                              # the poll still goes, with no count
         bodies = [json.loads(one[2]) for one in server.seen]
         (path, headers, _), (_, later_headers, _), *_rest = server.seen
         self.assertEqual((path, [body.get("users") for body in bodies]),
-                         ("/api/entitlement/renew", [1, 3, 2, 3, 4, 5, 6, 7, 8, 8, None]))
-        self.assertEqual([sorted(body) for body in bodies], [["users"]] * 10 + [[]])    # no name, and no agents
+                         ("/api/entitlement/renew", [1, 3, 2, 3, 4, 5, 6, 7, 8, 8, 8, 1, 8, 7, None]))
+        self.assertEqual([sorted(body) for body in bodies], [["count_rule", "users"]] * 14 + [[]])   # no name or agents
+        self.assertEqual({body.get("count_rule") for body in bodies[:14]}, {2})     # the rule of each count (D101)
         self.assertEqual(len(self.logged("%could not count this fleet's users%")), 1)
         self.assertEqual((headers["authorization"], later_headers["authorization"]),
                          ("Bearer " + held, "Bearer " + renewed))
@@ -2605,7 +2622,7 @@ class HubRoutes(OwnerAPI):
         ended = (410, {"error": "ended", "ended": self.word(licence), "says": "Ended."})
         t0 = hub.now()
         with self.ours():
-            self.assertEqual(self.licence_polled(ended, t0=t0)[0][2], {"users": 1})
+            self.assertEqual(self.licence_polled(ended, t0=t0)[0][2], {"users": 1, "count_rule": 2})
             self.assertFalse(hub.teams_on())
             asks = []
             for day in range(1, 33):

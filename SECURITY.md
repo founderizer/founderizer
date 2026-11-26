@@ -93,8 +93,14 @@ of a fleet must do.
 ## What a copy of the fleet holds
 
 A copy of the fleet holds the hub's records, and with them the licence of a fleet that has Founderizer for Teams: a
-bearer for Founderizer's own paid services for that one fleet, so that a restore needs no new claim. It opens nothing
-on the fleet's servers and reads nothing of the fleet.
+bearer for Founderizer's own paid services for that one fleet, so that a restore needs no new claim.
+
+A copy that the Founderizer app saves (Save a copy, and the copies that it keeps by itself, in iCloud Drive unless the
+owner chose another folder) also holds the private half of the fleet's owner access key, with no passphrase. With it,
+and a way to a server's SSH port, its holder logs in as root on each Linux server of the fleet, the hub's own included,
+and root on the hub's server can read every secret of the central vault. Keep such a copy as you keep the fleet itself.
+No step replaces that key after a copy leaked ([VAULT.md](VAULT.md), limit 33). A copy from the hub itself (the owner
+tool `take_backup`) holds no such key: it opens nothing on the fleet's servers.
 
 ## Who can read the owner's knowledge files
 

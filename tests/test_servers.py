@@ -107,16 +107,27 @@ class TeamAtStartup(unittest.TestCase):
         self.addCleanup(started.terminate)
         url = f"http://127.0.0.1:{port}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(100):
+        # A hub with no compiled copy of hub.py (a fresh tree, or tests that run with python3 -B) compiles it first:
+        # 6.5 seconds on the Mac, and more than the ten seconds of 100 tries on a busy Linux server of two cores. So
+        # 600 refused connections (no port yet) count, and only 3 other faults (a port that takes the connection and
+        # gives no answer in 5 seconds), so that a hub that hangs holds the test line for seconds, not for minutes. A
+        # hub that ends ends the wait at once.
+        refused = others = 0
+        while True:
             self.assertIsNone(started.poll(), f"the hub did not start: {(root / 'out.txt').read_text()}")
             try:
                 with opener.open(url + "/health", timeout=5) as answer:
                     self.assertEqual((answer.status, json.loads(answer.read())["ok"]), (200, True))
                 break
-            except OSError:
+            except OSError as e:
+                if isinstance(getattr(e, "reason", e), ConnectionRefusedError):     # urllib's URLError holds it
+                    refused += 1
+                else:
+                    others += 1
+                if refused >= 600 or others >= 3:
+                    self.fail(f"the hub never answered /health ({refused} refused, {others} other faults): "
+                              f"{(root / 'out.txt').read_text()}")
                 time.sleep(0.1)
-        else:
-            self.fail(f"the hub never answered /health: {(root / 'out.txt').read_text()}")
         return url, (root / "out.txt").read_text(), root / "hub.db"
 
     def page(self, url, path="/board"):

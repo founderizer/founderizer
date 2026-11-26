@@ -3422,12 +3422,16 @@ class HealthLive(unittest.TestCase):
     MARK = "HEALTH-LIVE-MARK-93ac"
 
     def test_a_real_process_s_arguments_and_environment_are_not_in_the_answer(self):
-        child = subprocess.Popen(["/bin/sleep", "300", f"--token={self.MARK}-ARG"], stdin=subprocess.DEVNULL,
+        # A program that takes the argument and lives on: GNU sleep refused it and ended at once, so health read a
+        # host with no such process, and the read of its arguments failed whenever the process had ended first.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", f"--token={self.MARK}-ARG"],
+                                 stdin=subprocess.DEVNULL,
                                  env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "API_KEY": f"{self.MARK}-ENV"})
         try:
             with open(f"/proc/{child.pid}/cmdline", "rb") as f:        # the marker is there for a program that reads it
                 self.assertIn(f"{self.MARK}-ARG".encode(), f.read())
             out = ROOT.call({"v": 1, "op": "health", "args": []})
+            self.assertIsNone(child.poll())                             # it lived while health read the host
         finally:
             child.kill()
             child.wait()

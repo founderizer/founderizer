@@ -1125,11 +1125,11 @@ class HandoverRecipients(VaultBroker):
         self.refused("the statement is for another fleet")
 
     def test_a_broker_with_no_key_of_the_owner_hands_nothing_over(self):
-        self.broker.close()
+        self.stop_broker()
         plain = {k: v for k, v in self.conf.items() if k not in vault.OWNER_PIN_KEYS}
         broker = vault.Broker(plain).open()
         threading.Thread(target=broker.serve, daemon=True).start()
-        self.addCleanup(broker.close)
+        self.addCleanup(self.stop_broker, broker)
         job = self.job()
         with self.assertRaises(fleet.Refused) as caught:
             fleet.vault_call({"op": "handover", "job": job})

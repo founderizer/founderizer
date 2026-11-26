@@ -921,8 +921,10 @@ class CimdCache(unittest.TestCase):
     the hub keeps at most 50; a refusal is kept no longer than a document."""
 
     def setUp(self):
-        self.fetched = []
+        self.fetched, self.lines = [], []
         for patcher in (patch.object(hub, "CAPP_CIMD", {"lock": hub.threading.Lock(), "kept": {}, "fetching": {}}),
+                        patch.object(hub, "CAPP_CIMD_SLOTS", hub.threading.BoundedSemaphore(hub.CAPP_CIMD_AT_ONCE)),
+                        patch.object(hub, "log", lambda kind, text: self.lines.append(text)),
                         patch.object(oauth_server, "fetch_cimd", self.fetch)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -965,6 +967,97 @@ class CimdCache(unittest.TestCase):
         self.assertEqual(len(hub.CAPP_CIMD["kept"]), hub.CAPP_CIMD_KEPT)
         self.assertNotIn(ids[0], hub.CAPP_CIMD["kept"])
         self.assertEqual(hub.CAPP_CIMD["fetching"], {})
+
+    def test_a_flood_of_client_ids_makes_at_most_four_fetches_at_once(self):
+        """GET /authorize asks no sign-in, and the gate lets 128 requests through at once: of as many client_ids on
+        the CIMD list, at most CAPP_CIMD_AT_ONCE are fetched at once, and a request that finds no free place within
+        the wait is refused, unkept, so that the next one fetches. Bug: a flood makes the hub open as many connections
+        to the apps' sites as it asks, or one busy refusal keeps a real client out for 300 seconds."""
+        hub_lock, gate, running, most, outcomes = hub.threading.Lock(), hub.threading.Event(), [0], [0], {}
+
+        def slow(client_id):
+            with hub_lock:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            gate.wait(10)
+            with hub_lock:
+                running[0] -= 1
+            return self.fetch(client_id)
+
+        def ask(client_id):
+            try:
+                outcomes[client_id] = hub.capp_cimd(client_id) and "document"
+            except hub.CappCimdBusy:
+                outcomes[client_id] = "busy"
+
+        ids = [f"https://claude.ai/oauth/flood{n}" for n in range(hub.CAPP_CIMD_AT_ONCE + 3)]
+        with patch.object(oauth_server, "fetch_cimd", slow), patch.object(hub, "CAPP_CIMD_WAIT", 0.3), \
+                patch.object(oauth_server, "CIMD_TIMEOUT", 0.2):
+            threads = [hub.threading.Thread(target=ask, args=(client_id,)) for client_id in ids]
+            for thread in threads:
+                thread.start()
+            until = time.monotonic() + 10
+            while len(outcomes) < 3 and time.monotonic() < until:       # the three with no place, after the wait
+                time.sleep(0.01)
+            gate.set()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(most[0], hub.CAPP_CIMD_AT_ONCE)
+        busy = sorted(c for c, said in outcomes.items() if said == "busy")
+        self.assertEqual((len(busy), len(outcomes)), (3, len(ids)))
+        self.assertEqual([c for c in busy if c in hub.CAPP_CIMD["kept"]], [])
+        self.assertEqual(hub.CAPP_CIMD["fetching"], {})
+        self.assertEqual(hub.capp_cimd(busy[0])["redirect_uris"], [CLAUDE_CB])      # the next request fetches it
+        self.assertEqual(hub.capp_client(busy[1])[1], "cimd")
+        places = [hub.CAPP_CIMD_SLOTS.acquire(blocking=False) for _ in range(hub.CAPP_CIMD_AT_ONCE)]
+        self.assertEqual(places, [True] * hub.CAPP_CIMD_AT_ONCE)       # every place came back, the refused ones too
+        for _ in places:
+            hub.CAPP_CIMD_SLOTS.release()
+
+    def test_requests_for_one_client_id_each_wait_one_deadline_while_no_place_is_free(self):
+        """While the four places stay full, ten requests for one client_id each end within one deadline
+        (CAPP_CIMD_WAIT + CIMD_TIMEOUT), and none of them leaves a lock or a refusal behind (the Door area's read).
+        Bug: the request that waits for a place holds the id's lock, so the tenth waits ten times as long, and the
+        owner's own client_id, which a stranger can put in a flood, waits behind every one of them."""
+        for _ in range(hub.CAPP_CIMD_AT_ONCE):
+            self.assertTrue(hub.CAPP_CIMD_SLOTS.acquire(blocking=False))
+        self.addCleanup(lambda: [hub.CAPP_CIMD_SLOTS.release() for _ in range(hub.CAPP_CIMD_AT_ONCE)])
+        client_id, took = "https://claude.ai/oauth/the-owners", []
+
+        def ask():
+            began = time.monotonic()
+            with self.assertRaises(hub.CappCimdBusy):
+                hub.capp_cimd(client_id)
+            took.append(time.monotonic() - began)
+
+        with patch.object(hub, "CAPP_CIMD_WAIT", 0.2), patch.object(oauth_server, "CIMD_TIMEOUT", 0.2):
+            threads = [hub.threading.Thread(target=ask) for _ in range(10)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(len(took), 10)
+        self.assertLess(max(took), 1.2, took)                   # one deadline each (0.4 s), not ten waits in a row (2 s)
+        self.assertEqual((self.fetched, hub.CAPP_CIMD["fetching"], hub.CAPP_CIMD["kept"]), ([], {}, {}))
+
+    def test_a_refused_document_is_logged_when_it_is_kept_and_once_a_minute(self):
+        """A refusal writes its line when a fetch keeps it, at most one a minute with a count (the Door area's read).
+        Bug: each request for a refused client_id that the hub keeps writes a row under LOCK, so a stranger who sends
+        one such client_id as fast as the gate lets through grows the database without bound."""
+        bad, lines = "https://claude.ai/oauth/refused", self.lines
+        for _ in range(3):
+            self.assertEqual(hub.capp_client(bad), (None, None))
+        self.assertEqual((self.fetched, len(lines)), ([bad], 1))
+        self.age(bad, hub.CAPP_CIMD_LIFE + 1)
+        hub.capp_client(bad)                                   # a second fetch within the minute: counted
+        self.assertEqual((len(self.fetched), len(lines)), (2, 1))
+        hub.CAPP_CIMD["said"][0] -= hub.CAPP_CIMD_LOG_EVERY + 1
+        self.age(bad, hub.CAPP_CIMD_LIFE + 1)
+        hub.capp_client(bad)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("(1 more since the last line)", lines[1])
+        places = [hub.CAPP_CIMD_SLOTS.acquire(blocking=False) for _ in range(hub.CAPP_CIMD_AT_ONCE)]
+        self.assertEqual(places, [True] * hub.CAPP_CIMD_AT_ONCE)       # each refused fetch gave its place back
 
 
 class Separate(unittest.TestCase):

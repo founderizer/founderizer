@@ -28535,7 +28535,8 @@ ROLE_DEFAULTS_BEFORE = {
                "domain, give you instructions and targets, and hand their own decisions to you. The owner's note on "
                "them names their domain.",
 }
-# Plan P1: the one conversion, when contacts.v2 turns on (contacts_v2_on). Nothing reads a stored role through this:
+# Plan P1: the one conversion, when contacts.v2 turns on (contacts_v2_on). Nothing reads a stored role through this,
+# but licence_tools, which reads the people of its keys as the roles that they become until the conversion runs (D95):
 # the rows are changed one time, and this goes with PERSON_ROLES when the live fleet has switched.
 ROLES_RENAMED = {"employee": "peer", "supervisor": "peer", "deputy": "manager"}
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")       # as ENTRY_ID: it is a word in the header of each message
@@ -79729,12 +79730,29 @@ def licence_sweep(t0):
     thread.start()
 
 
+def licence_tools(person):
+    """True when the licence counts this person's role: its tools are on (the coordinator's D92 and D95, 25 November
+    2026, from the owner's answer that a person whose role has tools off never counts). It is the switch that the
+    conversations read (person_access), so a role that the table does not hold reads as the most limited one: off.
+
+    While contacts.v2 is off, its default, no conversation runs with tools, and the people hold the old names, of which
+    the table holds customer alone. Until the one conversion has run (contacts_v2_on's kv mark contacts_v2_roles), a
+    key of ROLES_RENAMED reads as the role that the conversion will give it (employee and supervisor as peer, deputy as
+    manager), by the table as the owner set it: those are the people that contacts_v2_on converts, so they count the
+    same on both sides of the setting, and no fleet leaves it off to pay for nobody; customer is no key. After the
+    mark every name reads by the table on both sides: the setting can go off again after it was on, and an old name
+    that came later is converted by nothing, so it reads as the table holds it (a name that it does not hold: off)."""
+    if not contacts_v2() and not kv_get("contacts_v2_roles") and person["role"] in ROLES_RENAMED:
+        person = dict(person, role=ROLES_RENAMED[person["role"]])
+    return person_access(person)["tools"]
+
+
 def licence_users():
-    """The count that the licence's poll sends (the coordinator's D81, 25 November 2026, for the price of D79 and D80:
-    each user of the fleet pays): 1 for the owner, and 1 for each person of the fleet's People list (POST /ui/people)
-    who can write to an agent, by the coordinator's D85: a way to write that reaches an agent which person_reaches,
-    the gate that person_route asks for each message, lets the person's messages reach. So the count asks the gate's
-    own function, never a copy of its checks: not blocked, the agent on the person's list, a daily limit above 0.
+    """The count that the licence's poll sends (the coordinator's D81 and D92, 25 November 2026): 1 for the owner, and 1
+    for each person of the fleet's People list (POST /ui/people) whose role has tools on (licence_tools, asked first)
+    and who can write to an agent, by D85: a way to write that reaches an agent which person_reaches, the gate that
+    person_route asks for each message, lets the person's messages reach. So the count asks the gate's own function,
+    never a copy of its checks: not blocked, the agent on the person's list, a daily limit above 0.
     The ways, each found as the path of its messages finds it:
     - a chat app's handle (person_handles) that is not the owner's own (owner_handle, which chat_route asks before
       person_at: the owner's code link can make a person's handle the owner's): each account of chat_apps() of that
@@ -79744,14 +79762,16 @@ def licence_users():
     - a Founderizer app link: the agents that the Teams part's link_agents gives by link_inbound's own checks (an
       active link; an agent of `list`). With no loaded part a link is no way: no message of it is taken. A fault of
       the part gives one line, and no link is a way for the rest of this count.
-    Not counted, because they are no mark of the person: Pause all (chat_apps_paused, the owner's stop of every chat),
-    conversation_refusal (whether the agent can chat now: see person_reaches), and each check of one message or one
-    day (its words, its size, a saved secret, a link's rate or hold, the day's counts). No agent is counted, and the
-    count carries no name. The platform keeps its own minimum of 2."""
+    Left out, because they are no mark of the person: Pause all (chat_apps_paused, the owner's stop of every chat),
+    conversation_refusal (whether the agent can chat now: see person_reaches), a list that narrows the person's use of
+    an agent (person_scopes), and each check of one message or one day (its words, its size, a saved secret, a link's
+    rate or hold, the day's counts). No agent is counted, and the count carries no name."""
     accounts = [acc for acc in chat_apps().values() if chat_enabled(acc)]
     links = teams_part("person_links")
     count = 1
     for person in read_rows("SELECT * FROM people ORDER BY id"):
+        if not licence_tools(person):
+            continue                # a role with tools off: no user, whatever it can reach (D92)
         apps = {r["app"] for r in read_rows("SELECT app, handle, alias FROM person_handles WHERE person=?",
                                             (person["id"],))
                 if not owner_handle(r["app"], r["handle"], r["alias"])}
@@ -83718,13 +83738,34 @@ def capp_used(row):
 CAPP_CIMD_LIFE = 300               # seconds a fetched metadata document, or its refusal, is kept
 CAPP_CIMD_KEPT = 50                 # client_ids whose fetch the hub keeps; the oldest goes first
 CAPP_CIMD = {"lock": threading.Lock(), "kept": {}, "fetching": {}}     # client_id: (monotonic time, document, why)
+# At most 4 fetches at once, of different client_ids: GET /authorize asks no sign-in, so a flood of as many client_ids
+# on the CIMD list as the gate lets through at once (gate.py's CONNECTIONS) would make as many fetches from the hub (the
+# coordinator's read of the gate of 25 November 2026). Each request waits at most CAPP_CIMD_WAIT + CIMD_TIMEOUT in all,
+# for the fetch of its own client_id that runs and then for a free place (the Door area's read: a wait on the same id
+# that held its lock through the wait for a place made the k-th request wait k times). With neither in time it gets the
+# page of an unknown client, which is not kept, so the next request fetches. A known limit, beside the gate's own ("What
+# the limits do not do", gate.py): during such a flood the owner's own first sign-in of a client whose document is not
+# kept can wait up to 10 seconds before its fetch (which takes up to 5 more) and then get that page, whose words then
+# name the wrong cause; the gate's limits already let a flood refuse the owner's calls, so this widens nothing.
+CAPP_CIMD_AT_ONCE = 4
+CAPP_CIMD_SLOTS = threading.BoundedSemaphore(CAPP_CIMD_AT_ONCE)
+CAPP_CIMD_WAIT = oauth_server.CIMD_TIMEOUT      # seconds a request waits for a free place, beyond one fetch of its id
+CAPP_CIMD_LOG_EVERY = 60            # seconds between two lines of refused documents; a line counts those in between
+
+
+class CappCimdBusy(oauth_server.CimdRefused):
+    """No fetch of this client_id came in time, and no free place for one (CAPP_CIMD_AT_ONCE): a refusal that is not
+    kept and not logged."""
 
 
 def capp_cimd(client_id):
     """The checked metadata document of a client on the CIMD list (oauth_server.fetch_cimd): the one network call of
     the connected apps, never under LOCK. One client_id is fetched at most once in 300 seconds: the document, or the
     refusal, is kept that long in memory (at most 50 client_ids), and a second request for it waits for the fetch that
-    runs. So a flood of GET /authorize makes no flood of fetches. Raises oauth_server.CimdRefused."""
+    runs. So a flood of GET /authorize makes no flood of fetches: of one client_id, and of many, at most
+    CAPP_CIMD_AT_ONCE at once, and no request waits longer than CAPP_CIMD_WAIT + CIMD_TIMEOUT. A refusal is logged when
+    a fetch keeps it, at most one line in CAPP_CIMD_LOG_EVERY seconds: a request for a kept refusal writes no row.
+    Raises oauth_server.CimdRefused (CappCimdBusy where nothing came in time)."""
     def kept(t0):
         found = CAPP_CIMD["kept"].get(client_id)
         return found if found and 0 <= t0 - found[0] < CAPP_CIMD_LIFE else None
@@ -83732,19 +83773,43 @@ def capp_cimd(client_id):
         found = kept(time.monotonic())
         one = None if found else CAPP_CIMD["fetching"].setdefault(client_id, threading.Lock())
     if one is not None:
-        with one:
+        most = CAPP_CIMD_WAIT + oauth_server.CIMD_TIMEOUT
+        until = time.monotonic() + most
+        if not one.acquire(timeout=most):
+            raise CappCimdBusy("the hub fetches this metadata document now")      # a waiter removes nothing
+        said = None
+        try:
             with CAPP_CIMD["lock"]:
                 found = kept(time.monotonic())
             if not found:
+                if not CAPP_CIMD_SLOTS.acquire(timeout=max(0.0, until - time.monotonic())):
+                    raise CappCimdBusy("the hub fetches other metadata documents now")
                 try:
                     doc, why = oauth_server.fetch_cimd(client_id), None
                 except oauth_server.CimdRefused as e:
                     doc, why = None, str(e)
+                finally:
+                    CAPP_CIMD_SLOTS.release()
                 with CAPP_CIMD["lock"]:
-                    found = CAPP_CIMD["kept"][client_id] = (time.monotonic(), doc, why)
+                    t0 = time.monotonic()
+                    found = CAPP_CIMD["kept"][client_id] = (t0, doc, why)
                     while len(CAPP_CIMD["kept"]) > CAPP_CIMD_KEPT:
                         CAPP_CIMD["kept"].pop(min(CAPP_CIMD["kept"], key=lambda k: CAPP_CIMD["kept"][k][0]))
-                    CAPP_CIMD["fetching"].pop(client_id, None)
+                    if why is not None:
+                        mark = CAPP_CIMD.setdefault("said", [None, 0])    # the last line's time, refusals since
+                        if mark[0] is None or not 0 <= t0 - mark[0] < CAPP_CIMD_LOG_EVERY:
+                            said = f"a connected app's metadata document was refused: {why}" + \
+                                (f" ({mark[1]} more since the last line)" if mark[1] else "")
+                            mark[0], mark[1] = t0, 0
+                        else:
+                            mark[1] += 1
+        finally:
+            with CAPP_CIMD["lock"]:     # the request that held the id's lock lets go of it, however it ended
+                if CAPP_CIMD["fetching"].get(client_id) is one:
+                    CAPP_CIMD["fetching"].pop(client_id)
+            one.release()
+        if said:
+            log("hub", said)
     if found[2] is not None:
         raise oauth_server.CimdRefused(found[2])
     return json.loads(json.dumps(found[1]))         # a copy: no caller changes what is kept
@@ -83761,8 +83826,8 @@ def capp_client(client_id):
     if kind == "cimd":
         try:
             return capp_cimd(client_id), kind
-        except oauth_server.CimdRefused as e:
-            log("hub", f"a connected app's metadata document was refused: {e}")
+        except oauth_server.CimdRefused:
+            pass                    # capp_cimd logged a new refusal when it kept it: no row for each request
     return None, None
 
 

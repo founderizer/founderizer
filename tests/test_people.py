@@ -1418,9 +1418,37 @@ class Roles(People):
 
     # ---- the one conversion when contacts.v2 comes on
     def test_turning_contacts_v2_on_converts_every_old_role_once(self):
-        made = {role: self.add(name=role.title(), role=role)["id"]
-                for role in ("customer", "employee", "supervisor", "deputy")}
+        """The conversion, and the licence's count on both sides of it (hub.licence_tools, the coordinator's D92 and
+        D95): each person, alone, counts by the tools of their role. Until the one conversion has run, while the setting
+        is off, an old name counts as the role that the conversion will give it, by the table as the owner set it, and
+        customer does not; when it comes on the same people count, as peers and a manager, and the table's customer
+        does not; after it every name reads by the table on both sides: a stored peer or manager counts also after the
+        setting went off again, and an old name that came later counts on neither side, because no conversion takes it
+        any more and it reads as the most limited role. A narrowed pair and an agent whose Shell box is off change
+        nothing: the switch is the role's. The bugs: the staff of a fleet whose setting is off pay nothing; a person
+        pays on one side of the setting only, also when the owner turned off the tools of the role that they become,
+        or when they came after the conversion; a customer pays; the count asks the conversation's own rule
+        (conversation_works), which is off with the setting or the Shell box; the switch is read once."""
+        numbers = iter(range(10, 99))
+
+        def person(name, role):
+            """A person of studio's list with a handle that reaches studio by the whatsapp-studio account."""
+            handle = f"346001118{next(numbers)}@s.whatsapp.net"
+            return self.add(name=name, role=role, handles=[{"app": "whatsapp", "handle": handle}])["id"]
+
+        def counts(pid):
+            """Whether the licence's count takes this person, with each other person blocked."""
+            hub.q("UPDATE people SET blocked=1 WHERE id<>?", (pid,))
+            users = hub.licence_users()
+            hub.q("UPDATE people SET blocked=NULL")
+            return users == 2
+        made = {role: person(role.title(), role) for role in ("customer", "employee", "supervisor", "deputy")}
         self.assertFalse(hub.contacts_v2())
+        for role, pid in made.items():                      # the old roles, the setting off
+            self.assertIs(counts(pid), role != "customer", role)
+        for tools in (False, True):                         # the owner turns peer's tools off, then on again
+            self.assertEqual(self.role(name="peer", tools=tools)[0], 200)
+            self.assertIs(counts(made["employee"]), tools, "an employee reads as the peer that they become")
         hub.contacts_v2_on()                                                # off: nothing moves
         self.assertEqual(hub.q1("SELECT role FROM people WHERE id=?", (made["employee"],))["role"], "employee")
         receipt = self.switch_on()
@@ -1428,18 +1456,35 @@ class Roles(People):
         held = {r["id"]: r["role"] for r in hub.q("SELECT id, role FROM people")}
         self.assertEqual({role: held[pid] for role, pid in made.items()},
                          {"customer": "customer", "employee": "peer", "supervisor": "peer", "deputy": "manager"})
+        for role, pid in made.items():                      # the same people, the setting on
+            self.assertIs(counts(pid), role != "customer", role)
+        for role in hub.ROLE_DEFAULTS:                      # the table's own: customer, peer, manager
+            self.assertIs(counts(person(f"New {role}", role)), role != "customer", role)
+        hub.q("INSERT INTO person_scopes(person,agent,grants,updated) VALUES(?,'studio','{}',1)", (made["employee"],))
+        self.assertIs(counts(made["employee"]), True, "a narrowed pair")
+        hub.TEAM["agents"]["studio"]["can"] = ["shell"]
+        self.assertIs(counts(made["supervisor"]), True, "an agent with a Shell box, which studio has off in setUp")
+        for tools in (True, False):                         # the switch of a role, turned on and then off
+            self.assertEqual(self.role(name="customer", tools=tools)[0], 200)
+            self.assertIs(counts(made["customer"]), tools, "a role's tools")
         line = hub.q1("SELECT what FROM log WHERE what LIKE 'contacts.v2 is on%'")["what"]
         self.assertEqual(line, "contacts.v2 is on: employee to peer for 1, supervisor to peer for 1, "
                                "deputy to manager for 1")
         self.assertIsNotNone(hub.kv_get("contacts_v2_roles"))
         # once: off, a person of an old role again, and on again, and nothing is converted a second time
         self.assertEqual(self.settings(**{"contacts.v2": False})[0], 200)
-        late = self.add(name="Late", role="employee")
+        late = {"id": person("Late", "employee")}
+        self.assertIs(counts(late["id"]), False, "an old role after the conversion: no conversion takes it, on, "
+                                                 "so it does not count off either")
+        self.assertIs(counts(made["employee"]), True, "a peer that reads by the table, off again")
+        self.assertIs(counts(made["deputy"]), True, "a manager that reads by the table, off again")
+        self.assertIs(counts(made["customer"]), False, "a customer, off again")
         self.switch_on()
         self.assertEqual(hub.q1("SELECT role FROM people WHERE id=?", (late["id"],))["role"], "employee")
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'contacts.v2 is on%'")["n"], 1)
         # and that old name is a role the table does not hold: it reads as the most limited one
         self.assertEqual(hub.person_access(hub.q1("SELECT * FROM people WHERE id=?", (late["id"],)))["tools"], False)
+        self.assertIs(counts(late["id"]), False, "a role that the table does not hold")
 
     def test_a_hub_that_starts_with_contacts_v2_on_converts_the_roles_at_its_start(self):
         """main() calls contacts_v2_on after the schema: a team.json that came with the switch on, with no owner

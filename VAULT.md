@@ -1294,6 +1294,20 @@ host.
     you" from before 1.328, which took the entry out when no entry meant theirs, became `{"owner": true}` at the first
     start of 1.328 (`pool_default_keep_seed`).
 
+33. **A copy that the app saves holds the fleet's owner access key, and nothing replaces that key.** Each copy that the
+    Founderizer app saves, with Save a copy or by itself (at least the 7 newest stay in the folder, iCloud Drive unless
+    the owner chose another one), is a plain zip with the member `owner-access.key`: the private half of the fleet's
+    owner access key, as an OpenSSH key file with no passphrase (`Sources/FleetCore/OwnerAccessKey.swift`,
+    `OwnerAccess.withKey`).
+    Its public half is a line of root's `authorized_keys` on each Linux server of the fleet, the hub's own included
+    (`OwnerAccessSweep`). So whoever holds such a copy and reaches a server's SSH port (over the tailnet, or at a public
+    address that the server's installer did not close yet) logs in there as root, and root on the hub's server can read
+    every secret of the central vault; the recovery code, which the copy does not hold, is not needed for that. The key
+    is in the copy so that a new Mac reaches the fleet's servers after the owner's Mac is lost. No step replaces it after
+    a copy leaked: the app makes one key for each fleet and never a second (`OwnerAccessKeychain`), so the line stays a
+    way in until it is taken out of root's `authorized_keys` on each server by hand. A copy from the owner tool
+    `take_backup` holds no such key.
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key

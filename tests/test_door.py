@@ -65,6 +65,17 @@ def ref(n):
     return f"bws://{n:08d}-0000-4000-8000-000000000000"
 
 
+def unreadable_at_mode_0(module, path):
+    """module's open, refused by the system for `path` while its mode gives nobody the right to read, as a user with no
+    root meets it: also for root, and for a user who reads every file (a Linux sandbox of 23 November 2026 did)."""
+    def refusing(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and os.fspath(file) == os.fspath(path) and \
+                not os.stat(path).st_mode & 0o444:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(file))
+        return builtins.open(file, *args, **kwargs)
+    return patch.object(module, "open", refusing, create=True)
+
+
 ACCESS = {
     "v": 1,
     "hub": {"address": HUB, "port": 8765},
@@ -585,17 +596,17 @@ class Access(DoorCase):
             door.cmd_access(None)
         self.assertEqual(steps, [("group", 0, os.getgid()), ("replace", "0o640")])
 
-    @unittest.skipIf(os.geteuid() == 0, "root reads every file")
     def test_a_read_that_failed_does_not_stay_when_the_door_can_read_the_file(self):
         """A new owner or a new mode of the file moves no mtime. Before, the door kept the empty file of a read that
         failed under that mtime, and refused every caller until it started again."""
         path = self.root + door.ACCESS_FILE
-        os.chmod(path, 0)
-        self.assertIsNone(self.door.caller(ONE))
-        before = os.stat(path).st_mtime_ns
-        os.chmod(path, 0o640)
-        self.assertEqual(os.stat(path).st_mtime_ns, before)
-        self.assertEqual(self.door.caller(ONE), "ops-one")
+        with unreadable_at_mode_0(door, path):
+            os.chmod(path, 0)
+            self.assertIsNone(self.door.caller(ONE))
+            before = os.stat(path).st_mtime_ns
+            os.chmod(path, 0o640)
+            self.assertEqual(os.stat(path).st_mtime_ns, before)
+            self.assertEqual(self.door.caller(ONE), "ops-one")
 
 
 class TestHandler(door.Handler):
