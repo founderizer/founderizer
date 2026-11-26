@@ -6,8 +6,11 @@
 
 A target is a host (`ops web-1 restart nginx`, `ops web-1 journal unit=nginx lines=200`, `ops web-1 help`), a provider
 account (`ops cloudflare:main purge <zone> app.example.com`), a repository (`ops commit:acme/ops push --content
-change.json`, `ops deploy:acme/shop run`), the GitOps repository (`ops gitops:acme/cluster read apps/shop.yaml`) or
-the door's own server, for the agent that holds the fleet's own servers (`ops door:self upgradable`). A
+change.json`, `ops deploy:acme/shop run`), the GitOps repository (`ops gitops:acme/cluster read apps/shop.yaml`;
+`ops gitops:acme/cluster list apps` names the files below a folder that read gives, the whole repository with no
+folder; `ops gitops:acme/cluster find "redis host" apps` gives the lines of those files that hold the words, in any
+case, with a folder after the words or none) or the door's own server, for the agent that holds the fleet's own
+servers (`ops door:self upgradable`). A
 host takes a bash script in its box too (`ops web-1 script --content fix.sh`), and the agent that holds a host at
 Fix reads its files with one (`ops web-1 look --content read.sh`): a script in a box with no write and no network,
 which sees the apps' folders and logs and no key store and no file with a secret's name. The door answers what ran, or why it

@@ -1099,7 +1099,7 @@ QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bri
               # the health block of the error report (W15): its records, counts, holds and marks of a start
               "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
               "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-              "error_reports_restart", "error_reports_warnings")
+              "error_reports_restart", "error_reports_warnings", "error_reports_took")
 
 
 def kv_set(k, v):
@@ -7142,7 +7142,10 @@ class DesktopWaits(ToolError):
 # plan is ~/dev/founderizer-plans/feedback-diagnostics-plan.md. diagnostics.py keeps a fault as its class, its
 # files and lines in the code tree, numbers and times, and never as its words; the table faults keeps the counts.
 FAULT_DAYS = 30         # a row of faults ends after this many days, or with the code that wrote it
-FAULT_WARN_HOURS = 24   # System status says "The hub hit an error" while a fault of this code is this recent
+FAULT_WARN_HOURS = 24   # System status says "The hub hit an error" while a fault of this code is this recent, and
+                        # no error report can go (health_view, error_reports_go)
+FAULT_EARLY_MOST = 2    # a fault asks for an early report only while fewer early reports than this went in a DAY...
+FAULT_EARLY_GAP = 3600  # ...and none in this many seconds before (fault_flush)
 
 
 def print_fault():
@@ -7162,31 +7165,74 @@ def known_tool(name):
 
 
 def fault_flush(t0):
-    """Once a pass of the tick: write what diagnostics.py counted since the pass before, and end the rows of other
-    code or older than FAULT_DAYS. A count that a refused write loses is one pass of counts, never a handler."""
+    """Once a pass of the tick (under LOCK): write what diagnostics.py counted since the pass before, and end the rows
+    of other code or older than FAULT_DAYS. A count that a refused write loses is one pass of counts, never a handler.
+
+    While an error report can go (error_reports_go), a fault (kind "fault", as the warning hub_fault counts them; no
+    stall and no refused call) that our side has not received asks for an early report (error_report_early), which
+    carries it. The owner, 25 November 2026, of the card "The hub hit an error": "if telemetry is ON, we need to share
+    it automatically and the user sholdn't even see anything!" (health_view shows no card then). A report holds a
+    fault whose last time is after the report before it and after his yes (error_report_since), so our side has not
+    received a fault whose row had no count after his yes before this write, and the next report holds its count
+    when that count is after the report's `since`. So its first count after his yes asks once, and the same fault
+    counted again (a thread that fails at each pass) asks for nothing more. No second record of what went is kept:
+    the row's last time and the report's own `since` say it.
+
+    A fault asks only while fewer than FAULT_EARLY_MOST early reports of any cause went in the last DAY, and none in
+    the last FAULT_EARLY_GAP, both read from the early reports that went (error_report_earlies): so the faults' own
+    asks take at most two of the errorreports.EARLY_MOST, and a burst of faults asks once. The report before each
+    restart onto new code has its own rule (error_report_before_restart): it goes for a fault of the code that runs as
+    one of the four, and past them only for a new kind of fault, at most RESTART_PAST_MOST times in a DAY. So on a
+    fleet that releases often, the faults of each code can still use the four, and the early report of a failed
+    restart, a release that does not start or timers that stop then waits until the oldest is a DAY old. A fault that
+    comes while the faults' gate holds asks for nothing and goes in the next report that goes: an early report of
+    another cause, the report before a restart, or the day's report. A restart onto new code before that report loses
+    it when the report before the restart does not go (our side's hold, or the four went and its faults are of kinds
+    that a report of the day held, or RESTART_PAST_MOST went past them), because fault_rows reads only the code that
+    runs. An ask that waits (our side's hold, a failed try) goes when that ends, with the same limit at a restart.
+    A read of the switch or of these records that the database refuses asks for nothing, and the counts are still
+    stored; a write that the database refused asks for nothing, because it stored nothing that a report could
+    carry."""
     taken = diagnostics.pending()
     if not taken:
         return
     code = diagnostics.code_id()
+    yes = since = None          # read before the transaction: kv_get commits at once
+    try:
+        earlies = error_report_earlies() if error_reports_go() else None
+        if earlies is not None and len(earlies) < FAULT_EARLY_MOST and \
+                all(t0 - t >= FAULT_EARLY_GAP for t in earlies):
+            on_at = kv_time("error_reports_on_at")
+            yes = min(on_at, t0) if on_at else 0
+            since = error_report_since(kv_time("error_reports_sent"), t0)
+    except sqlite3.Error:       # no ask: the counts below are still stored
+        yes = since = None
+    new = 0
     # Quiet: no app waits for this. System status reads health on its own clock, and a refusal that comes back every
     # pass must not wake every app and the phone's badge each time (the review of 14 November 2026).
     try:
         with area("quiet"), transaction():
             DB.execute("DELETE FROM faults WHERE code != ? OR last < ?", (code, t0 - FAULT_DAYS * 86400))
             for f in taken:
+                sig = diagnostics.signature(f["kind"], f["program"], f["name"], f["frames"])
+                if yes is not None and f["kind"] == "fault" and f["last"] > since:
+                    old = DB.execute("SELECT last FROM faults WHERE sig=?", (sig,)).fetchone()     # its primary key
+                    if old is None or old["last"] <= yes:
+                        new += 1
                 DB.execute(
                     "INSERT INTO faults(sig,kind,program,name,frames,errno,http,count,first,last,code) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET count=count+excluded.count, "
                     "first=MIN(first,excluded.first), last=MAX(last,excluded.last), "
                     "errno=COALESCE(excluded.errno,errno), http=COALESCE(excluded.http,http)",
-                    (diagnostics.signature(f["kind"], f["program"], f["name"], f["frames"]), f["kind"], f["program"],
-                     f["name"], json.dumps(f["frames"], separators=(",", ":")), f["errno"], f["http"], f["count"],
-                     f["first"], f["last"], code))
+                    (sig, f["kind"], f["program"], f["name"], json.dumps(f["frames"], separators=(",", ":")),
+                     f["errno"], f["http"], f["count"], f["first"], f["last"], code))
             if any(f["kind"] == "stall" for f in taken):      # a stall's places vary: its rows are kept the newest
                 DB.execute("DELETE FROM faults WHERE kind='stall' AND sig NOT IN (SELECT sig FROM faults "
                            "WHERE kind='stall' ORDER BY last DESC LIMIT ?)", (diagnostics.STALL_ROWS,))
     except sqlite3.Error:       # a database that refuses the write: this pass's counts go, and no new fault comes
         return
+    if new:
+        error_report_early(f"{new} fault(s) of the hub that our side has not received")
 
 
 def thread_fault(args, default=threading.excepthook):
@@ -7223,11 +7269,32 @@ def fault_rows():
 # restart onto new code began, the version of the code that this process runs until it ends (error_report_restarting)
 _error_report = {"thread": None, "looked": None, "runs": None, "code": None}
 RESTART_REPORT_WAIT = 10        # seconds that the restart onto new code waits for the report before it
+# Past the day's errorreports.EARLY_MOST early reports, the reports before a restart onto new code that may still go in
+# a DAY, each only for a new kind of fault (error_report_before_restart). As many as the early reports: with them, at
+# most eight reports of a hub's faults in a day besides the day's report, far below the 20 an hour that our side takes
+# from one fleet. Most faults come back in each code, so a new kind after the first codes of a day is rare: four leave
+# room for a bad day of releases, and a hub whose new code faults in a new place at each release still sends at most
+# four.
+RESTART_PAST_MOST = 4
+TOOK_MOST = 16                  # reports kept in error_reports_took: a DAY holds about ten (error_report_took)
 
 
 def error_reports_on():
     """Off unless the owner turned it on: nothing is stored until then, and "0" is off too."""
     return kv_get("error_reports") == "1"
+
+
+def error_reports_go():
+    """Whether an error report can go: the owner turned reports on, and the fleet's release channel is our site
+    (errorreports.endpoint). On a channel that is not ours no report ever goes, so the hub's faults are as with
+    reports off: System status shows their card (health_view), and none asks for an early report (fault_flush)."""
+    if not error_reports_on():
+        return False
+    try:
+        errorreports.endpoint(release_channel())
+    except errorreports.ReportError:
+        return False
+    return True
 
 
 def set_error_reports(on):
@@ -7349,14 +7416,16 @@ def error_report_sweep(t0):
     thread.start()
 
 
-def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, taken=None):
+def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, taken=None, past=False):
     """The send of one report, outside LOCK. The switch is read again just before it, so a report that the owner
     turned off meanwhile does not go. Our side's hold is kept (a 429's Retry-After, a DAY for any other 4xx, an hour
     for a 5xx or a 3xx: errorreports.send); a report that went marks its day, and an early one (`early`) counts as
     one of the day's errorreports.EARLY_MOST.
     `asked`: the early ask that this report answers (error_reports_early_at when its body was made), which a report
     that went ends while the key still holds it: an event that came during the send wrote a new value
-    (error_report_early), which waits for the next report.
+    (error_report_early), which waits for the next report. Each report that went is kept with the kinds of its faults
+    (error_report_took); `past`, a report before a restart past the day's early reports, counts in its own cap and
+    not as one of them (error_report_before_restart).
 
     The contract's "The health of a fleet": after a 400 to a report with the health block, for any reason (a site
     that does not take the block yet, or a word that it does not take yet), the same report goes again at once
@@ -7394,12 +7463,14 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
         kv_set("error_reports_sent", stamp)
         if "health" in body and taken and taken.get("on_at") == kv_get("error_reports_on_at"):
             error_reports_counted(taken)
-        if early:
+        if early and not past:
             error_report_earlies(add=float(stamp))
+        error_report_took(add={"at": float(stamp), "kinds": errorreports.kinds(body), "past": bool(past)})
         if asked is not None and kv_get("error_reports_early_at") == asked:
             kv_set("error_reports_early_at", None)      # this report holds what the early one was asked for
-        which = "an early" if early else "the day's"
-        log("hub", f"sent {which} error report: {len(body['faults'])} errors, {len(body['refusals'])} refused calls"
+        which = ("the error report before a restart, past the day's early ones" if past else
+                 "an early error report" if early else "the day's error report")
+        log("hub", f"sent {which}: {len(body['faults'])} errors, {len(body['refusals'])} refused calls"
                    + (", and the fleet's health" if "health" in body else ""))
 
 
@@ -7445,6 +7516,23 @@ def error_report_earlies(add=None):
     if add is not None:
         kept.append(add)
         kv_set("error_reports_earlies", json.dumps(kept))
+    return kept
+
+
+def error_report_took(add=None):
+    """Inside LOCK: the reports that our side took in the last DAY, each {"at": its stamp, "kinds": the kinds of its
+    faults (errorreports.kinds), "past": whether it was a report before a restart past the day's early reports}, and
+    with `add` one more, which is kept. The report records nothing else of what it sent, so this is its own small
+    record: an entry older than a DAY (or more than a DAY ahead of the clock) drops at each read, and it keeps the
+    newest TOOK_MOST, each with at most errorreports.MOST kinds. It says which kinds of fault went that day, and how
+    many reports went past the four (error_report_before_restart)."""
+    t0 = now()
+    kept = [r for r in kv_json("error_reports_took", list) or []
+            if isinstance(r, dict) and finite(r.get("at")) and t0 - r["at"] < errorreports.DAY
+            and r["at"] - t0 <= errorreports.DAY and isinstance(r.get("kinds"), list)]
+    if add is not None:
+        kept = (kept + [add])[-TOOK_MOST:]
+        kv_set("error_reports_took", json.dumps(kept))
     return kept
 
 
@@ -7704,8 +7792,9 @@ WARNING_CODES = {
 # The kinds that never go: the owner's own work, plan or step (a copy of the fleet, an allowance, a manager on the
 # hub's own user, a trust in a server's vault that ends soon or ended, because his Mac did not sign it again: its
 # program is not out of date, and the privacy page names no such code; and the manager's other kinds: a sign-out, a
-# question on its screen, a limit, its silence, a switch), and what goes already (hub_fault as faults, disk_low as the
-# check disk). test_error_reports holds every kind that health_view can make to be in WARNING_CODES or here, and no
+# question on its screen, a limit, its silence, a switch), and what goes already (hub_fault as faults, which ask for
+# an early report themselves in fault_flush, and which health_view makes only while no report can go; disk_low as
+# the check disk). test_error_reports holds every kind that health_view can make to be in WARNING_CODES or here, and no
 # other kind, so that a new warning needs a decision.
 WARNING_KEPT = ("backup_missing", "backup_old", "hub_fault", "vault_pin_ends", "vault_pin_ended", "manager_hub_user",
                 "manager_silent", "manager_limited", "manager_screen", "manager_signed_out", "manager_switch_stalled",
@@ -7997,6 +8086,12 @@ def error_report_before_restart(pinned, reached):
     or a stall) of the code that runs now, fewer than errorreports.EARLY_MOST early reports went in the last DAY, and
     our side holds nothing back, so that the faults of this code, which the next code does not keep (fault_rows), are
     not lost (the plan's 3.3, the open point "Faults of a replaced code"). It counts as one of the day's early reports.
+    Past those, it still goes, at most RESTART_PAST_MOST times in a DAY and not as one of them, when it holds a fault
+    of a new kind: a class and an innermost file (errorreports.kinds) that no report that our side took in the last
+    DAY held (error_report_took). A fleet that releases often, with a fault that comes back in each code, uses the
+    four on its first restarts, and without this each new fault of its later codes that day was lost with its code,
+    with no card on the owner's screen (the review of 25 November 2026; his words: "share it automatically"); a
+    fault that only comes back sends nothing past the four.
     A report with refused calls alone waits for its day, as the privacy page says ("about once a day"). The report
     names the release of the code that runs now (version_at `pinned`, or the code of an earlier restart that did not
     start, error_report_runs_old: the checkout's HEAD is at `reached` already), and the one that the hub restarts onto
@@ -8010,8 +8105,10 @@ def error_report_before_restart(pinned, reached):
             return None
         kv_set("error_reports_restart", json.dumps({"to": reached, "at": t0}))
         hold, thread = kv_time("error_reports_hold"), _error_report["thread"]
+        past = len(error_report_earlies()) >= errorreports.EARLY_MOST
+        took = error_report_took()
         if (hold and t0 < hold <= t0 + errorreports.DAY) or (thread is not None and thread.is_alive()) or \
-                len(error_report_earlies()) >= errorreports.EARLY_MOST:
+                past and sum(1 for r in took if r.get("past")) >= RESTART_PAST_MOST:
             return None
         try:
             url = errorreports.endpoint(release_channel())
@@ -8025,12 +8122,14 @@ def error_report_before_restart(pinned, reached):
                                  restarting=version_at(reached) if reached else "unknown")
         if body is None or not body["faults"]:
             return None
+        if past and not set(errorreports.kinds(body)) - {kind for r in took for kind in r["kinds"]}:
+            return None         # past the four, only a new kind of fault goes
         stamp = repr(float(t0))
         kv_set("error_reports_tried", stamp)
         thread = _error_report["thread"] = threading.Thread(
             target=error_report_send, args=(url, body, stamp), name="error-report", daemon=True,
             kwargs={"timeout": RESTART_REPORT_WAIT, "asked": kv_get("error_reports_early_at"), "taken": taken,
-                    "early": True})
+                    "early": True, "past": past})
         thread.start()
     thread.join(RESTART_REPORT_WAIT)
     return body
@@ -9361,7 +9460,9 @@ def migrate():
                                   # person access plan, section 5: the person whose list held for this row's pair when
                                   # it was written (narrowed_mark), and NULL for every other row. A plain nullable
                                   # column, so a hub of the release before still writes its rows, with NULL
-                                  "scope_person": "INTEGER"},
+                                  "scope_person": "INTEGER",
+                                  # Only on the action that opens an ask_team task: the sorted message ids it named.
+                                  "ask_sources": "TEXT"},
         # the conversation window that made the call, whose person's words its args and detail can hold: a person's
         # removal clears them (person_remove), also for read_messages and reply, which keep no task
         # scope_person (person-scope-call-mark.md): the person whose list held for the session that made the call, at
@@ -22188,8 +22289,9 @@ def t_door_fleet(agent, a):
 def t_door_gitops(agent, a):
     """door_gitops (the manager, DevOps plan X3): team.json door.gitops[repo] = {sync, agents}. The app writes each of
     these Operators' GitOps target in the door's file, {kind: gitops, sync}: the door reads the repository at HEAD
-    through its filter, commits the listed forms, rolls back, syncs an app through the caller workflow `sync`, and
-    uncordons a node through uncordon-node.yml, all with its own App. No GitHub grant comes with it, so no token of the
+    through its filter, lists and searches the files that such a read gives, commits the listed forms, rolls back,
+    syncs an app through the caller workflow `sync`, and uncordons a node through uncordon-node.yml, all with its own
+    App. No GitHub grant comes with it, so no token of the
     agent reads the repository and its committed secrets. agents [] ends it."""
     import door_targets
     repo = str(a.get("repo") or "").strip()
@@ -22239,9 +22341,9 @@ def t_door_gitops(agent, a):
         result = save_integration(None, change, f"the door's GitOps target {repo}: {who or 'nobody'} ({why})", by=agent)
     except Refusal as e:
         raise ToolError(f"The hub refused it: {e}") from None
-    text = (f"{who} {'gets' if len(names) == 1 else 'get'} {repo} through the door: reads through its filter, commits "
-            f"of the listed forms, rollbacks, syncs through {sync}, and uncordons of a node through "
-            f"{door_targets.UNCORDON_WORKFLOW}." if names else
+    text = (f"{who} {'gets' if len(names) == 1 else 'get'} {repo} through the door: reads through its filter, listings "
+            f"and searches of what such a read gives, commits of the listed forms, rollbacks, syncs through {sync}, "
+            f"and uncordons of a node through {door_targets.UNCORDON_WORKFLOW}." if names else
             f"Nobody gets {repo} through the door.") + ("" if result["changed"] else " It was so already.") + \
         door_round_tail(invites=bool(names), tell=True)
     with transaction():
@@ -32549,15 +32651,56 @@ def open_work_pass(agent, a):
             f"words as a message.")
 
 
+def ask_message_ids(refs):
+    """The sorted set of message ids named in ask_team, or None for an invalid argument."""
+    refs = refs or []
+    if not isinstance(refs, list) or len(refs) > 20:
+        return None
+    matches = [CM_REF.fullmatch(str(ref)) for ref in refs]
+    return sorted({int(match[1]) for match in matches}) if all(matches) else None
+
+
+def open_team_question(agent, conv, requester, details, source_ids):
+    """An open ask_team task from this conversation with the same question, line, scope and named messages."""
+    candidates = q(f"SELECT t.id, m.ask_sources FROM tasks t JOIN conversation_messages m ON m.task=t.id AND "
+                   f"m.conversation=t.source_conversation WHERE t.source_conversation=? AND t.source_message IS NULL "
+                   f"AND t.owner=? AND t.requester=? AND t.details=? AND {OPEN_TASK} AND m.who='action' "
+                   f"AND m.scope_person IS ? AND m.text LIKE ? ORDER BY t.id",
+                   (conv["id"], agent, requester, details, narrowed_mark(conv), TEAM_ASKED + "%"))
+    encoded = json.dumps(source_ids)
+    for task in candidates:
+        if task["ask_sources"] is not None:
+            if task["ask_sources"] == encoded:
+                return task["id"]
+            continue
+        # An older hub kept the original ids in its successful call record. A later pass to the same task
+        # is not the question that opened it. If the original record is missing or masked, open new work.
+        call = q1("SELECT args FROM calls WHERE conversation=? AND agent=? AND name='ask_team' AND ok=1 AND "
+                  "detail GLOB ? ORDER BY id LIMIT 1", (conv["id"], agent, f"Asked as {tref(task['id'])}. *"))
+        if not call:
+            continue
+        try:
+            args = json.loads(call["args"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(args, dict) and ask_message_ids(args.get("messages")) == source_ids:
+            return task["id"]
+    return None
+
+
 def conversation_line_task(agent, conv, person, title, details, record, why, follows=None, question=None):
     """Inside the lock: one task on this agent from conversation `conv`, on the agent's wake-up route
     (wakeups.wake_route): the fleet manager as its requester, or its lead, in whose one task for its team's results
     (lead_batch_rows, plan P9.11) it is a subtask, as a wake is. Only this task carries the conversation: its result
     goes back there (conversation_result), and its session is one that a contact drives. The conversation's record
-    says so. Returns (its id, its requester)."""
+    says so. Returns (its id, its requester), or (its id, None) for a repeat of an open ask_team question."""
     route, why_not = wakeups.wake_route(wake_org(), agent)
     if route is None or route["kind"] != "task":
         raise ToolError(f"No task can be opened for this conversation: {why_not or 'there is no line to request it'}")
+    if question:
+        same = open_team_question(agent, conv, route["requester"], details, question["ids"])
+        if same is not None:
+            return same, None
     t0 = now()
     common = {"needs": "none", "goal": None, "goal_id": None, "follows": follows, "case_id": None, "parent": None}
     with transaction():
@@ -32567,12 +32710,20 @@ def conversation_line_task(agent, conv, person, title, details, record, why, fol
                                                   done_when="The work is done and its result says what came of it.",
                                                   why=why, question_record=(question or {}).get("record"),
                                                   source_conversation=conv["id"]))
-        if question:        # a colleague's question about one record (question_record)
+        if question and question.get("record"):  # a colleague's question about one record (question_record)
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                       (f"question_record:{tid}", json.dumps(question)))
-        DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,task,scope_person) "
-                   "VALUES(?,?,?,?,?,?,?)", (unused_id("conversation_messages"), conv["id"], "action",
-                                             f"{record} ({tref(tid)})", t0, tid, narrowed_mark(conv)))
+                       (f"question_record:{tid}", json.dumps({"record": question["record"],
+                                                            "message": question["rows"][-1]["id"]})))
+        DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,task,scope_person,ask_sources) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (unused_id("conversation_messages"), conv["id"], "action",
+                                               f"{record} ({tref(tid)})", t0, tid, narrowed_mark(conv),
+                                               json.dumps(question["ids"]) if question else None))
+        if question:
+            sent = now()       # after admit_task's start event
+            if question["first"]:
+                event_rows([(agent, "say", tid, question["first"], {})], sent)
+            if question["rows"]:
+                conversation_pass_rows(conv, person, tid, question["rows"], sent)
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                    (t0, agent, f"opened {tref(tid)} from C-{conv['id']} for {route['requester']}"))
     return tid, route["requester"]
@@ -32586,10 +32737,9 @@ def t_ask_team(agent, a):
     question = str(a.get("question") or "").strip()
     if not question or len(question) > CONVERSATION_ASK_MAX:
         raise ToolError(f"A question is 1 to {CONVERSATION_ASK_MAX} characters.")
-    refs = a.get("messages") or []          # as open_work's: the person's own words reach the task
-    if not isinstance(refs, list) or len(refs) > 20 or not all(CM_REF.match(str(r)) for r in refs):
+    ids = ask_message_ids(a.get("messages"))          # as open_work's: the person's own words reach the task
+    if ids is None:
         raise ToolError("messages is a list of up to 20 messages of this conversation, each as CM-<number>.")
-    ids = sorted({int(CM_REF.match(str(r)).group(1)) for r in refs})
     record = str(a.get("record") or "").strip() or None
     if record and not TYPED_ID.fullmatch(record):
         raise ToolError("record is the id of one record, as the person wrote it: a letter or a digit and then up to "
@@ -32639,21 +32789,17 @@ def t_ask_team(agent, a):
                     f"message as source, its own words, scope agent; and you end one with end_standing, with the "
                     f"message of theirs that asks for it as asked_by. A wish for the whole team goes with "
                     f"message_agent to {task_giver(agent)}, which gives you your tasks." if staff else ""))
-        same = q1(f"SELECT id FROM tasks WHERE source_conversation=? AND source_message IS NULL AND details=? AND "
-                  f"{OPEN_TASK}", (conv["id"], details))
-        if same:
-            return f"{tref(same['id'])} with the same question is already open. Nothing was asked twice."
-        tid, _ = conversation_line_task(agent, conv, person, title, details, f"{TEAM_ASKED}{question}",
-                                        f"{person['name']} asked in C-{conv['id']}.",
-                                        question={"record": record, "message": rows[-1]["id"]} if record else None)
+        first = None
         if closed:          # read by this task's own session alone: no requester reads a message of its task
             note = f" What the owner says about {person['name']}: {mask_secrets(person['note'])}" \
                 if person["note"] else ""         # their domain, which a manager's wish is judged in
             # the note before the person's words, whose JSON string stays the last line (json_words, mask_message)
-            emit(agent, "say", f"[hub] The question of {person['name']} in C-{conv['id']}.{note} {quoted}", task=tid)
-        if rows:            # their own words, which a lasting wish of theirs is kept in (standing_asked)
-            with transaction():
-                conversation_pass_rows(conv, person, tid, rows, now())
+            first = f"[hub] The question of {person['name']} in C-{conv['id']}.{note} {quoted}"
+        tid, requester = conversation_line_task(agent, conv, person, title, details, f"{TEAM_ASKED}{question}",
+                                               f"{person['name']} asked in C-{conv['id']}.",
+                                               question={"ids": ids, "rows": rows, "record": record, "first": first})
+        if requester is None:
+            return f"{tref(tid)} with the same question is already open. Nothing was asked twice."
     return (f"Asked as {tref(tid)}. Tell {person['name']} that you asked. The answer arrives here as a line from "
             f"Fleet.")
 
@@ -57281,7 +57427,8 @@ TOOLS = [
        ["request_id", "key", "to", "why"])),
     ("manager", "door_gitops", t_door_gitops,
      "Give Operators a business's GitOps repository through the door, or end it. The door then reads it at HEAD "
-     "through its filter (never a Secret, _config/ or a path of the exposure register), commits a checked image tag or "
+     "through its filter (never a Secret, _config/ or a path of the exposure register), lists and searches the files "
+     "that such a read gives, commits a checked image tag or "
      "digest, a replica count or a restart annotation as rule calls, rolls back to the last good digest, syncs an app "
      "through the repository's caller workflow and uncordons a node through its uncordon-node.yml, which it dispatches "
      "with its own App. No GitHub grant comes with it, so no token of the agent reads the repository: give a GitOps "
@@ -77335,6 +77482,7 @@ COPY_ZIP = "copy.zip"
 COPY_PIECE = 1024 * 1024            # what a copy reads, packs or sums at a time
 COPY_SEND_PIECE = 16 * COPY_PIECE   # what one sendfile of a copy's answer sends at most (send_file)
 COPY_IDLE = 300                     # seconds in which the client of a copy takes nothing: then the copy's answer ends
+BODY_IDLE = 60                      # seconds of silence in a request's body before the hub ends its read (Handler.do_POST)
 # What a copy leaves free on the disk of the records beside its own files: room for what the hub writes in the minutes of
 # a copy (the write-ahead file is held at 64 MiB, an attachment is 25 MiB, a delivery 24 MiB). Not DISK_LOW: the copy
 # was made in memory before 22 November 2026 and needed no disk, so a reserve of 2 GiB refused the daily copy of a hub on
@@ -77664,6 +77812,12 @@ Keep anything you cannot afford to lose in your own password manager as well.
 keep where you keep your own files. Every secret in the records is a salt and a hash; `team.json` holds names —
 a repository, an account, a server — and a name opens nothing. A copy carrying a live GitHub key would be a
 different object, and it would need somewhere to hide.
+
+**One exception: `owner-access.key`.** A copy that Founderizer for Mac saved (Save copy, and the copies that it
+keeps by itself) can hold that file, which the app adds after the hub wrote this one. It is your fleet's owner
+access key, with no passphrase: whoever has it and reaches one of your Linux servers over SSH logs in there as
+root, and root on the hub's server can read every secret that the fleet keeps there. Keep a copy that holds that
+file as you keep the fleet itself, not where others can read it.
 
 ## Putting it back when the hub machine is gone
 
@@ -78638,10 +78792,15 @@ def health_view(kinds_seen=None):
              "Restart the hub's server, and tell us if this comes back.", agent=on_the_hub)
     # The lane "Bug reports" (the owner's yes of 14 November 2026 to the picture E1): the hub's own faults of the
     # code that runs now, while one is recent. The app's title is "The hub hit an error", and its button is Report
-    # a problem, which carries them (GET /ui/diagnostics).
+    # a problem, which carries them (GET /ui/diagnostics). Only while no error report can go (error_reports_go:
+    # reports off, or a release channel that is not our site): with them on, the faults go to us by themselves
+    # (fault_flush asks for an early report for one that our side has not received), and no app shows them, also
+    # not a fault from before his yes, which never goes. The owner, 25 November 2026, of this card: "if telemetry is
+    # ON, we need to share it automatically and the user sholdn't even see anything!"
     try:        # a database that refused the table at the start (build_schema) keeps the rest of this page
-        recent = q1("SELECT SUM(count) AS n, MIN(first) AS since FROM faults WHERE kind='fault' AND code=? "
-                    "AND last>=?", (diagnostics.code_id(), t0 - FAULT_WARN_HOURS * 3600))
+        recent = None if error_reports_go() else q1(
+            "SELECT SUM(count) AS n, MIN(first) AS since FROM faults WHERE kind='fault' AND code=? AND last>=?",
+            (diagnostics.code_id(), t0 - FAULT_WARN_HOURS * 3600))
     except sqlite3.Error:
         recent = None
     if recent and recent["n"]:
@@ -90914,7 +91073,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True        # no line takes these bytes: they are not read into memory
                 return self.send(404, "This upload line is not valid: it was used, or it ended. Call attach_file for a "
                                       "new one.\n", "text/plain; charset=utf-8")
-            self._raw = self.rfile.read(n) if n else b""
+            # the body only, under a time of silence of its own: a client that stops mid-body ends its read, and with it
+            # the thread and the bytes that it held; a kept connection that waits for its next request keeps no such
+            # time, because the apps send a POST on a kept connection and URLSession does not send a POST again on one
+            # that the hub closed (Chat and files, 26 November 2026)
+            kept = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(BODY_IDLE)
+                self._raw = self.rfile.read(n) if n else b""
+            except TimeoutError:            # the client sent nothing for BODY_IDLE seconds
+                self._raw = None
+            finally:
+                with contextlib.suppress(OSError):
+                    self.connection.settimeout(kept)
+            if self._raw is None or len(self._raw) != n:
+                # a body that ended before its Content-Length (a phone that lost its network, a cancel, an app put
+                # in the background): nothing of it is kept, so the client's Try again with the same request id goes
+                # through, where a cut file was kept and its retry refused for good (command_reused_file; the reader
+                # of Chat and files' iPhone fix, 26 November 2026), as the connected apps' read already does
+                self.close_connection = True
+                return
             # after the body, so the client reads its 421
             if not self.funnel_refused() and self.host_allowed() and self.origin_allowed():
                 self.post()

@@ -3,13 +3,16 @@ and what the agent gets: the picture or the text in its tool's answer, or a one-
 no live fleet."""
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -89,6 +92,52 @@ class Attachments(test_ui_api.OwnerAPI):
         except urllib.error.HTTPError as r:
             with r:
                 return r.code, r.read(), dict(r.headers)
+
+    def test_a_body_cut_short_keeps_nothing_and_its_request_id_goes_through_again(self):
+        """A client whose connection ends before the body's Content-Length (a phone that loses its network, a
+        cancel): the hub keeps no file of it, so the same request id goes through on its Try again. Before, the cut
+        bytes were kept as the file (a PNG's or a PDF's head passes the type check) and the Try again was refused
+        for good with command_reused_file (Chat and files' reader, 26 November 2026)."""
+        request_id = str(uuid.uuid4())
+        host, port = self.base.split("//", 1)[1].split(":")
+        with socket.create_connection((host, int(port)), timeout=5) as raw:
+            raw.sendall((f"POST /ui/attachments?db=test-generation HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                         f"Content-Type: image/png\r\nX-Fleet-Client: founderizer-swift/1/test\r\n"
+                         f"X-Fleet-Name: shot.png\r\nX-Fleet-Request-Id: {request_id}\r\n"
+                         f"Content-Length: {len(PNG) + 1000}\r\n\r\n").encode() + PNG)
+            raw.shutdown(socket.SHUT_WR)
+            while raw.recv(65536):
+                pass                                # the hub ends the connection with no answer
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM attachments")["n"], 0)
+        self.assertEqual(self.upload(request_id=request_id)["name"], "shot.png")
+
+    def test_a_body_s_time_of_silence_ends_a_stalled_body_and_never_a_kept_connection(self):
+        """BODY_IDLE holds only while a body comes in: a kept connection that sent a whole POST still answers a GET
+        after more than that time, and a body that stops coming ends with no answer, no file and no fault. A hub
+        that left the body's time on the connection would close each kept connection BODY_IDLE after its first
+        POST, and the apps' next POST on it would be lost (URLSession sends a POST again on no closed connection);
+        one with no time at all held a stalled upload's thread and bytes (Chat and files, 26 November 2026)."""
+        host, port = self.base.split("//", 1)[1].split(":")
+        head = (f"POST /ui/attachments?db=test-generation HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                f"Content-Type: image/png\r\nX-Fleet-Client: founderizer-swift/1/test\r\nX-Fleet-Name: shot.png\r\n")
+        with patch.object(hub, "BODY_IDLE", 0.3), patch.object(hub, "print_fault") as fault:
+            kept = http.client.HTTPConnection(host, int(port), timeout=5)
+            self.addCleanup(kept.close)
+            kept.request("POST", "/ui/attachments?db=test-generation", PNG,
+                         {"Content-Type": "image/png", "X-Fleet-Client": "founderizer-swift/1/test",
+                          "X-Fleet-Name": "shot.png", "X-Fleet-Request-Id": str(uuid.uuid4())})
+            first = kept.getresponse()
+            first.read()
+            self.assertEqual(first.status, 200)
+            time.sleep(0.6)
+            kept.request("GET", "/ui/attachments/999?db=test-generation")
+            self.assertEqual(kept.getresponse().status, 404)            # the same connection answers
+            with socket.create_connection((host, int(port)), timeout=5) as raw:
+                raw.sendall((head + f"X-Fleet-Request-Id: {uuid.uuid4()}\r\nContent-Length: {len(PNG) * 2}\r\n\r\n")
+                            .encode() + PNG)
+                self.assertEqual(raw.recv(65536), b"")                  # ended with no answer, its side open
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM attachments")["n"], 1)
+        self.assertFalse(fault.called)
 
     def answer(self, status_body):
         return json.loads(status_body)

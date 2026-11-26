@@ -588,13 +588,32 @@ class OnTheHub(OwnerAPI):
         self.assertEqual(row["file"], "hub.py")
         self.assertNotIn("no_such_tool", json.dumps(row))
 
-    def test_system_status_says_how_many_times_and_since_when(self):
+    def test_system_status_says_how_many_times_and_since_when_only_while_no_error_report_can_go(self):
+        """With error reports off, the card "The hub hit an error" is the owner's one way out (Report a problem). With
+        them on, the faults go to us by themselves and no app shows the card (the owner, 25 November 2026: "the user
+        sholdn't even see anything!"): a hub that kept the warning would show him a card that asks him to do what
+        already happened. Off again, the card is back as it was. On a release channel that is not our site no report
+        ever goes, so it is as with reports off: the card stays, and a new fault asks for no early report. A hub that
+        read only the switch would hide a fault that nobody gets."""
         self.fault(times=3)
+        for on, channel in ((False, None), (True, None), (False, None), (True, "https://releases.example.com")):
+            with hub.LOCK:
+                hub.kv_set("error_reports", "1" if on else "0")
+                hub.kv_set("release_channel", channel)
+                warnings = [w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"]
+            if on and channel is None:
+                self.assertEqual(warnings, [])
+                continue
+            self.assertEqual(len(warnings), 1)
+            self.assertRegex(warnings[0]["detail"], r"^3 times since .+\.$")
+            self.assertIsNone(warnings[0]["fix"])
+        try:
+            fail_with(ValueError(canary()))
+        except ValueError:
+            diagnostics.record("hub")
         with hub.LOCK:
-            warnings = [w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"]
-        self.assertEqual(len(warnings), 1)
-        self.assertRegex(warnings[0]["detail"], r"^3 times since .+\.$")
-        self.assertIsNone(warnings[0]["fix"])
+            hub.fault_flush(hub.now())
+        self.assertIsNone(hub.kv_get("error_reports_early_at"))
 
     def test_one_fault_says_once(self):
         self.fault()
@@ -717,7 +736,18 @@ class OnTheHub(OwnerAPI):
         self.assertEqual(hub.known_tool("read_messages_" + canary()), "other")
         self.assertEqual(hub.known_tool(None), "other")
 
-    def test_a_write_that_the_database_refuses_makes_no_new_fault(self):
+    def test_a_read_or_a_write_that_the_database_refuses_makes_no_new_fault(self):
+        """The pass's store of the counts raises nothing when the database refuses the read of the error reports'
+        records or the write of the counts: else each pass would count a fault of its own. A refused read asks for no
+        early report, and the counts are still stored."""
+        try:
+            fail_with(KeyError("x"))
+        except KeyError:
+            diagnostics.record("hub")
+        with hub.LOCK, unittest.mock.patch.object(hub, "error_reports_go",
+                                                  side_effect=hub.sqlite3.OperationalError("database is locked")):
+            hub.fault_flush(hub.now())          # raises nothing
+        self.assertEqual([r["name"] for r in hub.q("SELECT name FROM faults")], ["KeyError"])
         hub.ins("DROP TABLE faults")
         try:
             fail_with(KeyError("x"))

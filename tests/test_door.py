@@ -20,11 +20,13 @@ import copy
 import datetime
 import errno
 import fcntl
+import gzip
 import hashlib
 import io
 import json
 import os
 import pathlib
+import posixpath
 import pwd
 import re
 import shutil
@@ -1213,7 +1215,73 @@ class Refusals(DoorCase):
                 d = self.decide(target, "uncordon", "app-node-2", agent=agent)
                 self.assertEqual((d.kind, d.plan), ("refused", None))
         d = self.decide("gitops:one-org/cluster", "drain", "app-node-2")
-        self.assertEqual(d.why, "the GitOps repository takes read, push, rollback, sync and uncordon")
+        self.assertEqual(d.why, door_targets.GITOPS_FORMS)
+        for word in ("read <path>", "list [<folder>]", 'find "<words>" [<folder>]', "in quotes", "sync <app> [prune]",
+                     "uncordon <node>"):     # what each form takes, for an agent that asks with help
+            self.assertIn(word, self.decide("gitops:one-org/cluster", "help").why)
+
+    def test_a_listing_and_a_search_take_a_folder_by_the_rules_of_a_read_s_path_and_no_secret_folder(self):
+        """list [<folder>] and find <words> [<folder>] (the owner's yes of 25 November 2026) are reads, with the
+        rules of a read's path for the folder, and no folder whose every path is secret: Secrets, _config or a folder
+        of the exposure register. The bugs: a folder of .. or a / at its start reaches outside what read reads, a
+        secret folder is searched, an argument too many is taken as a folder (a search's words in the record), a
+        content is taken, or the decision writes the words in its record line."""
+        target = "gitops:one-org/cluster"
+        for args, plan in (([], {"list": ""}), (["apps"], {"list": "apps"}), (["apps/shop"], {"list": "apps/shop"}),
+                           (["a" * 993 + "/x.yaml"], {"list": "a" * 993 + "/x.yaml"}),
+                           (["apps/leg"], {"list": "apps/leg"}), (["secrets"], {"list": "secrets"})):
+            with self.subTest(op="list", args=args):
+                d = self.decide(target, "list", *args)
+                self.assertEqual((d.kind, d.write, d.plan), ("read", False, dict(plan, repo="one-org/cluster",
+                                                                                 filter=True)))
+        for args, folder in ((["Ana Example"], ""), (["redis host", "apps/shop"], "apps/shop"), (["ab"], ""),
+                             (["x" * 200], ""), (["tab\there"], "")):
+            with self.subTest(op="find", args=args):
+                d = self.decide(target, "find", *args)
+                self.assertEqual((d.kind, d.write, d.plan), ("read", False, {"repo": "one-org/cluster", "find": args[0],
+                                                                             "folder": folder, "filter": True}))
+                self.assertNotIn(args[0], d.why)
+        shape = ("the folder is a path of the repository, with no / at its start, no empty, . or .. part, and only "
+                 "printable characters")
+        below = "each path below {} is a secret path of the GitOps repository or in the exposure register"
+        folders = {"/apps": shape, "apps/../Secrets": shape, "..": shape, "../x": shape, "apps//shop": shape,
+                   "apps/": shape, "": shape, ".": shape, "apps/./shop": shape, "a\0b": shape, "apps\nSecrets": shape,
+                   "Secrets": below.format("Secrets"), "apps/Secrets": below.format("apps/Secrets"),
+                   "_config": below.format("_config"), "apps/_config": below.format("apps/_config"),
+                   "Secrets/db": "Secrets/db is a secret path of the GitOps repository",
+                   "_config/x": "_config/x is a secret path of the GitOps repository",
+                   "apps/legacy": "apps/legacy is in the exposure register",
+                   "apps/legacy/old": "apps/legacy/old is in the exposure register",
+                   "a" * 1001: "the folder has more than 1000 characters",
+                   "a/" * 65 + "x": "the folder has more than 64 folders"}
+        for folder, why in folders.items():
+            for op, args in (("list", [folder]), ("find", ["words", folder])):
+                with self.subTest(op=op, folder=folder[:40]):
+                    d = self.decide(target, op, *args)
+                    self.assertEqual((d.kind, d.why, d.plan), ("refused", why, None))
+        for args in (["apps", "shop"], ["apps", "shop", "x"]):
+            with self.subTest(op="list", args=args):
+                self.assertEqual(self.decide(target, "list", *args).why, door_targets.LIST_FORM)
+        for args in ([], ["a"], ["x" * 201], ["two\nlines"], ["ends\n"], ["cr\rhere"], ["ls" + chr(0x2028) + "x"],
+                     ["Ana", "Example", "apps"], ["Ana Example", "apps", "shop"]):
+            with self.subTest(op="find", args=args):
+                d = self.decide(target, "find", *args)
+                self.assertEqual((d.kind, d.why), ("refused", door_targets.FIND_FORM))
+                self.assertFalse([a for a in args if len(a) > 2 and a in d.why])
+        for op, args in (("list", []), ("find", ["words"])):
+            with self.subTest(op=op, content=True):
+                self.assertEqual(self.decide(target, op, *args, content=b"").why,
+                                 f"{op} takes no content: only its arguments")
+            for agent, other in (("ops-two", target), ("ops-one", "gitops:one-org/shop"),
+                                 ("ops-one", "gitops:one-org/website")):
+                with self.subTest(op=op, agent=agent, target=other):
+                    self.assertEqual(self.decide(other, op, *args, agent=agent).kind, "refused")
+        # read's own path rules, which list and find take for each file (read_path_refused): GitHub reads a/./b and
+        # a//b as a/b, so such a path reached a file of the exposure register
+        for args in ([], ["/x"], [".."], [""], ["a/../b"], ["apps/./legacy/old.yaml"], ["apps//legacy/old.yaml"],
+                     ["apps/shop/"], ["./apps/x.yaml"], ["a.yaml", "b.yaml"]):
+            with self.subTest(op="read", args=args):
+                self.assertEqual((self.decide(target, "read", *args).why), "read takes one path of the repository")
 
     def test_provider_calls_that_are_never_the_door_s(self):
         self.assertEqual(self.decide("hetzner:one", "change", "POST", "/servers/1/actions/enable_rescue", "web-1",
@@ -1245,6 +1313,26 @@ class Refusals(DoorCase):
         link = json.dumps({"message": "m", "files": [{"path": "docs/x", "mode": "120000",
                                                       "content": base64.b64encode(b"/etc").decode()}]}).encode()
         self.assertEqual(self.decide("commit:one-org/ops", "push", content=link).kind, "refused")
+        # how git exports the files of a GitOps repository (working-tree-encoding, export-subst, export-ignore), which
+        # the render box, list and find read: a person's file there; in another repository a commit as before
+        for path in (".gitattributes", "apps/.gitattributes", "a/b/.GitAttributes"):
+            for op in ("push", "rollback"):
+                with self.subTest(path=path, op=op):
+                    d = self.decide("gitops:one-org/cluster", op,
+                                    content=self.commit((path, "* working-tree-encoding=UTF-16LE\n")))
+                    self.assertEqual((d.kind, d.why), ("refused", f"{path} says how git exports the files of the "
+                                                                  f"GitOps repository: a person changes it, outside "
+                                                                  f"the door"))
+            with self.subTest(path=path, target="commit:one-org/ops"):
+                d = self.decide("commit:one-org/ops", "push", content=self.commit((path, "* text=auto\n")))
+                self.assertEqual(d.kind, "rule", d)
+        # and among the files that the commit holds in the end, with those that the door writes again (with_generated)
+        with patch.object(door_targets, "with_generated", lambda d, *rest: door_targets.Decision(
+                d.kind, d.why, target=d.target, plan=dict(d.plan, files=list(d.plan["files"]) + [
+                    ("apps/.GitAttributes", b"* -text\n", "100644")]))):
+            d = self.decide("gitops:one-org/cluster", "push", content=self.commit(("docs/notes.txt", "x\n")))
+        self.assertEqual((d.kind, d.why), ("refused", "apps/.GitAttributes says how git exports the files of the "
+                                                      "GitOps repository: a person changes it, outside the door"))
 
     def test_a_path_of_more_than_1000_characters_is_refused_before_the_commit_rules(self):
         """The commit rules read a path from each of its folders (glob_match), so a path of 16,000 characters took 2 s,
@@ -2905,9 +2993,22 @@ def at_head(self, method, url):
         return None
     if "/git/trees/" in url:
         repo = url.split("/repos/", 1)[1].split("/git/trees/", 1)[0]
-        stubbed = [u.split(f"/repos/{repo}/contents/", 1)[1].split("?", 1)[0] for m, u in self.answers
-                   if m == "GET" and f"/repos/{repo}/contents/" in u]
-        return 200, git_tree(stubbed + list(getattr(self, "tree", None) or {} if repo == "one-org/cluster" else {}))
+        files = {}          # each stubbed file with its bytes, which give its sha as git's (a read checks them)
+        for (m, u), answer in self.answers.items():
+            if m == "GET" and f"/repos/{repo}/contents/" in u:
+                body = answer[1] if isinstance(answer, tuple) and len(answer) == 2 else None
+                data = base64.b64decode(body["content"]) if isinstance(body, dict) and \
+                    body.get("encoding") == "base64" else None
+                path = u.split(f"/repos/{repo}/contents/", 1)[1].split("?", 1)[0]
+                if data is not None or path not in files:
+                    files[path] = data
+        for path, data in (getattr(self, "tree", None) or {} if repo == "one-org/cluster" else {}).items():
+            files.setdefault(path, data.encode() if isinstance(data, str) else data)
+        tree = git_tree(list(files))
+        for entry in tree["tree"]:
+            if entry["mode"] == "100644" and files.get(entry["path"]) is not None:
+                entry.update(sha=git_blob(files[entry["path"]]), size=len(files[entry["path"]]))
+        return 200, tree
     if f"?ref={HEAD_SHA}" in url:
         return next((self.answers[("GET", url.replace(f"?ref={HEAD_SHA}", f"?ref={branch}"))]
                      for branch in ("master", "main")
@@ -3392,6 +3493,70 @@ class PruneParts(unittest.TestCase):
         self.assertEqual((d.kind, d.route), ("refused", "again"))
 
 
+# A GitOps repository for list and find: each file with a word of its own, and whether a read gives it. Read keeps
+# back a Secret (also its words outside the secret's data), a private key (also the line before it), a JSON Secret,
+# a YAML file that is not UTF-8, and refuses a secret path, a path of the exposure register (ACCESS), a path of more
+# than 64 folders or 1000 characters; and GitHub's contents API gives no file of over 1 MB.
+SEARCH_TREE = {
+    "apps/shop/deployment.yaml": ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: shop  # word-deployment\n",
+                                  True),
+    "apps/shop/notes.md": ("# Notes\n\nword-notes: the shop's Redis host is redis-master\n", True),
+    "apps/shop/latin1.txt": ("word-latin \xe9t\xe9\n".encode("latin-1"), True),     # read gives it, with U+FFFD
+    "apps/shop/secret.yaml": ("apiVersion: v1\nkind: Secret\nmetadata:\n  name: word-secret-name\ndata:\n"
+                              "  key: c2VjcmV0  # word-secret-data\n", False),
+    "apps/shop/key.pem": ("word-key-comment\n-----BEGIN PRIVATE KEY-----\nMIIEword\n-----END PRIVATE KEY-----\n",
+                          False),
+    "apps/shop/secret.json": ('{"kind": "Secret", "metadata": {"name": "word-json"}}', False),
+    "apps/shop/wide.yaml": ("word-wide: 1\n".encode("utf-16"), False),
+    "apps/shop/big.txt": ("word-big\n" + "x" * 1000 * 1000, False),
+    "Secrets/db.yaml": ("password: word-secrets-folder\n", False),
+    "apps/Secrets/db.yaml": ("password: word-deep-secrets\n", False),
+    "_config/app.yaml": ("token: word-config\n", False),
+    "apps/legacy/old.yaml": ("host: word-exposure\n", False),
+    "a/" * 65 + "deep.yaml": ("word-too-deep: 1\n", False),
+    "c" * 990 + "/" + "d" * 20 + ".yaml": ("word-too-long: 1\n", False),
+}
+SEARCH_LINKS = {"apps/shop/link.yaml": "../../Secrets/db.yaml"}       # a link is never followed nor named
+SEARCH_LEFT = 6         # the files that read refuses only once it has them: 4 kept back, 1 over 1 MB, the link
+
+
+def git_blob(data):
+    "git's sha of a file's bytes as a blob"
+    return hashlib.sha1(b"blob %d" % len(data) + bytes(1) + data).hexdigest()
+
+
+def blob_tree(files, links=(), modules=()):
+    """GitHub's answer to a read of a whole tree (git_tree), with each file's sha and size as git makes them of its
+    bytes: list and find take a file of the tarball only when its bytes have that sha."""
+    answer = git_tree(list(files), links, modules)
+    for entry in answer["tree"]:
+        if entry["mode"] in ("100644", "100755"):
+            data = files[entry["path"]]
+            data = data.encode() if isinstance(data, str) else data
+            entry.update(sha=git_blob(data), size=len(data))
+    return answer
+
+
+def odd_tarball(members, fmt=tarfile.PAX_FORMAT):
+    """A tarball that GitHub never packs: (name, type, the bytes of a file or the name that a link names), each name as
+    it stands in the tarball, so absolute, with .., twice, or in any order."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz", format=fmt) as tar:
+        for name, kind, data in members:
+            info = tarfile.TarInfo(name)
+            info.type, info.mode = kind, 0o644
+            if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                info.linkname = data
+                tar.addfile(info)
+            elif kind == tarfile.REGTYPE:
+                data = data.encode() if isinstance(data, str) else data
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            else:
+                tar.addfile(info)
+    return out.getvalue()
+
+
 class GitHubFacts(DoorCase):
     """What the door reads from GitHub for its checks: each repository's default branch (one has only `master`), and
     the runs of the repository that built an image, never those of the GitOps repository."""
@@ -3512,9 +3677,10 @@ class GitHubFacts(DoorCase):
                  "scripts/pick.js": ("const kind = choice.ok\n  ? kind: 'supplier'\n  : 'shop'\n", None),
                  "apps/x/alias.txt": ("x: &k Secret\ny: {kind: *k, data: {a: Yg==}}\n", may),
                  "charts/shop/templates/_helpers.tpl": ('{{- define "name" -}}{{ .Chart.Name }}{{- end }}\n', None)}
-        for path, (text, why) in files.items():
+        for path, (text, why) in files.items():        # the tree at one head, which never changes
             self.answers[("GET", f"{api}{path}?ref=master")] = (200, {
                 "encoding": "base64", "content": base64.b64encode(text.encode()).decode()})
+        for path, (text, why) in files.items():
             with self.subTest(path=path):
                 got = self.call(ONE, "gitops:one-org/cluster", "read", path)
                 if why is None:
@@ -3561,6 +3727,339 @@ class GitHubFacts(DoorCase):
         self.assertEqual(got["kind"], "refused")
         self.assertIn("could not check this call: GitHub gave no default branch of one-org/cluster", got["why"])
         self.assertFalse([d for m, u, d in self.calls if m == "PATCH"])
+
+    # ---- list and find (the owner's yes of 25 November 2026): what a read gives, by the tree and a tarball of the head
+
+    def head_tarball(self, tree, links=None, modules=(), packed=None, members=None):
+        """GitHub with this tree at the head: the trees API with each file's sha and size (blob_tree), the contents API
+        as GitHub answers a read (a link to a file with that file's text, under its own path), and the tarball (each
+        request of it in self.raw_calls): of the tree, or packed, or these members (odd_tarball) in their order. The
+        door's kept head is let go, as each test's tarball is of the same head."""
+        api = "https://api.github.com/repos/one-org/cluster"
+        files = {p: (d.encode() if isinstance(d, str) else d) for p, d in tree.items()}
+        for path, data in files.items():
+            self.answers[("GET", f"{api}/contents/{urllib.parse.quote(path)}?ref=master")] = (200, {
+                "type": "file", "path": path, "encoding": "none", "content": ""} if len(data) > 1000 * 1000 else {
+                "type": "file", "path": path, "encoding": "base64", "content": base64.b64encode(data).decode()})
+        for path, target in (links or {}).items():
+            named = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            if named in files:
+                self.answers[("GET", f"{api}/contents/{path}?ref=master")] = (200, {
+                    "type": "file", "path": named, "encoding": "base64",
+                    "content": base64.b64encode(files[named]).decode()})
+        self.answers[("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1")] = (200, blob_tree(files, list(links or {}),
+                                                                                            modules))
+        packed = odd_tarball(members) if members is not None else tarball(tree, links) if packed is None else packed
+        self.raw_calls, self.door.head_kept = [], None
+
+        def raw(method, url, headers, limit, timeout=120):
+            self.raw_calls.append((method, url, headers.get("Authorization"), limit))
+            return 200, packed
+        self.door.raw = raw
+
+    def gitops(self, op, *args):
+        "The answer's text of a call that ran, and the failure's words of one that did not."
+        got = self.call(ONE, "gitops:one-org/cluster", op, *args)
+        return got["out"] if got["ok"] else "failed: " + got["why"]
+
+    def test_a_read_gives_only_a_path_that_the_tree_at_head_names_as_a_file(self):
+        """GitHub's contents API answers a link to a file with that file's text, under the file's own path or the
+        link's, and a person can put such a link in the repository: a link to a secret path gave that path's file
+        through read, past the rule of secret paths, and a plain password line is no Secret object. Read now gives a
+        path only when the tree at the head says that it is a file (100644 or 100755). Also a UTF-16 text with no mark,
+        which is UTF-8 with a NUL between its letters, where no pattern of the filter reads a word."""
+        api = "https://api.github.com/repos/one-org/cluster"
+        secret = {"type": "file", "encoding": "base64",
+                  "content": base64.b64encode(b"password: word-secret\n").decode()}
+        key = "-----BEGIN PRIVATE KEY-----\nMIIEword\n-----END PRIVATE KEY-----\n".encode("utf-16-le")
+        self.answers[("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1")] = (200, blob_tree(
+            {"apps/shop/deployment.yaml": OLD_DEPLOYMENT, "Secrets/db.yaml": "password: word-secret\n",
+             "apps/shop/key16.txt": key}, links=["apps/x.yaml", "apps/y.yaml"], modules=["vendor/sub"]))
+        for path in ("apps/x.yaml", "apps/y.yaml", "vendor/sub"):
+            for said in (path, "Secrets/db.yaml"):          # GitHub's answer under the asked path, or the file's own
+                with self.subTest(path=path, said=said):
+                    self.answers[("GET", f"{api}/contents/{path}?ref={HEAD_SHA}")] = (200, dict(secret, path=said))
+                    got = self.call(ONE, "gitops:one-org/cluster", "read", path)
+                    self.assertEqual((got["ok"], got.get("why")), (False, f"{path} is a link or a submodule at HEAD"),
+                                     got)
+                    self.assertNotIn("word-secret", json.dumps(got))
+        self.assertEqual(self.gitops("read", "apps/shop/deployment.yaml"), OLD_DEPLOYMENT)
+        self.answers[("GET", f"{api}/contents/apps/shop/key16.txt?ref={HEAD_SHA}")] = (200, {
+            "type": "file", "path": "apps/shop/key16.txt", "encoding": "base64",
+            "content": base64.b64encode(key).decode()})
+        self.assertEqual(self.gitops("read", "apps/shop/key16.txt"), "failed: apps/shop/key16.txt holds a control "
+                         "character other than a tab or a line break, which can hide a Secret from the filter: the "
+                         "filter keeps it back")
+        # the tree at a head is read once (Door.head_kept): a later read costs the head and its file
+        trees = [u for _m, u, _d in self.calls if "/git/trees/" in u]
+        self.assertEqual(len(trees), 1)
+        # a tree that GitHub cuts (more than 100,000 entries or 7 MB): the listing of the path's folder says what it is,
+        # a symlink as one, so a read in a big repository still works, and still gives no link
+        self.door.head_kept = None
+        self.answers[("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1")] = (200, dict(git_tree(["a"]), truncated=True))
+        self.answers[("GET", f"{api}/contents/apps/shop?ref={HEAD_SHA}")] = (200, [
+            {"type": "file", "name": "deployment.yaml", "path": "apps/shop/deployment.yaml",
+             "sha": git_blob(OLD_DEPLOYMENT.encode())},
+            {"type": "symlink", "name": "link.yaml", "path": "apps/shop/link.yaml", "sha": git_blob(b"../db.yaml")},
+            # a link that the listing calls a file: the contents API gives the bytes of the file that it names
+            {"type": "file", "name": "alias.yaml", "path": "apps/shop/alias.yaml", "sha": git_blob(b"../db.yaml")},
+            {"type": "dir", "name": "conf", "path": "apps/shop/conf", "sha": "1" * 40}])
+        for path in ("apps/shop/link.yaml", "apps/shop/alias.yaml"):
+            self.answers[("GET", f"{api}/contents/{path}?ref={HEAD_SHA}")] = (200, dict(secret, path="Secrets/db.yaml"))
+        self.assertEqual(self.gitops("read", "apps/shop/deployment.yaml"), OLD_DEPLOYMENT)
+        self.assertEqual(self.gitops("read", "apps/shop/link.yaml"),
+                         "failed: apps/shop/link.yaml is a link or a submodule at HEAD")
+        self.assertEqual(self.gitops("read", "apps/shop/alias.yaml"),
+                         "failed: apps/shop/alias.yaml is not a file at HEAD: GitHub gave other bytes than the tree's")
+        for path in ("apps/shop/conf", "apps/shop/none.yaml", "nowhere/x.yaml"):    # the last folder: GitHub's 404
+            self.assertEqual(self.gitops("read", path), f"failed: {path} is not a file at HEAD")
+        self.assertEqual(self.gitops("list"), "failed: GitHub gives no whole tree of one-org/cluster: it has more "
+                         "than 100,000 entries or 7 MB, so the door cannot list or search its files: read them one by "
+                         "one")
+        self.answers[("GET", f"{api}/contents/apps/shop?ref={HEAD_SHA}")] = (200, [
+            {"type": "file", "path": f"apps/shop/f{n}"} for n in range(1000)])
+        self.assertTrue(self.gitops("read", "apps/shop/deployment.yaml").startswith(
+            "failed: GitHub lists 1000 entries of the folder apps/shop at most, so the door cannot say that"))
+        self.door.head_kept = None
+        self.answers[("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1")] = (502, {})
+        self.assertTrue(self.gitops("read", "apps/shop/deployment.yaml").startswith(
+            "failed: GitHub gave no whole tree of one-org/cluster (502), so the door cannot say that"))
+
+    def test_a_listing_and_a_search_name_exactly_the_files_that_read_gives(self):
+        """Trap 2 of the review: a listing names a file only when read gives it, so it reads each file's text and
+        not only its name, and a search reads only those files, in the text that read gives. The bugs: a name from the
+        tree alone (a Secret, a key, a file in Secrets/, _config/, the exposure register, a path too deep or too long,
+        a file of over 1 MB, a link), or a search of the raw bytes and not of read's text."""
+        tree = {path: text for path, (text, _given) in SEARCH_TREE.items()}
+        self.head_tarball(tree, SEARCH_LINKS)
+        given = sorted(path for path, (_text, ok) in SEARCH_TREE.items() if ok)
+        left = (f"{SEARCH_LEFT} more files in the repository are left out: read does not give them (a file that the "
+                f"filter keeps back, a link, or a file of over 1 MB).\n")
+        searched = f"{SEARCH_LEFT} more files in the repository were not searched: read does not give them.\n"
+        self.assertEqual(self.gitops("list"), "\n".join(given) + "\n" + left)
+        for path, (text, ok) in list(SEARCH_TREE.items()) + [(p, ("", False)) for p in SEARCH_LINKS]:
+            with self.subTest(path=path[:60]):
+                read = self.call(ONE, "gitops:one-org/cluster", "read", path)
+                self.assertEqual(read["ok"], ok, read)
+                word = re.search(r"word-[a-z-]+", text if isinstance(text, str) else text.decode("utf-8", "ignore"))
+                if word and ok:     # the line that holds the word, as read gives it
+                    n, line = next((n, line) for n, line in enumerate(read["out"].split("\n"), 1)
+                                   if word.group() in line)
+                    self.assertEqual(self.gitops("find", word.group()), f"{path}:{n}: {line}\n{searched}")
+        self.assertIn("apps/shop/latin1.txt:1: word-latin \ufffdt\ufffd\n", self.gitops("find", "word-latin"))
+        self.assertEqual(self.gitops("list", "apps/shop"), "apps/shop/deployment.yaml\napps/shop/latin1.txt\n"
+                         "apps/shop/notes.md\n6 more files below apps/shop are left out: read does not give them (a "
+                         "file that the filter keeps back, a link, or a file of over 1 MB).\n")
+        self.assertEqual(self.gitops("find", "REDIS HOST", "apps/shop"), "apps/shop/notes.md:3: word-notes: the "
+                         "shop's Redis host is redis-master\n6 more files below apps/shop were not searched: read does "
+                         "not give them.\n")
+        # a folder that the tree does not have, also the second word of a search with no quotes, or a file
+        self.assertEqual(self.gitops("list", "apps/shop/deployment.yaml"),
+                         "failed: apps/shop/deployment.yaml is no folder at HEAD")
+        self.assertEqual(self.gitops("find", "redis", "host"),
+                         "failed: host is no folder at HEAD: put words of more than one part in quotes")
+        self.assertEqual(self.gitops("find", "apps", "redis"),
+                         "failed: redis is no folder at HEAD: put words of more than one part in quotes")
+
+    def test_a_search_tells_nothing_of_a_file_that_read_does_not_give(self):
+        """Trap 1 of the review: a search runs on the text after read's filter, so a word that only a kept-back file
+        or a refused path holds (also outside a Secret's data, as its name, or on the line before a key) gives the
+        same answer as a word that no file holds: no line, no count of lines, no "more" number and no name. And as
+        read never says whether a path that it refuses by its name is there, a listing neither names nor counts one,
+        and a folder of only such paths is no folder. The bugs: a search of every file of the tree, a count of
+        matches before the filter, or a name or a count of a file that it left out."""
+        tree = {path: text for path, (text, _given) in SEARCH_TREE.items()}
+        self.head_tarball(tree, SEARCH_LINKS)
+        hidden = [p for p, (_t, ok) in SEARCH_TREE.items() if not ok] + list(SEARCH_LINKS)
+        names = hidden + [p.rsplit("/", 1)[-1] for p in hidden if p.rsplit("/", 1)[-1] not in ("db.yaml",)]
+        words = ["word-secret-name", "word-secret-data", "c2VjcmV0", "word-key-comment", "PRIVATE KEY", "MIIEword",
+                 "word-json", "word-wide", "word-big", "word-secrets-folder", "word-deep-secrets", "word-config",
+                 "word-exposure", "word-too-deep", "word-too-long", "Secrets/db.yaml", "password"]
+        for folder in ((), ("apps",), ("apps/shop",)):
+            nothing = self.gitops("find", "no-file-holds-this", *folder)
+            self.assertTrue(nothing.startswith("No line of a file"), nothing)
+            self.assertIn(f"\n{SEARCH_LEFT} more files", nothing)       # the Secrets and the register are not counted
+            for word in words:
+                with self.subTest(word=word, folder=folder):
+                    self.assertEqual(self.gitops("find", word, *folder), nothing)
+            for said in (nothing, self.gitops("list", *folder)):
+                self.assertFalse([name for name in names if name in said], said)
+        # and the count of the rest counts no line of a file that read does not give
+        self.head_tarball({"apps/a.md": "common\n" * 230, "Secrets/x.yaml": "common\n" * 500,
+                           "apps/secret.yaml": "kind: Secret\ndata:\n" + "  k: common\n" * 500,
+                           "apps/legacy/y.md": "common\n" * 500, "apps/x/Secrets/db.yaml": "common\n"})
+        for folder in ((), ("apps",)):
+            got = self.gitops("find", "Common", *folder).split("\n")
+            self.assertEqual(got[:2] + got[199:], [
+                "apps/a.md:1: common", "apps/a.md:2: common", "apps/a.md:200: common",
+                "And 30 more lines hold them: name a folder or more words to see them.",
+                f"1 more file {'below apps' if folder else 'in the repository'} was not searched: read does not give "
+                f"it.", ""])
+        self.assertEqual(self.gitops("list", "apps/x"), "failed: apps/x is no folder at HEAD")
+
+    def test_a_listing_and_a_search_stop_at_their_limits(self):
+        """2000 names at most and 200 lines, each with the count of the rest, and each line cut to 200 characters
+        around the words, a cut marked, with each character that is not printable shown as U+FFFD, so that no line of a
+        file looks like two in the answer. The bugs: an answer of a whole monorepo's names, or of a minified file's
+        line of megabytes, a cut that leaves the words out, or a line that ends where the file's line does not."""
+        line = "x" * 3000 + "Needle" + "y" * 2000
+        tree = {f"apps/f{n:04d}.yaml": "n: 1\n" for n in range(2005)}
+        tree.update({"apps/long.txt": line + "\n" + "Needle" + "z" * 500 + "\n", "apps/many.md": "a needle\n" * 230,
+                     "apps/odd.md": "the needle\rhere\x85a" + chr(0x2028) + "b\x7fc\xa0d\te\n"})
+        self.head_tarball(tree)
+        got = self.gitops("list").split("\n")
+        self.assertEqual((len(got), got[0], got[1999], got[2000:]), (
+            2002, "apps/f0000.yaml", "apps/f1999.yaml", ["And 8 more files: name a folder to see them.", ""]))
+        found = self.gitops("find", "NEEDLE").split("\n")
+        self.assertEqual(len(found), 202)
+        first, second = found[0].split(": ", 1)[1], found[1].split(": ", 1)[1]
+        self.assertEqual((found[0].split(": ")[0], len(first), first[0], first[-1], "Needle" in first,
+                          first[1:-1] in line), ("apps/long.txt:1", 202, "\u2026", "\u2026", True, True))
+        self.assertEqual((found[1].split(": ")[0], second), ("apps/long.txt:2", "Needle" + "z" * 194 + "\u2026"))
+        self.assertEqual(found[2:4], ["apps/many.md:1: a needle", "apps/many.md:2: a needle"])
+        self.assertEqual(found[200:], ["And 33 more lines hold them: name a folder or more words to see them.", ""])
+        self.assertEqual(self.gitops("find", "the needle"),
+                         "apps/odd.md:1: the needle\ufffdhere\ufffda\ufffdb\ufffdc\ufffdd\te\n")
+        # the first 200 lines by name and line, out of a tarball in any order: the search keeps 800 at most meanwhile
+        z, m, a = ("hit\n" * n for n in (900, 700, 5))
+        self.head_tarball({"z.md": z, "m.md": m, "a.md": a}, members=[
+            ("t/z.md", tarfile.REGTYPE, z), ("t/m.md", tarfile.REGTYPE, m), ("t/a.md", tarfile.REGTYPE, a)])
+        found = self.gitops("find", "hit").split("\n")
+        self.assertEqual(found, [f"a.md:{n}: hit" for n in range(1, 6)] + [f"m.md:{n}: hit" for n in range(1, 196)] +
+                         ["And 1405 more lines hold them: name a folder or more words to see them.", ""])
+
+    def test_a_tarball_holds_a_file_only_with_the_bytes_of_the_tree_and_names_nothing_else(self):
+        """The tree at the head names the files (as read reads them), and the tarball gives a file's bytes only when
+        git's hash of them is the tree's sha: git archive writes a file as .gitattributes says (UTF-16, which hides each
+        word of a key from the filter, export-subst), and a tarball can hold anything. A member that is no path, a link
+        to a secret path, a hard link, a device, a file that the tarball lacks or holds with other bytes, and a name
+        that is not printable (one that holds a line break would add a line to the answer) are never named; a tarball
+        over a cap or that cannot be read is a failed call with no name in it. The bugs: a file of the tarball read as
+        read gives it, a link that the reader follows, a header or a tarball read whole into the door's memory, or a
+        reading with no end."""
+        top = "one-org-cluster-0123abc/"
+        key = "word-conv\n-----BEGIN PRIVATE KEY-----\nMIIEbody\n"
+        files = {"ok.yaml": "word-ok: 1\n", "a\\b.yaml": "word-backslash: 1\n",
+                 "Secrets/db.yaml": "password: word-secret\n",
+                 "apps/x\nSecrets/db.yaml": "word-newline\n", "apps/hard.yaml": "word-hard\n", "apps/dev": "word-dev\n",
+                 "etc/abs.yaml": "word-absolute\n", "escape.yaml": "word-up\n", "apps/conv.txt": key}
+        self.head_tarball(files, {"apps/key.yaml": "../Secrets/db.yaml"}, ["vendor/sub"], members=[
+            (top, tarfile.DIRTYPE, None), (top + "ok.yaml", tarfile.REGTYPE, "kind: Secret\ndata: {}\n"),
+            (top + "ok.yaml", tarfile.REGTYPE, files["ok.yaml"]),
+            (top + "a\\b.yaml", tarfile.REGTYPE, files["a\\b.yaml"]),
+            (top + "Secrets/db.yaml", tarfile.REGTYPE, files["Secrets/db.yaml"]),
+            (top + "apps/x\nSecrets/db.yaml", tarfile.REGTYPE, files["apps/x\nSecrets/db.yaml"]),
+            ("/etc/abs.yaml", tarfile.REGTYPE, files["etc/abs.yaml"]),
+            (top + "../escape.yaml", tarfile.REGTYPE, files["escape.yaml"]),
+            (top + "apps/key.yaml", tarfile.SYMTYPE, "../Secrets/db.yaml"),
+            (top + "apps/hard.yaml", tarfile.LNKTYPE, top + "Secrets/db.yaml"),
+            (top + "apps/dev", tarfile.CHRTYPE, None),
+            (top + "apps/conv.txt", tarfile.REGTYPE, key.encode("utf-16-le"))])
+        self.assertEqual(self.gitops("list"), "a\\b.yaml\nok.yaml\n8 more files in the repository are left out: read "
+                         "does not give them (a file that the filter keeps back, a link, or a file of over 1 MB).\n")
+        nothing = self.gitops("find", "no-file-holds-this")
+        for word in ("word-absolute", "word-up", "word-secret", "word-newline", "word-hard", "word-dev", "word-conv",
+                     "M\0I\0I\0E", "Secrets/db.yaml", "kind: Secret"):
+            with self.subTest(word=word):
+                self.assertEqual(self.gitops("find", word), nothing)
+        self.assertEqual(self.gitops("find", "WORD-OK"), "ok.yaml:1: word-ok: 1\n" + nothing.split("\n", 1)[1])
+        self.assertEqual(self.raw_calls[1:], [])            # one tarball for the four calls: the door kept it
+        many = {"apps/a.yaml": "word-cap\n" * 5000, "apps/b.yaml": "b\n", "apps/c.yaml": "c\n", "apps/d.yaml": "d\n"}
+        long_name = "apps/" + "n" * 600 + ".yaml"
+        chain = b"".join(tarfile.TarInfo._create_gnu_long_header("t/x" * 3, tarfile.GNUTYPE_LONGNAME, "utf-8", "strict")
+                         for _ in range(3000))          # a chain of long names, each header read in the one before it
+        cases = [({"packed": b"x" * (door_render.TAR_MAX + 1)}, {}, "the tarball of one-org/cluster is over 64 MiB"),
+                 ({"packed": tarball(many)[10:]}, {}, "the tarball of one-org/cluster cannot be read (no gzip)"),
+                 ({"packed": tarball(many)[:len(tarball(many)) // 2]}, {},
+                  "the tarball of one-org/cluster cannot be read"),
+                 ({"packed": gzip.compress(chain + b"\0" * 1024)}, {},
+                  "the tarball of one-org/cluster cannot be read (RecursionError)"),
+                 ({}, {(door_render, "TREE_FILES"): 3}, "one-org/cluster has more than 3 files"),
+                 ({}, {(door, "TAR_STREAM_MOST"): 20000}, "the tarball of one-org/cluster cannot be read (OSError)"),
+                 ({}, {(door, "HEAD_FILES_SECONDS"): -1}, "the files of one-org/cluster took more than"),
+                 ({"tree": {long_name: "word-cap\n"}}, {(door, "TAR_HEADER_MOST"): 512},
+                  "the tarball of one-org/cluster cannot be read (HeaderError)")]
+        for given, caps, why in cases:
+            with contextlib.ExitStack() as stack:
+                for (module, name), value in caps.items():
+                    stack.enter_context(patch.object(module, name, value))
+                tree = given.pop("tree", many)
+                self.head_tarball(tree, **given)
+                for op, args in (("list", []), ("find", ["word-cap"])):
+                    with self.subTest(why=why, op=op):
+                        got = self.call(ONE, "gitops:one-org/cluster", op, *args)
+                        self.assertEqual((got["ok"], got["why"].startswith(why)), (False, True), got)
+                        self.assertNotIn("out", got)
+                        self.assertNotIn("a.yaml", got["why"])
+
+    def test_one_listing_or_search_of_a_repository_runs_at_a_time(self):
+        """Each reads up to TAR_STREAM_MOST of a tarball in the door's own memory: a second call of the same repository
+        while one runs answers that it is busy, and runs once that one has ended. The bug: many calls at once that each
+        hold a tarball's bytes, and the door's server out of memory."""
+        self.head_tarball({"apps/a.md": "word-a\n"})
+        held = self.door.held(self.door.repo_locks, "files:one-org/cluster")
+        with held:
+            for op, args in (("list", []), ("find", ["word-a"])):
+                self.assertEqual(self.gitops(op, *args), "failed: another listing or search of one-org/cluster runs "
+                                 "now: send this call again when it has ended")
+        self.assertEqual(self.gitops("find", "word-a"), "apps/a.md:1: word-a\n")
+
+    def test_a_listing_and_a_search_read_the_head_once_and_keep_no_words(self):
+        """A first call reads GitHub for the head of the default branch, as read takes it, its tree and one tarball of
+        it; a later call of the same head reads only the head, as a commit's tree and tarball never change. No file, and
+        no other branch. The record keeps the form and the folder, never the words of a search, nor a hash of them (a
+        person may search for a name, and the hash of a short name is found by trying names), also of a search that the
+        door refuses, and no folder that the tree does not have (a word of a search with no quotes). The bugs: a read
+        of each file, the branch of the access file's entry (a commit's), or the words in the record's line or its
+        call hash."""
+        self.write_access(dict(ACCESS, agents=dict(ACCESS["agents"], **{"ops-one": dict(
+            ACCESS["agents"]["ops-one"], repos=dict(ACCESS["agents"]["ops-one"]["repos"], **{
+                "one-org/cluster": {"kind": "gitops", "sync": "sync-app.yml", "branch": "release"}}))})))
+        self.head_tarball({"apps/shop/notes.md": "the owner is Ana Example\n"})
+        self.calls.clear()
+        self.assertEqual(self.gitops("list", "apps"), "apps/shop/notes.md\n")
+        self.assertEqual(self.gitops("find", "Ana Example", "apps"), "apps/shop/notes.md:1: the owner is Ana Example\n")
+        self.assertEqual(self.gitops("find", "Ana Example"), "apps/shop/notes.md:1: the owner is Ana Example\n")
+        refused = self.call(ONE, "gitops:one-org/cluster", "find", "Ana", "Example", "apps")
+        self.assertEqual((refused["ok"], refused["why"]), (False, door_targets.FIND_FORM))
+        self.assertEqual(self.gitops("find", "Ana", "Example"),
+                         "failed: Example is no folder at HEAD: put words of more than one part in quotes")
+        with self.door.held(self.door.repo_locks, "files:one-org/cluster"):        # fails before its folder is read
+            self.assertTrue(self.gitops("find", "Ana", "Example").startswith("failed: another listing or search"))
+        refused = self.call(ONE, "gitops:one-org/cluster", "find", "Ana", "apps/legacy")     # the register's folder
+        self.assertEqual((refused["ok"], refused["why"]), (False, "apps/legacy is in the exposure register"))
+        api = "https://api.github.com/repos/one-org/cluster"
+        asked = [(m, u) for m, u, _d in self.calls if not u.endswith(("/installation", "/access_tokens"))]
+        self.assertEqual(asked, [("GET", api), ("GET", f"{api}/git/ref/heads/master"),
+                                 ("GET", f"{api}/git/trees/{HEAD_SHA}?recursive=1")] +
+                         [("GET", f"{api}/git/ref/heads/master")] * 3)       # the busy one reads nothing
+        self.assertEqual(self.raw_calls, [("GET", f"{api}/tarball/{HEAD_SHA}", "Bearer ghs_door",
+                                           door_render.TAR_MAX + 1)])
+        lines = self.door.record.after(0)[-7:]
+        unrun = "a search of the GitOps repository, which did not run"
+        self.assertEqual([(e["action"], e["kind"], e["outcome"], e["why"]) for e in lines], [
+            ("list", "read", "done", "a listing at HEAD through the filter, below apps"),
+            ("find", "read", "done", "a search at HEAD through the filter, below apps"),
+            ("find", "read", "done", "a search at HEAD through the filter, in the whole repository"),
+            ("find", "refused", "refused", door_targets.FIND_FORM),
+            ("find", "read", "failed", "a search at HEAD through the filter, below a folder that is not there"),
+            ("find", "read", "failed", unrun), ("find", "refused", "refused", unrun)])
+        with open(door.P(door.RECORD_FILE), encoding="utf-8") as f:
+            kept = f.read()
+        for args in (["Ana Example", "apps"], ["Ana Example"], ["Ana", "Example", "apps"], ["Ana", "Example"],
+                     ["Ana", "apps/legacy"]):
+            self.assertNotIn(door.call_hash("gitops:one-org/cluster", "find", args), kept)
+        self.assertFalse([w for w in ("Ana", "Example", "legacy") if w in kept])
+        self.assertEqual({e["sha256"] for e in lines[1:]}, {door.call_hash("gitops:one-org/cluster", "find", [])})
+        # a read keeps its path in its hash, as before
+        self.assertEqual(door.recorded_args("gitops:one-org/cluster", "read", ["apps/x.yaml"]), ["apps/x.yaml"])
+        # the next head is read anew
+        self.answers[("GET", f"{api}/git/ref/heads/master")] = (200, {"object": {"sha": "f" * 40}})
+        self.answers[("GET", f"{api}/git/trees/{'f' * 40}?recursive=1")] = (200, blob_tree({"apps/new.md": "x\n"}))
+        packed = tarball({"apps/new.md": "x\n"})
+        self.door.raw = lambda method, url, headers, limit, timeout=120: (self.raw_calls.append(url), (200, packed))[1]
+        self.assertEqual(self.gitops("list"), "apps/new.md\n")
+        self.assertEqual(self.raw_calls[1:], [f"{api}/tarball/{'f' * 40}"])
 
 
 class AWSRole(DoorCase):

@@ -14,8 +14,9 @@ gives.
     <provider>:<name>   one provider account of the access file (door_providers.py)
     commit:<owner/repo> a commit that the door makes on a repository the access file gives the agent
     deploy:<owner/repo> that repository's documented deploy
-    gitops:<owner/repo> the GitOps repository: a read at HEAD through a filter, commits of the listed forms, a sync,
-                        and an uncordon of a node through the repository's one fixed workflow
+    gitops:<owner/repo> the GitOps repository: a read at HEAD through a filter, a listing and a search of what that
+                        read gives, commits of the listed forms, a sync, and an uncordon of a node through the
+                        repository's one fixed workflow
     door:self           the door's own server: fixed reads that the door runs as its own user (DOOR_SELF_READS)
 
 The host forms come from host/ops-root and host/ops-read themselves, so the door and the host check each form with
@@ -1593,11 +1594,16 @@ def loose_secret(text):
     return False
 
 
+# The C0 control characters but a tab and the line breaks, as bytes: UTF-8 writes none of them in another way
+CONTROL = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def kept_back(path, data, read=None):
     """Why the filter of a read keeps one file of a GitOps repository back from every agent, or None: no Secret
     object leaves the door. The file as the patterns read it holds a Secret or a private key; or it is not block
     style, or has another name than .yaml, .yml or .json, and a loose reading of its text says that it may hold one;
-    or it is not UTF-8 text, where the filter sees nothing. The render box asks nothing of what a file holds: a unit
+    or it is not UTF-8 text, where the filter sees nothing, or it holds a control character (CONTROL), between whose
+    letters no pattern reads a word. The render box asks nothing of what a file holds: a unit
     that can read a path that the door gives no agent is closed, by its paths alone (door_render.closed). read:
     manifest_text(path, data), when the caller has it."""
     text, why = manifest_text(path, data) if read is None else read
@@ -1606,7 +1612,10 @@ def kept_back(path, data, read=None):
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             return "is not UTF-8 text, so it may hold a Secret that the filter cannot see: the filter keeps it back"
-    elif secret_object(text) or any("-----begin" in low for low in loose_texts(text)):     # also with an escape
+    if CONTROL.search(data):        # UTF-16 with no mark is UTF-8 too, with a NUL between the letters of each word
+        return ("holds a control character other than a tab or a line break, which can hide a Secret from the filter: "
+                "the filter keeps it back")
+    if not why and (secret_object(text) or any("-----begin" in low for low in loose_texts(text))):     # with an escape
         return "holds a Secret, which the filter keeps back"
     # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
     if (why or not manifest_name(path)) and \
@@ -2009,6 +2018,61 @@ def gitops_path_refused(path, access):
     return None
 
 
+def read_path_refused(path, access):
+    """Why a read of the GitOps repository refuses a path by its form or its place, or None: decide_gitops for read,
+    and for each file that a listing or a search reads (door.GitHub.head_files), so that they give the same files."""
+    if not path or path.startswith("/") or any(p in ("", ".", "..") for p in path.split("/")):
+        return "read takes one path of the repository"      # GitHub reads a/./b and a//b as a/b
+    if len(path) > PATH_MOST:
+        return f"the path has more than {PATH_MOST} characters"
+    if path.count("/") > FOLDERS_MOST:
+        return f"the path has more than {FOLDERS_MOST} folders"
+    return gitops_path_refused(path, access)
+
+
+def read_text(path, data):
+    """(the text that a read of the GitOps repository gives of one file's bytes at HEAD, None), or (None, why the
+    filter keeps the file back): door.GitHub.read, and each file of a listing and of a search, which so name and
+    search only what a read gives, and only in the text that it gives."""
+    read = manifest_text(path, data)        # once: a file at the limit takes a moment to read
+    kept = kept_back(path, data, read)
+    if kept:
+        return None, kept
+    return (data.decode("utf-8") if read[1] else data.decode("utf-8", "replace")), None
+
+
+# What each form of the GitOps repository takes: the answer to any other word, help too
+GITOPS_FORMS = ('the GitOps repository takes read <path>, list [<folder>], find "<words>" [<folder>] (words of more '
+                'than one part in quotes), push and rollback with a commit as content, sync <app> [prune], and '
+                'uncordon <node>')
+# What list and find of the GitOps repository take (the owner's yes of 25 November 2026: a search over the files that
+# a read gives already, and no new access)
+LIST_FORM = "list takes one folder of the repository at most: with none, it lists the whole repository"
+FIND_FORM = ("find takes the words to look for, 2 to 200 characters on one line, and after them one folder of the "
+             "repository at most: with none, it searches the whole repository")
+FIND_WORDS = (2, 200)
+
+
+def folder_refused(folder, access):
+    """Why list or find refuses a folder, or None: the rules of a read's path (read_path_refused), and a folder that
+    is a secret path itself or that holds only paths that no read gives (Secrets, _config, a folder of the exposure
+    register). A NUL stands for any name below it: no path of a repository holds one, and only a pattern's wildcard
+    takes it."""
+    if not folder or folder.startswith("/") or any(p in ("", ".", "..") for p in folder.split("/")) or \
+            not folder.isprintable():
+        return ("the folder is a path of the repository, with no / at its start, no empty, . or .. part, and only "
+                "printable characters")
+    if len(folder) > PATH_MOST:
+        return f"the folder has more than {PATH_MOST} characters"
+    if folder.count("/") > FOLDERS_MOST:
+        return f"the folder has more than {FOLDERS_MOST} folders"
+    if gitops_path_refused(folder, access):
+        return gitops_path_refused(folder, access)
+    if gitops_path_refused(folder + "/\0", access):
+        return f"each path below {folder} is a secret path of the GitOps repository or in the exposure register"
+    return None
+
+
 # ---------------------------------------------------------------- uncordon a node
 #
 # The owner's yes, 22 November 2026: "a narrow route to uncordon cordoned app nodes" of a business's k3s cluster, for
@@ -2025,26 +2089,60 @@ UNCORDON_INPUT = "node"                       # its one input
 NODE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")      # a Kubernetes node's name of one label
 
 
+def gitattributes_refused(files):
+    """Why a GitOps commit of these files is refused for a .gitattributes, at any depth and in any case, or None: the
+    commit's own files, and its final ones, with those that the door writes again (with_generated). The render box, and
+    list and find, read the repository as git exports it (export-ignore, export-subst, working-tree-encoding): in a
+    GitOps repository .gitattributes is a person's file. In an app or a devops repository an attribute needs git
+    configuration that the repository does not hold to do more than change how a checkout looks, and the blob hash
+    guards list and find (door.GitHub.head_files)."""
+    for path, _data, _mode in files:
+        if path.casefold().rsplit("/", 1)[-1] == ".gitattributes":
+            return (f"{path} says how git exports the files of the GitOps repository: a person changes it, outside "
+                    f"the door")
+    return None
+
+
 def decide_gitops(access, me, repo, op, args, content, lookups):
-    """read <path> at HEAD through the filter; commit an image tag or digest, a replica count or a restart
-    annotation as rule calls; rollback to the last good digest after a schema check; sync through the listed caller
-    workflow; uncordon <node> through UNCORDON_WORKFLOW. Other manifests are the agent's own call."""
+    """read <path> at HEAD through the filter; list [<folder>] the files that such a read gives; find <words>
+    [<folder>] in their text; commit an image tag or digest, a replica count or a restart annotation as rule calls;
+    rollback to the last good digest after a schema check; sync through the listed caller workflow; uncordon <node>
+    through UNCORDON_WORKFLOW. Other manifests are the agent's own call."""
     entry = repo_entry(me, repo, ("gitops",))
     if entry is None:
         return refused(f"the door gives this agent nothing on {repo}", route="holder")
     target = f"gitops:{repo}"
     if op == "read":
-        if len(args) != 1 or not args[0] or args[0].startswith("/") or ".." in args[0].split("/"):
-            return refused("read takes one path of the repository", target=target)
-        if len(args[0]) > PATH_MOST:
-            return refused(f"the path has more than {PATH_MOST} characters", target=target)
-        if args[0].count("/") > FOLDERS_MOST:
-            return refused(f"the path has more than {FOLDERS_MOST} folders", target=target)
-        why = gitops_path_refused(args[0], access)
+        why = read_path_refused(args[0], access) if len(args) == 1 else "read takes one path of the repository"
         if why:
             return refused(why, target=target)
         return Decision("read", "a read at HEAD through the filter", target=target, write=False,
                         plan={"repo": repo, "read": args[0], "filter": True})
+    if op in ("list", "find"):
+        # The files that a read gives, and nothing else (door.GitHub.head_files). The words of a search never go into
+        # the door's record (a person may search for a name): the decision's words name the folder alone, and the
+        # door hashes a search's call with no argument (door.recorded_args).
+        if content is not None:
+            return refused(f"{op} takes no content: only its arguments", target=target)
+        words = None
+        if op == "find":
+            if len(args) not in (1, 2):
+                return refused(FIND_FORM, target=target)
+            words, args = args[0], args[1:]
+            if not FIND_WORDS[0] <= len(words) <= FIND_WORDS[1] or "".join(words.splitlines()) != words:
+                return refused(FIND_FORM, target=target)
+        elif len(args) > 1:
+            return refused(LIST_FORM, target=target)
+        folder = args[0] if args else ""
+        why = folder_refused(folder, access) if args else None
+        if why:
+            return refused(why, target=target)
+        where = f"below {folder}" if folder else "in the whole repository"
+        if op == "list":
+            return Decision("read", f"a listing at HEAD through the filter, {where}", target=target, write=False,
+                            plan={"repo": repo, "list": folder, "filter": True})
+        return Decision("read", f"a search at HEAD through the filter, {where}", target=target, write=False,
+                        plan={"repo": repo, "find": words, "folder": folder, "filter": True})
     if op == "sync":
         caller = entry.get("sync")
         if len(args) not in (1, 2) or not APP_NAME.fullmatch(str(args[0])) or not caller or \
@@ -2067,7 +2165,7 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
                         window="deploy", plan={"repo": repo, "workflow": UNCORDON_WORKFLOW,
                                                "inputs": {UNCORDON_INPUT: args[0]}, "wait": True})
     if op not in ("push", "rollback"):
-        return refused("the GitOps repository takes read, push, rollback, sync and uncordon", target=target)
+        return refused(GITOPS_FORMS, target=target)
     files, message = commit_files(content)
     if files is None:
         return refused(message, target=target)
@@ -2082,6 +2180,9 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
             return refused(f"{path} is under the commit rules", target=target)
         if mode not in ("100644", "100755"):        # 040000 too: a tree entry at a file's path
             return refused(f"{path} has the mode {mode}", target=target)
+        why = gitattributes_refused([(path, data, mode)])
+        if why:
+            return refused(why, target=target)
         if path.casefold() == DOOR_DECLARATION:
             return refused(f"{path} names the files that the door writes itself: a person changes it, outside the "
                            f"door", target=target)
@@ -2112,7 +2213,8 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
             d = with_owner(d, report, files, plan, target)
         d = with_generated(d, report, lookups, files, plan, target)
         # the files that the commit holds in the end, with those that the door writes again (with_generated)
-        why = (paths_clash(d.plan["files"]) or head_refused(d.plan["files"], lookups)) \
+        why = (paths_clash(d.plan["files"]) or head_refused(d.plan["files"], lookups) or
+               gitattributes_refused(d.plan["files"])) \
             if d.kind != "refused" and isinstance(d.plan, dict) and d.plan.get("files") else None
         return refused(why, target=target) if why else d
     except (KeyError, TypeError, AttributeError, ValueError, RecursionError):

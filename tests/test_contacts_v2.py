@@ -2239,6 +2239,41 @@ class ShellOffRule(Base):
         self.assertIn("same question", self.ok("ask_team", self.context(cid), question=question))
         self.assertIn("Asked as", self.ok("ask_team", self.context(cid), question="And my invoice?"))
 
+    def test_ask_team_reuses_the_open_question_only_for_the_same_source_messages(self):
+        self.person("Ana", "customer", ANA)
+        first = self.says(ANA, "Order A is missing.")
+        cid = first["conversation"]
+        second = self.says(ANA, "Order B went to the wrong address.")
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        a, b = hub.cm_ref(first["id"]), hub.cm_ref(second["id"])
+
+        def ask(**args):
+            return self.ok("ask_team", self.context(cid), question="Can you check the order?", **args)
+
+        def opened(**args):
+            response = ask(**args)
+            self.assertTrue(response.startswith("Asked as "), response)
+            return response.split()[2].rstrip(".")
+
+        one = opened(messages=[a])
+        # A hub from before ask_sources recorded the source ids in the call that created the task.
+        hub.ins("UPDATE conversation_messages SET ask_sources=NULL WHERE who='action' AND task=?",
+                (hub.parse_task(one),))
+        self.assertIn(f"{one} with the same question", ask(messages=[a, a]))
+        two = opened(messages=[b])
+        self.assertNotEqual(one, two)
+        for task, present, absent in ((one, first, second), (two, second, first)):
+            said = " ".join(r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND kind='say'",
+                                                    (hub.parse_task(task),)))
+            self.assertIn(present["text"], said)
+            self.assertNotIn(absent["text"], said)
+        both = opened(messages=[b, a])
+        self.assertIn(f"{both} with the same question", ask(messages=[a, b]))
+        none = opened()
+        self.assertIn(f"{none} with the same question", ask(messages=[]))
+        self.assertIn(f"{two} with the same question", ask(messages=[b]))
+
     def test_a_colleague_s_question_waits_for_the_line_and_keeps_only_their_own_wish(self):
         """The owner, 19 November 2026: a colleague asked an agent whose Shell box is off for links "for next time".
         No session of it could keep that wish or wait for its line's answer, and its chat told the colleague that the

@@ -349,6 +349,15 @@ class Copy(Fixture):
         self.assertIn("vps on vps (broker)", notes)
         self.assertIn("python3 hub.py --restore", notes)
 
+    def test_the_copy_names_the_key_that_the_mac_app_can_add_to_it(self):
+        """RESTORE.md says that no key is in the copy as the hub made it, and names the one that the Mac app can add
+        after it, owner-access.key, root on each server that its holder reaches (VAULT.md, the copy's key). Bug: the
+        notes tell the owner that a copy which opens root on their servers is safe to keep with their own files."""
+        notes = zipfile.ZipFile(io.BytesIO(self.download()[2])).read("RESTORE.md").decode()
+        self.assertIn("**One exception: `owner-access.key`.**", notes)
+        self.assertIn("can hold that file", notes)
+        self.assertIn("logs in there as", notes)
+
     def test_the_copy_says_to_read_the_open_tasks_before_they_run_again(self):
         """Records from an hour ago hold tasks that were open an hour ago, and their agents cannot know what the
         old machine did afterwards. That is rule 9, and after a restore it is the owner's to apply."""

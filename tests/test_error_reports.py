@@ -597,14 +597,40 @@ class OnTheHub(OwnerAPI):
         self.sweep(t0 + 3 * errorreports.DAY)
         self.assertEqual(len(self.sent), 2)
 
-    def fault(self, words):
+    def fault(self, words, error=KeyError):
+        """A fault of the hub at one place, of class `error` (each class is a fault of its own), counted at the hub's
+        clock (hub.now, which clock() moves) and stored as a pass of the tick stores it."""
         try:
-            fail_with(KeyError(words))
-        except KeyError:
-            with contextlib.redirect_stderr(io.StringIO()):
-                hub.print_fault()
+            fail_with(error(words))
+        except error:
+            diagnostics.record("hub", clock=lambda: hub.now())
         with hub.LOCK:
             hub.fault_flush(hub.now())
+
+    def refusal(self):
+        """A refused call of one of the hub's own tools (diagnostics.view keeps no other)."""
+        try:
+            fail_with(hub.ToolError("a refused call"))
+        except hub.ToolError:
+            diagnostics.refused("read_messages", clock=lambda: hub.now())
+        with hub.LOCK:
+            hub.fault_flush(hub.now())
+
+    def stall(self):
+        """A stall of the hub (a thread that held the others 2 s), as the stall watch counts it."""
+        watch = diagnostics.Watch(cpu=lambda ids: None, wall=lambda: hub.now(), out=io.StringIO())
+        watch.stall("hold", "a thread", (("hub.py", 1),), 2.0)
+        with hub.LOCK:
+            hub.fault_flush(hub.now())
+
+    def clock(self):
+        """The hub's clock from now on, which the test moves (`at[0] += seconds`): the faults, the passes and the
+        reports all read it, so a report's stamp is never ahead of the next pass, as at the real clock."""
+        at = [hub.now()]
+        patcher = unittest.mock.patch.object(hub, "now", lambda: at[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return at
 
     def test_a_real_fault_reaches_the_report_with_no_words(self):
         words = canary()
@@ -623,15 +649,106 @@ class OnTheHub(OwnerAPI):
         for value in strings(body):            # no path, but the folder of these tests in a clone
             self.assertNotIn("/", value.removeprefix(FOLDER + "/") if FOLDER != "." else value)
 
-    def test_a_fault_from_before_the_switch_does_not_go(self):
+    def test_a_fault_from_before_the_switch_neither_goes_nor_shows_a_card(self):
+        """Nothing from before the owner's yes goes (the privacy page), and with reports on no app shows the card of
+        the hub's faults, also not for such a fault (the owner, 25 November 2026: "the user sholdn't even see
+        anything!"). Counted again after the yes, it asks for an early report, which holds it, because no report
+        held it: a hub that asked only for a new row would keep it back for up to a day."""
         self.fault(canary())
         self.switch(True)
-        t0 = hub.now()
-        self.sweep(t0)
+        with hub.LOCK:
+            self.assertEqual([w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"], [])
+        self.sweep(hub.now())                   # the day's report
         self.assertEqual(self.sent[-1][1]["faults"], [])
         self.fault(canary())
-        self.sweep(t0 + errorreports.DAY + 1)
+        self.sweep(hub.now())
         self.assertEqual([f["class"] for f in self.sent[-1][1]["faults"]], ["KeyError"])
+        self.assertEqual((len(self.sent), len(hub.error_report_earlies())), (2, 1))
+
+    def test_a_fault_that_our_side_has_not_received_goes_early_once(self):
+        """The owner, 25 November 2026, of the card "The hub hit an error": "if telemetry is ON, we need to share it
+        automatically and the user sholdn't even see anything!" With error reports on, a fault that our side has not
+        received asks for one early report, which holds it, and the same fault counted again asks for none, also
+        hours after that report: a hub that asked at each count, or again after each report that went, would spend
+        the early reports of each day on one thread that fails at each pass. A stall and a refused call ask for none:
+        the privacy page says that a report goes about once a day, sooner only when something breaks."""
+        at = self.clock()
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        at[0] += 10
+        self.refusal()
+        self.stall()
+        self.assertIsNone(hub.kv_get("error_reports_early_at"))
+        at[0] += 10
+        self.fault(canary())
+        self.sweep(hub.now())
+        for _ in range(3):                      # the same fault, counted again hours later
+            at[0] += hub.FAULT_EARLY_GAP + 1
+            self.fault(canary())
+            self.sweep(hub.now())
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual([f["class"] for f in self.sent[1][1]["faults"]], ["KeyError", "StallHold"])
+        self.assertEqual((len(hub.error_report_earlies()), hub.kv_get("error_reports_early_at")), (1, None))
+
+    def test_the_faults_ask_for_two_early_reports_a_day_at_most_and_one_an_hour(self):
+        """The four early reports of a day are for every cause (the plan's 3.3). A fault asks for one only while fewer
+        than two went, and none in the last hour, so the faults' own asks take two of the four at most and leave room
+        for a failed restart, a release that does not start or timers that stop; a hub without the limit spent the
+        four in some 20 seconds on a burst (the review of 25 November 2026). A fault that comes while that holds asks
+        for nothing, and goes in the next report that goes. (The report before a restart has its own rule: the test
+        of a new kind of fault before a restart.)"""
+        at = self.clock()
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        at[0] += 10
+        self.fault(canary(), KeyError)          # the faults' first early report
+        self.sweep(hub.now())
+        at[0] += 10
+        self.fault(canary(), ValueError)        # 10 s later: it waits for the next report
+        self.sweep(hub.now())
+        self.assertEqual(len(self.sent), 2)
+        at[0] += hub.FAULT_EARLY_GAP
+        self.fault(canary(), OSError)           # an hour after the first: the second, which holds both
+        self.sweep(hub.now())
+        self.assertEqual([f["class"] for f in self.sent[-1][1]["faults"]], ["OSError", "ValueError"])
+        at[0] += hub.FAULT_EARLY_GAP
+        self.fault(canary(), IndexError)        # two went: it waits for the next report...
+        self.sweep(hub.now())
+        self.assertEqual(len(self.sent), 3)
+        with hub.LOCK:
+            hub.error_report_early("a test")    # ...which another cause still gets
+        self.sweep(hub.now())
+        self.assertEqual((len(self.sent), [f["class"] for f in self.sent[-1][1]["faults"]]), (4, ["IndexError"]))
+
+    def test_a_new_kind_of_fault_goes_before_a_restart_past_the_four_early_reports(self):
+        """The validator's day of 25 November 2026: a fault that comes back in each code, and a release with new code
+        every 2 hours. The reports before the first restarts use the four early reports of the day. After them, the
+        report before a restart still goes, at most four times a day (hub.RESTART_PAST_MOST), only for a fault of a
+        new kind: a class and an innermost file that no report that our side took in the last day held. A hub without
+        it lost every new fault of the later codes of the day, with no card (his words: "share it automatically"); one
+        that sent it for the fault that comes back would send a report at each release."""
+        at = self.clock()
+        self.addCleanup(diagnostics._code.__setitem__, "id", diagnostics.code_id())
+        self.switch(True)
+        self.sweep(hub.now())                           # the day's report
+        new = [ValueError, OSError, IndexError, TypeError, ZeroDivisionError]
+        held = []                                       # the classes of the report before each restart, or None
+        for n in range(1, 11):
+            for _ in range(2):                          # the fault that comes back, twice in each code
+                at[0] += 3600
+                self.fault(canary(), KeyError)
+                if n >= 5 and new and not _:            # from the fifth code on, a new kind in each code
+                    self.fault(canary(), new.pop(0))
+                self.sweep(hub.now())
+            body = hub.error_report_before_restart("c" * 40, "d" * 40)
+            held.append(None if body is None else sorted({f["class"] for f in body["faults"]}))
+            diagnostics._code["id"] = f"{n:024x}"       # the new code after the restart
+        self.assertEqual(held, [["KeyError"]] * 3 + [None] + [sorted(["KeyError", c]) for c in
+                                                              ("ValueError", "OSError", "IndexError", "TypeError")]
+                         + [None, None])                # the fifth new kind past the four: the cap
+        self.assertEqual((len(hub.error_report_earlies()), sum(r["past"] for r in hub.error_report_took())), (4, 4))
+        at[0] += errorreports.DAY + 1                   # a day later, no entry of what our side took stays
+        self.assertEqual(hub.error_report_took(), [])
 
     def test_a_mark_from_a_clock_that_was_ahead_loses_no_fault(self):
         self.switch(True)
@@ -719,7 +836,7 @@ class OnTheHub(OwnerAPI):
         for key in ("error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at",
                     "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
                     "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-                    "error_reports_restart", "error_reports_warnings"):
+                    "error_reports_restart", "error_reports_warnings", "error_reports_took"):
             self.assertIn(key, hub.QUIET_KEYS)
         self.assertNotIn("error_reports", hub.QUIET_KEYS)       # the owner's switch is news for every app
 
@@ -793,15 +910,6 @@ class HealthOnTheHub(OnTheHub):
     def watch(self, said):
         with hub.LOCK:
             hub.kv_set("server_watch", json.dumps(said))
-
-    def refusal(self):
-        """A refused call of one of the hub's own tools (diagnostics.view keeps no other)."""
-        try:
-            fail_with(hub.ToolError("a refused call"))
-        except hub.ToolError:
-            diagnostics.refused("read_messages")
-        with hub.LOCK:
-            hub.fault_flush(hub.now())
 
     @staticmethod
     def git(versions):
@@ -1247,8 +1355,8 @@ class HealthOnTheHub(OnTheHub):
         """The report before a restart onto new code is for the faults (exceptions and stalls) of the code that the
         restart replaces, and it is one of the day's four early reports. With no fault, also with refused calls
         alone, it waits for its day, as the privacy page says ("about once a day"), and so it does when four early
-        reports went: a fleet that takes releases by itself would else send a report at each release. The restart's
-        revision is kept all the same."""
+        reports went and its faults are of kinds that a report of the day held: a fleet that takes releases by itself
+        would else send a report at each release. The restart's revision is kept all the same."""
         self.switch(True)
         self.sweep(hub.now())       # the day's report
         self.refusal()

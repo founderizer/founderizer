@@ -51,6 +51,7 @@ import calendar
 import contextlib
 import datetime
 import fcntl
+import gzip
 import hashlib
 import hmac
 import io
@@ -73,6 +74,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # python3 -I leaves the code's own folder out
@@ -306,6 +308,18 @@ RUN_FIND = 60               # seconds in which the run of a dispatch whose answe
 LOG_MOST = 1024 * 1024      # bytes of a job's log that the door reads: a listing run prints one line
 LOG_TRIES = 3               # reads of a job's log that GitHub does not give yet, when its job just ended
 LOG_PAUSE = 5               # seconds between them
+# list and find of the GitOps repository (the owner's yes of 25 November 2026): the files that a read gives, from one
+# tarball of the head (GitHub.head_files)
+# bytes of a file that GitHub's contents API gives, and so a read: its limit is "1 MB", which may mean 1 MiB, and
+# 1,000,000 is the safe side (a file between the two that read gives is only counted)
+CONTENTS_MOST = 1000 * 1000
+LIST_MOST = 2000            # paths that a listing names; it counts the rest
+FIND_MOST = 200             # lines that a search gives; it counts the rest
+FIND_LINE = 200             # characters of each line that it gives
+HEAD_FILES_SECONDS = 120    # one listing or search: a repository that takes longer is searched by its folders
+TAR_HEADER_MOST = 1024 * 1024   # bytes of one long name or pax header of the tarball that the door reads
+# the tarball's bytes after gzip: its files (door_render.TREE_BYTES) and their headers
+TAR_STREAM_MOST = door_render.TREE_BYTES + 256 * 1024 * 1024
 # The log lines of a failed check or run (error_lines, GitHub.error_log): the agent holds no token of the repository,
 # so without them it reads only a step's name, and it guessed a cause from one (20 November 2026).
 ERR_RUNS = 2                # failed runs of one answer whose log lines the door gives
@@ -327,6 +341,20 @@ class ReachLate(Exception):
 
 class Refused(Exception):
     pass
+
+
+class CutTree(door_providers.Stop):
+    "A tree that GitHub gives cut (more than 100,000 entries or 7 MB): GitHub.head_entries."
+
+
+class NoFolder(door_providers.Stop):
+    """A listing or a search below a folder that the tree at the head does not have. The folder may be a word of a
+    search that had no quotes (find redis host searches redis below host), so the record keeps `recorded`, which names
+    no folder, in place of the decision's words."""
+
+    def __init__(self, words, recorded):
+        super().__init__(words)
+        self.recorded = recorded
 
 
 def P(path):
@@ -703,6 +731,15 @@ def error_lines(text, started=None, known=()):
     if not marked:
         return []
     return [log_line(x, known) for x in out[-ERR_OUT:] + marked]
+
+
+def recorded_args(target, op, args):
+    """The arguments of a call as the door's record hashes them (call_hash): all of them, but none of a search of the
+    GitOps repository (find), whose words never go into the record: a person may search for a name, and the hash of a
+    short name is found by trying names. Its decision's words name its folder."""
+    if isinstance(target, str) and target.startswith("gitops:") and op == "find":
+        return []
+    return args
 
 
 def call_hash(target, op, args, content=None):
@@ -1099,6 +1136,7 @@ class Door:
         self.yes_read_next = 0.0        # the time.monotonic() from which a call may ask the hub again (yes_read)
         self.asked, self.asked_kept = 0, 0      # the askings of the hub's signed statements (fetch_approvals)
         self.aws_sessions = {}          # each AWS role's session of an hour, in memory only (door_providers.aws_session)
+        self.head_kept = None           # the last tree and tarball of a GitOps head that list and find read (at_head)
 
     # ---- the files
     def access(self):
@@ -1494,7 +1532,7 @@ class Door:
         if getattr(d, "hash_content", None) is not None:
             # what the door adds to the call: a prune's list, a commit's regenerated file. The owner's yes is to them too (X3)
             content = (content or b"") + d.hash_content
-        sha = call_hash(target, op, args, content)
+        sha = call_hash(target, op, recorded_args(target, op, args), content)
         hashed = d.kind in ("own", "full")      # a refusal of these two kinds is the owner's to lift: it gives the hash
         full_host = d.host if d.kind == "full" else None
 
@@ -1523,9 +1561,17 @@ class Door:
                                          target=d.target)
             else:               # the owner, 11 November 2026: no model decides, "it needs to be the agent itself"
                 d.why = f"{agent}'s own call, which it answers for: {d.why}"
+        quiet = isinstance(target, str) and target.startswith("gitops:") and op == "find"
+
+        def said(why):
+            """The words of a call that did not pass, as the record keeps them: never an argument of a search, whose
+            folder may be a word of it (find redis host, with no quotes), and whose words never go there."""
+            if quiet and any(isinstance(a, str) and a in why for a in args or []):
+                return "a search of the GitOps repository, which did not run"
+            return why
         if d.kind == "refused":
             n = self.record.add(caller=agent, target=target, action=op, kind="refused", outcome="refused",
-                                why=d.why[:300], sha256=sha, **noted)
+                                why=said(d.why)[:300], sha256=sha, **noted)
             answer = {"ok": False, "kind": "refused", "why": d.why, "n": n, "route": "yes" if hashed else
                       d.route if d.route in ROUTES else "none"}
             if hashed:
@@ -1535,7 +1581,7 @@ class Door:
             if d.needs:
                 answer.update(needs=d.needs, **({"level": d.level} if d.level else {}))
             return answer
-        ran = log = None        # a run that the door waited for and that ended badly: the record says how
+        ran = log = unnamed = None      # a run that the door waited for and that ended badly: the record says how
         try:
             out = self.run(agent, access, d, op, args, content)
             ok, outcome = True, "done"
@@ -1543,11 +1589,14 @@ class Door:
             ok, outcome, out = False, "failed", str(e)
             ran = str(e) if isinstance(e, RunFailed) else None
             log = e.log if isinstance(e, RunFailed) else None
+            unnamed = e.recorded if isinstance(e, NoFolder) else None
         made = ((d.plan or {}).get("repo_new") or {}).get("name") if ok else None     # N3: what the call made
         if ok and d.form == "look":     # how much of the host went back to the caller: the count, never the bytes
             noted = dict(noted, bytes=len(out.encode("utf-8", "replace")))
         n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome,
-                            why=(f"{ran}. {d.why}" if ran else d.why)[:300], sha256=sha, **({"made": made} if made else {}),
+                            why=(unnamed or (f"{ran}. {d.why}" if ran else d.why if ok else said(d.why)))[:300],
+                            sha256=sha,
+                            **({"made": made} if made else {}),
                             **noted)
         # the failed steps' log lines go to the caller alone: the repository's text, never in the record (RunFailed)
         return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n, **({"log": log} if log is not None else {})}
@@ -1640,6 +1689,17 @@ class Door:
             return out
         if "read" in plan:
             return hub.read(plan["read"], access)
+        if "list" in plan or "find" in plan:
+            # one at a time for each repository: each reads up to TAR_STREAM_MOST of a tarball in the door's memory
+            lock = self.held(self.repo_locks, "files:" + plan["repo"].lower())
+            if not lock.acquire(blocking=False):
+                raise door_providers.Stop(f"another listing or search of {plan['repo']} runs now: send this call "
+                                          f"again when it has ended")
+            try:
+                return hub.list_files(plan["list"], access) if "list" in plan else \
+                    hub.find_lines(plan["find"], plan["folder"], access)
+            finally:
+                lock.release()
         if "workflow" in plan:
             out = hub.dispatch(plan["workflow"], plan["inputs"], wait=bool(plan.get("wait")))
             if plan.get("pruned"):          # the run passed: what it pruned is no longer waiting
@@ -2481,28 +2541,39 @@ class GitHub:
             return None
         return base64.b64decode(answer["content"])
 
-    def head_tree(self, ref):
-        """{path: "file" | "folder" | "link"} of each entry of the tree at ref (a commit), in one read of GitHub's trees
-        API, which lists the whole tree: a submodule and a symlink are links. door_targets.head_refused reads what each
-        path of a commit is there, since a file written at a folder's path replaces the whole folder. One read for the
-        whole decision, so a commit of many files in many folders costs one call of the App's hourly allowance, which
-        all of the owner's agents share. Each answer that is not this tree whole is Stop: a status other than 200, a
-        tree that GitHub cut ("truncated"), and an entry with no path or a type or mode that the door does not know."""
+    def head_entries(self, ref):
+        """{path: {kind: "file" | "folder" | "link", sha, size}} of each entry of the tree at ref (a commit), in one
+        read of GitHub's trees API, which lists the whole tree: a submodule and a symlink are links, and size is a
+        file's own. Each answer that is not this tree whole is Stop: a status other than 200, a tree that GitHub cut
+        ("truncated"), and an entry with no path or a type or mode that the door does not know."""
         status, got = self.call("GET", f"/repos/{self.repo}/git/trees/{urllib.parse.quote(ref, safe='')}?recursive=1",
                                 most=TREE_MOST)
+        if status == 200 and (isinstance(got, str) or isinstance(got, dict) and got.get("truncated") is True):
+            raise CutTree(f"GitHub gives no whole tree of {self.repo}: it has more than 100,000 entries or 7 MB")
         entries = got.get("tree") if status == 200 and isinstance(got, dict) else None
         if not isinstance(entries, list) or got.get("truncated") is not False:
-            raise door_providers.Stop(f"GitHub gave no whole tree of {self.repo} ({status}): send the commit again later, "
-                                      f"or in a repository that the door can read whole")
-        kinds, known = {}, {("tree", "040000"): "folder", ("blob", "100644"): "file", ("blob", "100755"): "file",
+            raise door_providers.Stop(f"GitHub gave no whole tree of {self.repo} ({status})")
+        found, known = {}, {("tree", "040000"): "folder", ("blob", "100644"): "file", ("blob", "100755"): "file",
                             ("blob", "120000"): "link", ("commit", "160000"): "link"}
         for entry in entries:
             kind = known.get((entry.get("type"), entry.get("mode"))) if isinstance(entry, dict) else None
             path = entry.get("path") if isinstance(entry, dict) else None
             if kind is None or not isinstance(path, str) or not path:
                 raise door_providers.Stop(f"GitHub gave a tree of {self.repo} with an entry that the door does not read")
-            kinds[path] = kind
-        return kinds
+            found[path] = {"kind": kind, "sha": entry.get("sha"), "size": entry.get("size")}
+        return found
+
+    def head_tree(self, ref):
+        """{path: "file" | "folder" | "link"} of each entry of the tree at ref (head_entries). door_targets.head_refused
+        reads what each path of a commit is there, since a file written at a folder's path replaces the whole folder.
+        One read for the whole decision, so a commit of many files in many folders costs one call of the App's hourly
+        allowance, which all of the owner's agents share."""
+        try:
+            entries = self.head_entries(ref)
+        except door_providers.Stop as e:
+            raise door_providers.Stop(f"{e}: send the commit again later, or in a repository that the door can read "
+                                      f"whole") from None
+        return {path: entry["kind"] for path, entry in entries.items()}
 
     def head(self, branch):
         """The commit at the head of a branch. A branch that GitHub does not give (none of that name, or a repository
@@ -2546,18 +2617,188 @@ class GitHub:
         return None
 
     def read(self, path, access):
-        """A read at HEAD of the GitOps repository, through the filter: no Secret object leaves the door."""
-        data = self.file_at_head(path)
+        """A read at HEAD of the GitOps repository, through the filter: no Secret object leaves the door. Only of a
+        path that the tree at the head names as a file (mode 100644 or 100755): GitHub's contents API answers a link to
+        a file with that file's text, under the link's path or the file's own, so a link to a secret path, which a
+        person can put in the repository, gave that path's file past gitops_path_refused."""
+        head = self.head(self.branch())
+        try:
+            kind, sha = self.kind_at(path, head)
+        except door_providers.Stop as e:
+            raise door_providers.Stop(f"{e}, so the door cannot say that {path} is a file at HEAD") from None
+        if kind == "link":
+            raise Refused(f"{path} is a link or a submodule at HEAD")
+        data = self.file_at_head(path, head) if kind == "file" and isinstance(sha, str) else None
         if data is None:
             raise Refused(f"{path} is not a file at HEAD")
+        # the file's own bytes, as list and find take a member of the tarball: a listing that calls a link a file, and a
+        # contents API that answers the link with the bytes of the file that it names, give other bytes than its blob
+        if blob_sha(data, sha) != sha:
+            raise Refused(f"{path} is not a file at HEAD: GitHub gave other bytes than the tree's")
         # The file as the patterns read it. One that is not block style is no refusal here, as it is in a commit: the
         # repository's own people wrote it, and the door is the agent's only way to read it. So it comes back, unless
         # the filter keeps it back (door_targets.kept_back).
-        read = door_targets.manifest_text(path, data)      # once: a file at the limit takes a moment to read
-        kept = door_targets.kept_back(path, data, read)
+        text, kept = door_targets.read_text(path, data)
         if kept:
             raise Refused(f"{path} {kept}")
-        return data.decode("utf-8") if read[1] else data.decode("utf-8", "replace")
+        return text
+
+    def kind_at(self, path, head):
+        """(what the tree at a head says that a path is: "file" (100644 or 100755), "folder", "link" (a symlink or a
+        submodule), or None; its sha). From the whole tree (at_head, which the door keeps); in a tree that GitHub cuts,
+        from the contents API's listing of the path's folder (one call), which names each entry's type and sha: a
+        symlink as one, and a submodule as a file (GitHub's old form), whose read the contents API answers with no
+        bytes. read checks the bytes that it gets against the sha (blob_sha)."""
+        tree = self.at_head(head)["tree"]
+        if not isinstance(tree, CutTree):
+            entry = tree.get(path) or {}
+            return entry.get("kind"), entry.get("sha")
+        folder = path.rpartition("/")[0]
+        where = f"/repos/{self.repo}/contents" + (f"/{urllib.parse.quote(folder)}" if folder else "")
+        status, listed = self.call("GET", f"{where}?ref={urllib.parse.quote(head, safe='')}")
+        if status == 404:
+            return None, None
+        if status != 200 or not isinstance(listed, list):
+            raise door_providers.Stop(f"GitHub answered {status} for the folder {folder or '/'} of {self.repo}")
+        entry = next((e for e in listed if isinstance(e, dict) and e.get("path") == path), None)
+        if entry is None and len(listed) >= GITHUB_LISTED:     # GitHub lists 1000 entries of a folder at most
+            raise door_providers.Stop(f"GitHub lists {GITHUB_LISTED} entries of the folder {folder or '/'} at most")
+        entry = entry or {}
+        return {"file": "file", "dir": "folder", "symlink": "link", "submodule": "link"}.get(entry.get("type")), \
+            entry.get("sha")
+
+    def at_head(self, head, tar=False):
+        """{tree: head_entries, or the CutTree of a tree that GitHub cuts; tar: the tarball} of the repository at a
+        head, the tarball only when asked. The door keeps the last ones that it read, of one repository at one head,
+        which never change: a second read, listing or search of the same head reads GitHub only for the head, and for a
+        read's file (Door.head_kept)."""
+        at = (self.repo.lower(), head)
+        kept = getattr(self.door, "head_kept", None)
+        kept = dict(kept) if isinstance(kept, dict) and kept.get("at") == at else {"at": at}
+        if "tree" not in kept:
+            try:
+                kept["tree"] = self.head_entries(head)
+            except CutTree as e:        # as big at the next call of this head
+                kept["tree"] = e
+        if tar and "tar" not in kept:
+            status, raw = self.door.raw("GET", f"{self.API}/repos/{self.repo}/tarball/{head}", {
+                "Authorization": "Bearer " + self.token(), "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"}, door_render.TAR_MAX + 1)
+            if status != 200:
+                raise door_providers.Stop(f"GitHub answered {status} for the tarball of {self.repo}")
+            if len(raw) > door_render.TAR_MAX:
+                raise door_providers.Stop(f"the tarball of {self.repo} is over {door_render.TAR_MAX // 2 ** 20} MiB, "
+                                          f"which the door does not read: read its files one by one")
+            kept["tar"] = raw
+        self.door.head_kept = kept
+        return kept
+
+    def head_files(self, folder, access, take, search=False):
+        """What list and find of the GitOps repository read: each file below a folder (the whole repository for "") at
+        the head of the default branch that read gives, one by one: take(path, the text that read gives). The names and
+        kinds are the tree's at the head, which read takes too (head_entries); a path that read refuses by its name
+        (door_targets.read_path_refused) is passed over, and not counted, as read never says whether it is there. The
+        answer is the count of the other files below the folder, whose names nobody gets: a link or a submodule, a file
+        of over CONTENTS_MOST bytes, a name that is not one line of printable text, a file that the filter keeps back
+        (door_targets.read_text), and a file of the tree whose bytes the tarball does not hold as they are. The bytes
+        come from the tarball of the head (one read, as Door.render reads it, with its caps), a member only when git's
+        hash of its bytes is the tree's sha of that file: git archive writes a file as .gitattributes says (another
+        encoding, a substitution), and read gives the file's own bytes. A folder with no such path is NoFolder."""
+        head = self.head(self.branch())
+        try:
+            tree = self.at_head(head)["tree"]
+        except door_providers.Stop as e:
+            raise door_providers.Stop(f"{e}, so the door cannot list or search its files now") from None
+        if isinstance(tree, CutTree):
+            raise door_providers.Stop(f"{tree}, so the door cannot list or search its files: read them one by one")
+        prefix = folder + "/" if folder else ""
+        below = {path: entry for path, entry in tree.items() if path.startswith(prefix) and entry["kind"] != "folder"
+                 and not door_targets.read_path_refused(path, access)}
+        if folder and not below:
+            raise NoFolder(f"{folder} is no folder at HEAD" + (": put words of more than one part in quotes"
+                                                               if search else ""),
+                           f"a {'search' if search else 'listing'} at HEAD through the filter, below a folder that is "
+                           f"not there")
+        left, wanted = 0, {}
+        for path, entry in below.items():
+            size, sha = entry.get("size"), entry.get("sha")
+            if entry["kind"] != "file" or not isinstance(size, int) or size > CONTENTS_MOST or \
+                    not isinstance(sha, str) or not path.isprintable():
+                left += 1
+            else:
+                wanted[path] = sha
+        until = time.monotonic() + HEAD_FILES_SECONDS
+        for path, member, read in tar_entries(self.at_head(head, tar=True)["tar"], self.repo) if wanted else ():
+            if time.monotonic() > until:
+                raise door_providers.Stop(f"the files of {self.repo} took more than {HEAD_FILES_SECONDS} seconds to "
+                                          f"read: name a folder")
+            sha = wanted.get(path)
+            if sha is None or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or member.size > CONTENTS_MOST:
+                continue
+            data = read()
+            if blob_sha(data, sha) != sha:
+                continue
+            del wanted[path]
+            text, kept = door_targets.read_text(path, data)
+            if kept:
+                left += 1
+                continue
+            take(path, text)
+        return left + len(wanted)       # and each file of the tree that the tarball does not hold as the tree says
+
+    def list_files(self, folder, access):
+        """list [<folder>]: the paths of the files below a folder that read gives, sorted, LIST_MOST at most, with the
+        count of the rest and of the files that read does not give."""
+        names = []
+        left = self.head_files(folder, access, lambda path, _text: names.append(path))
+        names.sort()
+        where = f"below {folder}" if folder else "in the repository"
+        out = names[:LIST_MOST] or [f"No file {where} is one that read gives."]
+        if len(names) > LIST_MOST:
+            out.append(f"And {count(len(names) - LIST_MOST, 'file')}: name a folder to see them.")
+        if left:
+            out.append(f"{count(left, 'file')} {where} {'is' if left == 1 else 'are'} left out: read does not give "
+                       f"{'it' if left == 1 else 'them'} (a file that the filter keeps back, a link, or a file of over "
+                       f"1 MB).")
+        return "\n".join(out) + "\n"
+
+    def find_lines(self, words, folder, access):
+        """find <words> [<folder>]: the lines that hold the words, in any case, of the files below a folder that read
+        gives, in the text that read gives, as path:line: text, FIND_MOST at most, each cut to FIND_LINE characters
+        around the words (a cut side marked with \u2026), with the count of the rest. A character that is not printable,
+        but a tab, shows as U+FFFD, so that no line of a file looks like two. Nothing of a file that read does not give
+        counts."""
+        want, found, total = words.casefold(), [], 0
+
+        def take(path, text):
+            nonlocal total
+            for n, line in enumerate(text.split("\n"), 1):
+                line = line[:-1] if line.endswith("\r") else line
+                low = line.casefold()
+                at = low.find(want)
+                if at < 0:
+                    continue
+                total += 1
+                start = 0
+                if len(line) > FIND_LINE and len(low) == len(line):     # around the words, where casefold keeps places
+                    start = max(0, min(at - (FIND_LINE - len(want)) // 2, len(line) - FIND_LINE))
+                end = min(len(line), start + FIND_LINE)
+                shown = "".join(c if c == "\t" or c.isprintable() else "\ufffd" for c in line[start:end])
+                found.append((path, n, ("\u2026" if start else "") + shown + ("\u2026" if end < len(line) else "")))
+                if len(found) > 4 * FIND_MOST:
+                    found.sort()
+                    del found[FIND_MOST:]
+        left = self.head_files(folder, access, take, search=True)
+        found.sort()
+        where = f"below {folder}" if folder else "in the repository"
+        out = [f"{path}:{n}: {line}" for path, n, line in found[:FIND_MOST]] or \
+            [f"No line of a file {where} that read gives holds these words."]
+        if total > FIND_MOST:
+            out.append(f"And {count(total - FIND_MOST, 'line')} hold them: name a folder or more words to see them.")
+        if left:
+            out.append(f"{count(left, 'file')} {where} {'was' if left == 1 else 'were'} not searched: read does not "
+                       f"give {'it' if left == 1 else 'them'}.")
+        return "\n".join(out) + "\n"
 
     def commit(self, plan):
         """One commit on the branch's head, made through the API: the blobs, one tree on the head's tree, the commit,
@@ -2940,6 +3181,82 @@ def http_redirect(method, url, headers, timeout=30):
         return e.code, e.headers.get("Location") if e.code in (301, 302, 303, 307, 308) else ""
     except (urllib.error.URLError, OSError) as e:
         return 599, str(e)
+
+
+class TarEntry(tarfile.TarInfo):
+    """One member of a tarball that the door reads (tar_entries): a long name or a pax header of over TAR_HEADER_MOST
+    bytes is refused before Python's tarfile reads it whole into memory."""
+
+    def _proc_member(self, tar):
+        if self.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE,
+                         tarfile.SOLARIS_XHDTYPE) and self.size > TAR_HEADER_MOST:
+            raise tarfile.HeaderError("a header over the door's cap")
+        return super()._proc_member(tar)
+
+
+class Capped(io.RawIOBase):
+    "A stream that ends the reading with OSError past `most` bytes: the tarball after gzip, which can be any size."
+
+    def __init__(self, inner, most):
+        self.inner, self.most, self.n = inner, most, 0
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        data = self.inner.read(size)
+        self.n += len(data)
+        if self.n > self.most:
+            raise OSError("over the door's cap")
+        return data
+
+
+def tar_entries(raw, repo):
+    """Each member of a repository's tarball as GitHub packs it (gzip, one top folder, which goes), in its order, read
+    in memory and never on a disk: (its path in the repository, the member, a function that gives the bytes of a file).
+    A member whose name has an empty, . or .. part is passed over, and so is the top folder: GitHub.head_files takes a
+    member only for a path of the tree whose sha its bytes have. The render's caps (door_render.unpack): TREE_FILES
+    members and TREE_BYTES of files. The tarball is read as a stream, once, with a cap on its bytes after gzip and on
+    each header (TarEntry): nothing in it is followed or written. Over a cap, and a tarball that cannot be read, is
+    Stop."""
+    unread = (tarfile.TarError, OSError, EOFError, zlib.error, RecursionError)  # RecursionError: a chain of long names
+
+    def stop(e):
+        return door_providers.Stop(f"the tarball of {repo} cannot be read ({e.__class__.__name__})")
+
+    def bytes_of(tar, member):          # called by the reader while this member is the stream's current one
+        try:
+            return tar.extractfile(member).read()
+        except unread as e:
+            raise stop(e) from None
+    if raw[:2] != b"\x1f\x8b":         # GitHub's tarball is gzip: a plain tar cut between two members reads as whole
+        raise door_providers.Stop(f"the tarball of {repo} cannot be read (no gzip)")
+    count = size = 0
+    try:
+        stream = gzip.GzipFile(fileobj=io.BytesIO(raw))
+        with tarfile.open(fileobj=Capped(stream, TAR_STREAM_MOST), mode="r|", tarinfo=TarEntry) as tar:
+            for member in tar:
+                parts = member.name.split("/")
+                if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
+                    continue
+                count, size = count + 1, size + (member.size if member.isreg() else 0)
+                if count > door_render.TREE_FILES or size > door_render.TREE_BYTES:
+                    raise door_providers.Stop(f"{repo} has more than {door_render.TREE_FILES} files or "
+                                              f"{door_render.TREE_BYTES // 2 ** 30} GiB, which the door does not read "
+                                              f"at once: read its files one by one")
+                yield "/".join(parts[1:]), member, lambda tar=tar, member=member: bytes_of(tar, member)
+    except unread as e:
+        raise stop(e) from None
+
+
+def count(n, word):
+    "n more of a word, as an answer says it: 1 more file, 2 more files."
+    return f"{n} more {word}" + ("" if n == 1 else "s")
+
+
+def blob_sha(data, sha):
+    "git's hash of a file's bytes as a blob, of the kind of the sha that it is compared with (SHA-1, or SHA-256)."
+    return (hashlib.sha1 if len(sha) == 40 else hashlib.sha256)(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def http_raw(method, url, headers, limit, timeout=120):

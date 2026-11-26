@@ -392,6 +392,19 @@ def health(release, checks, machine):
     return block
 
 
+def kinds(body):
+    """The kinds of the faults that a report holds, its stalls left out: each the fault's class and the mark of its
+    innermost file of the code tree ("lib" when none of its frames is in the tree), joined by ":", without the line,
+    which moves with each release of the code. Sorted, each once (the hub's error_report_took)."""
+    stalls, found = set(STALL_CLASSES.values()), set()
+    for fault in (body or {}).get("faults") or []:
+        if not isinstance(fault, dict) or fault.get("class") in stalls:
+            continue
+        files = [f.get("file") for f in fault.get("frames") or [] if isinstance(f, dict) and f.get("file") != "lib"]
+        found.add(f"{fault.get('class')}:{files[-1] if files else 'lib'}")
+    return sorted(found)
+
+
 def report(fleet, version, system, code, agents, servers, view, since=0, health=None):
     """The day's report: the facts and the faults, stalls (as faults of STALL_CLASSES) and refused calls of `view`
     (diagnostics.view) whose last time is after `since`, at most MOST of each, and the oldest of them left out until
