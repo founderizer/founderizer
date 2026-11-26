@@ -3068,7 +3068,8 @@ class PhoneYes(Devices):
             hub.q(f"UPDATE owner_device_signing SET {column}=?", (row[column],))
         real = hub.owner_device_at                      # the owner removes the phone between the check and the lock
         with patch.object(hub, "owner_device_at", lambda address: None if hub.LOCK._is_owned() else real(address)):
-            self.assertEqual(answer(owner_sign(yes, secret))[0], 409)
+            status, said = answer(owner_sign(yes, secret))
+        self.assertEqual((status, said.get("code")), (403, "not_owner_device"), said)  # what it sent changes nothing
         self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
         status, said = answer(owner_sign(yes, secret))
         self.assertEqual(status, 200, said)

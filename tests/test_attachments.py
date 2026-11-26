@@ -678,6 +678,18 @@ class Attachments(test_ui_api.OwnerAPI):
         theirs = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
                          "VALUES(?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), "chart.png", "image/png", len(PNG),
                                                      one["sha256"], hub.now(), "agent/worker", "worker"))
+        # the press race (25 November 2026): a phone that the owner removes right after its check reads no file that
+        # it does not show, though its address maps to no device by then, as the owner's computer does
+        self.assertEqual(self.call("GET", f"/ui/attachments/{theirs}?db=test-generation")[0], 200)     # the Mac's
+        removed = []
+
+        def checked(handler, device):
+            removed.append(device)
+            return True
+        with patch.object(hub, "owner_device_at", lambda address: None if removed else "phone"), \
+                patch.object(hub.Handler, "device_allowed", checked):
+            self.assertEqual(self.call("GET", f"/ui/attachments/{theirs}?db=test-generation")[0], 404)
+        self.assertEqual(removed, ["phone"])
         # an agent's file (attach_file), also for an owner app whose X-Fleet-Client is the label of that upload
         self.assertEqual(self.request(f"/ui/tasks/{task}/steer", self.command(attachments=[theirs]),
                                       {"Content-Type": "application/json", "X-Fleet-Client": "agent/worker"})[0], 409)

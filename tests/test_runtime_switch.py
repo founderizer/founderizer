@@ -528,9 +528,23 @@ class HelperSide(unittest.TestCase):
         h.retire_old_chat()
 
     def test_the_old_chat_closes_only_when_quiet_and_bound(self):
+        """The previous runtime's chat closes only when it is quiet and its conversation is recorded, and the rest of
+        its file (its last turn end) goes to the hub before it closes. The bug of that end: the helper read only the
+        new runtime's chat, and the old chat's last end never came, so a press of Stop whose Esc did not take gave a
+        result that its turn had handled a second time."""
         old = "env FLEET_TASK= codex resume --no-daemon " + THREAD
         fleet.save_chat_record("vps", {"generation": "test-db", "marker": None, "session": THREAD, "started": 1.0})
         self.codex_chat()
+        ended = "2026-10-11T05:52:00Z"
+        rollout = next((self.home / ".codex" / "sessions").rglob("rollout-*.jsonl"))
+        with open(rollout, "a") as f:
+            f.write(json.dumps({"type": "event_msg", "timestamp": ended,
+                                "payload": {"type": "task_complete", "turn_id": "t1"}}) + "\n")
+        sent = []
+
+        def post(method, path, data=None, timeout=40):
+            sent.append((path, data.get("ended"), list(windows)))
+            return 200, {}
         windows = ["owner-chat"]
         h = self.helper(windows, old, screen="Working (12s - esc to interrupt)")
         self.assertEqual(h.other_runtime_windows(), ["owner-chat"])
@@ -538,11 +552,13 @@ class HelperSide(unittest.TestCase):
             self.quiet_twice(h)
             self.assertEqual(windows, ["owner-chat"])                 # a running turn goes on
         h = self.helper(windows, old)
-        with patch.object(h, "task_work", return_value={}), patch.object(h, "quiesce", return_value=(True, 0, "")):
+        with patch.object(h, "task_work", return_value={}), patch.object(h, "quiesce", return_value=(True, 0, "")), \
+                patch("fleet.http", post):
             h.retire_old_chat()
             self.assertEqual(windows, ["owner-chat"])                 # one quiet reading is not enough
             self.quiet_twice(h)
         self.assertEqual((windows, h.other_runtime_windows()), ([], []))
+        self.assertEqual(sent, [("/helper/turn/vps", fleet.row_when(ended), ["owner-chat"])])  # before it closed
         h.lifecycle.report.assert_called()
         self.assertEqual(fleet.load_chat_record("vps")["session"], THREAD)      # kept for a switch back
 

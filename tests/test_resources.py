@@ -972,6 +972,16 @@ class Resources(OwnerAPI):
             for card in (nid, mail):        # a repository, and a mailbox (F6 piece 2)
                 code, said = hub.phone_submit(self.command(choice=0), "a phone", card, address="100.64.0.9")
                 self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WHERE))
+        # the press race (25 November 2026): the route checked the device (ui_allowed), and the owner removed it while
+        # the press waited for the hub's writes. Its address maps to no device then, which a lookup reads as the
+        # owner's computer: neither a PC's press nor a phone's gives
+        with patch.object(hub, "owner_device_at", lambda address: None), \
+                patch.object(hub, "owner_device_class", lambda device: {"pc": "Windows", "phone": "iPhone"}.get(device)):
+            for device in ("pc", "phone"):
+                for card in (nid, mail):
+                    said = hub.phone_submit(self.command(choice=0), "a device", card, address="100.64.0.9",
+                                            device=device)
+                    self.assertEqual((said[0], said[1].get("code")), (403, "not_owner_device"), said)
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (mail,))["answer"], None)
         self.assertNotIn("google", self.committed()["agents"]["lead"])
         code, said = self.request(f"/ui/needs/{nid}", self.command(answer="give dev write"))

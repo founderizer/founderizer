@@ -4620,15 +4620,15 @@ def limit_record(runtime, path):
 
 
 HANDOVER_MAX = 256      # message ids in one runtime's list of a hand-over: the hub takes no more (hub.HANDOVER_MAX)
-READ_HEAD = re.compile(r"\AUnread messages: (M-\d+(?:, M-\d+)*)\.\n")     # the first line of the manager's read answer
+READ_HEAD = re.compile(r"\AUnread messages: (M-\d+(?:, M-\d+)*)\.\n")     # the first line of a read answer
 FLEET_READ = "mcp__fleet__read_messages"
 HANDOVER_TAIL = 4 * 1024 * 1024     # the end of a conversation file that unfinished_turn_reads reads first
 
 
 def read_ids(value):
-    """The message ids that one answer of the manager's read_messages names in its first line (hub t_read_messages),
-    from its text, or from the tool result's JSON in older rollouts. Only that line counts: no message text can name
-    one."""
+    """The message ids that one answer of read_messages names in its first line, the manager's or an owner chat's
+    (hub t_read_messages), from its text, or from the tool result's JSON in older rollouts. Only that line counts: no
+    message text can name one."""
     text = text_of(value)
     if text.lstrip().startswith(("{", "[")):
         with contextlib.suppress(ValueError):
@@ -4645,11 +4645,12 @@ def reads_its_screen(runtime):
 
 
 def turn_reads(runtime, rows):
-    """(ended, ids): whether a turn of the session ended normally in these conversation rows, and the ids of the
-    messages that read_messages gave it after the last such end. A Claude turn ends normally with the model's own
+    """(ended, ids, at): whether a turn of the session ended normally in these conversation rows, the ids of the
+    messages that read_messages gave it after the last such end, and the time of that end's own row (None with no
+    time). A Claude turn ends normally with the model's own
     end_turn, a Codex turn with a task_complete that has no error. A turn that its usage limit or another error stopped,
     or that was interrupted, did not end normally."""
-    ended, ids, calls = False, [], set()
+    ended, ids, calls, at = False, [], set(), None
     for row in rows:
         if runtime == "claude":
             if row.get("isSidechain"):
@@ -4659,7 +4660,7 @@ def turn_reads(runtime, rows):
                 if isinstance(message.get("content"), list) else []
             if row.get("type") == "assistant" and message.get("stop_reason") == "end_turn" and \
                     not row.get("isApiErrorMessage"):
-                ended, ids, calls = True, [], set()
+                ended, ids, calls, at = True, [], set(), row_when(row.get("timestamp"))
             elif row.get("type") == "assistant":
                 calls.update(b["id"] for b in blocks if b.get("type") == "tool_use" and b.get("name") == FLEET_READ
                              and isinstance(b.get("id"), str))
@@ -4674,7 +4675,7 @@ def turn_reads(runtime, rows):
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
         kind, ptype = row.get("type"), payload.get("type")
         if kind == "event_msg" and ptype == "task_complete" and not payload.get("error"):
-            ended, ids, calls = True, [], set()
+            ended, ids, calls, at = True, [], set(), row_when(row.get("timestamp"))
         elif kind == "event_msg" and ptype == "item_completed":
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             if item.get("type") == "McpToolCall" and item.get("server") == "fleet" and item.get("tool") == "read_messages":
@@ -4685,18 +4686,28 @@ def turn_reads(runtime, rows):
             calls.add(payload["call_id"])
         elif kind == "response_item" and ptype == "function_call_output" and str(payload.get("call_id")) in calls:
             ids += read_ids(payload.get("output"))
-    return ended, ids
+    return ended, ids, at
 
 
 def unfinished_turn_reads(runtime, path, until=None):
-    """The ids of the manager's messages that its session read after its last turn that ended normally (turn_reads),
-    from its conversation file: a turn that its usage limit stopped, for example, did not finish them. A switch hands
-    them to the new runtime's session (hub record_status). [] when every read was finished, or the file cannot be
-    read. Only the end of a long file is read, unless a normal turn end is not in it. until: only the rows up to that
-    time (owner feature chat_stop: the reads of the turn that a cut end at that time ended, Helper.report_limit), and
-    none after it, which are of a later turn."""
+    """unfinished_turn's ids."""
+    return unfinished_turn(runtime, path, until)[0]
+
+
+def unfinished_turn(runtime, path, until=None):
+    """(ids, at, cut): the ids of the messages that a standing session read after its last turn that ended normally
+    (turn_reads), the time of that end (None when the file shows none, or it has no time), and of the newest end that
+    was not normal before it in the same rows (chat_turn_ends): a row read between the two was read by turns that ended
+    normally. With no such end in the rows, the time of their first row when they are not the whole file (0 when they
+    are): what was read before them is not taken as handled. All from its conversation file: a turn that its usage
+    limit stopped, for example, did not finish them. A switch hands them to the new runtime's session (hub
+    record_status). [] when every read was finished, or the file cannot be read. Only the end of a long file is read,
+    unless a normal turn end is not in it. until: only the rows up to that time (owner feature chat_stop: the reads of
+    the turn that a cut end at that time ended, Helper.report_limit), and none after it, which are of a later turn. The
+    manager's file and an owner chat's alike: the first line of each answer of read_messages names its messages
+    (hub.t_read_messages). cut is None when at is."""
     if not path or runtime not in MANAGER_RUNTIMES:
-        return []
+        return [], None, None
     step = HANDOVER_TAIL
     try:
         size = os.path.getsize(path)
@@ -4706,12 +4717,72 @@ def unfinished_turn_reads(runtime, path, until=None):
                 rows = complete_rows(stream.read(min(size, step)))
                 if until is not None:       # a row with no time is kept: it is no later turn's start
                     rows = [r for r in rows if not isinstance(r, dict) or (row_when(r.get("timestamp")) or 0) <= until]
-                ended, ids = turn_reads(runtime, rows)
+                ended, ids, at = turn_reads(runtime, rows)
             if ended or step >= size:
-                return sorted(set(ids))[-HANDOVER_MAX:]
+                cut = None
+                if at is not None:
+                    cuts = [t for t, normal in chat_turn_ends(runtime, rows) if not normal and t < at]
+                    times = [row_when(r.get("timestamp")) for r in rows if isinstance(r, dict)]
+                    cut = max(cuts) if cuts else (min([t for t in times if t] or [at]) if step < size else 0.0)
+                return sorted(set(ids))[-HANDOVER_MAX:], at, cut
             step *= 4
     except OSError:
-        return []
+        return [], None, None
+
+
+CHAT_TURN_SEARCH = 20     # passes of the helper between two searches for an owner chat's file (chat_turn_file)
+
+
+def turn_end_reports(ends):
+    """[{"ended", "cut_end"?}] of turn ends in their order [(time, normal)], split after each normal end that a cut end
+    follows: the hub keeps the newest end and the newest cut end of a report (hub.helper_turn), so a normal end
+    between two of them would be lost, and the press whose turn it ended would give its reads again. Each report
+    holds cut ends and then normal ends (owner feature chat_stop)."""
+    out, marks, normal = [], {}, False
+    for at, ok in ends:
+        if not ok and normal:
+            out.append(marks)
+            marks = {}
+        marks["ended"] = max(marks.get("ended", 0), at)
+        if not ok:
+            marks["cut_end"] = max(marks.get("cut_end", 0), at)
+        normal = ok
+    return out + ([marks] if marks else [])
+
+
+def chat_turn_ends(runtime, rows):
+    """[(time, normal)] of the turn ends of a standing session in these rows of its own conversation file, each at
+    the time of its own row (rows with no time are left out): a Claude turn ends normally at the model's end_turn,
+    and not normally at an API error or at the user's interrupt; a Codex turn at its task_complete, normally with no
+    error, and not normally at turn_aborted. A subagent's rows end no turn (owner feature chat_stop,
+    Helper.report_chat_turns)."""
+    out = []
+    for row in rows:
+        at = row_when(row.get("timestamp"))
+        if at is None:
+            continue
+        if runtime == "claude":
+            if row.get("isSidechain") or row.get("isMeta"):
+                continue
+            message = row.get("message") if isinstance(row.get("message"), dict) else {}
+            content = message.get("content")
+            texts = [content] if isinstance(content, str) else [b.get("text") for b in content or [] if
+                                                                  isinstance(b, dict) and b.get("type") == "text"] \
+                if isinstance(content, list) else []
+            if row.get("type") == "assistant" and row.get("isApiErrorMessage"):
+                out.append((at, False))
+            elif row.get("type") == "assistant" and message.get("stop_reason") == "end_turn":
+                out.append((at, True))
+            elif row.get("type") == "user" and any(str(t or "").startswith("[Request interrupted by user")
+                                                   for t in texts):
+                out.append((at, False))
+            continue
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        if row.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            out.append((at, not payload.get("error")))
+        elif row.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
+            out.append((at, False))
+    return out
 
 
 def start_handover(agent, generation):
@@ -5243,6 +5314,11 @@ class Helper:
         # poll, when that answer came), or None while there is none: an older hub, or a poll that failed
         self.hub_turns = None
         self.manager_session = None
+        self.chat_turn_read = {}    # {conversation file: the offset after its last line read} (report_chat_turns)
+        self.chat_turn_files = {}   # {the owner chat's record: its conversation file} (chat_turn_file)
+        self.chat_turn_left = {}    # {the file of a chat that was replaced: its runtime}, whose rest goes first
+        self.chat_turn_unread = set()   # the files whose read error a line told, until a read of each works
+        self.hub_offset = 0.0       # the hub's clock minus this helper's (the delivery poll's now; chat_turn_stop)
         self.manager_turn = {}    # {"session", "running"}: the manager's own turn, as its records go by (report_limit)
         self.manager_turn_end = 0.0     # the time of the newest turn end in those records (report_limit, chat_stop)
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
@@ -7330,6 +7406,7 @@ class Helper:
         The messages of the poll that want a signal are told after its last event, one signal for each window, so
         that the signal knows every message it tells of (signal). A window with none pending forgets what it was told:
         its next message is a new one."""
+        self.send_chat_turns()          # owner feature chat_stop: its turn ends reach the hub before its answers
         pending = {ev["id"] for ev in events}
         self.start_waits = {i: w for i, w in self.start_waits.items() if i in pending}
         self.wanted = {}
@@ -8604,7 +8681,8 @@ class Helper:
         whatever its age, because the hub knows an episode it already held or ended by that reset, and one without a
         reset only while it is fresh, because nothing else tells an old one from a new one. Its turn starts and ends
         go too, with no content (plan C1): the newest of each in the batch, so that the hub knows when the manager
-        last ended a turn. A hub before that route answers 404, and the batch goes on."""
+        last ended a turn. A normal end that a cut end follows ends a report of its own (turn_end_reports). A hub
+        before the route answers 404, and the batch goes on."""
         for r in batch["events"]:
             if r["type"] == "error" and r.get("code") == "usage_limit" and r.get("ts") and \
                     (r.get("resets_at") or time.time() - r["ts"] < 900):
@@ -8616,7 +8694,7 @@ class Helper:
                 self.say(f"manager: usage limit reported to the hub, reset {r.get('resets_at')}")
         turn = {"session": batch.get("session"), "running": self.manager_turn.get("session") == batch.get("session")
                 and self.manager_turn.get("running", False)}
-        marks, read = {}, time.time()
+        marks, read, reports, normal = {}, time.time(), [], False
         # the error of its provider at which a turn of the session that runs now ended, with its time, until one of its
         # turns works (signal names it to the hub); a usage limit has its own report above and its own warning, and a
         # cancelled turn proves nothing
@@ -8638,6 +8716,10 @@ class Helper:
             if not ts:
                 continue
             if r["type"] == "result":
+                # a normal end that a cut end follows ends a report of its own (turn_end_reports)
+                if r.get("stop_reason") != "end_turn" and normal:
+                    reports, marks = reports + [marks], {}
+                normal = r.get("stop_reason") == "end_turn"
                 turn["running"], marks["ended"] = False, ts
                 # owner feature chat_stop: the time of the newest end that was not normal (cancelled or error, not
                 # end_turn), so that the hub gives a cut turn's reads again only after such an end that came after the
@@ -8646,12 +8728,13 @@ class Helper:
                     marks["cut_end"] = ts
             elif r["type"] not in ("session", "model", "error") and not turn["running"]:
                 turn["running"], marks["started"] = True, r["ts"]
-        if "ended" in marks:        # owner feature chat_stop: a turn that ended after a press is not the press's turn
-            self.manager_turn_end = max(self.manager_turn_end, marks["ended"])
-        if "cut_end" in marks:      # owner feature chat_stop: what the cut turn read, up to its end
-            marks["cut_reads"] = self.cut_reads("manager", "", until=marks["cut_end"])
-        if marks:
-            code, _ = http("POST", f"/helper/turn/{self.agent}", marks, timeout=10)
+        for marks in reports + ([marks] if marks else []):
+            if "ended" in marks:    # owner feature chat_stop: a turn that ended after a press is not the press's turn
+                self.manager_turn_end = max(self.manager_turn_end, marks["ended"])
+            if "cut_end" in marks:  # owner feature chat_stop: what the cut turn read, up to its end
+                marks["cut_reads"] = self.cut_reads("manager", "", until=marks["cut_end"])[0]
+            # on this helper's clock: the hub converts with its own (helper_turn)
+            code, _ = http("POST", f"/helper/turn/{self.agent}", dict(marks, now=time.time()), timeout=10)
             if code not in (200, 404):
                 return code, {}
         self.manager_turn, self.manager_error = turn, error
@@ -9367,6 +9450,10 @@ class Helper:
         idle = reads_its_screen(old) and (self.screens.get("owner-chat") or {}).get("class") == "idle"
         if not idle and time.monotonic() - self.retiring[0] < RETIRE_QUIET:
             return
+        # owner feature chat_stop: the rest of its file (its last turn end) reaches the hub before it closes, since
+        # report_chat_turns reads the new runtime's chat now
+        if not self.report_chat_file(old, binding, replaced=True):
+            return
         before = self.task_work("owner-chat", "", keep_runtime=False)
         tmux("kill-window", "-t", target)
         time.sleep(1)
@@ -9684,14 +9771,15 @@ class Helper:
         answer = load_chat_stop_answers(self.agent).get(key)
         if answer is None:
             confirmed, detail, cut = self.chat_turn_stop(window, extra)
+            # whenever confirmed or cut: the hub keeps those of an answer that cut (chat_stops.reads) and gives them
+            # again only at the end of a press that cut, by any path; with them, from the same read of the
+            # session's conversation file, the time of its last normal turn end
+            got = self.cut_reads(window, str(extra.get("generation") or "")) if confirmed or cut else ([], None, None)
+            reads, normal_end, normal_cut = got[0], got[1], got[2] if len(got) > 2 else None
             answer = {"stop": stop, "confirmed": confirmed, "detail": detail, "cut": cut,
                       # the time of its event: the hub takes no answer of an earlier event of the same row
                       "created": extra.get("created"),
-                      # whenever confirmed or cut: the hub keeps those of an answer that cut (chat_stops.reads) and
-                      # gives them again only at the end of a press that cut, by any path; a turn that ended
-                      # normally gives none
-                      "reads": self.cut_reads(window, str(extra.get("generation") or ""))
-                      if confirmed or cut else []}
+                      "reads": reads, "normal_end": normal_end, "normal_cut": normal_cut}
             if cut:
                 self.lines.pop(window, None)
             # kept before the send: a hub that gives no answer at all (a release restarts it) raises here, and the
@@ -9702,7 +9790,7 @@ class Helper:
                 save_chat_stop_answers(self.agent, {key: answer})
             except OSError as e:
                 self.say(f"{window}: the answer of the press of Stop is not kept ({type(e).__name__}); it goes now")
-        code, _ = http("POST", f"/helper/chat-stop/{self.agent}", answer)
+        code, _ = http("POST", f"/helper/chat-stop/{self.agent}", dict(answer, now=time.time()))
         if code not in (200, 409):
             raise Refused(f"the hub did not take the answer of the press of Stop ({code})")
         with contextlib.suppress(OSError):
@@ -9720,13 +9808,108 @@ class Helper:
             if not isinstance(answer, dict) or answer.get("stop") in here:
                 continue
             try:
-                code, _ = http("POST", f"/helper/chat-stop/{self.agent}", answer)
+                code, _ = http("POST", f"/helper/chat-stop/{self.agent}", dict(answer, now=time.time()))
             except (urllib.error.URLError, OSError, ValueError):
                 continue
             if code in (200, 404, 409):
                 with contextlib.suppress(OSError):
                     save_chat_stop_answers(self.agent, {})
                 self.say(f"the kept answer of a press of Stop went to the hub ({code})")
+
+    def send_chat_turns(self, search=True):
+        """report_chat_turns, at the start of each round of the loop (before a step replaces the chat: a revoked
+        credential, a chat's proof, new tools; with no search, so that a Codex chat's count is of rounds) and before
+        the events of a poll. A file that it cannot read keeps nothing else of the round from its work."""
+        try:
+            self.report_chat_turns() if search else self.report_chat_turns(search=False)
+        except Exception as e:
+            self.say(f"owner chat: its turn ends did not go to the hub ({type(e).__name__})")
+
+    def report_chat_turns(self, search=True):
+        """The turn ends of this agent's owner chat to the hub (helper feature chat_turns, POST /helper/turn/<agent>),
+        as report_limit sends the manager's: the newest end (`ended`) and the newest end that was not normal
+        (`cut_end`, with what its turn read up to it, `cut_reads`) of the rows that its conversation file got since
+        the last pass, each at the time of its own row (chat_turn_ends), on this helper's clock (`now`). A first pass
+        reads the end of the file only. A normal end that a cut end follows ends a report of its own, so that the hub
+        has each in its order (turn_end_reports). A send that the hub does not take reads the same rows again at the
+        next pass; the hub keeps a report of a worker's or a lead's as the manager's, and a hub of an earlier build
+        answers 404. The manager's come from its records (report_limit). When the chat was replaced (its record
+        changed: chat_turn_file), the rest of the old chat's file goes first, so that its last turn end is not lost
+        and the hub has the ends in their order; the new file's ends wait until it went."""
+        if self.conf.get("role") == "manager":
+            return
+        runtime = self.conf.get("runtime")
+        try:
+            record = load_chat_record(self.agent, runtime)
+        except Refused:
+            return
+        path = self.chat_turn_file(runtime, record, search) if isinstance(record, dict) else None
+        for old, old_runtime in list(self.chat_turn_left.items()):
+            if old != path and not self.report_chat_file(old_runtime, old, replaced=True):
+                return              # its rest again at the next pass, before the new file's ends
+            self.chat_turn_left.pop(old, None)
+        if path:
+            self.report_chat_file(runtime, path)
+
+    def report_chat_file(self, runtime, path, replaced=False):
+        """The turn ends of one conversation file of the owner chat since the last pass (report_chat_turns). False when
+        a report did not go, and the same rows go again at the next pass; else True, also for a file that is gone or
+        cannot be read (one line says so, once until a read of it works): the file of a chat that was replaced
+        (`replaced`) that stays unreadable holds back neither the new chat's ends nor the close of the previous
+        runtime's chat. The current chat's file keeps its offset, so its ends go when it can be read again."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return True
+        start = self.chat_turn_read.get(path)
+        start = max(0, size - HANDOVER_TAIL) if start is None or start > size else start
+        try:
+            with open(path, "rb") as stream:
+                stream.seek(start)
+                data = stream.read(size - start)
+        except OSError as e:
+            if path not in self.chat_turn_unread:
+                self.chat_turn_unread.add(path)
+                self.say(f"owner chat: {os.path.basename(path)} cannot be read ({type(e).__name__}); " +
+                         ("the turn ends of the replaced chat since the last pass do not go to the hub" if replaced
+                          else "its turn ends go to the hub when it can be read again"))
+            return True
+        self.chat_turn_unread.discard(path)
+        whole = data.rfind(b"\n") + 1      # the complete lines only: a writer can still be finishing the last one
+        for marks in turn_end_reports(chat_turn_ends(runtime, complete_rows(data[:whole]))):
+            if "cut_end" in marks:
+                marks["cut_reads"] = unfinished_turn_reads(runtime, path, until=marks["cut_end"])
+            try:
+                code, _ = http("POST", f"/helper/turn/{self.agent}", dict(marks, now=time.time()), timeout=10)
+            except (urllib.error.URLError, OSError, ValueError):
+                return False
+            if code not in (200, 404):
+                return False        # the same rows again at the next pass, the reports that went too
+        self.chat_turn_read[path] = start + whole
+        return True
+
+    def chat_turn_file(self, runtime, record, search=True):
+        """The conversation file of the owner chat of this record (chat_binding), kept for the same chat while it is
+        there: a Codex chat's is a search of its rollouts, which report_chat_turns would make at each pass, so a Codex
+        chat with no file found yet is searched for again at every CHAT_TURN_SEARCH-th pass that searches (one in each
+        round of the loop: send_chat_turns). A Claude chat's is one stat, and its file appears only at its first
+        message: it is looked for at each pass."""
+        key = (runtime, record.get("generation"), record.get("session"), record.get("marker"))
+        if key not in self.chat_turn_files:     # the chat was replaced: the rest of its file goes first
+            for (old_runtime, *_), (old, _) in self.chat_turn_files.items():
+                if old and old in self.chat_turn_read:
+                    self.chat_turn_left[old] = old_runtime
+        path, misses = self.chat_turn_files.get(key, (None, CHAT_TURN_SEARCH))
+        if path and os.path.exists(path):
+            return path
+        if not search and runtime == "codex":
+            return None
+        if not path and misses < CHAT_TURN_SEARCH and runtime == "codex":
+            self.chat_turn_files = {key: (None, misses + 1)}
+            return None
+        path = self.chat_binding(runtime, record.get("generation"))
+        self.chat_turn_files = {key: (path, 1)}
+        return path
 
     def chat_turn_stop(self, window, extra):
         """(confirmed, detail, cut) of a press of Stop for `window` (chat_stop): cut when a key of interrupt went to the
@@ -9756,7 +9939,8 @@ class Helper:
             return True, "no turn was running", False
         if self.feeds_of(window):
             self.tailer.flush(window)       # its newest records first (report_limit keeps their newest turn end)
-            if self.manager_turn_end > float(extra.get("created") or 0):
+            # its turn end is on this helper's clock, the press's time on the hub's
+            if self.manager_turn_end + self.hub_offset > float(extra.get("created") or 0):
                 return True, "its turn ended before the interrupt", False
         confirmed, detail = self.interrupt(window)
         cut = self.interrupt_keys > 0       # "no turn was running" and "no session was running" sent no key
@@ -9782,18 +9966,19 @@ class Helper:
         return False, "its conversation file still changes after the interrupt"
 
     def cut_reads(self, window, generation, until=None):
-        """The ids of the messages that the cut turn of `window` had read (unfinished_turn_reads), from the session's
-        own conversation file: the manager's by its window's @fleet_session (manager_binding), an owner chat's by its
-        record (chat_binding). Only a read whose first line names its messages counts (read_ids), and only the
-        manager's read begins so (hub.t_read_messages): a worker's or a lead's chat names none, so its list is empty
-        here. until: only its reads up to that time (unfinished_turn_reads)."""
+        """(ids, at, cut): the ids of the messages that the cut turn of `window` had read, the time of the session's
+        last normal turn end and the bound before it, from one read of its own conversation file
+        (unfinished_turn): the manager's by its
+        window's @fleet_session (manager_binding), an owner chat's by its record (chat_binding). Only a read whose
+        first line names its messages counts (read_ids): the manager's and an owner chat's both do
+        (hub.t_read_messages). until: only its reads up to that time."""
         runtime = self.conf.get("runtime")
         if window == "manager":
             state = self.manager_state()
             path = manager_binding(self.agent, runtime, state[0]) if state and state[0] else None
         else:
             path = self.chat_binding(runtime, generation)
-        return unfinished_turn_reads(runtime, path, until)
+        return unfinished_turn(runtime, path, until)
 
     def deposit(self, extra):
         """A key or a login that the central vault sealed for this machine's vault (owner feature
@@ -11626,6 +11811,8 @@ def cmd_run(args):
                       "key that its server service or the owner registers")
             if code != 200:
                 raise Refused(f"hub answered {code}")
+            if isinstance(data.get("now"), (int, float)) and not isinstance(data.get("now"), bool):
+                h.hub_offset = data["now"] - time.time()        # owner feature chat_stop: a press's time is the hub's
             h.doing("chat")
             h.listed = data.get("listed") if isinstance(data.get("listed"), dict) else {}
             turns = data.get("turns")       # plan P0: the hub sends it to a helper with update_between_turns
@@ -11634,6 +11821,7 @@ def cmd_run(args):
             h.conversations = data.get("conversations") if isinstance(data.get("conversations"), list) else None
             h.conversation_modes = data.get("conversation_modes") \
                 if isinstance(data.get("conversation_modes"), dict) else None
+            h.send_chat_turns(search=False)     # owner feature chat_stop: its last turn end before a step replaces it
             h.close_revoked(data.get("revoked"), names)    # owner API 1.12: a key change revoked their credential
             h.chat_proof(data.get("events", []), data.get("chat"))  # the one count on the proof: a read, its tools
             h.keep_chat(data.get("chat"), data.get("db"))

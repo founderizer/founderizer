@@ -14,6 +14,7 @@ An in-process hub with a temporary database and a set clock. No AI call, no live
 import ast
 import hashlib
 import json
+import re
 import unittest
 import uuid
 from unittest.mock import patch
@@ -223,7 +224,7 @@ class SecretThroughAnEscape(Base):
              patch.object(hub, "team_start_text", lambda agent: team):
             text, error = hub.call_tool("studio", "read_messages", {})
         self.assertFalse(error, text)
-        self.assertTrue(text.startswith(hub.MASK + "\n\nMessage M-"), text[:80])
+        self.assertRegex(text, r"\AUnread messages: M-\d+\.\n\n" + re.escape(hub.MASK) + "\n\nMessage M-")
         self.assertIn("Use the staging shop first.", text)
         self.assertNotIn("assw0rd", text)
 

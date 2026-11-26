@@ -180,6 +180,8 @@ MECHANICS = {
         "record_files": "the same, for the conversation files of an owner chat whose stuck screen the helper reads "
                         "(runtime gaps C2)",
         "turn_reads": "how a turn ends in each provider's own records",
+        "chat_turn_ends": "the same, for an owner chat's conversation file",
+        "chat_turn_file": "only Codex finds a conversation file by a search of its rollouts; Claude's is one path",
         "reads_its_screen": "only Claude Code's idle input line and turn records are read as facts (plan C5); another "
                             "provider keeps its clocks until its own are read",
         "cmd_chat_session": "reading a conversation id out of each provider's own records",

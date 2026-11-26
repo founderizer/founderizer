@@ -362,6 +362,27 @@ class Copy(Fixture):
         zf = zipfile.ZipFile(io.BytesIO(self.download()[2]))
         self.assertEqual({one.date_time for one in zf.infolist()}, {(1980, 1, 1, 0, 0, 0)})
 
+    def test_a_skill_file_of_a_copy_s_key_name_from_an_older_copy_is_left_out_of_the_restore(self):
+        """A copy taken before such names were refused (lifecycle.COPY_KEY_NAMES) can list a skill file named
+        owner-access.key under config/: the restore leaves that one member out and takes the rest, so the owner's
+        older copy still restores, and no file of that name comes back onto the configuration ref."""
+        code, _headers, data = self.download()
+        self.assertEqual(code, 200)
+        old = zipfile.ZipFile(io.BytesIO(data))
+        members = {name: old.read(name) for name in old.namelist()}
+        planted, body = "config/skills/vps/deploy/Owner-Access.Key", b"not the key\n"
+        members[planted] = body
+        manifest = json.loads(members["fleet.json"])
+        manifest["files"][planted] = {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()}
+        members["fleet.json"] = json.dumps(manifest).encode()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, member in members.items():
+                zf.writestr(name, member)
+        config = self.bundle(buffer.getvalue())["config"]
+        self.assertNotIn(planted[len(hub.BACKUP_CONFIG):], config)
+        self.assertIn("team.json", config)
+
     def test_each_copy_that_the_hub_serves_is_one_that_a_restore_takes(self):
         """A restore unpacks at most RESTORE_UNPACK of a copy's files, takes at most BACKUP_ENTRIES_MAX entries and
         BACKUP_DIRECTORY_MAX of central directory, and reads at most BACKUP_MANIFEST_MAX of its fleet.json. Records of

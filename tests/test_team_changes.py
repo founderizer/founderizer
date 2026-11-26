@@ -141,6 +141,14 @@ class TeamChanges(Remove):
                                               {"need": card["id"], "choice": 0})
         self.assertEqual(status, 409, answer)
         self.assertEqual(self.board({"choice": "0"}), 303)
+        # the press race (25 November 2026): a PC's or a phone's press that the route checked, whose device the
+        # owner removed while it waited for the answer's turn, makes no plan, and never counts as the owner's computer
+        with patch.object(hub, "owner_device_at", lambda address: None), \
+                patch.object(hub, "owner_device_class", lambda device: {"pc": "Windows", "phone": "iPhone"}.get(device)):
+            for device in ("pc", "phone"):
+                said = hub.phone_submit({"request_id": str(uuid.uuid4()), "db": hub.kv_get("db_id"), "choice": 0},
+                                        "founderizer-swift/1/test", card["id"], address="100.64.0.9", device=device)
+                self.assertEqual(said[0], 403, said)
         self.assertIsNone(self.card()["answer"])
         self.assertIn("scout", self.origin_team()["agents"])
         before = self.head()

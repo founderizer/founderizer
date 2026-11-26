@@ -1249,6 +1249,15 @@ class Handover(StandIn):
         self.assertEqual(fleet.unfinished_turn_reads("claude", self.write(timed),
                                                      until=fleet.row_when("2026-11-22T10:00:02Z")), [3])
         self.assertEqual(fleet.unfinished_turn_reads("claude", self.write(timed)), [3, 4])
+        ended = [dict(r, timestamp=f"2026-11-22T10:00:0{n}Z") for n, r in
+                 enumerate([*claude_read("r1", 3), claude_end(), *claude_read("r2", 4)])]
+        self.assertEqual(fleet.unfinished_turn("claude", self.write(ended)),
+                         ([4], fleet.row_when("2026-11-22T10:00:02Z"), 0.0))
+        # owner feature chat_stop: and the newest end that was not normal before that normal end, from the same rows
+        cut = [dict(r, timestamp=f"2026-11-22T10:00:0{n}Z") for n, r in enumerate(
+            [*claude_read("r1", 3), CLAUDE_LIMIT, *claude_read("r2", 4), claude_end(), *claude_read("r3", 5)])]
+        self.assertEqual(fleet.unfinished_turn("claude", self.write(cut)),
+                         ([5], fleet.row_when("2026-11-22T10:00:05Z"), fleet.row_when("2026-11-22T10:00:02Z")))
 
     def test_odd_rows_never_stop_a_start(self):
         """A conversation file is the runtime's: an id of another type there gives no hand-over and no exception."""

@@ -401,12 +401,17 @@ class ConfigRef(OwnerAPI):
         this path admits them a release before the tool that writes them. A script among them is no Fleet code, so
         a machine that has not fetched the skill yet is not behind, and the owner's copy carries every skill."""
         for path in ("skills/vps/deploy-acme/SKILL.md", "skills/vps/deploy-acme/check.py",
-                     "skills/vps/deploy-acme/scripts/run.sh", "skills/vps/a/b/c/notes_1.txt", "skills/vps/0/SKILL.md"):
+                     "skills/vps/deploy-acme/scripts/run.sh", "skills/vps/a/b/c/notes_1.txt", "skills/vps/0/SKILL.md",
+                     # near a copy's key names, and still a skill's files
+                     "skills/vps/x/my-owner-access.key", "skills/vps/x/owner-access.keys",
+                     "skills/vps/x/owner-access.key.txt"):
             self.assertTrue(hub.CONFIG_FILES.match(path), path)
         for path in ("skills/vps/deploy-acme/../../../hub.py", "skills/vps/x/a..b", "skills/vps/Deploy/SKILL.md",
                      "skills/vps/-x/SKILL.md", "skills/vps/x/.env", "skills/vps/x/a/.git/config",
                      "skills/vps/x/a/b/c/deep.txt", "skills/vps/SKILL.md", "skills/V/x/SKILL.md", "skills/vps/x/",
-                     "skills/vps/x//SKILL.md", "skills/" + "a" * 32 + "/x/SKILL.md", "skills/vps/" + "x" * 65 + "/a"):
+                     "skills/vps/x//SKILL.md", "skills/" + "a" * 32 + "/x/SKILL.md", "skills/vps/" + "x" * 65 + "/a",
+                     # the names of the owner's access key in a copy, in any case and folder (Door and security)
+                     "skills/vps/x/owner-access.key", "skills/vps/x/OWNER-ACCESS.KEY", "skills/vps/x/a/owner-access.pub"):
             self.assertFalse(hub.CONFIG_FILES.match(path), path)
         commit = hub.commit_kit_file("skills/vps/deploy-acme/SKILL.md", b"---\nname: deploy-acme\n---\n\nSteps.\n",
                                      "vps wrote the skill deploy-acme", author="vps",

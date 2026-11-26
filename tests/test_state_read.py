@@ -346,14 +346,17 @@ class StateCase(OwnerAPI):
           ("leo", T0 - 900, T0 - 600, 1, None, "usage", T0 - 600))
         for name, reported, data in (
                 ("manager", T0 - 20, {"runtime": {"name": "claude", "signed_in": True}, "reading_age": 3}),
-                ("mia", T0 - 100, {"features": ["agent_key", "chat_warm", "chat_stop"],
+                ("mia", T0 - 100, {"features": ["agent_key", "chat_warm", "chat_stop", "chat_turns"],
                                    "runtimes": {"claude": {"signed_in": False}}}),
-                ("leo", T0 - hub.MACHINE_STALE - 100, {"features": ["agent_key", "chat_warm", "chat_stop"],
+                ("leo", T0 - hub.MACHINE_STALE - 100, {"features": ["agent_key", "chat_warm", "chat_stop",
+                                                                    "chat_turns"],
                                                        "runtimes": {"codex": {"signed_in": False}}}),
-                ("oli", T0 - 10, {"features": ["chat_warm", "chat_stop"], "runtimes": {"codex": {"signed_in": True}}}),
-                ("kai", T0 - 50, {"features": ["agent_key", "chat_warm", "chat_stop"],
+                ("oli", T0 - 10, {"features": ["chat_warm", "chat_stop", "chat_turns"],
+                                  "runtimes": {"codex": {"signed_in": True}}}),
+                ("kai", T0 - 50, {"features": ["agent_key", "chat_warm", "chat_stop", "chat_turns"],
                                   "runtimes": {"claude": {"signed_in": False}}}),
-                ("zoe", T0 - 40, {"features": ["agent_key", "chat_stop"], "runtimes": {"claude": {"signed_in": True}}})):
+                ("zoe", T0 - 40, {"features": ["agent_key", "chat_stop", "chat_turns"],
+                                  "runtimes": {"claude": {"signed_in": True}}})):
             x("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)", (name, json.dumps(data), reported))
         for name, runtime, state, kind, step, at in (("mia", "claude", "done", "install", "sign_in", T0 - 50),
                                                      ("mia", "claude", "done", "prepare", "sign_in", T0 - 70),

@@ -372,6 +372,7 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
             "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
             "task_outputs",         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
+            "chat_turns",           # it sends its owner chat's turn ends to the hub (fleet.Helper.report_chat_turns)
             "status_now",           # it reports at once when the hub asks (event status_now, report_soon)
             "chat_warm",            # it starts the owner chat before a message when the hub says so (keep_chat)
             "conversation_reads",   # a conversation's event stays until its session reads it (plan C5)
@@ -2506,8 +2507,18 @@ FLOOR_FILE = "release-floor"        # in ~/.fleet: the newest release that this 
 # hub can write but a release can replace is drift by construction. publish.py calls all of knowledge/ the fleet's own
 # (OWNER_FILES). skills/ is each agent's own (design v4 D1): skills/<agent>/<name>/SKILL.md and the few small files
 # beside it, at most two folders deep and never hidden.
-CONFIG_FILES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"
-                          rf"{SKILLS}/[a-z][a-z0-9-]{{1,30}}/{SKILL_NAME}/{SKILL_FILE})\Z")
+# The names under which a copy of the fleet keeps the owner's access key (the Mac app's OwnerAccess.member): a copy
+# must hold no file of either name but that key, and the readers of a later design refuse a copy with either. So no
+# configuration file takes one, in any letter case and in any folder, and no file that an agent or a gift writes can
+# stand for the key in a copy (owner_files) and stop the copy's readers (the Door and security area, 25 November 2026).
+# Only a skill's files can have such a name: the other paths end in .md.
+COPY_KEY_NAMES = ("owner-access.key", "owner-access.pub")
+COPY_KEY_NAME = re.compile(r"(?:.*/)?(?i:" + "|".join(re.escape(name) for name in COPY_KEY_NAMES) + r")\Z")
+# The places of the configuration ref, whatever a file's name: a removal of a file that a fleet held before the names
+# above were refused still goes through them (hub.commit_kit_file), and so does a copy's member that a restore skips.
+CONFIG_PLACES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"
+                           rf"{SKILLS}/[a-z][a-z0-9-]{{1,30}}/{SKILL_NAME}/{SKILL_FILE})\Z")
+CONFIG_FILES = re.compile(f"(?!{COPY_KEY_NAME.pattern})" + CONFIG_PLACES.pattern)
 OUTPUTS = "outputs/"                # the files of a delivered task, which the hub commits (hub.commit_outputs)
 DATA_MODE = "100644"                # a plain file: no program, no link and no submodule
 GONE = "000000"                     # the mode git gives a path that a commit does not have
@@ -2518,6 +2529,14 @@ def data_path(path):
     """True for a path of the configuration ref that is data and never code: what a release leaves as the fleet has it
     (releases.Update), and what a checkout may take from the hub with no release."""
     return bool(CONFIG_FILES.match(path)) or (path.startswith(OUTPUTS) and ".." not in path.split("/"))
+
+
+def data_move(path, mode):
+    """True for a change of one path (its mode in the new tree, GONE for a removal) that moves only data: a path of
+    data_path, or the removal of a file in a place of the configuration ref whatever its name (CONFIG_PLACES): a skill
+    file of a copy's key name that a fleet held before such names were refused leaves the ref as data, never as code
+    (the owner's remove_skill, an agent's retire), while adding one stays refused."""
+    return data_path(path) or (mode == GONE and bool(CONFIG_PLACES.match(path)))
 
 
 def _git(kit, run, *args, timeout=60):
@@ -2646,7 +2665,7 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     plain = [path for path, mode in changed if data_path(path) and mode not in (DATA_MODE, GONE)]
     if plain:
         return f"{new[:12]} brings {plain[0]}, which is not a plain file"
-    if all(data_path(path) for path, _ in changed):
+    if all(data_move(path, mode) for path, mode in changed):
         return None
     text = _blob(kit, run, new, RELEASE_FILE)
     if text is None:
@@ -2892,7 +2911,7 @@ def start_problem(kit, commit, role, run=None, head="HEAD", floor=None):
         if old == commit:
             return None
         changed = changed_paths(kit, run, old, commit) if old else None
-        if changed is not None and all(data_path(path) for path, _ in changed):
+        if changed is not None and all(data_move(path, mode) for path, mode in changed):
             return None
         text = _blob(kit, run, commit, RELEASE_FILE)
         revision, version = released(text) if text is not None else (None, None)
