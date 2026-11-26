@@ -249,7 +249,8 @@ class Rule(WithKeyFolder):
 
     def test_what_stands_in_place_of_the_key_file_and_is_no_file_opens_nothing(self):
         """A folder, a file that this user cannot read, and a link whose file is gone: each is a key file that is
-        damaged, never "no key"."""
+        damaged, never "no key". A file that a chmod repairs is read again with no restart: the bug was a stamp with
+        no ctime, under which the hub kept refusing the owner's computer until it restarted."""
         path = self.folder / hub.OWNER_KEY_FILE
         path.mkdir()
         self.assertEqual(self.ask()[0], 403)
@@ -266,6 +267,7 @@ class Rule(WithKeyFolder):
             self.assertEqual(self.ask()[0], 403)
             self.assertEqual(self.ask(token=KEY)[1]["auth"], "owner_key_mismatch")
         path.chmod(0o600)
+        self.assertEqual(self.ask(token=KEY)[0], 200)      # read again, with the stamp that the refusal kept
         path.unlink()
         self.assertEqual(self.ask()[0], 200)        # nothing at all at the path: no key was registered
 

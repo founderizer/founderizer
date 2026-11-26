@@ -608,6 +608,7 @@ class Columns(unittest.TestCase):
         "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_name_who:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_link_step:": "a KPI's standing item (lanes/agent-kpis.md)",
+        "kpi_resetup_step:": "a KPI's standing item (lanes/agent-kpis.md)",
         "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):

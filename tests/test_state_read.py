@@ -96,6 +96,9 @@ from unittest.mock import patch
 import hub
 from test_ui_api import KIT, PATIENCE, OwnerAPI, parent_pipe
 
+# Seconds that a test waits for a hub.py of its own to answer after its start, on a loaded machine too.
+HUB_START = 120
+
 T0 = 1794322671.5                       # the hub's clock stands still, so two reads of the state are the same bytes
 LOGIN = "Pr4ct!ce-Login#2026"           # a registered login, found as it stands
 QUOTED = 'Qu0te"Login-77'               # one with a quote, found in the JSON form of a text: Qu0te\"Login-77
@@ -1662,7 +1665,10 @@ class RealHub(unittest.TestCase):
             proc.stdout.close()
         self.addCleanup(stop)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(200):
+        # until the hub answers or ends: a start of hub.py on a loaded machine took more than the 20 seconds that this
+        # wait gave it before (a test server's sandbox of two cores, 25 November 2026, in three runs of one batch)
+        deadline = time.monotonic() + HUB_START
+        while True:
             if proc.poll() is not None:
                 self.fail("the hub did not start: " + proc.stdout.read())
             try:
@@ -1670,9 +1676,9 @@ class RealHub(unittest.TestCase):
                     state = json.load(r)
                 break
             except (urllib.error.URLError, OSError):
-                time.sleep(0.1)
-        else:
-            self.fail("the hub never answered")
+                if time.monotonic() > deadline:
+                    self.fail(f"the hub never answered in {HUB_START} seconds")
+                time.sleep(0.2)
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         listed = subprocess.run([lsof, "-n", "-P", "-Fn", "-p", str(proc.pid)], capture_output=True, text=True,
                                 timeout=60).stdout

@@ -39,7 +39,7 @@ from unittest.mock import patch
 
 import hub
 import releases
-from test_ui_api import OwnerAPI, parent_pipe
+from test_ui_api import PATIENCE, OwnerAPI, parent_pipe
 from leftovers import ROOT
 
 KIT = ROOT
@@ -883,15 +883,17 @@ class Restore(Fixture):
                                 env=dict(os.environ, HOME=self.tmp.name))     # its timer sweeps ~/.fleet/attachments
         self.addCleanup(self.stop, proc)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(100):
+        deadline = time.monotonic() + 120         # until it answers or ends: a start on a loaded machine is slow
+        while True:
             if proc.poll() is not None:
                 self.fail("the restored hub did not start: " + proc.stdout.read())
             try:
-                opener.open(f"http://127.0.0.1:{port}/health", timeout=1).read()
+                opener.open(f"http://127.0.0.1:{port}/health", timeout=PATIENCE).read()
                 return proc, f"http://127.0.0.1:{port}"
             except (urllib.error.URLError, OSError):
-                time.sleep(0.1)
-        self.fail("the restored hub never answered")
+                if time.monotonic() > deadline:
+                    self.fail("the restored hub never answered in 120 seconds")
+                time.sleep(0.2)
 
     @staticmethod
     def stop(proc):

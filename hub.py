@@ -2842,7 +2842,10 @@ def owner_key():
             return None
         except OSError:
             return dict(OWNER_KEY_BROKEN)
-        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        # the mode, the owner, the group and ctime too: a chmod or a chown that repairs a file that could not be read
+        # changes nothing else of it, and the hub must read it again, with no restart; ctime alone can stay the same on
+        # Linux, where it moves in coarse steps, so a chmod 0 and a chmod 600 of one step look alike
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns, st.st_mode, st.st_uid, st.st_gid)
         if OWNER_KEY["stamp"] != stamp:
             try:
                 with open(path, encoding="utf-8") as f:
@@ -53085,21 +53088,27 @@ def chat_kpi_text(agent):
 
 def kpi_parent_text(agent):
     """The parent's lines (spec 7.4), for the session of a lead's team-results task and the fleet manager's brief,
-    only while the setting kpis is on: the active agents whose tasks it gives that have no KPI, and its KPIs whose setup
-    finished with no link since, with the call that links each (kpi_setup_unlinked). Reads only: start_text runs
-    inside admit_task's transaction."""
+    only while the setting kpis is on: the active agents whose tasks it gives that have no KPI, its KPIs whose setup
+    finished with no link since, with the call that links each (kpi_setup_unlinked), and its KPIs whose setup ended
+    with no check (kpi_dead_setups). Reads only: start_text runs inside admit_task's transaction."""
     if not setting("kpis"):
         return ""
     held = {r["agent"] for r in read_rows("SELECT DISTINCT agent FROM standing WHERE kind='kpi' AND ended IS NULL")}
     none = [n for n in agents() if n != agent and n not in held and agent_active(n) and role_of(n) != "manager"
             and task_giver(n) == agent]
     unlinked = kpi_unlinked_setups(agent)       # a setup that finished links nothing by itself: they get no value
+    dead = kpi_dead_setups(agent, before=now() - KPI_DAY)     # as the step: its parent may act on it first
     return ((f"\nSet KPIs with set_kpi on the agents whose tasks you give that have no KPI: "
              f"{', '.join(name_and_role(n) for n in none)}.\n" if none else "") +
             (f"\nLink the KPIs whose setup finished: they get no value until you do. " + "; ".join(
                 f"{r['name']} of {r['agent']}, {tref(r['setup_task'])}: {kpi_setup_call(r, kpi_setup_rules(r['setup_task']))}"
                 for r in unlinked[:ITEMS_NAMED]) + (f"; and {len(unlinked) - ITEMS_NAMED} more" if len(unlinked) >
-                                                    ITEMS_NAMED else "") + ".\n" if unlinked else ""))
+                                                    ITEMS_NAMED else "") + ".\n" if unlinked else "") +
+            (f"\nSet up again or end the KPIs whose setup ended with no check: they get no value. " + "; ".join(
+                f"{r['name']} of {r['agent']} ({iref(r['id'])}): {tref(r['setup_task'])} {kpi_setup_ended(r)}"
+                for r in dead[:ITEMS_NAMED])
+             + (f"; and {len(dead) - ITEMS_NAMED} more" if len(dead) > ITEMS_NAMED else "")
+             + f". A new setup is set_kpi(id, measured_by=...).\n" if dead else ""))
 
 
 def kpi_readable(caller):
@@ -53322,6 +53331,50 @@ def kpi_unlinked_setups(parent=None, accepted=False):
                      'AND NOT EXISTS (SELECT 1 FROM kpi_changes c '
                      'WHERE c.item=s.id AND c.at>=t.created AND c.words LIKE \'linked to %\') ORDER BY s.id')
     return [r for r in rows if r["agent"] in agents() and (parent is None or kpi_parent(r["agent"]) == parent)]
+
+
+KPI_SETUP_ENDED = {"failed": "failed", "rejected": "was rejected", "canceled": "was canceled",
+                   "completed": "finished with no check", "given back": "was given back"}
+
+
+def kpi_setup_ended(r):
+    """How the setup of a row of kpi_dead_setups ended, in a few words."""
+    return KPI_SETUP_ENDED["given back" if r["setup_state"] == "completed" and r["setup_accepted"] == 0 else
+                           r["setup_state"]]
+
+
+def kpi_dead_setups(parent=None, before=None):
+    """The active KPIs with no link whose setup task ended with no working check: it failed, was rejected or canceled,
+    finished with no rule that it saved and that still stands, or was given back (check_result accepted false); with
+    no link since that setup began, and no open task that follows the setup at any depth (the parent's own follow-up).
+    Of one parent, or of all; with before, only those whose setup and its follow-ups all ended before that time. On 25 November 2026 five of the eleven KPIs with
+    no value in the owner's fleet were such (two failed, two canceled, one finished with no rule), and no step reached
+    them. Read only."""
+    rows = read_rows('SELECT s.*, t.state AS setup_state, t.accepted AS setup_accepted, t.what AS setup_what, '
+                     'COALESCE(t.delivered, t.last_activity, t.created) AS setup_end FROM standing s JOIN tasks t ON '
+                     't.id=s.setup_task WHERE s.kind=\'kpi\' AND s.ended IS NULL AND s."check" IS NULL AND '
+                     's.source IS NULL AND (t.state IN (\'failed\', \'rejected\', \'canceled\') OR '
+                     '(t.state=\'completed\' AND (t.accepted=0 OR NOT EXISTS (SELECT 1 FROM trigger_history h JOIN '
+                     'triggers g ON g.id=h.trigger_id WHERE h.saved_by_task=t.id AND g.state!=\'deleted\')))) AND '
+                     'NOT EXISTS (SELECT 1 FROM kpi_changes c WHERE c.item=s.id AND c.at>=t.created AND c.words LIKE '
+                     '\'linked to %\') ORDER BY s.id')
+    out = []
+    for r in rows:
+        if r["agent"] not in agents() or (parent is not None and kpi_parent(r["agent"]) != parent):
+            continue
+        # the tasks that follow the setup, at any depth: one that still runs takes the work on, and the last end of
+        # them starts the day of grace
+        end, ids, seen, running = r["setup_end"] or 0, [r["setup_task"]], set(), False
+        while ids and not running and len(seen) < 100:
+            seen.update(ids)
+            later = read_rows(f"SELECT id, state, COALESCE(delivered, last_activity, created) AS done FROM tasks "
+                              f"WHERE follows IN ({','.join('?' * len(ids))})", tuple(ids))
+            running = any(k["state"] not in TERMINAL for k in later)
+            end = max([end] + [k["done"] or 0 for k in later])
+            ids = [k["id"] for k in later if k["id"] not in seen]
+        if not running and (before is None or end < before):
+            out.append(r)
+    return out
 
 
 def kpi_setup_call(r, rules):
@@ -54105,7 +54158,8 @@ def kpi_link_step_rows(t0):
     """Inside the hub's daily pass: each active KPI with no link whose setup task finished and was accepted gives its
     parent one step "Link <name>" for that setup (kv kpi_link_step:<id> holds the setup task that had its step): the
     acceptance of a setup did not link its KPI before check_result refused it (kpi_setup_unlinked), and a checker
-    that may not link it still accepts it."""
+    that may not link it still accepts it. And each one whose setup ended with no check (kpi_dead_setups) gives its
+    parent one step "Name who measures <name>"."""
     in_transaction("kpi_link_step_rows")
     if not setting("kpis"):
         return
@@ -54126,6 +54180,19 @@ def kpi_link_step_rows(t0):
         if step:
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (f"kpi_link_step:{r['id']}", str(r["setup_task"])))
+    # a setup that ended with no check, a day after its end (its parent may already act on its result): the step "Name
+    # who measures <name>", which frees the measurer and the link for the parent while its task is open (kpi_locks);
+    # kv kpi_resetup_step:<id> holds the setup task that had its step
+    for r in kpi_dead_setups(before=t0 - KPI_DAY):
+        told = DB.execute("SELECT v FROM kv WHERE k=?", (f"kpi_resetup_step:{r['id']}",)).fetchone()
+        if (told and told["v"] == str(r["setup_task"])) or kpi_parent(r["agent"]) is None:
+            continue
+        said = " ".join(str(r["setup_what"] or "").split())
+        step = kpi_name_who_rows(r, f"{tref(r['setup_task'])}, the setup of this KPI, {kpi_setup_ended(r)}, so the KPI "
+                                    f"gets no value" + (f" (its result: {clip(said, 240)})" if said else "") + ".", t0)
+        if step:
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (f"kpi_resetup_step:{r['id']}", str(r["setup_task"])))
 
 
 def session_task(agent, a):

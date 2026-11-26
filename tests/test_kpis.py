@@ -423,6 +423,62 @@ class Parents(Kpis):
         self.assertNotEqual(now["setup_task"], setup["id"])
 
 
+    def test_a_setup_that_ended_with_no_check_gives_its_parent_one_step(self):
+        """A KPI whose setup failed, was canceled, finished with no check or was given back gets its parent one step
+        "Name who measures <name>" a day after that end (unless a task of the parent's follows the setup and still
+        runs), and the parent's start names it, until a new setup or a link. Protects against the five KPIs of 25
+        November 2026 in the owner's fleet whose setups ended with no check, which nothing reached."""
+        steps = lambda: sorted((t["owner"], t["title"]) for t in hub.q(
+            "SELECT owner, title FROM tasks WHERE title LIKE 'Name who measures %'"))
+
+        def daily(at):
+            for _ in range(2):              # a second pass gives no second step
+                with hub.transaction():
+                    hub.kpi_daily_rows(at)
+        failed, _ = self.set_kpi("lead", "hand")
+        canceled, _ = self.set_kpi("lead", "hand", name="Drafts kept")
+        empty, _ = self.set_kpi("lead", "hand", name="Drafts read")
+        built, _ = self.set_kpi("lead", "sublead", name="Team drafts")       # finished with a check: Link, not this
+        back, _ = self.set_kpi("lead", "sublead", name="Team kept")          # given back with its check
+        redo, _ = self.set_kpi("lead", "sublead", name="Team read")          # given back, and a follow-up runs
+        deep, _ = self.set_kpi("lead", "deep", name="Deep drafts")           # given back; a follow-up of one runs
+        self.clock += 3 * DAY                                               # the grace counts from the end
+        hub.q("UPDATE tasks SET state='failed', delivered=?, what='No source holds the data.' WHERE id=?",
+              (self.clock, failed["setup_task"]))
+        hub.q("UPDATE tasks SET state='canceled', delivered=? WHERE id=?", (self.clock, canceled["setup_task"]))
+        self.end(empty["setup_task"])
+        for r in (built, back, redo, deep):
+            self.rule(r["agent"], saved_in=r["setup_task"])
+            self.end(r["setup_task"])
+        hub.q("UPDATE tasks SET accepted=0 WHERE id IN (?, ?, ?)", (back["setup_task"], redo["setup_task"],
+                                                                   deep["setup_task"]))
+        self.new_task("sublead", title="Fix the check", follows=redo["setup_task"])
+        first = self.new_task("deep", title="Fix the check", follows=deep["setup_task"], state="completed",
+                              delivered=self.clock)
+        self.new_task("deep", title="Fix it again", follows=first)
+        self.new_task("sublead", title="Check it once more", follows=back["setup_task"], state="completed",
+                      delivered=self.clock + 1.75 * DAY)                     # a day of grace from its own end
+        daily(self.clock + DAY / 2)                                         # its parent may act on the result first
+        self.assertEqual(steps(), [])
+        self.assertNotIn(f"({hub.iref(failed['id'])})", hub.kpi_parent_text("lead"))    # nor does its start
+        daily(self.clock + 2 * DAY)
+        self.assertEqual(steps(), [("lead", f"Name who measures {name}") for name in sorted(
+            [failed["name"], "Drafts kept", "Drafts read"])])
+        self.clock += 3 * DAY
+        daily(self.clock)
+        self.assertEqual(steps(), [("lead", f"Name who measures {name}") for name in sorted(
+            [failed["name"], "Drafts kept", "Drafts read", "Team kept"])])
+        self.assertIn("No source holds the data.", hub.q1("SELECT details FROM tasks WHERE title=?", (
+            f"Name who measures {failed['name']}",))["details"])
+        start = hub.kpi_parent_text("lead")
+        for r in (failed, canceled, empty, back):
+            self.assertIn(f"({hub.iref(r['id'])})", start)
+        for r in (built, redo, deep):
+            self.assertNotIn(f"({hub.iref(r['id'])})", start)
+        self.assertNotIn(f"({hub.iref(deep['id'])})", hub.kpi_parent_text("sublead"))
+        self.kpi_ok("lead", id=hub.iref(failed["id"]), measured_by="hand")     # a new setup: off the list
+        self.assertNotIn(f"({hub.iref(failed['id'])})", hub.kpi_parent_text("lead"))
+
     def test_an_accepted_setup_links_its_kpi_and_an_old_one_gives_the_parent_a_step(self):
         """A KPI's setup task that finished with a check is accepted only once its KPI is linked, and the link accepts
         it; one accepted with no link gives its parent one step "Link <name>", and the parent's start names each such
