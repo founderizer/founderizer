@@ -225,7 +225,8 @@ class People(test_chat_apps.ChatApps):
         event = hub.q1("SELECT * FROM events WHERE kind='conversation'")
         self.assertEqual((event["agent"], json.loads(event["extra"])["conversation"]), ("studio", conv["id"]))
         self.assertNotIn("help me", event["text"])          # the helper never types a person's words into a window
-        # the same person on the account of an agent that the owner did not give them: nothing, for anybody
+        # the same person on the account of an agent that the owner did not give them: a customer gets nothing (the
+        # owner's list is their only gate), and is no unknown sender of the owner's list of them
         self.assertEqual(self.handle(1, app="discord", handle=JORDI)[0], 200)
         self.assertEqual(self.wrote(account="discord-vps", sender=JORDI), "ignored")
         self.assertEqual(self.count("conversations"), 1)
@@ -247,6 +248,45 @@ class People(test_chat_apps.ChatApps):
         self.assertEqual((hub.agent_introduced("studio"), hub.agent_display("studio")), ("Studio Ops", "Studio Ops"))
         del hub.TEAM["agents"]["studio"]["title"]
         self.assertEqual((hub.agent_introduced("studio"), hub.agent_display("web-dev")), ("Studio", "Web-Dev"))
+
+    def test_a_colleague_who_writes_to_an_agent_not_on_their_list_reads_why_once_a_day(self):
+        """A person of the org (a role with tools on: an employee is a peer) who writes to an agent that the owner did
+        not give them reads one fixed reply a day that names the agent and whom to ask, with no AI turn (the owner's
+        direction of 26 November 2026, point 7), also when WhatsApp sends the hidden ID and their handle is the phone
+        number's (sender_alt). No try of theirs goes into the unknown senders' list or its count, which the app offers
+        to add as a new person, and their removal leaves nothing of theirs. Bugs: the colleague gets no word and cannot
+        know why; the agent gets a turn, a conversation or a task; each message gets the reply again (a flood that the
+        sender drives); a blocked colleague is answered; a known person shows as a stranger, by the hidden ID that no
+        removal finds, and pushes the true strangers off the list."""
+        hub.TEAM["settings"] = {"owner.name": "Alex"}
+        phone, hidden = "34600222333@s.whatsapp.net", "123456789012345@lid"
+        bea = self.add(name="Bea Example", role="employee", agents=["vps"])
+        self.assertEqual(self.handle(bea["id"], handle=phone)[0], 200)
+        for text in ("Can you check the server?", "Hello?"):
+            self.assertEqual(self.wrote(text=text, sender=hidden, sender_alt=phone), "ignored")
+        self.assertEqual(self.texts(), ["You have no access to Studio. Ask Alex."])
+        for table in ("conversations", "conversation_messages", "tasks", "ui_requests", "needs", "chat_ignored"):
+            self.assertEqual(self.count(table), 0, table)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='studio'")["n"], 0)
+        page = self.request("/ui/people?db=test-generation")[1]
+        self.assertEqual([i for i in page["ignored"] if i["account"] == "whatsapp-studio"],
+                         [{"account": "whatsapp-studio", "today": 0, "last": []}])
+        # the owner with no name in Settings is the owner, as the first message to a person names them
+        hub.TEAM["settings"] = {}
+        self.assertEqual(self.wrote(text="Anyone?", sender=hidden, sender_alt=phone), "ignored")
+        self.assertEqual(self.texts(), ["You have no access to Studio. Ask the owner of this fleet."])
+        # a blocked colleague reads nothing
+        self.assertEqual(self.change(bea["id"], blocked=True)[0], 200)
+        hub.TEAM["settings"] = {"owner.name": "Sam"}
+        self.assertEqual(self.wrote(text="Still there?", sender=hidden, sender_alt=phone), "ignored")
+        self.assertEqual(self.texts(), [])
+        # their removal leaves no row that holds their ids, their name or their words
+        code, gone = self.change(bea["id"], delete=True)
+        self.assertEqual((code, gone.get("deleted")), (200, True), gone)
+        for table in [r["name"] for r in hub.q("SELECT name FROM sqlite_master WHERE type='table'")]:
+            rows = json.dumps([dict(r) for r in hub.q(f'SELECT * FROM "{table}"')], default=str)
+            for theirs in (phone, hidden, "Bea Example", "check the server", "Hello?", "Anyone?", "Still there?"):
+                self.assertNotIn(theirs, rows, (table, theirs))
 
     def test_nothing_a_person_writes_widens_their_own_access(self):
         person = self.person_with_handle()

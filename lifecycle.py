@@ -2513,7 +2513,8 @@ FLOOR_FILE = "release-floor"        # in ~/.fleet: the newest release that this 
 # stand for the key in a copy (owner_files) and stop the copy's readers (the Door and security area, 25 November 2026).
 # Only a skill's files can have such a name: the other paths end in .md.
 COPY_KEY_NAMES = ("owner-access.key", "owner-access.pub")
-COPY_KEY_NAME = re.compile(r"(?:.*/)?(?i:" + "|".join(re.escape(name) for name in COPY_KEY_NAMES) + r")\Z")
+# with any dots after it too: Windows drops a name's last dots when it writes the file (the Setup area, 26 November 2026)
+COPY_KEY_NAME = re.compile(r"(?:.*/)?(?i:" + "|".join(re.escape(name) for name in COPY_KEY_NAMES) + r")\.*\Z")
 # The places of the configuration ref, whatever a file's name: a removal of a file that a fleet held before the names
 # above were refused still goes through them (hub.commit_kit_file), and so does a copy's member that a restore skips.
 CONFIG_PLACES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"

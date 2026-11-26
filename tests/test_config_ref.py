@@ -411,7 +411,9 @@ class ConfigRef(OwnerAPI):
                      "skills/vps/x/a/b/c/deep.txt", "skills/vps/SKILL.md", "skills/V/x/SKILL.md", "skills/vps/x/",
                      "skills/vps/x//SKILL.md", "skills/" + "a" * 32 + "/x/SKILL.md", "skills/vps/" + "x" * 65 + "/a",
                      # the names of the owner's access key in a copy, in any case and folder (Door and security)
-                     "skills/vps/x/owner-access.key", "skills/vps/x/OWNER-ACCESS.KEY", "skills/vps/x/a/owner-access.pub"):
+                     "skills/vps/x/owner-access.key", "skills/vps/x/OWNER-ACCESS.KEY", "skills/vps/x/a/owner-access.pub",
+                     # with dots after it, which Windows drops when it writes the file
+                     "skills/vps/x/owner-access.key.", "skills/vps/x/a/owner-access.PUB."):
             self.assertFalse(hub.CONFIG_FILES.match(path), path)
         commit = hub.commit_kit_file("skills/vps/deploy-acme/SKILL.md", b"---\nname: deploy-acme\n---\n\nSteps.\n",
                                      "vps wrote the skill deploy-acme", author="vps",

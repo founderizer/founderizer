@@ -25789,12 +25789,13 @@ CHAT_SENDING = 120              # seconds a message item may stay sending before
 CHAT_TYPING = 120               # seconds of one typing item
 CHAT_TEXT_MAX = 4000
 # The hub's fixed replies to a message of a chat app, each one sentence that its sender reads: the first three to the
-# owner (chat_route) and to a person (person_route), the last one to a person only. A refusal of person_route keeps its
+# owner (chat_route) and to a person (person_route), the last two to a person only. A refusal of person_route keeps its
 # sentence in the message (m["refusal"]), so that a caller can tell which one it was (Teams design 4, S4).
 CHAT_TEXT_ONLY = "I can read text only for now."
 CHAT_TOO_LONG = "This message is too long. The limit is 4,000 characters."
 CHAT_SECRET_HELD = "That message held a saved secret. It was not stored."
 PERSON_DAY_LIMIT = "You reached today's limit. Try again tomorrow."
+PERSON_NO_ACCESS = "You have no access to {agent}. Ask {owner}."     # a person of the org, an agent not on their list
 CHAT_INBOUND_DAY = 500          # inbound messages a day over all accounts
 WHATSAPP_PARTS_DAY = 200        # sent WhatsApp parts a day for each account
 CHAT_IGNORED_KEEP = 20          # ignored messages kept for each account
@@ -30035,6 +30036,21 @@ def person_reaches(person, agent):
     return None
 
 
+def person_of_org(person):
+    """True for a person of the org (the owner's direction of 26 November 2026, ~/dev/founderizer-plans/
+    channels-direction-2026-11-26): a person of the People list whose role has tools on, a colleague, whom the
+    licence counts as a user (licence_tools). A role with tools off, a customer's, is an outsider: "An outsider: a
+    customer." (ROLE_DEFAULTS). Plain reads: safe inside chat_route's transaction."""
+    return licence_tools(person)
+
+
+def person_no_access(agent):
+    """The fixed reply to a person of the org who wrote to an agent that is not on their list (CHAT-APPS.md 8.5):
+    the agent as the owner's apps name it (agent_display), and the owner by the name of Settings, which is what the
+    agents call them, or "the owner of this fleet" with none."""
+    return PERSON_NO_ACCESS.format(agent=agent_display(agent), owner=setting("owner.name") or "the owner of this fleet")
+
+
 def person_route(account, acc, person, m, t0, hit):
     """Inside chat_route's transaction: a message from a person the owner added. The checks are in order and every one
     of them fails closed. Returns stored or ignored."""
@@ -30044,7 +30060,17 @@ def person_route(account, acc, person, m, t0, hit):
     if reach == "blocked":
         return "ignored"                # the owner blocked this person: nothing is stored and nothing is sent
     if reach == "not_given":
-        return "ignored"                # an agent the owner did not give them: it does not exist for this person
+        # An agent that is not on their list: no AI turn, no conversation and no file (CHAT-APPS.md 6.4 and 8.5, the
+        # owner's direction of 26 November 2026, point 7). A person of the org gets one fixed reply, at most once a day
+        # in that chat; anybody else, a customer among them, gets nothing, whatever the account's rule for unknown
+        # senders: the owner's list is the only gate of a person of the People page (person_may). No try of a person is
+        # kept in the unknown senders' list (chat_ignored) or its count: that list is for senders whom the owner does
+        # not know, and its app offers to add each one. The Founderizer app's own place (BUILT_IN_ACCOUNT) refuses such
+        # a message before it comes here (teams_person_links.link_inbound, code unknown), so it queues no reply.
+        if account != BUILT_IN_ACCOUNT and person_of_org(person):
+            m["refusal"] = person_no_access(agent)
+            fixed_once(account, m["chat"], m["refusal"], t0, person["id"])
+        return "ignored"
     refusal = conversation_refusal(agent, person)
     if refusal is None:
         refusal = chat_command(m, person)
@@ -48082,7 +48108,7 @@ def t_write_skill(agent, a):
                 raise ToolError(f"{path!r} is not a file name in a skill: letters, digits, . _ and -, at most two "
                                 f"folders deep, no name that starts with a dot or a dash, and not SKILL.md, which "
                                 f"text writes.")
-            if str(path).rsplit("/", 1)[-1].lower() in COPY_KEY_NAMES:
+            if str(path).rsplit("/", 1)[-1].lower().rstrip(".") in COPY_KEY_NAMES:
                 raise ToolError(f"{path} is a name that a copy of the fleet keeps for the owner's access key: give "
                                 f"the file another name.")
             if not isinstance(body, str) or "\0" in body:
@@ -48417,7 +48443,7 @@ def skill_gift_read(data):
         if not re.fullmatch(SKILL_FILE, p) or ".." in p:
             raise Refusal(422, f"{skill_gift_shown(p)} is not a path that a skill can hold: a path in a skill is "
                                f"{SKILL_GIFT_PATH}.")
-        if p.rsplit("/", 1)[-1].lower() in COPY_KEY_NAMES:
+        if p.rsplit("/", 1)[-1].lower().rstrip(".") in COPY_KEY_NAMES:
             raise Refusal(422, f"{skill_gift_shown(p)} has a name that a copy of the fleet keeps for the owner's "
                                f"access key: give the file another name.")
     folded, folders = {}, set()
@@ -80295,8 +80321,11 @@ def licence_tools(person):
     manager), by the table as the owner set it: those are the people that contacts_v2_on converts, so they count the
     same on both sides of the setting, and no fleet leaves it off to pay for nobody; customer is no key. After the
     mark every name reads by the table on both sides: the setting can go off again after it was on, and an old name
-    that came later is converted by nothing, so it reads as the table holds it (a name that it does not hold: off)."""
-    if not contacts_v2() and not kv_get("contacts_v2_roles") and person["role"] in ROLES_RENAMED:
+    that came later is converted by nothing, so it reads as the table holds it (a name that it does not hold: off).
+    Plain reads (read_row, never kv_get, which commits), so that person_route asks it inside chat_route's transaction
+    (person_of_org)."""
+    mark = read_row("SELECT v FROM kv WHERE k='contacts_v2_roles'")
+    if not contacts_v2() and not (mark and mark["v"]) and person["role"] in ROLES_RENAMED:
         person = dict(person, role=ROLES_RENAMED[person["role"]])
     return person_access(person)["tools"]
 
