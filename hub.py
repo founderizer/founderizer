@@ -2414,6 +2414,7 @@ OWNER_DEVICE_LABELS = OWNER_APP_LABELS + ("founderizer-ios/",)
 OWNER_SESSION = re.compile(r"[A-Za-z0-9._:/-]{1,128}")      # X-Fleet-Session, e.g. claude-code/<session id>
 OWNER_TOOL_VIA = "ai-session"           # the mark of a tool's request in its header: [owner via ai-session]
 OWNER_PROGRAM_VIA = "program"           # and of an "other" request (any label that no app of the owner's gives)
+MANAGER_MARK = "[fleet manager]"        # the whole mark of an act with the fleet manager's hand (MANAGER_HAND)
 # The hands whose words are the owner's own (Fable's check of 20 November 2026, finding 1: a request with any label
 # that no client lists, `curl/8.7.1` for one, had the owner's force, so the whole chain of N-230 ran again): the Mac
 # app's own screen, an app on an enrolled device and a chat app's message. No hand (None) is none of them (owner API
@@ -2439,9 +2440,15 @@ def owner_force(hand):
 
 def request_via(hand):
     """The mark of a request's header for its hand: ai-session for a tool, program for any other label that is no app
-    of the owner's and for the release job ("job"), None for the owner's own hand (whose device or app the caller
-    marks as before). A hand that is no owner's hand always has a mark: None would say that the owner wrote it."""
-    return OWNER_TOOL_VIA if hand == "tool" else OWNER_PROGRAM_VIA if hand in ("other", "job") else None
+    of the owner's and for the release job ("job"), None for the owner's own hand (whose device or app the caller marks
+    as before). A hand that is no owner's hand always has a mark: None would say that the owner wrote it. For the fleet
+    manager's own `admin` (MANAGER_HAND) it is the whole mark MANAGER_MARK, "[fleet manager]", with no "owner" in it:
+    words with that hand are never the owner's, nor "[owner via ...]", which RULES.md tells an agent to do as the
+    owner's request (claim 9 of the F6 design). No route writes such a line yet: each route that writes a line into an
+    agent's chat or task as the owner is the owner's in MANAGER_OPS, and the manager's admin is refused there until
+    piece M1 decides how its line reads."""
+    return OWNER_TOOL_VIA if hand == "tool" else OWNER_PROGRAM_VIA if hand in ("other", "job") else \
+        MANAGER_MARK if hand == MANAGER_HAND else None
 
 
 def request_hand(client, device=None, connection=None, origin=None, session=None):
@@ -85666,21 +85673,32 @@ def phone_task(task_id, query):
         {"Cache-Control": "no-store"}
 
 
-def phone_knowledge(query, internal=False):
+def phone_knowledge(query, internal=False, reader=None):
     """GET /ui/knowledge after ui_allowed: one knowledge file with its text (owner feature owner_knowledge). An owner
     file for each reader (the owner's devices, a connected app's read_knowledge); an internal file too for the owner's
     computer only (internal, owner feature knowledge_internal_read): the owner, 20 November 2026, "Yes, read-only" to
     a card's badge of an agents' internal file that opens it on the Knowledge page. A read that fails, of the catalog
     (an UnreadCatalog) or of a listed file's text, is 503 knowledge_unread and never the 404 of a file that is not
-    there: the app's list keeps the file while the reads fail (knowledge_shown)."""
+    there: the app's list keeps the file while the reads fail (knowledge_shown).
+    reader: an agent that reads this page under its own name, never as the owner (the Fleet Manager's own CLI, F6-8
+    of the owner's feedback of 22 November 2026, claim 12 of its design): it gets only an owner file that the
+    Knowledge files section of its own profile lists, at the hub's revision (RULES.md, "Where work goes"), and never
+    an internal file. Each other path is the 404 of a file that is not there, and its text is not read. When git
+    does not give the revision or the profile now, the list is not known: 503 (a profile that failed to read is no
+    profile with no files)."""
     generation = kv_get("db_id")
     if query.get("db") != generation:
         return 409, refusal_words.answer("hub_changed"), None
     catalog = knowledge_entries()
-    scopes = ("owner", "internal") if internal else ("owner",)
-    entry = next((k for k in catalog if k["path"] == query.get("path") and k["scope"] in scopes), None)
+    scopes = ("owner", "internal") if internal and reader is None else ("owner",)
+    rev, listed = kit_revision(fresh=True) if reader is not None else None, None
+    if rev:
+        with contextlib.suppress(KitUnread):
+            listed = set(profile_knowledge_files(reader, rev, strict=True))
+    entry = next((k for k in catalog if k["path"] == query.get("path") and k["scope"] in scopes
+                  and (reader is None or k["path"] in (listed or ()))), None)
     text = knowledge_text(entry) if entry else None
-    if isinstance(catalog, UnreadCatalog) or entry and text is None:
+    if isinstance(catalog, UnreadCatalog) or entry and text is None or reader is not None and listed is None:
         return 503, refusal_words.answer("knowledge_unread"), None
     if text is None:
         return 404, {"error": "no such knowledge file" if internal else "no such owner knowledge file"}, None
@@ -85801,6 +85819,170 @@ def manager_resumes_only_its_own(h):
         who = hold_holder(h)
         raise Refusal(403, f"{who[:1].upper() + who[1:]} held it, and the fleet manager resumes only what it held "
                            f"itself.")
+
+
+# The Fleet Manager's own CLI: the class of each operation of the owner API (F6-8 of the owner's feedback of 22 November
+# 2026, the owner's answer "A after all: its own CLI, and my one press for what gives access", which is shape 2 of
+# ~/dev/founderizer-plans/owner-feedback-2026-11-22/F6-manager-cli-design.md, section 3, with the Door and security
+# area's read of it in ADDENDA.md of the same folder). The manager runs an operation under its own name, never as the
+# owner, and the class of the operation says how:
+#   alone  the manager runs it, and nothing is said
+#   told   the manager runs it with one line of why, and the hub writes that line into the owner's chat with the manager
+#   owner  it stays the owner's own press on a card, or the owner's own hand where no card exists
+# A name is one of these:
+#   "<route>"                  an owner write (POST): the route that its ui_command gives, with {} for each part that
+#                              changes, or the route of the dispatch when no ui_command gives one
+#   "GET <route>"              an owner GET route that writes (get_writes)
+#   "<route> <field>"          the part of one route that a call with this field does
+#   "<route> <field>=<value>"  the part of one route that a call does when its field has this value (true, false: JSON)
+#   "<read>"                   a read of the owner CLI that reaches the hub (owner_mcp.SWIFT_READS and read_attachment),
+#                              and "fleet_read page=<page>" for each page of fleet_read
+# One call takes the strictest class of all the names that it matches: its route's own name, and the name of each field
+# and each value that it gives. A route, a field or a value that is in no list makes the call the owner's: one call
+# can give `model` and `can` together, and it is then the owner's. A field of MANAGER_MODIFIERS is no part of its own:
+# it only says how the rest of its call applies, and takes that call's class. So each field of an alone or told route
+# has its own name, or is a modifier.
+# The table is data only: no tool reads it yet. Piece M1 of the design (the area "Needs-you and the manager") builds the
+# manager's tool `admin` on it. test_manager_admin.py keeps the table whole: each owner route, each field and value of
+# a route with parts, and each page in exactly one list, and no name that is no route, field or value. A new owner
+# route thus fails its push until somebody gives it its class here.
+# Where the design and the Door area's read do not agree, the Door area's read is used: the page knowledge is the
+# owner's (for the owner it gives each file of knowledge/owner/, more than the manager's profile lists;
+# phone_knowledge's reader is the filter for an agent, which gives only the files of its profile, and no caller gives
+# it yet); a pause of a wake-up rule is told, not silent. The page people is the owner's too, by claim 12 of the design:
+# it gives the first words of each message of an unknown sender (chat_ignored.preview), a stranger's text that no
+# agent reads today. Since the first reads of this table (23 November 2026):
+# - The parts of piece M3 for tasks and wake-up rules are on main (MANAGER_HAND, task_control_act, trigger_state_act):
+#   with the manager's hand, a resume (also resume_check) refuses a hold or a pause that the manager did not make, and
+#   run_now refuses a rule that sends to people. So those rows are told or alone. A conversation's resume, an agent
+#   turned on and the end of a hold have no such rule yet: they are the owner's until M3 adds it.
+# - model, effort and screen of /ui/team/agents/<name> are the owner's: the owner's route checks only what is offered,
+#   and the manager's own set_agent_model refuses its own model, a lead's team and every change while model_changes is
+#   off. fleet_overview is the owner's: it reads GET /ui/state, the page state, with the newest reports of each agent.
+# - A server of the caller's own in /ui/mcp/check (the field server) is the owner's: the hub asks any https address
+#   that it names, or a port of its own host. The route's own fault (a saved token sent to such an address) is fixed
+#   apart, for every caller (check_mcp_server).
+# - A told row needs no more than its line, but two are not sure: the manager's own change_trigger pauses and deletes
+#   a rule of its team with no line at all, so a told pause or delete through admin may be one line too many; and
+#   /ui/outbound/<id>/again of a message whose state is unknown sends a person a second message (rule 9): M3 refuses it
+#   for the manager's hand.
+# - Before admin serves an alone page, piece M1 checks its filter for a narrowed pair, as the design (section 10) asks:
+#   responsibility (the words of a case's steps), standing (a person's kept wish, and the ended ones) and trigger (a
+#   run's own output, such as a read of new mail) hold text that no person of the fleet wrote for the manager.
+# - The owner's knowledge files are a rule in words, not a limit of access: the manager reads each of them through its
+#   own read_knowledge, and each machine's checkout of the configuration ref holds knowledge/owner/.
+# - /ui/servers/<name>/prepare installs a pinned runtime; on a server that is not signed in, its job ends with a
+#   sign-in that stays the owner's (server.py prepare).
+# The rows that the design does not class are the owner's: the design's "Has it" rows (the manager has its own tool for
+# each) and the routes that came after it.
+MANAGER_OPS = {
+    "alone": (
+        # the reads: the fleet's own facts, with no words of a person and no chat of the owner's
+        "see_costs",
+        "fleet_read page=capacity", "fleet_read page=chat_apps", "fleet_read page=checks", "fleet_read page=devices",
+        "fleet_read page=diagnostics", "fleet_read page=goal", "fleet_read page=health", "fleet_read page=homes",
+        "fleet_read page=hosts", "fleet_read page=kpis", "fleet_read page=machines", "fleet_read page=profiles",
+        "fleet_read page=releases", "fleet_read page=resources",
+        "fleet_read page=responsibilities", "fleet_read page=responsibility", "fleet_read page=roles",
+        "fleet_read page=servers", "fleet_read page=settings", "fleet_read page=skills", "fleet_read page=standing",
+        "fleet_read page=team", "fleet_read page=trigger", "fleet_read page=triggers", "fleet_read page=vault",
+        # a stop of a task, a check or a run of a wake-up rule that sends to no person, a reading, an update when the
+        # agent is idle, a check of a saved MCP server, a check of the release channel (take: a release that the
+        # automatic updates take anyway, at their next tick)
+        "/ui/tasks/{}/control action=pause", "/ui/tasks/{}/control action=stop",
+        "/ui/triggers/{}/state action=check_now", "/ui/triggers/{}/state action=run_now",
+        "/ui/servers/{}/prepare agent", "/ui/servers/{}/prepare runtime", "/ui/machines/{}/check",
+        "/ui/machines/{}/update",
+        "/ui/mcp/check name", "/ui/mcp/check agent",
+        "/ui/releases/check", "/ui/releases/check take",
+    ),
+    "told": (
+        # a stop, a resume of the manager's own stop (main refuses the owner's), a pause or a delete of a wake-up rule,
+        # an agent turned off, a number that tunes the fleet, a message again
+        "/ui/tasks/{}/control action=resume", "/ui/tasks/{}/control action=resume_check",
+        "/ui/triggers/{}/state action=pause", "/ui/triggers/{}/state action=resume",
+        "/ui/triggers/{}/state action=delete",
+        "/ui/team/agents/{} active=false",
+        "/ui/settings settings=memory.start_chars", "/ui/settings settings=session_reuse",
+        "/ui/settings settings=checks.run_seconds", "/ui/settings settings=checks.output_bytes",
+        "/ui/settings settings=servers.reboot_times",
+        "/ui/conversations/{} action=pause",
+        "/ui/chat-apps/pause paused=true",
+        "/ui/outbound/{}/again",
+    ),
+    "owner": (
+        # the reads of people's words, of the owner's chats, of an agent's own notes and lessons, of the whole
+        # snapshot, of a QR, of the owner's files and of the orders that put a profile in order; the whole history and
+        # the digest of the snapshot, for which the manager has its own tools (see_history, see_team, see_capacity,
+        # see_goals, see_responsibilities); a file of the owner's
+        "search_history", "fleet_overview", "read_attachment",
+        # routes that came after the table's reads, the owner's as every route that the design does not class (27
+        # November 2026): the company's name and logo, and F17 SP1's signed records of the servers that clients made
+        # and the mark of an install's end, which only a client of the owner's sends
+        "/ui/company", "/ui/servers/made", "/ui/servers/made/swept", "/ui/servers/{}/install-ended",
+        "fleet_read page=state", "fleet_read page=owner_chat", "fleet_read page=conversation",
+        "fleet_read page=conversations", "fleet_read page=events", "fleet_read page=notes", "fleet_read page=lessons",
+        "fleet_read page=chat_link", "fleet_read page=agent_messages", "fleet_read page=artifacts",
+        "fleet_read page=knowledge", "fleet_read page=people", "fleet_read page=profile_orders",
+        # work: the owner's own voice and files, Stop in the owner's chat box, an outcome, the owner's view of a screen;
+        # a goal (the manager has update_goal)
+        "/ui/messages", "/ui/chats/{}/stop", "/ui/tasks/{}/steer",
+        "/ui/goals/{}/state", "/ui/outcomes/{}", "/ui/attachments", "/ui/attachments/{}/keep",
+        "GET /ui/tasks/{}/desktop",
+        # Needs you: an answer to a card
+        "/ui/needs/{}", "/ui/needs/{}/talk", "/ui/needs/{}/secret", "/ui/needs/{}/takeover",
+        # behaviour: a profile, an owner file, the owner's take-backs; a duty (the manager has change_duty)
+        "/ui/profiles/{}", "/ui/knowledge", "/ui/standing/{}/end", "/ui/responsibilities/{}/state",
+        "/ui/skills/remove", "/ui/notes/{}/restore", "/ui/memory/{}/{}/forget",
+        # the team's shape, what an agent can reach, a sign-in, an account, the switches of the fleet
+        "/ui/servers/{}/agents", "/ui/team/agents/{}/remove", "/ui/team/agents/{}/rename", "/ui/team/agents/{}/move",
+        "/ui/team/agents/{} model", "/ui/team/agents/{} effort", "/ui/team/agents/{} screen",
+        # an agent turned on, a conversation let run again and the end of a hold, until M3 refuses the owner's own for
+        # the manager's hand; an MCP server that the caller names, which the hub asks at its address
+        "/ui/team/agents/{} active=true", "/ui/conversations/{} action=resume", "/ui/resources/take",
+        "/ui/mcp/check server",
+        # what an agent can reach and who it is
+        "/ui/team/agents/{} title", "/ui/team/agents/{} expertise", "/ui/team/agents/{} can",
+        "/ui/team/agents/{} web_hosts", "/ui/team/agents/{} account", "/ui/team/agents/{} runtime",
+        "/ui/team/agents/{} vault", "/ui/team/agents/{} vault_create",
+        "/ui/team/lines", "/ui/machines/{}/manager", "/ui/team/reload",
+        "/ui/settings settings=model_changes", "/ui/settings settings=contacts.v2",
+        "/ui/settings settings=conversations.closed_runtime", "/ui/settings settings=conversations.closed_version",
+        "/ui/settings settings=checks.lines", "/ui/settings settings=checks.reads", "/ui/settings settings=kpis",
+        "/ui/settings settings=releases.early", "/ui/settings settings=owner.name",
+        "/ui/settings settings=owner.language", "/ui/settings settings=owner.app_language",
+        "/ui/settings runtime_facts",
+        # servers: money, the owner's sign-ins, keys
+        "/ui/servers/join", "/ui/servers/{}/remove", "/ui/servers/grant", "/ui/servers/shape", "/ui/team/access",
+        "/ui/machines/{}/signin", "/ui/machines/{}/signin/code", "/ui/team/accounts", "/ui/team/agents/{}/key",
+        "/ui/servers/{}/key-swap", "/ui/servers/{}/key-swap-reading",
+        # access: a grant outside the pool (in the pool the manager has grant_access), logins, tool sources, secrets
+        "/ui/team/repos", "/ui/team/tools", "/ui/team/google", "/ui/secrets/grant", "/ui/resources", "/ui/team/logins",
+        "/ui/team/mcp", "/ui/mcp/connect", "/ui/mcp/finish", "/ui/mcp/disconnect", "/ui/mcp/package", "/ui/mcp/find",
+        "/ui/google/connect", "/ui/google/finish", "/ui/google/disconnect", "/ui/secrets/add", "/ui/secrets/import",
+        "/ui/secrets/fingerprints", "/ui/vault/intake", "/ui/vault/pin", "/ui/vault/recovery", "/ui/vault/grant",
+        "/ui/vault/client",
+        # people: who may write to agents, the invite of a member's app (Founderizer for Teams), the owner's own chat
+        # accounts, and chat apps that run again
+        "/ui/people", "/ui/people/{}/handles", "/ui/people/{}/links", "/ui/roles", "/ui/people/codes",
+        "/ui/people/handles",
+        "/ui/team/chat-apps", "/ui/chat-apps/pause paused=false", "/ui/chat-apps/{}/{}", "/ui/chat-apps/{}/token",
+        # releases, the claim of Founderizer for Teams, a backup and a restore
+        "/ui/releases/update", "/ui/releases/auto", "/ui/releases/entitlement", "/ui/teams/claim",
+        "/ui/backups/confirm", "GET /ui/backup", "/ui/restore",
+        # the owner's devices and computer, connected apps, error reports, the GitHub App, the door
+        "/ui/owner/devices", "/ui/owner/devices/code", "/ui/owner/devices/{}/code", "/ui/owner/devices/{}/certify",
+        "/ui/owner/devices/{}/push", "/ui/owner/devices/{}/recovery", "/ui/owner/devices/{}/recovery/held",
+        "/ui/owner/enroll", "/ui/owner/key", "/ui/owner/computer",
+        "/ui/connect/code", "/ui/connect/settings", "/ui/connect/{}/revoke", "/ui/error-reports", "/ui/github-app",
+        "/ui/door", "/ui/door/secrets", "/ui/door/github-app", "/ui/door/host", "/ui/door/mode",
+    ),
+}
+
+# The fields of a route of MANAGER_OPS that are no part of their own: they say how the rest of the call applies, and
+# take its class. A settings write's only_unset (keep a value that the owner set), and a task control's note (the
+# words of the hold, which the owner reads with it).
+MANAGER_MODIFIERS = (("/ui/settings", "only_unset"), ("/ui/tasks/{}/control", "note"))
 
 
 def task_control_read(task_id, data):
