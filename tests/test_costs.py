@@ -683,6 +683,11 @@ class Scope(Base):
         self.assertIn("is not one of them", self.refused("lead", "see_history", agent="solo"))
         self.assertIn("must be one of costs", self.refused("hand", "see_history", what="agents"))
         self.assertIn("does not take duty", self.refused("hand", "see_history", duty="R-1"))
+        # a task that a person's conversation opened, and a part of it, read nothing of it: the counts of reply tasks
+        # by day tell a person how much the others used the agent (privacy between colleagues)
+        opened = self.new_task("lead", title="Answer Ana", source_conversation=7)
+        for agent, task in (("lead", opened), ("hand", self.new_task("hand", title="Find the order", parent=opened))):
+            self.assertIn("reads no history of the fleet", self.refused(agent, "see_history", task=task, what="costs"))
 
     def test_a_worker_and_a_lead_have_the_short_costs_tool_and_the_manager_every_mode(self):
         def entry(agent):

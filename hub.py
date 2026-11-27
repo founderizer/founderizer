@@ -56977,6 +56977,10 @@ def history_costs(a, days, start, before):
 def t_see_history(agent, a):
     """One reader with modes, so the manager asks for the measure it needs and carries nothing else in its session.
     A worker or a lead reads one mode, its costs: its own, and a lead its team's as well (AUTONOMY.md P8)."""
+    # spec 7.4 and privacy between colleagues (B5): what a person's words drive reads no KPI, and no cost either: the
+    # agent's counts of reply tasks by day tell a person how much the others used it (the SMB audit's P6 reader, MUST 2)
+    if contact_session(agent):
+        raise ToolError("A session that a person's message drives reads no history of the fleet: no cost and no KPI.")
     manager = role_of(agent) == "manager"
     # a lead reviews its team's KPIs too (lanes/agent-kpis.md, spec 7.6); a worker's number reaches it in its task. A
     # lead's owner chat reads its team's KPIs alone (KPIs version 2, 4.4)
@@ -56994,8 +56998,6 @@ def t_see_history(agent, a):
     a = dict(a, agent=who or None, scope=[who] if who else scope, viewer=agent)
     if what == "kpis" and not setting("kpis"):
         raise ToolError(KPIS_OFF.replace("so nothing changed", "so there is nothing to read"))
-    if what == "kpis" and contact_session(agent):      # spec 7.4: what a person's words drive reads no KPI
-        raise ToolError("A session that a person's message drives reads no KPI.")
     if what == "kpis" and a.get("window") in (None, ""):
         a["window"] = KPI_REVIEW_DAYS
     days, start, before = history_window(a)
