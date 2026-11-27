@@ -20804,6 +20804,12 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
     if rid:
         return {"repos": [], "resources": []}
     if raised:
+        # the owner's record of each repository that the press raised, as the other kinds get one (resource_record):
+        # so a Give at read stays a read and never becomes the door's commits for an Operator (door_commit_holds, the
+        # Door area's readers of 26 November 2026)
+        with transaction():
+            for repo in raised:
+                resource_record(f"repo:{repo}", agent, level, "owner", result["revision"])     # the page's own id
         pages = github_unreached(raised)
         emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
              f"{level} access to {', '.join(raised)} now. An agent gets the change in its next task session." +
@@ -76709,6 +76715,21 @@ def door_app_id():
     return app_id if isinstance(app_id, str) and re.fullmatch(r"[1-9][0-9]{0,11}", app_id) else None
 
 
+def door_commit_holds(name, repos):
+    """The repositories of this agent's holds that the door may make commit targets of when the agent is an Operator
+    (DoorAccess.operatorGitHub; the Door area's read of 26 November 2026): each hold at write or deploy, and each hold
+    that no record of the hub's names (resource_grants), which is the owner's own from their page or from before the
+    records. A read that the manager gave (the pool default gives a repository at read only) and a read of the owner's
+    Give are no commit target, since the door commits with its own token: else a read would become a write the day the
+    agent gets a server, or while its business has no ready host. Called with LOCK held."""
+    newest = {}         # each repository's newest record of this agent: a take-back (level NULL) or an older level
+    for row in q("SELECT resource, level FROM resource_grants WHERE agent=? AND resource LIKE 'repo:%' ORDER BY id",
+                 (name,)):  # that the hold no longer has is no record of the hold that stands now
+        newest[str(row["resource"]).lower()] = row["level"]
+    return sorted(repo for repo, level in repos.items()
+                  if level in ("write", "deploy") or newest.get(f"repo:{str(repo).lower()}") != level)
+
+
 def door_view():
     """GET /ui/door (owner feature door_setup, DevOps plan 13, items 1 and 3): what the app needs to keep the door with
     no step of the owner's. The door's entry, each credential of its rules with the agents that use it, and each
@@ -76729,7 +76750,8 @@ def door_view():
             "credentials": {name: {"secret": c["secret"], "agents": [u for u in c.get("agents") or [] if u in holders]}
                             for name, c in sorted((door.get("credentials") or {}).items())},
             "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name),
-                              "repos": dict(sorted((a.get("repos") or {}).items()))}
+                              "repos": dict(sorted((a.get("repos") or {}).items())),
+                              "targets": door_commit_holds(name, a.get("repos") or {})}
                        for name, a in sorted(agents().items()) if a.get("machine") in addresses},
             # plan 13, item 4: the hub's own App key, which the app moves to the door, and whether the hub is linked
             "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,

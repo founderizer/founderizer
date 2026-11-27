@@ -1018,6 +1018,11 @@ class Resources(OwnerAPI):
         self.assertEqual(code, 200, receipt)
         self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})
         self.assertEqual(self.commits(), before + 1)
+        # the owner's record of the repository that the press gave, as each other kind gets one: so the door makes no
+        # commit target of a Give at read (door_commit_holds). Bug: a Give writes no row, and reads as a page grant.
+        row = hub.q1("SELECT level, by FROM resource_grants WHERE resource='repo:acme/web' AND agent='dev' "
+                     "ORDER BY id DESC LIMIT 1")
+        self.assertEqual((row["level"], row["by"]), ("write", "owner"))
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Give Dev write")
         self.assertIn("The hub gave it at this press",
                       hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"])

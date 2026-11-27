@@ -745,12 +745,34 @@ class DoorTokens(Access):
         hub.CFG["github_app"] = str(key)
         self.addCleanup(hub.CFG.pop, "github_app", None)
         team = self.origin_team()
-        team["agents"]["vps"]["repos"] = {"acme/web": "write", "founderizer/founderizer-apps": "read"}
+        team["agents"]["vps"]["repos"] = {"acme/web": "write", "founderizer/founderizer-apps": "read",
+                                          "acme/x-Given": "read", "acme/x-pressed": "read", "acme/zz-Back": "read",
+                                          "acme/x-other": "read"}
         team["agents"]["studio"]["repos"] = {"other/site": "read"}
         self.write_team(team)
+        # a read that the manager gave and a read of the owner's Give have records; the others are the owner's own
+        # a read that the manager gave, a read of the owner's Give (need_give_press writes it), a hold that the owner
+        # took back and then gave again from the agent's page (no row: the newest row is the take-back), and another
+        # agent's row for a repository that vps holds with none of its own
+        for ts, rid, agent, level, by in ((1, "repo:acme/x-given", "vps", "read", "manager"),
+                                          (2, "repo:acme/x-pressed", "vps", "read", "owner"),
+                                          (3, "repo:acme/zz-back", "vps", "read", "manager"),
+                                          (4, "repo:acme/zz-back", "vps", None, "owner"),
+                                          (5, "repo:acme/x-other", "studio", "read", "manager")):
+            hub.q("INSERT INTO resource_grants(ts,resource,agent,level,by) VALUES(?,?,?,?,?)",
+                  (ts, rid, agent, level, by))
         view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
         self.assertEqual((view["github_app"]["app_id"], view["linked"], view["door_secrets"]), ("12345", False, False))
-        self.assertEqual(view["agents"]["vps"]["repos"], {"acme/web": "write", "founderizer/founderizer-apps": "read"})
+        self.assertEqual(view["agents"]["vps"]["repos"], {"acme/web": "write", "acme/zz-Back": "read",
+                                                          "acme/x-Given": "read", "acme/x-other": "read",
+                                                          "acme/x-pressed": "read",
+                                                          "founderizer/founderizer-apps": "read"})
+        # The holds that the door may make commit targets of, for an Operator (the Door area's read of 26 November
+        # 2026): a write, and a hold that no record names. Bug: a read that the manager gave becomes the door's commits,
+        # whose push the repository's jobs run beside their secrets, once the agent gets a server.
+        self.assertEqual(view["agents"]["vps"]["targets"], ["acme/web", "acme/x-other", "acme/zz-Back",
+                                                             "founderizer/founderizer-apps"])
+        self.assertEqual(view["agents"]["studio"]["targets"], ["other/site"])
         token, record = "t" * 43, "r" * 43
         StubDoor.answers["/github/token"] = (200, {"tokens": [], "errors": [{"repos": ["other/site"], "error": "no App"}]})
         status, answer = self.owner("/ui/door/secrets", token=token, record=record)
