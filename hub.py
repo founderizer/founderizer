@@ -3306,7 +3306,15 @@ PUSH_BUTTON = 50
 PUSH_KEEP = 86400       # seconds that Apple keeps a ping for a phone that is switched off
 PING_EVERY = 30         # seconds between two looks at the queue when nothing woke the sender
 PING_WAKE = threading.Event()
-_ping_hold = {"until": 0.0}     # no ping goes before this time: our side held one back because a count is full (429)
+_ping_hold = {"until": 0.0, "licence": None}    # no ping goes before this time: our side held one back (a count is
+                                                # full, a 503...); `licence`: the entitlement that a 401 or 402 refused
+                                                # ("" for none), whose hold another one ends (owner_hold_until); None
+                                                # for each other hold
+PHONE_HOLDS = {}                # an owner's device -> the time until which Apple holds its pings (PHONE), under LOCK
+                                # (the member thread reads it too); in memory, so after a restart that phone asks again
+PING_FLIGHT = {"n": 0}          # owner's pings (Needs-you, replies) between 'sending' and their end, under LOCK
+PING_HELD_EVERY = 3600          # seconds between two log lines of the owner's pings that one kind of hold queued again
+PING_HELD_LINE = {}             # the kind of a hold (its words) -> {"n": tries since its last line, "at": that line}
 # **The number on the app's icon** (the owner's yes of 12 November 2026, "Yes, all four", point 1): the count of what
 # needs the owner now (owner_count), and no number at zero. Each Needs-you ping carries it as aps.badge; when it changes
 # and no Needs-you ping is about to carry it, the sender sends each phone one push that holds only {"aps": {"badge": n}}
@@ -3513,14 +3521,26 @@ def ping_sender():
     """The one thread that sends pings: in order, and each one once. While our side holds the queue back (send_ping)
     it looks again when that time ends; a ping that is queued meanwhile wakes it, and it sends nothing before then.
     When the queue is empty, it looks whether a phone's icon shows another number than now (badge_look): each change of
-    the records wakes it (changed)."""
+    the records wakes it (changed). When a ping that may go now still waits after its look (the owner's presence at a
+    Mac app ended after send_ping read it), it looks again at once in place of PING_EVERY later: member pings wait for
+    it (owner_pings_now). Its wait is read before that second look, so a presence or a hold that ends after the look
+    still ends the wait on time."""
     while True:
+        wait = None
         try:
             while send_ping() or badge_look():
                 pass
+            wait = ping_wait()      # before the second look: an end of his presence or of a hold after it is in it
+            if owner_pings_now() > 0:
+                continue            # his presence at the Mac ended after send_ping read it: the ping goes now
         except Exception:
             print_fault()
-        PING_WAKE.wait(ping_wait())
+        try:                        # ping_wait reads the records in a hold of the licence: a fault there ends no thread
+            wait = ping_wait() if wait is None else wait
+        except Exception:
+            print_fault()
+            wait = PING_EVERY
+        PING_WAKE.wait(wait)
         PING_WAKE.clear()
 
 
@@ -3528,31 +3548,71 @@ def ping_wait():
     """The seconds until the sender looks at the queue again: PING_EVERY, or less when our side's hold ends sooner,
     or when the owner's presence at a Mac app ends sooner, so that the pings it held go then."""
     t0 = now()
-    ends = [until - t0 for until in (_ping_hold["until"], owner_present_until(t0), BADGE["until"]) if until > t0]
+    with LOCK:                      # the member thread ends a phone's hold under LOCK too (owner_pings_now)
+        phones = [PHONE_HOLDS[d] for d in phones_held(t0)]
+    ends = [until - t0 for until in (owner_hold_until(), owner_present_until(t0), BADGE["until"], *phones)
+            if until > t0]
     return min([PING_EVERY] + ends)
+
+
+def phones_held(t0=None):
+    """The owner's devices whose pings Apple holds now (PHONE_HOLDS), sorted; a hold that ended goes. Under LOCK, as
+    each write of PHONE_HOLDS: the sender and the member thread (owner_pings_now) both read it."""
+    t0 = now() if t0 is None else t0
+    with LOCK:
+        for device in [d for d, until in PHONE_HOLDS.items() if until <= t0]:
+            PHONE_HOLDS.pop(device, None)
+        return sorted(PHONE_HOLDS)
+
+
+def owner_hold_until():
+    """The time until which our side holds the owner's pings back (_ping_hold), or 0.0. A hold for the licence (a 401
+    or 402 of the entitlement that it names, "" for none) ends as soon as the fleet holds another entitlement (a first
+    one too), also one stored while that ping's call ran, before the hold was set; the sender looks again then. A hold
+    whose time ended names no entitlement any more."""
+    with LOCK:
+        hold = dict(_ping_hold)
+        if hold.get("licence") is None:
+            return hold["until"]
+        if hold["until"] <= now():
+            _ping_hold.update(until=0.0, licence=None)
+            return 0.0
+        row = read_row("SELECT token FROM entitlement WHERE id=1")     # a read that commits nothing: its caller may
+        if ((row["token"] if row else None) or "") == hold["licence"]:  # hold a transaction (teams_moved)
+            return hold["until"]
+        if _ping_hold.get("licence") == hold["licence"]:                # not another hold that came meanwhile
+            _ping_hold.update(until=0.0, licence=None)
+    PING_WAKE.set()
+    return 0.0
 
 
 def owner_pings_now():
     """The count of the owner's pings that may go now, by send_ping's own conditions: the queued Needs-you pings and
-    replies and the one in flight, none while our side holds the owner's pings back (_ping_hold) or while the owner is
-    at a Mac app, and no badge-only push. It commits nothing.
+    replies, none while our side holds the owner's pings back (_ping_hold) or while the owner is at a Mac app, no
+    badge-only push, and the one that send_ping took and has not ended (PING_FLIGHT, in memory: a row that a fault left
+    in 'sending' holds nothing back). The mark and the rows are read in one hold of LOCK, and send_ping sets the mark
+    in the same hold that makes its row 'sending', so no read falls between the two. It commits nothing.
 
     The one read of the Teams part person_links in this region (B9, b9-phone-members.md, section 5): the part's own
     thread sends no ping to a member's phone while this count is above 0, so the owner's pings go first, and a ping of
     his that waits for him at the Mac or for our side's hold stops no member ping. A member ping never sets
     _ping_hold, and the part never reads or writes the table pings: it holds its own pings, in memory."""
-    if now() < _ping_hold["until"] or owner_present_until() > 0:
-        return 0
-    return read_row("SELECT COUNT(*) n FROM pings WHERE state IN ('queued','sending') AND kind IN ('needs','talk')")[
-        "n"]
+    with LOCK:
+        flying = PING_FLIGHT["n"]
+        if now() < owner_hold_until() or owner_present_until() > 0:
+            return flying
+        held = phones_held()        # a phone that Apple holds sends nothing now, so its rows stop no member ping
+        return flying + read_row("SELECT COUNT(*) n FROM pings WHERE state='queued' AND kind IN ('needs','talk') AND "
+                                 f"device NOT IN ({','.join('?' * len(held))})", tuple(held))["n"]
 
 
 def send_ping():
     """Sends the oldest queued ping, through our side (push.py): with this fleet's entitlement as the bearer when it
     holds one, and with no Authorization header when it does not, because our side's route asks for no account. False
-    when none waits. Apple's answer decides its state, and a token that Apple calls gone is dropped, so that phone gets
-    no ping until the app gives a new one at its next start. A ping that our side refuses fails with the one line that
-    says why.
+    when none waits. push.outcome's one table decides its state (below): a token that Apple calls gone (410, 400
+    BadDeviceToken or DeviceTokenNotForTopic) or that push.py's own checks refuse is dropped, so that phone gets no
+    ping until the app gives a new one at its next start; a ping that our side refuses for its own fault fails with
+    the one line that says why.
 
     A ping that our side held back because a count of its is full (429) is queued again, first of the queue, and no
     ping goes before the time that our side named (push.PushError.retry_after): our side sent nothing to Apple, so
@@ -3565,14 +3625,36 @@ def send_ping():
     with the number of the moment it goes. Its refusals touch no Needs-you ping: a 429 holds back only the badge-only
     pushes (BADGE["until"]), and a 400, our side's answer to a shape that it does not take, ends them until the hub
     starts again (BADGE["off"]). Apple keeps no badge-only push for a phone that is off (expires 0), so it never takes
-    the place of a Needs-you ping that Apple keeps for that phone."""
-    if now() < _ping_hold["until"]:
+    the place of a Needs-you ping that Apple keeps for that phone.
+
+    Each answer goes through push.outcome's one table, as for the members' pings, for a development build's ping too
+    (our side sends it to Apple's sandbox): held (our side's 502, 503, 401, 402, 429, no connection, a 3xx, 403, 404,
+    405, 408, 421, 425, 426 or 431, a channel or a bearer that cannot go out; Apple's 5xx, its 403 of a production ping,
+    its 429 TooManyProviderTokenUpdates) queues the ping again first while inside PUSH_KEEP and holds every owner ping
+    for its time (a row past PUSH_KEEP fails and holds nothing); Apple's other 429, and its 403 of a development ping,
+    hold only that phone's pings (PHONE_HOLDS, in memory: after a restart that phone asks again); may have gone (status
+    0, our side's 500, 504 or other 5xx) makes it unknown and holds the next pings RETRY_DEFAULT; the ping's own fault
+    fails it, and the token goes when the table says so (push.py's own refusal of it, Apple's 410, its 400
+    BadDeviceToken or DeviceTokenNotForTopic). A 502 that is not our side's own (a proxy's, when our side stops at a
+    deploy) holds a ping one time, and the row keeps it (status 502) while it stays queued, through the other holds in
+    between and across a restart: one second send, which can ring twice; the second such 502 of the same row makes it
+    unknown. Apple names no 502 of its own, so a row's 502 is a proxy's.
+
+    The end of the call goes to the row only while it is 'sending': a row that went meanwhile (join_items_gone_rows),
+    or a new row whose id came back, takes none of it.
+
+    While a held Needs-you ping stays queued, up to PUSH_KEEP, badge_look sends that phone no badge-only push, so its
+    icon's number waits with it: a badge-only push never stands before a Needs-you ping, and it would meet the same
+    hold."""
+    if now() < owner_hold_until():
         return False
     present = owner_present_until() > 0     # the owner is at a Mac app: a Needs-you ping waits in the queue
     badges_wait = BADGE["off"] or now() < BADGE["until"]
     with LOCK:
+        held = phones_held()
         row = q1("SELECT * FROM pings WHERE state='queued' AND NOT (? AND kind IN ('needs','talk')) AND NOT "
-                 "(? AND kind='badge') ORDER BY kind='badge', id LIMIT 1", (present, badges_wait))
+                 f"(? AND kind='badge') AND device NOT IN ({','.join('?' * len(held))}) ORDER BY kind='badge', id "
+                 "LIMIT 1", (present, badges_wait, *held))
         if not row:
             return False
         q("UPDATE pings SET state='sending' WHERE id=?", (row["id"],))
@@ -3584,50 +3666,105 @@ def send_ping():
         device = q1("SELECT * FROM owner_device_push WHERE device=?", (row["device"],))
         generation, channel, entitlement = kv_get("db_id"), release_channel(), entitlement_token()
         count = owner_count()
+        if not badge:       # last, in the hold that made the row 'sending': owner_pings_now counts it from now on
+            PING_FLIGHT["n"] += 1
     if badge:
         return send_badge(row, device, count, generation, channel, entitlement)
-    state, status, error, hold = "skipped", None, None, None
-    if not device or row["device"] not in owner_devices():
-        error = "the device has no push token now"
-    elif not need or row["db"] != generation:
-        error = "the item is not in these records"
-    elif need["answer"] is not None and not (reply and need["answered_by"] == reply["who"] and
-                                             need["answered"] == reply["ts"]):
-        # (a close whose reason is the agent's reply to his message, made in the same moment, is that reply's own
-        # end: it goes, t_withdraw_need, owner API 1.316)
-        error = "the item was answered before the ping went"
-    elif row["error"] and now() >= row["created"] + PUSH_KEEP:
-        state, error = "failed", row["error"]       # our side held it back, and its day ended (a hub that was down)
-    else:
-        # A ping that our side held back has its line in `error` while it is queued again, and keeps the day from its
-        # making; a first try gets a day from now, as always.
-        expires = (row["created"] if row["error"] else now()) + PUSH_KEEP
-        try:
-            status, reason = push.send(channel, entitlement, device["token"],
-                                       ping_payload(need, generation, device["seal"], count, reply),
-                                       device["environment"], collapse=f"need-{need['id']}", expires=expires)
-            state, error = ("sent" if status == 200 else "unknown" if status == 0 else "failed"), reason or None
-        except push.PushError as e:
-            state, error, hold = "failed", str(e), e.retry_after
-            if hold and now() + hold - row["created"] < PUSH_KEEP:
-                state = "queued"
-    with LOCK:
-        q("UPDATE pings SET state=?, sent=?, status=?, error=? WHERE id=?", (state, now(), status, error, row["id"]))
-        if status == 200:           # the icon shows the number that the ping carried
-            q("UPDATE owner_device_push SET badge=? WHERE device=? AND token=?", (count, row["device"], device["token"]))
-            BADGE_TRIED.pop(row["device"], None)
-        if status == 410 or (status == 400 and error in ("BadDeviceToken", "DeviceTokenNotForTopic")):
-            q("DELETE FROM owner_device_push WHERE device=? AND token=?", (row["device"], device["token"]))
-    if hold:
-        # The next ping too. A full count of this caller or of all pings would hold it back as well. A full count of one
-        # phone holds the pings of the other phones back for that time too, push.RETRY_MOST at most: the answer does
-        # not say which count is full, and the hub keeps the pings of every phone in one queue.
-        _ping_hold["until"] = now() + hold
-    log("hub", f"ping {row['id']} to {row['device']} for " + (f"N-{nid}" if nid else "a reply that is gone")
-        + (" (a reply)" if reply else "") + f": {state}"
-        + (f" ({error})" if error else "")
-        + (f"; it goes again in {hold} seconds" if state == "queued" else ""))
-    return True
+    try:
+        state, status, error, hold, got, licence, kind = "skipped", None, None, None, None, False, ""
+        phone_until, again = None, None
+        if not device or row["device"] not in owner_devices():
+            error = "the device has no push token now"
+        elif not need or row["db"] != generation:
+            error = "the item is not in these records"
+        elif need["answer"] is not None and not (reply and need["answered_by"] == reply["who"] and
+                                                 need["answered"] == reply["ts"]):
+            # (a close whose reason is the agent's reply to his message, made in the same moment, is that reply's own
+            # end: it goes, t_withdraw_need, owner API 1.316)
+            error = "the item was answered before the ping went"
+        elif row["error"] and now() >= row["created"] + PUSH_KEEP:
+            state, error = "failed", row["error"]       # our side held it back, and its day ended (a hub that was down)
+        else:
+            # A ping that our side held back has its line in `error` while it is queued again, and keeps the day from
+            # its making; a first try gets a day from now, as always.
+            expires = (row["created"] if row["error"] else now()) + PUSH_KEEP
+            refused = None
+            try:
+                status, reason = push.send(channel, entitlement, device["token"],
+                                           ping_payload(need, generation, device["seal"], count, reply),
+                                           device["environment"], collapse=f"need-{need['id']}", expires=expires)
+                got = push.outcome(status, reason, environment=device["environment"])
+            except push.PushError as e:
+                refused, got = e, push.outcome(error=e, environment=device["environment"])
+            if refused is not None and refused.status == 502 and refused.word != "unreachable" and \
+                    got.kind == push.HELD:
+                # A proxy's 502 holds his ping one time (a second send, which can ring twice), and the row keeps it
+                # (status 502), also across a restart; at the second one of this row its first call may well have
+                # reached Apple, so it never goes again.
+                if row["status"] == 502:
+                    got = push.Outcome(push.MAYBE, push.RETRY_DEFAULT, False, False, got.words)
+                status = 502
+            # push.outcome's one table: held (queued again while inside PUSH_KEEP), may have gone (unknown, and the
+            # next pings wait), the ping's own fault (failed), sent
+            error = got.words or None
+            kind = (f"our side: {refused.status} {refused.word or refused.setting or ''}" if refused is not None
+                    else f"Apple: {status} {reason}")       # the kind of a hold, for its log line
+            if got.kind == push.SENT:
+                state = "sent"
+            elif got.kind in (push.PHONE, push.HELD):
+                state = "queued" if now() + got.wait - row["created"] < PUSH_KEEP else "failed"
+                if state == "queued":           # a row past PUSH_KEEP fails and holds nothing
+                    again = got.wait
+                    if got.kind == push.PHONE:  # that phone's pings wait; the others go
+                        phone_until = now() + got.wait
+                    else:
+                        hold, licence = got.wait, got.licence
+            elif got.kind == push.MAYBE:
+                state, hold = "unknown", got.wait
+            else:
+                state = "failed"
+            if state == "queued" and row["status"] == 502:
+                status = 502                    # the proxy's mark stays through each other hold until the row ends
+            if state == "sent":                 # the cause of each hold ended: a new outage says its first line again
+                PING_HELD_LINE.clear()
+        with LOCK:
+            q("UPDATE pings SET state=?, sent=?, status=?, error=? WHERE id=? AND state='sending'",
+              (state, now(), status, error, row["id"]))
+            if phone_until:
+                PHONE_HOLDS[row["device"]] = phone_until
+            if hold:
+                # The next ping too. A full count of this caller or of all pings would hold it back as well. Our
+                # side's count of one phone holds the pings of the other phones back for that time too, push.RETRY_MOST
+                # at most: our side's answer to the owner's route does not say which count is full. Apple's PHONE
+                # answers hold only that phone (PHONE_HOLDS). A hold of the licence names the entitlement of this call
+                # ("" for none).
+                _ping_hold.update(until=now() + hold, licence=(entitlement or "") if licence else None)
+            if status == 200:           # the icon shows the number that the ping carried
+                q("UPDATE owner_device_push SET badge=? WHERE device=? AND token=?",
+                  (count, row["device"], device["token"]))
+                BADGE_TRIED.pop(row["device"], None)
+            if got is not None and got.token_gone:
+                q("DELETE FROM owner_device_push WHERE device=? AND token=?", (row["device"], device["token"]))
+        line = (f"ping {row['id']} to {row['device']} for " + (f"N-{nid}" if nid else "a reply that is gone")
+                + (" (a reply)" if reply else "") + f": {state}" + (f" ({error})" if error else "")
+                + (f"; it goes again in {again} seconds" if state == "queued" else ""))
+        if state != "queued":
+            log("hub", line)
+        else:                       # each kind of hold says its first line, then a count, one line an hour at most
+            t0 = now()
+            if len(PING_HELD_LINE) >= 64 and kind not in PING_HELD_LINE:
+                PING_HELD_LINE.clear()
+            seen = PING_HELD_LINE.setdefault(kind, {"n": 0, "at": 0.0})
+            if t0 - seen["at"] >= PING_HELD_EVERY:
+                more = seen["n"]
+                seen.update(n=0, at=t0)
+                log("hub", line + (f" ({more} more held tries since the last line)" if more else ""))
+            else:
+                seen["n"] += 1
+        return True
+    finally:
+        with LOCK:
+            PING_FLIGHT["n"] -= 1
 
 
 def send_badge(row, device, count, generation, channel, entitlement):
@@ -3654,11 +3791,11 @@ def send_badge(row, device, count, generation, channel, entitlement):
             elif e.status == 400:
                 BADGE["off"] = True         # a site from before badge-only pushes: none until the hub starts again
     with LOCK:
-        q("UPDATE pings SET state=?, item=?, sent=?, status=?, error=? WHERE id=?",
-          (state, count, now(), status, error, row["id"]))
+        q("UPDATE pings SET state=?, item=?, sent=?, status=?, error=? WHERE id=? AND state='sending'",
+          (state, count, now(), status, error, row["id"]))     # a row that went meanwhile takes none of it
         if status == 200:
             q("UPDATE owner_device_push SET badge=? WHERE device=? AND token=?", (count, row["device"], device["token"]))
-        if status == 410 or (status == 400 and error in ("BadDeviceToken", "DeviceTokenNotForTopic")):
+        if status == 410 or (status == 400 and error in push.GONE_REASONS):
             q("DELETE FROM owner_device_push WHERE device=? AND token=?", (row["device"], device["token"]))
     if status == 200 or state == "queued":
         BADGE_TRIED.pop(row["device"], None)
@@ -73474,7 +73611,7 @@ def server_made_swept_rows():
 # server, provider or id of a record: the fleet manager reads that log.
 
 SERVER_MADE_FIELDS = frozenset({"v", "kind", "fleet", "at", "machine", "provider", "id", "use"})
-SERVER_MADE_PROVIDERS = ("hetzner", "digitalocean", "vultr", "akamai")       # FleetCore's CloudProvider
+SERVER_MADE_PROVIDERS = ("hetzner", "digitalocean", "vultr", "akamai", "hostinger")      # FleetCore's CloudProvider
 SERVER_MADE_USES = ("hub", "agent")                                          # FleetCore's CloudServerUse
 SERVER_MADE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")                           # FleetCore's CloudServers.isID
 SERVER_MADE_LONGEST = 4096                                                   # characters of one statement
@@ -82679,6 +82816,8 @@ def store_entitlement(token, renews=None):
 TEAMS_PLAN = "teams"
 TEAMS_PARTS = {}        # a part's feature name -> its own condition (a function with no argument), or None
 TEAMS_WAKE = threading.Condition()      # a part's thread that holds its calls waits on it (teams_moved)
+TEAMS_WAKES = {"n": 0}                  # one more at each teams_moved, under TEAMS_WAKE: a part's thread that read it
+                                        # before its round waits only when it is the same (B9's ping thread)
 
 
 def teams_held(row):
@@ -82734,9 +82873,16 @@ def teams_moved():
     """The kept licence changed (a token was stored, or the signed word was marked): wake each thread of a Teams part
     that waits on TEAMS_WAKE, so that it reads teams_on() and teams_licence() again at once. Its caller can hold LOCK
     (store_entitlement runs in the act of an owner command, in the release poll and in the licence's poll, which hold
-    it), so a thread reads those two after its wait, never while it holds TEAMS_WAKE."""
+    it), so a thread reads those two after its wait, never while it holds TEAMS_WAKE. TEAMS_WAKES counts each such
+    wake, so a thread that compares it under TEAMS_WAKE before it waits never misses one that came after its round.
+    A hold of the owner's pings for an entitlement (_ping_hold's `licence`: our side's 401 or 402) ends here too when
+    the fleet holds another one (owner_hold_until); any other hold stays."""
     with TEAMS_WAKE:
+        TEAMS_WAKES["n"] += 1
         TEAMS_WAKE.notify_all()
+    if _ping_hold.get("licence") is not None:   # our side refused the owner's pings for an entitlement: a new one
+        if owner_hold_until() == 0.0:           # ends that hold now
+            PING_WAKE.set()
 
 
 def teams_features():

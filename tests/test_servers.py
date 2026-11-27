@@ -3408,6 +3408,12 @@ class ServerMadeRoutes(Servers):
         signature, key = self.sign(text, "another of the owner's keys")
         self.assertEqual(self.made(text, signature, key)[1]["kept"], True)
         self.assertEqual(len(self.made_read()["records"]), 2)
+        # a VPS that Add server bought at Hostinger: its id is the VPS's whole number (the Hostinger thread, 27
+        # November 2026)
+        text = self.vector["statement"].replace('"provider":"hetzner"', '"provider":"hostinger"')
+        text = text.replace("58213977", "1048576")
+        self.assertEqual(self.made(text, *self.sign(text))[1]["kept"], True)
+        self.assertEqual(len(self.made_read()["records"]), 3)
         logged = " ".join(r["what"] for r in hub.q("SELECT what FROM log"))
         for value in ("58213977", "58213990", "worker-3", "hetzner"):
             self.assertNotIn(value, logged)

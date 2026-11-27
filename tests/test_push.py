@@ -4,7 +4,6 @@ address for the Mac and the phone, and a stand-in for our side's push route (the
 No real device, key, network or AI call."""
 import base64
 import hashlib
-import inspect
 import json
 import threading
 import unittest
@@ -37,6 +36,8 @@ class OurSide(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.server.got.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()},
                                 "body": json.loads(body), "raw": body.decode()})
+        if getattr(self.server, "during", None):        # what happens at our side while the call runs
+            self.server.during()
         status, answer, *more = self.server.answer
         out = json.dumps(answer).encode()
         self.send_response(status)
@@ -71,7 +72,9 @@ class PushCase(Devices):
         hub.CFG["release_channel"] = f"http://127.0.0.1:{self.side.server_port}"
         hub.q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored) "
               "VALUES(1,'0f1e2d3c4b5a6978',?,'founder-monthly',?,5,10,1,?)", (ENTITLEMENT, hub.now() + 86400, hub.now()))
-        hub._ping_hold["until"] = 0.0           # a hold is in memory: none comes from another test
+        hub._ping_hold.update(until=0.0, licence=None)      # a hold is in memory: none comes from another test
+        hub.PING_HELD_LINE.clear()
+        hub.PHONE_HOLDS.clear()
         hub.BADGE.update(off=False, until=0.0)
         hub.BADGE_TRIED.clear()
 
@@ -414,18 +417,63 @@ class Sender(PushCase):
         self.assertNotIn(fleet, got["raw"] + json.dumps(got["headers"]))     # and no fleet id anywhere
 
     def test_a_route_that_asks_for_an_account_is_refused_and_the_phone_keeps_its_token(self):
-        """A route that still asks for an account (our side's before the open service) answers 401 or 402. The ping
-        fails with one line that names no subscription, and Apple was not asked, so the phone keeps its token."""
+        """A route that still asks for an account (our side's before the open service) answers 401 or 402: nothing
+        went to Apple, so the ping waits, first, for LICENCE_HOLD (push.outcome's table, as for the members' route),
+        with one line that names no subscription, and the phone keeps its token."""
         self.give(self.enrolled())
         for status in (401, 402):
             with self.subTest(status=status):
+                hub.q("DELETE FROM pings")
+                hub._ping_hold["until"] = 0.0
                 self.raise_item(title=f"Item {status}")
                 self.side.answer = (status, {"error": "lapsed"})
                 ping = self.sent()
-                self.assertEqual((ping["state"], ping["status"]), ("failed", None))
+                self.assertEqual((ping["state"], ping["status"]), ("queued", None))
+                self.assertAlmostEqual(hub._ping_hold["until"], hub.now() + push.LICENCE_HOLD, delta=5)
                 self.assertEqual(ping["error"], f"127.0.0.1 refused this fleet ({status}), so it sends no pings "
                                                 f"for it")
                 self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))  # our side refused, not Apple
+                self.assertEqual(hub._ping_hold["licence"], ENTITLEMENT)     # the entitlement that it refused
+                hub.teams_moved()                   # the same entitlement: the hold stays
+                self.assertGreater(hub._ping_hold["until"], hub.now() + 60)
+                hub.q("UPDATE entitlement SET token=?", (ENTITLEMENT + "x",))   # a new one, also one stored during
+                hub.teams_moved()                                               # the call: the hold ends now
+                self.assertEqual(hub._ping_hold["until"], 0.0)
+                hub.q("UPDATE entitlement SET token=?", (ENTITLEMENT,))
+
+    def test_apples_outage_or_its_refusal_of_our_key_holds_the_owners_ping_and_a_cut_answer_is_unknown(self):
+        """Our side's answer is Apple's, inside a 200: Apple's 500 or 503, and its 403 for our side's own key, hold
+        the owner's ping, queued and first, for RETRY_DEFAULT, and so do Apple's 429 and our side's own 502; a proxy's
+        502 holds it one time (one second send, which can ring twice), and its second makes the row unknown; our
+        side's 504 makes it unknown, never sent again, and the next ping waits. Apple's 403 of a development build's
+        ping (our side sends it to Apple's sandbox, where a fault of the key may stand alone) holds only that phone,
+        and its token stays. Bugs: an Apple outage, or an expired provider key of our side, fails each card's ping; a
+        proxy's 502 or 504 after the ping went to Apple sends it twice; a development build holds each card's ping of
+        every phone for a day; or its key fault takes the phone's token."""
+        self.give(self.enrolled())
+        for answer, state in (((200, {"status": 500, "reason": "InternalServerError"}), "queued"),
+                              ((200, {"status": 503, "reason": "ServiceUnavailable"}), "queued"),
+                              ((200, {"status": 403, "reason": "ExpiredProviderToken"}), "queued"),
+                              ((502, {"error": "unreachable"}), "queued"),
+                              ((502, {"error": "bad_gateway"}), "queued"),
+                              ((504, {"error": "gateway"}), "unknown")):
+            with self.subTest(answer=answer):
+                hub.q("DELETE FROM pings")
+                hub._ping_hold["until"] = 0.0
+                self.raise_item(title=f"Item {answer[0]}")
+                self.side.answer = answer
+                ping = self.sent()
+                self.assertEqual(ping["state"], state)
+                self.assertAlmostEqual(hub._ping_hold["until"], hub.now() + push.RETRY_DEFAULT, delta=5)
+                self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))
+        hub.q("DELETE FROM pings")
+        hub._ping_hold["until"] = 0.0
+        hub.q("UPDATE owner_device_push SET environment='development'")
+        self.raise_item(title="From a development build")
+        self.side.answer = (200, {"status": 403, "reason": "BadCertificateEnvironment"})
+        self.assertEqual((self.sent()["state"], hub._ping_hold["until"]), ("queued", 0.0))
+        self.assertEqual(sorted(hub.PHONE_HOLDS), ["iphone"])
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))
 
     def test_the_refusals_of_the_open_route_say_what_our_side_said(self):
         """The route that asks for no account has answers of its own (docs/CONTRACTS.md, "Pings to the iPhone app"):
@@ -496,16 +544,16 @@ class Sender(PushCase):
                 self.assertIn("; it goes again in 120 seconds",
                               hub.q1("SELECT what FROM log WHERE what LIKE 'ping %: queued%' ORDER BY id DESC")["what"])
 
-    def test_a_held_back_ping_that_would_be_too_old_fails_and_the_queue_still_waits(self):
-        """A ping that would be older than a day (PUSH_KEEP) by its next try fails with our side's line, and the next
-        ping still waits for the time that our side named, because our side would hold it back too."""
+    def test_a_held_back_ping_that_would_be_too_old_fails_and_holds_nothing(self):
+        """A ping that would be older than a day (PUSH_KEEP) by its next try fails with our side's line, and sets no
+        hold: old rows do not drain one for each hold and ring a day late, and the next ping asks for itself."""
         self.give(self.enrolled())
         self.raise_item()
         hub.q("UPDATE pings SET created=?", (hub.now() - hub.PUSH_KEEP + 60,))
         self.side.answer = (429, {"error": "busy", "says": "a count is full"}, {"Retry-After": "120"})
         ping = self.sent()
         self.assertEqual((ping["state"], ping["error"]), ("failed", "127.0.0.1 answered 429: a count is full"))
-        self.assertGreater(hub._ping_hold["until"], hub.now())
+        self.assertEqual(hub._ping_hold["until"], 0.0)
 
     def test_a_held_back_ping_whose_day_ended_while_the_hub_was_down_fails_before_it_goes(self):
         """The hold is in memory only, so after a restart a held ping goes at once. When its day ended meanwhile, it
@@ -529,11 +577,12 @@ class Sender(PushCase):
         self.assertEqual(hub.ping_wait(), hub.PING_EVERY)
         hub._ping_hold["until"] = hub.now() - 1                 # a hold that ended
         self.assertEqual(hub.ping_wait(), hub.PING_EVERY)
-        self.assertIn("PING_WAKE.wait(ping_wait())", inspect.getsource(hub.ping_sender))
 
     def test_the_wait_is_what_our_side_said_within_bounds(self):
-        """Our side writes Retry-After as whole seconds. A date or no header waits RETRY_DEFAULT, and no wait is
-        shorter than a second or longer than RETRY_MOST (20 minutes, two of our side's windows)."""
+        """Our side writes Retry-After as whole seconds, for a 429 and a 503, on the owner's route as on the members'.
+        A date or no header waits RETRY_DEFAULT, and no wait is shorter than a second or longer than RETRY_MOST (20
+        minutes, two of our side's windows). Bug: a long 503 of our side (a switch, a closed shop) brings each fleet's
+        call back each minute."""
         for value, seconds in (("120", 120), ("  7 ", 7), (None, push.RETRY_DEFAULT),
                                ("Wed, 21 Oct 2026 07:28:00 GMT", push.RETRY_DEFAULT), ("0", 1), ("-5", 1),
                                ("99999", push.RETRY_MOST)):
@@ -548,7 +597,7 @@ class Sender(PushCase):
             self.side.answer = (status, {"error": "x"}, {"Retry-After": "30"})
             with self.assertRaises(push.PushError) as refused:
                 push.send(hub.CFG["release_channel"], None, TOKEN, {"aps": {}}, "production")
-            self.assertIsNone(refused.exception.retry_after, status)
+            self.assertEqual(refused.exception.retry_after, 30 if status == 503 else None, status)
 
     def test_the_banner_is_the_one_alert_our_side_takes(self):
         """A rule of the wire: our side's push route takes a ping only when `aps.alert` is exactly {"title": "Needs
@@ -569,12 +618,195 @@ class Sender(PushCase):
                 self.assertNotIn("subscription", said, status)
                 self.assertNotIn("entitlement", said, status)
 
-    def test_our_side_out_of_reach_sends_nothing(self):
+    def test_a_hold_that_is_not_the_licences_stays_when_the_licence_moves_and_each_kind_logs_once_an_hour(self):
+        """Our side's 503 holds the owner's pings; a new entitlement (teams_moved) does not end that hold, which is not
+        the licence's. A hold that stays logs its first line, then nothing within the hour, then one line with the
+        count; another kind of hold has its own first line. Bugs: each hold is taken as the licence's and ends at any
+        entitlement; or a hold logs each minute for a day, or never, or hides another kind's first line."""
+        self.give(self.enrolled())
+        self.raise_item()
+        self.side.answer = (503, {"error": "unavailable"})
+        self.assertEqual(self.sent()["state"], "queued")
+        self.assertIsNone(hub._ping_hold["licence"])
+        hub.q("UPDATE entitlement SET token=?", (ENTITLEMENT + "x",))
+        hub.teams_moved()
+        self.assertGreater(hub._ping_hold["until"], hub.now() + 30)         # the 503's hold stands
+
+        def lines():
+            return [r["what"] for r in hub.q("SELECT what FROM log WHERE what LIKE 'ping %: queued%' ORDER BY id")]
+        hub._ping_hold["until"] = 0.0
+        self.assertTrue(hub.send_ping())                    # the same hold again, within the hour: no line
+        self.assertEqual(len(lines()), 1)
+        for seen in hub.PING_HELD_LINE.values():
+            seen["at"] -= hub.PING_HELD_EVERY + 1           # the hour ends
+        hub._ping_hold["until"] = 0.0
+        self.assertTrue(hub.send_ping())
+        self.assertEqual(len(lines()), 2)
+        self.assertIn("(1 more held tries since the last line)", lines()[-1])
+        hub._ping_hold["until"] = 0.0
+        self.side.answer = (429, {"error": "too_many", "says": "a count is full"}, {"Retry-After": "60"})
+        self.assertTrue(hub.send_ping())                    # another kind of hold: its own first line
+        self.assertEqual(len(lines()), 3)
+
+    def test_a_proxys_502_holds_a_card_ping_one_time_and_its_second_makes_it_unknown(self):
+        """A 502 that is not our side's own (a proxy's, when our side stops at a deploy, maybe after it gave the ping to
+        Apple) holds the owner's ping one time; the second such 502 of the same row makes it unknown, never sent again.
+        The row keeps the first one (status 502) while it stays queued: through each other hold in between (our
+        side's 503, Apple's 429 of that phone) and across a restart; a new row whose id comes back has none. Bugs: the
+        row goes again at each hold's end for a day, about 1,440 sends of one card, each with a sound, and each newer
+        card waits behind it; or a hold in between writes over the mark, so a 502 and 503 flap rings the phone at each
+        502; or each restart sends it once more; or a new row's first proxy 502 makes it unknown at once."""
+        self.give(self.enrolled())
+        self.raise_item()
+        self.side.answer = (502, {"error": "bad_gateway"})
+        self.assertEqual((self.sent()["state"], self.pings()[-1]["status"]), ("queued", 502))
+        for between in ((503, {"error": "unavailable"}), (200, {"status": 429, "reason": "TooManyRequests"})):
+            hub._ping_hold.update(until=0.0, licence=None)
+            hub.PHONE_HOLDS.clear()
+            self.side.answer = between
+            self.assertTrue(hub.send_ping())
+            self.assertEqual((self.pings()[-1]["state"], self.pings()[-1]["status"]), ("queued", 502))
+        hub._ping_hold.update(until=0.0, licence=None)      # a restart in between: the row keeps its mark
+        hub.PHONE_HOLDS.clear()
+        hub.settle_pings()
+        self.side.answer = (502, {"error": "bad_gateway"})
+        self.assertTrue(hub.send_ping())
+        self.assertEqual((self.pings()[-1]["state"], len(self.side.got)), ("unknown", 4))
+        hub._ping_hold["until"] = 0.0
+        self.assertFalse(hub.send_ping())                   # never again
+        hub.q("DELETE FROM pings")                          # a row whose id comes back starts with no mark
+        hub._ping_hold["until"] = 0.0
+        self.raise_item(title="A second card")
+        self.assertEqual(self.sent()["state"], "queued")
+
+    def test_a_row_that_goes_during_its_call_lends_its_end_to_no_new_row(self):
+        """The card's ping row goes while its call runs (join_items_gone_rows takes the pings of a join item), and a new
+        row of a card takes its id: the call's end goes to no row but its own, which is 'sending'. Bug: the new row
+        gets the old call's state, 'sent', and its own ping never goes."""
+        self.give(self.enrolled())
+        self.raise_item()
+        old = self.pings()[-1]
+
+        def gone():
+            hub.q("DELETE FROM pings WHERE id=?", (old["id"],))
+            hub.q("INSERT INTO pings(id,device,kind,item,db,state,created) VALUES(?,?,?,?,?,'queued',?)",
+                  (old["id"], old["device"], old["kind"], old["item"], old["db"], hub.now()))
+        self.side.during = gone
+        self.assertTrue(hub.send_ping())
+        self.assertEqual([(r["state"], r["status"], r["error"]) for r in self.pings()], [("queued", None, None)])
+        self.side.during = None
+        self.assertEqual(self.sent()["state"], "sent")      # the new row's own ping goes
+        self.assertEqual(len(self.side.got), 2)
+
+    def test_a_licence_stored_during_the_refused_call_lets_the_next_ping_go_at_once(self):
+        """Our side refuses the owner's ping for the licence (401 or 402) while the fleet stores a new entitlement
+        during that call: the hold names the entitlement of the call, so the next look sends at once, with no
+        teams_moved; and a hold of a call with no entitlement ends at the first one. Bugs: the hold takes the
+        entitlement of after the call, or send_ping reads the hold's time alone, and the cards wait 15 minutes with a
+        new licence ready."""
+        self.give(self.enrolled())
+        self.raise_item()
+        self.side.during = lambda: hub.q("UPDATE entitlement SET token=?", (ENTITLEMENT + "y",))
+        self.side.answer = (401, {"error": "no_licence"})
+        self.assertTrue(hub.send_ping())
+        self.assertEqual((self.pings()[-1]["state"], hub._ping_hold["licence"]), ("queued", ENTITLEMENT))
+        self.side.during, self.side.answer = None, (200, {"status": 200, "reason": ""})
+        self.assertTrue(hub.send_ping())
+        self.assertEqual(self.pings()[-1]["state"], "sent")
+        hub.q("DELETE FROM entitlement")                    # no entitlement at all: the hold names none
+        self.raise_item(title="A second card")
+        self.side.answer = (402, {"error": "lapsed"})
+        self.assertEqual(self.sent()["state"], "queued")
+        self.assertEqual(hub._ping_hold["licence"], "")
+        hub.q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored) "
+              "VALUES(1,'0f1e2d3c4b5a6978',?,'founder-monthly',?,5,10,1,?)",
+              (ENTITLEMENT, hub.now() + 86400, hub.now()))
+        self.assertEqual(hub.owner_hold_until(), 0.0)       # the first entitlement ends it
+        hub._ping_hold.update(until=hub.now() - 1, licence=ENTITLEMENT)
+        self.assertEqual((hub.owner_hold_until(), hub._ping_hold["licence"]), (0.0, None))     # its time ended
+
+    def test_apples_429_holds_only_that_phone_and_a_development_ping_takes_the_same_table(self):
+        """Apple's 429 (too many pings to that phone) holds only that phone's pings, its log line says when it goes
+        again, and the other phone's ping goes at once. A development build's ping (our side sends it to Apple's
+        sandbox) takes the same table: our side's 429 queues it again, and Apple's 410 drops its token. Bugs: one
+        phone's 429 holds every phone of the owner; or a development ping is lost at our side's 429, or keeps a token
+        that Apple called gone and goes to it again."""
+        hub.TEAM["owner_devices"]["ipad"] = {"label": "iPad", "address": OTHER}     # a second phone of the owner
+        self.give(self.enrolled())
+        self.give(self.enrolled("ipad", OTHER), device="ipad", source=OTHER, token="cd" * 32)
+        hub.q("DELETE FROM pings")
+        self.raise_item()                                   # one row for each phone
+        rows = {r["device"]: r["id"] for r in hub.q("SELECT id, device FROM pings")}
+        self.side.answer = (200, {"status": 429, "reason": "TooManyRequests"})
+        self.assertTrue(hub.send_ping())                    # the first phone's: held
+        self.assertEqual((hub._ping_hold["until"], sorted(hub.PHONE_HOLDS)),
+                         (0.0, [min(rows, key=rows.get)]))
+        self.assertIn(f"it goes again in {push.RETRY_DEFAULT} seconds",
+                      hub.q1("SELECT what FROM log WHERE what LIKE 'ping %: queued%' ORDER BY id DESC")["what"])
+        self.side.answer = (200, {"status": 200, "reason": ""})
+        self.assertTrue(hub.send_ping())                    # the other phone's goes at once
+        self.assertFalse(hub.send_ping())                   # and the held one waits
+        states = {r["device"]: r["state"] for r in hub.q("SELECT device, state FROM pings")}
+        self.assertEqual(sorted(states.values()), ["queued", "sent"])
+        hub.PHONE_HOLDS.clear()
+        self.assertTrue(hub.send_ping())                    # its hold ended
+        hub.q("DELETE FROM pings")
+        hub.q("UPDATE owner_device_push SET environment='development'")
+        self.raise_item(title="From development builds")
+        first = self.pings()[0]["device"]
+        self.side.answer = (429, {"error": "too_many", "says": "a count is full"}, {"Retry-After": "30"})
+        self.assertTrue(hub.send_ping())
+        self.assertEqual((self.pings()[0]["state"], hub._ping_hold["until"] > hub.now() + 20), ("queued", True))
+        hub._ping_hold["until"] = 0.0
+        self.side.answer = (200, {"status": 410, "reason": "Unregistered"})
+        self.assertTrue(hub.send_ping())
+        self.assertEqual(self.pings()[0]["state"], "failed")
+        self.assertEqual([r["device"] for r in hub.q("SELECT device FROM owner_device_push")],
+                         [d for d in ("iphone", "ipad") if d != first])    # only that phone's token went
+
+    def test_a_fault_of_the_senders_wait_ends_no_thread(self):
+        """A read fault in ping_wait (it reads the records while a hold of the licence stands), also after a fault of
+        the look itself, is reported, and the thread waits PING_EVERY and goes on. Bug: the thread that sends every
+        owner ping dies for the life of the process, and member pings stop too."""
+        class Stop(BaseException):
+            pass
+
+        class Wake:
+            def wait(self, seconds=None):
+                raise Stop(seconds)
+
+            def set(self):
+                pass
+
+            def clear(self):
+                pass
+
+        def fault(*args):
+            raise RuntimeError("a read fault")
+        with patch.object(hub, "send_ping", fault), patch.object(hub, "ping_wait", fault), \
+                patch.object(hub, "PING_WAKE", Wake()), patch.object(hub, "print_fault"):
+            with self.assertRaises(Stop) as stopped:
+                hub.ping_sender()
+        self.assertEqual(stopped.exception.args, (hub.PING_EVERY,))
+
+    def test_the_hold_log_keeps_at_most_64_kinds(self):
+        """The log of the held owner pings keeps at most 64 kinds of hold in memory. Bug: an endless run of new kinds
+        grows the map for the life of the process."""
+        hub.PING_HELD_LINE.update({f"kind {i}": {"n": 0, "at": hub.now()} for i in range(64)})
+        self.give(self.enrolled())
+        self.raise_item()
+        self.side.answer = (503, {"error": "unavailable"})
+        self.assertEqual(self.sent()["state"], "queued")
+        self.assertEqual(len(hub.PING_HELD_LINE), 1)
+
+    def test_our_side_out_of_reach_sends_nothing_and_the_ping_waits(self):
+        """No connection to our side: nothing went to Apple, so the ping waits, first, for RETRY_DEFAULT."""
         self.give(self.enrolled())
         self.raise_item()
         hub.CFG["release_channel"] = "http://127.0.0.1:1"
         ping = self.sent()
-        self.assertEqual(ping["state"], "failed")
+        self.assertEqual(ping["state"], "queued")
+        self.assertAlmostEqual(hub._ping_hold["until"], hub.now() + push.RETRY_DEFAULT, delta=5)
         self.assertIn("cannot be reached", ping["error"])
 
     def test_no_answer_from_our_side_is_unknown_and_never_sent_again(self):
@@ -885,11 +1117,184 @@ class MemberRoute(PushCase):
             call()
         return refused.exception
 
+    def test_each_answer_has_one_class_in_the_table(self):
+        """push.outcome classes each answer once, for both routes: held (nothing went to Apple, a cause of the fleet or
+        of a service), phone, may have gone, the ping's own fault, sent. Bugs: a 502 or an Apple outage drops pings;
+        a 504 after the ping went sends it twice; a refusal of the token keeps the token."""
+        E = push.PushError
+        held, phone, maybe, refused, sent = push.HELD, push.PHONE, push.MAYBE, push.REFUSED, push.SENT
+        D, L = push.RETRY_DEFAULT, push.LICENCE_HOLD
+        table = [
+            (dict(error=E("x", status=502, word="unreachable")), (held, D, False, False)),
+            (dict(error=E("x", status=502)), (held, D, False, False)),                  # the owner's route
+            (dict(error=E("x", status=502), member=True), (maybe, D, False, False)),
+            (dict(error=E("x", status=502, word="bad_gateway"), member=True), (maybe, D, False, False)),
+            (dict(error=E("x", status=502, word="unreachable"), member=True), (held, D, False, False)),
+            (dict(error=E("x", status=410, gone=True), member=True), (refused, None, False, True)),
+            (dict(error=E("x", status=410, gone=True)), (refused, None, False, False)),
+            (dict(error=E("x", status=410), member=True), (refused, None, False, False)),
+            (dict(error=E("x", status=405)), (held, D, False, False)),
+            (dict(error=E("x", status=408)), (held, D, False, False)),
+            (dict(error=E("x", status=421)), (held, D, False, False)),
+            (dict(error=E("x", status=425)), (held, D, False, False)),
+            (dict(error=E("x", status=426)), (held, D, False, False)),
+            (dict(error=E("x", status=431)), (held, D, False, False)),
+            (dict(error=E("x", status=503, retry_after=7)), (held, 7, False, False)),
+            (dict(error=E("x", status=401)), (held, L, True, False)),
+            (dict(error=E("x", status=402)), (held, L, True, False)),
+            (dict(error=E("x", status=429, retry_after=30, full="fleet")), (held, 30, False, False)),
+            (dict(error=E("x", status=429, retry_after=30, full="phone")), (phone, 30, False, False)),
+            (dict(error=E("cannot be reached")), (held, D, False, False)),
+            (dict(error=E("x", setting="channel")), (held, D, False, False)),
+            (dict(error=E("x", setting="bearer")), (held, L, True, False)),
+            (dict(error=E("x", status=301)), (held, D, False, False)),
+            (dict(error=E("x", status=403)), (held, D, False, False)),
+            (dict(error=E("x", status=404)), (held, D, False, False)),
+            (dict(error=E("x", status=500)), (maybe, D, False, False)),
+            (dict(error=E("x", status=504)), (maybe, D, False, False)),
+            (dict(error=E("x", status=599)), (maybe, D, False, False)),
+            (dict(error=E("x", status=400)), (refused, None, False, False)),
+            (dict(error=E("x", status=413)), (refused, None, False, False)),
+            (dict(error=E("x", status=422)), (refused, None, False, False)),
+            (dict(error=E("x", local=True)), (refused, None, False, True)),
+            (dict(status=200, reason=""), (sent, None, False, False)),
+            (dict(status=0, reason="no answer"), (maybe, D, False, False)),
+            (dict(status=429, reason="TooManyRequests"), (phone, D, False, False)),
+            (dict(status=500, reason="InternalServerError"), (held, D, False, False)),
+            (dict(status=503, reason="ServiceUnavailable"), (held, D, False, False)),
+            (dict(status=403, reason="ExpiredProviderToken"), (held, D, False, False)),
+            (dict(status=403, reason="ExpiredProviderToken", environment="production"), (held, D, False, False)),
+            (dict(status=403, reason="BadCertificateEnvironment", environment="development"), (phone, D, False, False)),
+            (dict(status=403, reason="BadCertificateEnvironment", environment="development", member=True),
+             (phone, D, False, False)),
+            (dict(status=410, reason="Unregistered", environment="development"), (refused, None, False, True)),
+            (dict(status=429, reason="TooManyProviderTokenUpdates"), (held, D, False, False)),
+            (dict(status=403, reason="InvalidProviderToken"), (held, D, False, False)),
+            (dict(status=403, reason="BadCertificateEnvironment"), (held, D, False, False)),
+            (dict(status=410, reason="Unregistered"), (refused, None, False, True)),
+            (dict(status=400, reason="BadDeviceToken"), (refused, None, False, True)),
+            (dict(status=400, reason="DeviceTokenNotForTopic"), (refused, None, False, True)),
+            (dict(status=400, reason="PayloadEmpty"), (refused, None, False, False)),
+            (dict(status=413, reason="PayloadTooLarge"), (refused, None, False, False)),
+            (dict(status=403, reason="Forbidden"), (held, D, False, False)),
+            (dict(status=403, reason="UnrelatedKeyIdInToken", environment="production"), (held, D, False, False)),
+            (dict(status=403, reason="Forbidden", environment="development"), (phone, D, False, False)),
+        ]
+        for given, (kind, wait, licence, gone) in table:
+            with self.subTest(given=str(given)):
+                got = push.outcome(**given)
+                self.assertEqual((got.kind, got.wait, got.licence, got.token_gone), (kind, wait, licence, gone))
+
+    def test_an_answer_that_never_comes_whole_is_no_answer_and_never_a_fault(self):
+        """A 200 whose chunked body is cut, or a status line that is no HTTP, after the ping went out: (0, no answer),
+        on the member route and on the owner's, as for a time-out; a body of JSON too deep to read is a bad body, not
+        a fault. Bugs: http.client's own fault, or the JSON reader's, gets out of push.py, so the ping thread sends the
+        member ping again, and the owner's row stays 'sending' until a restart."""
+        class Broken(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if self.server.cut == "deep":       # a whole body of JSON too deep to read
+                    body = b"[" * 100000
+                    self.send_response(self.server.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.server.cut:
+                    self.send_response(self.server.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("Retry-After", "45")
+                    self.end_headers()
+                    self.wfile.write(b"20\r\n{\"status\":200")       # a chunk of 32 bytes, cut after 13
+                else:
+                    self.wfile.write(b"NO HTTP AT ALL\r\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *_args):
+                pass
+        side = ThreadingHTTPServer(("127.0.0.1", 0), Broken)
+        threading.Thread(target=side.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        self.addCleanup(side.server_close)
+        self.addCleanup(side.shutdown)
+        channel = f"http://127.0.0.1:{side.server_port}"
+        for cut in (True, False):
+            side.cut, side.status = cut, 200
+            with self.subTest(cut=cut):
+                for send in (lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+                             lambda: push.send(channel, None, TOKEN, {"aps": {}}, "production")):
+                    status, reason = send()
+                    self.assertEqual((status, reason), (0, "127.0.0.1 gave no answer in time"))
+        # a 429 whose body is cut: still our side's refusal, with the time of its head
+        side.cut, side.status = True, 429
+        for send in (lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+                     lambda: push.send(channel, None, TOKEN, {"aps": {}}, "production")):
+            e = self.refusal(send)
+            self.assertEqual((e.status, e.retry_after), (429, 45))
+        # a body of JSON too deep to read: a 200 is an answer that is not Apple's, a 429 our side's refusal
+        side.cut, side.status = "deep", 200
+        self.assertEqual(push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+                         (0, "127.0.0.1 answered with something other than Apple's answer"))
+        side.status = 429
+        e = self.refusal(lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"))
+        self.assertEqual((e.status, e.full), (429, "fleet"))
+
+    def test_a_channel_or_a_bearer_that_cannot_go_into_a_request_is_a_refusal_of_the_setting(self):
+        """An address that no request can go to (no http or https, no host, a host that IDNA does not take, a user or
+        a password, a % in the host, a port that is no number, a character that is not ASCII, a space, a control
+        character or DEL), or a licence with a line break: push.py refuses before anything goes out, as a setting of
+        the fleet (setting "channel" or "bearer"), never as the ping's own fault (local), on both routes. Bugs:
+        http.client's fault before the request reads as "it went, no answer"; or a bad setting drops each ping."""
+        before = len(self.side.got)
+        good = hub.CFG["release_channel"]
+        cases = [(c, ENTITLEMENT, "channel") for c in (
+            "http://127.0.0.1:port", good + "/a b", good + chr(7), good + chr(0x7f), "ftp://127.0.0.1/",
+            "http:///path", "http://a..b/", "https://u:p@127.0.0.1/", "http://127.0.0.1%3A80/", good + "/" + chr(0xe9))]
+        cases.append((good, ENTITLEMENT + "\r\nX-Other: 1", "bearer"))
+        for channel, bearer, setting in cases:
+            with self.subTest(channel=channel, bearer=bearer[-12:]):
+                for send in (lambda: push.send_member(channel, bearer, TOKEN, self.PAYLOAD, "production"),
+                             lambda: push.send(channel, bearer, TOKEN, {"aps": {}}, "production")):
+                    e = self.refusal(send)
+                    self.assertEqual((e.setting, e.local), (setting, False))
+        self.assertEqual(len(self.side.got), before)
+
+    def test_a_410_gone_of_the_member_route_says_so(self):
+        """Our side's 410 {"gone": true} on the member route (a value that does not belong to the fleet, or does not
+        open): PushError.gone. Bug: the hub reads it as any 4xx, keeps the link's token, and each later ping to it gets
+        410 again and counts in the fleet's 600."""
+        for body, gone in (({"gone": True}, True), ({"gone": "yes"}, False), ({"error": "x"}, False)):
+            with self.subTest(body=body):
+                self.side.answer = (410, body)
+                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD,
+                                                          "production"))
+                self.assertEqual((e.status, e.gone), (410, gone))
+        self.side.answer = (410, {"gone": True})            # the owner's route has no such answer
+        self.assertFalse(self.refusal(lambda: push.send(hub.CFG["release_channel"], None, TOKEN, {"aps": {}},
+                                                        "production")).gone)
+
+    def test_a_502_says_whether_it_is_our_sides_own(self):
+        """Our side's own 502 has the body {"error": "unreachable"} (Apple could not be reached): PushError.word says
+        so, and a proxy's 502 has no such word. Bug: every 502 is taken as our side's, and a proxy's 502 after the ping
+        went to Apple sends it again."""
+        for body, word in (({"error": "unreachable", "says": "Apple could not be reached"}, "unreachable"),
+                           ({"error": "bad_gateway"}, "bad_gateway"), ({"nothing": 1}, None)):
+            with self.subTest(word=word):
+                self.side.answer = (502, body)
+                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD,
+                                                          "production"))
+                self.assertEqual((e.status, e.word), (502, word))
+                self.assertEqual(str(e), "127.0.0.1 could not reach Apple's push service" if word == "unreachable"
+                                 else "127.0.0.1 answered 502")     # a proxy's 502 does not claim it
+
     def test_push_gives_the_name_of_the_full_count_of_a_429_and_a_member_ping_goes_by_its_own_route(self):
         """Bugs: the hub reads no count from a 429, so a full count of one phone holds back the member pings of every
         phone of the fleet, or a full count of the fleet holds back none; a member ping goes to /api/push, which
         refuses the member form, or with no licence; a 503 of the member route (its switch, a closed shop) gives no
-        time, so its ping is lost or sent again at once."""
+        time, so its ping is lost or sent again at once; a refusal of push.py's own checks reads as one of our side,
+        so the sender holds every ping for it in place of dropping the one that can never go; or no licence, or no
+        network, reads as such a refusal, and each ping that meets it is dropped."""
         self.assertEqual(self.member(collapse="c" * 32, expires=123), (200, ""))
         got = self.side.got[-1]
         self.assertEqual((got["path"], got["headers"]["authorization"]), ("/api/push/member", "Bearer " + ENTITLEMENT))
@@ -909,9 +1314,18 @@ class MemberRoute(PushCase):
         self.assertEqual((self.refusal(self.member).retry_after, self.refusal(self.member).full), (600, None))
         self.side.answer = (503, {"error": "unavailable"})                  # no APNs key at our side: no time
         self.assertIsNone(self.refusal(self.member).retry_after)
+        self.assertFalse(self.refusal(self.member).local)                  # our side refused it: it went out
         before = len(self.side.got)
         e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], None, TOKEN, self.PAYLOAD, "production"))
-        self.assertEqual((len(self.side.got), e.status), (before, None))
+        self.assertEqual((len(self.side.got), e.status, e.local), (before, None, False))     # no licence: it waits
+        for token, environment in (("XY" * 32, "production"), (TOKEN, "sandbox")):     # push.py's own checks
+            e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, token, self.PAYLOAD,
+                                                      environment))
+            self.assertEqual((e.local, len(self.side.got)), (True, before))
+        e = self.refusal(lambda: push.send_member("http://127.0.0.1:1", ENTITLEMENT, TOKEN, self.PAYLOAD,
+                                                  "production"))
+        self.assertIn("cannot be reached", str(e))
+        self.assertIs(e.local, False)           # an outage of the network: each ping waits, none is dropped
 
 
 if __name__ == "__main__":
