@@ -309,7 +309,9 @@ class Asks(OwnerAPI):
         ref = f"M-{message['event_id']}"
         task, _ = self.create(ask=ref, asked="Move the images")
         plain, _ = self.create()
-        item = {"title": "Which colour?", "why": "Only he chose the brand", "what_to_do": "Say blue or green", "reason": "person"}
+        # each item after the first is of the same ask, the owner's job, so it says that it is another need (P7 4.2)
+        item = {"title": "Which colour?", "why": "Only he chose the brand", "what_to_do": "Say blue or green",
+                "reason": "person", "also": "Another choice of that work."}
 
         def raised(**more):
             self.ok("manager", "raise_needs_you", dict(item, **more))

@@ -1109,6 +1109,26 @@ class DoorTokens(Access):
         said = hub.grant_check("vps", "repo:acme/site", "write")
         self.assertIn('raise_needs_you(needs_access="repo:acme/site", needs_level="write", needs_agent="vps")', said)
         self.assertIsNone(hub.card_access("repo:acme/site", "write", agent="vps"))
+        # the agent that asks holds it at that level itself: nothing to give, and no route to a card that card_access
+        # refuses (the repo-reach validator's D2). Bug: the words send the manager to the owner's card, which is refused
+        repos = team["agents"]["vps"].get("repos")
+        team["agents"]["vps"]["repos"] = dict(repos or {}, **{"acme/site": "read"})
+        self.write_team(team)
+        said = hub.grant_check("vps", "repo:acme/site", "read")
+        self.assertIn("vps holds it at read already: nothing to give.", said)
+        self.assertNotIn("raise_needs_you", said)
+        self.assertIsNotNone(hub.card_access("repo:acme/site", "read", agent="vps"))
+        if repos is None:
+            team["agents"]["vps"].pop("repos")
+        else:
+            team["agents"]["vps"]["repos"] = repos
+        # and above the default, the refusal names no lower give then
+        team["agents"]["studio"]["repos"] = {"acme/site": "write"}
+        self.write_team(team)
+        said = hub.grant_check("studio", "repo:acme/site", "write")
+        self.assertIn("studio holds it at write already: nothing to give.", said)
+        self.assertNotIn("Give read only if", said)
+        team["agents"]["studio"]["repos"] = {"acme/site": "read"}
         team["resources"] = {"repo:acme/site": {"max": "read"}}
         self.write_team(team)
         self.assertIn("only the owner's own level of write", hub.grant_check("vps", "repo:acme/site", "read"))

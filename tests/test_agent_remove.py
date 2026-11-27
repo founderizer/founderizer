@@ -86,6 +86,12 @@ class Remove(Servers):
         hub.kv_set(f"tools:{agent}", "[]")
         hub.kv_set(f"listed:{agent}:manager", 1)
         hub.kv_set(f"memory_close:{agent}", "[]")
+        # P1 T1: an act of the agent's that waits for a person, and a press of it (T2 writes presses)
+        key = hub.hashlib.sha256(b"act " + agent.encode()).hexdigest()[:16]
+        hub.q("INSERT INTO acts(id,kind,person,agent,state,created) VALUES(?,'question',1,?,'open',?)",
+              (key, agent, t0))
+        hub.q("INSERT INTO act_presses(via,request,act,code,at) VALUES(?,?,?,'answered',?)",
+              ("app:" + "a" * 32, f"press-{agent}", key, t0))
 
     def count(self, agent):
         return {table: hub.q1(f"SELECT COUNT(*) c FROM {table} WHERE {column}=?", (agent,))["c"]
@@ -150,6 +156,8 @@ class Remove(Servers):
         self.assertEqual((hub.kv_get("tools:vps"), hub.kv_get("memory_close:vps")), ("[]", "[]"))
         self.assertEqual([r["k"] for r in hub.q("SELECT k FROM kv WHERE k LIKE 'talk_guard:%'")],
                          ["talk_guard:ann:vps"])
+        # its acts go (REMOVED_OWN) with their presses, which remove_rows takes while the acts still name them
+        self.assertEqual([r["request"] for r in hub.q("SELECT request FROM act_presses")], ["press-vps"])
         # the search's copies of what the delete took go with it, so they keep no name; vps's stay
         self.assertEqual(copies(), {"scout": 0, "vps": 3})
         job = hub.q1("SELECT * FROM server_jobs WHERE id=?", (receipt["job"],))

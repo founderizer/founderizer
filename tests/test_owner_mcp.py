@@ -88,6 +88,7 @@ class Client:
         # the AI session that runs the server (owner_mcp.session_label): the test's own, never the one of the Claude
         # Code session that runs these tests
         env.pop("CLAUDE_CODE_SESSION_ID", None)
+        env.pop("CODEX_THREAD_ID", None)
         if session:
             env["CLAUDE_CODE_SESSION_ID"] = session
         if hub_base:
@@ -626,6 +627,43 @@ class FromNothing(WithServer):
                                       (sent["request_id"],))), ("tool", "claude-code/0d8aa41c-95ba"))
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "not a name"}):
             self.assertIsNone(owner_mcp.session_label())
+        # Codex gives a shell command its thread's id, and an MCP server only its own name in the initialize (both
+        # proven on 26 November 2026): each names a Codex session, and a client of no known name names none. A bug
+        # here leaves a Codex session's message with no AI mark and no session, or marks another client as an AI's.
+        thread = "a1b2c3d4-0000-4000-8000-000000000001"
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": thread}), patch.dict(owner_mcp.CLIENT_SESSION, clear=True):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            self.assertEqual(owner_mcp.session_label(), f"codex/{thread}")
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "0d8aa41c-95ba"      # Claude Code's own variable comes first
+            self.assertEqual(owner_mcp.session_label(), "claude-code/0d8aa41c-95ba")
+        with patch.dict(os.environ), patch.dict(owner_mcp.CLIENT_SESSION, clear=True):
+            for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+                os.environ.pop(name, None)
+            owner_mcp.rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"clientInfo": {"name": "grok-cli", "version": "1.0.46"}}})
+            self.assertIsNone(owner_mcp.session_label())
+            owner_mcp.rpc({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                           "params": {"clientInfo": {"name": "codex-mcp-client", "title": "Codex", "version": "0.171.0"}}})
+            first = owner_mcp.session_label()
+            self.assertRegex(first or "", r"^codex/mcp-[0-9a-f]{32}$")
+            self.assertTrue(owner_mcp.SESSION_NAME.fullmatch(first))
+            owner_mcp.rpc({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                           "params": {"clientInfo": {"name": "codex-mcp-client"}}})
+            self.assertEqual(owner_mcp.session_label(), first)          # one session for the server's process
+            owner_mcp.CLIENT_SESSION.clear()
+            for name in (["codex-mcp-client"], {"a": 1}, 7, None):     # no name of a client fails the initialize
+                answer = owner_mcp.rpc({"jsonrpc": "2.0", "id": 4, "method": "initialize",
+                                        "params": {"clientInfo": {"name": name}}})
+                self.assertIn("result", answer)
+            self.assertIsNone(owner_mcp.session_label())
+        # The program inside the app holds the same two lists (SessionLabel)
+        swift = HERE / "app/Sources/FleetOwnerAPI/OwnerHub.swift"
+        if swift.exists():
+            text = swift.read_text()
+            self.assertIn("static let variables = [" + ", ".join(f'("{v}", "{r}")' for v, r in owner_mcp.SESSION_VARIABLES)
+                          + "]", text)
+            self.assertIn("static let clients = [" + ", ".join(f'"{c}": "{r}"' for c, r in owner_mcp.SESSION_CLIENTS.items())
+                          + "]", text)
 
         # The answer carries a file, as a file that the owner drops on the item in the app does.
         source = pathlib.Path(tempfile.mkdtemp(prefix="fleet-answer-")) / "card.txt"

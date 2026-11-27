@@ -573,6 +573,7 @@ class Columns(unittest.TestCase):
         ("capp_grants", "name"): "the connected app of an authorization code",
         ("capp_connections", "ended_by"): "what ended a connected app: owner, reuse, code_reuse, off, client or "
                                           "restore",
+        ("acts", "by"): "who answered an act: a person ('P-<id>') or the owner (P1 T1, UI-API.md 1.366)",
     }
     WORDS = {"agent", "owner", "requester", "asker", "from_agent", "to_agent", "decided_by", "by", "sender", "recipient",
              "released_by", "paused_by", "created_by", "closed_by", "dropped_by", "name", "who", "machine", "target",

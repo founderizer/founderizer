@@ -374,6 +374,17 @@ class Resources(OwnerAPI):
         hub.TEAM["agents"]["shopper"]["servers"] = {"web-1": "fix"}
         self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
         self.refused("dev", "repo:acme/web", "read")       # its words send the work to shopper, which holds it
+        # only a hold that may be a commit target keeps it (door_commit_holds): a read that the manager gave the
+        # Operator is none, and a read under a newer record of another level, in any case, is the owner's own again.
+        # Bugs: every hold of an Operator keeps the repository, so Give and the default refuse it for nothing; a record
+        # of the manager's at any level lets it go; or a newer record in another spelling is not seen
+        with hub.transaction():
+            rows = [hub.resource_record("repo:acme/web", "shopper", "read", "manager", None)]
+        self.assertIsNone(hub.resource_kept("repo:acme/web"))
+        with hub.transaction():
+            rows.append(hub.resource_record("repo:ACME/Web", "shopper", None, "owner", None))
+        self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
+        hub.q(f"DELETE FROM resource_grants WHERE id IN ({rows[0]},{rows[1]})")
         hub.TEAM["agents"]["shopper"].pop("servers")
         self.assertTrue(hub.owner_gave("dev", "jobs"))                  # a hold from before the records
         self.granted("dev", "tool:jobs", "use")
@@ -1096,8 +1107,8 @@ class Resources(OwnerAPI):
         early = raw(**api)
         self.assertIsInstance(early, int, early)
         hub.TEAM["agents"]["lead"].update(servers={"web-1": "fix"}, repos={"acme/api": "write"})
-        words = ("The door checks each commit to acme/api, which it syncs to a server or which an Operator holds, so "
-                 "Give does not give it")
+        words = ("The door checks each commit to acme/api, which it syncs to a server or which an Operator commits "
+                 "to, so Give does not give it")
         self.assertIn(words, raw(**api))
         code, said = self.request(f"/ui/needs/{early}", self.command(choice=0))
         self.assertEqual((code, said.get("code")), (409, "request_answered"), said)

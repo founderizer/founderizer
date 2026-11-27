@@ -563,8 +563,10 @@ class Needs(Chain):
         # a default with a code: the details say the code in plain words, as each word of a card does (bug: need_words
         # refuses the code, the default's check wants it, and the card can never go up: round 3, R3-M1)
         coded = self.ask("top", self.t1, default=f"Keep T-{self.t1} on the old colour until the owner decides")
+        # (the card of w's question is open on the same job, so each of these says that it is another need: P7 4.2)
         card = {"title": "Which colour?", "why": "Only the owner chose the brand", "what_to_do": "Say blue or green",
-                "question_id": f"Q-{coded}", "reason": "decision", "owner_words": self.OWNER_KEEPS}
+                "question_id": f"Q-{coded}", "reason": "decision", "owner_words": self.OWNER_KEEPS,
+                "also": "Top asks about its own pages."}
         self.assertEqual(self.refused("manager", "raise_needs_you", dict(card, details="Top asks which colour.")),
                          f"Not raised: details name what top goes on with until the owner answers, so that the owner "
                          f"sees it while they decide. Add it to details in these words, with each code in plain "
@@ -580,6 +582,217 @@ class Needs(Chain):
                 self.ok("manager", "raise_needs_you", dict(card, question_id=f"Q-{linked}", details=(
                     f"Until you answer, top goes on with: keep both open, and I link the route item{between}the key "
                     f"item to the new route until the owner decides.")))
+
+    # P7 section 4 (the owner's yes of 26 November 2026, D145): one need is one card
+    CARD = {"title": "Which colour?", "why": "Only he chose the brand", "what_to_do": "Say blue or green",
+            "reason": "person"}
+
+    def test_a_second_card_on_a_job_is_refused_once_and_passes_with_replaces_or_also(self):
+        """One job, one open card (P7 4.2). Bugs: a second card for one need rings the owner twice (42 of 161 cards
+        in a week); the refusal names no way on, or holds for good, so another need of the same job never reaches
+        the owner; a question of another job is refused too; or `also` leaves no record of the manager's word."""
+        qid = self.up_to_manager()                          # w's question, on the job of top's task
+        first, _ = self.raised(qid)
+        font = self.ask("top", self.t1, question="Which font?")
+        said = self.refused("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{font}"))
+        self.assertEqual(said, f"Not raised: N-{first['id']} (Which colour?) is open on the same job, and one need is "
+                               f"one card. If this is the same need, raise it with replaces=\"N-{first['id']}\" and "
+                               f"question_ids=[\"Q-{qid}\", \"Q-{font}\"], so that the owner's one answer goes to each "
+                               f"asker. If it is another need, raise it with also: what is different, in a few words.")
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
+        # the same need: one card for both questions, in the place of the first
+        self.ok("manager", "raise_needs_you", dict(self.CARD, replaces=f"N-{first['id']}",
+                                                   question_ids=[f"Q-{qid}", f"Q-{font}"]))
+        both = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
+        self.assertEqual((both["question"], json.loads(both["questions"])), (qid, [qid, font]))
+        self.assertEqual(hub.q1("SELECT replaced_by FROM needs WHERE id=?", (first["id"],))["replaced_by"], both["id"])
+        # another need of the same job (mid's, on a subtask of top's task): refused once, and passed with also
+        logo = self.ask("mid", self.t2, question="Which logo?")
+        self.pass_up("top", logo, self.t1)
+        self.assertIn(f"Not raised: N-{both['id']} (Which colour?) is open on the same job",
+                      self.refused("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{logo}")))
+        self.ok("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{logo}",
+                                                   also="The logo is another decision."))
+        third = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+        self.assertEqual(hub.q1("SELECT what FROM log WHERE agent='manager' AND what LIKE ?",
+                                (f"raised N-{third} beside%",))["what"],
+                         f"raised N-{third} beside N-{both['id']} of the same job: The logo is another decision.")
+        # a question of another job needs neither
+        work = self.create("manager", "solo")
+        self.raised(self.ask("solo", work, question="Which shelf?"))
+
+    def test_one_card_takes_the_questions_of_two_askers_and_both_go_on(self):
+        """Two askers, one card (P7 4.3). Bugs: the owner's answer reaches the first asker alone, and the second task
+        waits for ever; a second card for the second question goes up beside it and rings twice; or the card hides
+        the second asker's words."""
+        qid = self.up_to_manager()
+        font = self.ask("top", self.t1, question="Which font?")
+        said = self.ok("manager", "raise_needs_you", dict(self.CARD, question_ids=[f"Q-{qid}", f"Q-{font}"]))
+        need = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
+        self.assertEqual(need["details"], 'W\'s question, in its own words: "Blue or green?"\n\n'
+                                          'Top\'s question, in its own words: "Which font?"')
+        self.assertIn(f"It is for Q-{qid} of w and Q-{font} of top: the owner's answer goes to each asker as the "
+                      f"answer of its question by itself.", said)
+        self.assertEqual((self.item(need["id"])["question"], self.item(need["id"])["question_ids"]), (qid, [qid, font]))
+        self.assertIn(f"N-{need['id']} already takes Q-{font}",
+                      self.refused("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{font}",
+                                                                       also="The font alone.")))
+        code, receipt = self.request(f"/ui/needs/{need['id']}", self.command(answer="Green, always."))
+        self.assertEqual(code, 200, receipt)
+        for asker, asked, task in (("w", qid, self.t3), ("top", font, self.t1)):
+            with self.subTest(asker=asker):
+                self.assertEqual((self.question(asked)["answer"], self.question(asked)["answered_by"]),
+                                 ("Green, always.", "owner"))
+                self.assertEqual(self.task(task)["state"], "working")
+                self.assertIn(f"Q-{asked} on T-{task}, answered by the owner: Green, always.",
+                              self.said(asker, task)[-1])
+        manager = hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        self.assertIn(f"The hub gave it to w as the answer to Q-{qid} and to top as the answer to Q-{font}: do not "
+                      f"pass it on again.", manager)
+
+    def test_an_asker_answered_another_way_leaves_the_card_and_the_last_one_closes_it(self):
+        """A card of two askers stays open while one of them waits (P7 4.3). Bugs: an answer that came another way, or
+        the end of one asker's task, closes the card, and the other asker waits with no card; the card still names the
+        asker that has its answer (question, question_ids), so an app links it to work that waits for nothing;
+        withdraw_need closes a card that a task waits on; or the card never closes when its last asker leaves."""
+        qid = self.up_to_manager()
+        font = self.ask("top", self.t1, question="Which font?")
+        self.ok("manager", "raise_needs_you", dict(self.CARD, question_ids=[f"Q-{qid}", f"Q-{font}"]))
+        nid = hub.q1("SELECT MAX(id) id FROM needs")["id"]
+        self.answer("manager", qid, "Blue.")
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
+        self.assertEqual((row["answer"], row["question"], self.item(nid)["question_ids"]), (None, font, [font]))
+        code, receipt = self.request(f"/ui/needs/{nid}", self.command(answer="Serif."))
+        self.assertEqual(code, 200, receipt)
+        told = hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        self.assertIn(f"The hub gave it to top as the answer to Q-{font}: do not pass it on again.", told)
+        self.assertNotRegex(told, rf"Q-{qid}\b")             # w has its answer already
+        self.assertEqual((self.question(qid)["answer"], self.question(font)["answer"]), ("Blue.", "Serif."))
+        # one asker's work ends: the card stays for the other, and closes as the hub's close when it is answered
+        qid, font = self.up_to_manager(), self.ask("top", self.t1, question="Which size?")
+        self.ok("manager", "raise_needs_you", dict(self.CARD, question_ids=[f"Q-{qid}", f"Q-{font}"]))
+        nid = hub.q1("SELECT MAX(id) id FROM needs")["id"]
+        self.assertEqual(self.refused("manager", "withdraw_need", {"need": f"N-{nid}", "why": "Not needed."}),
+                         f"N-{nid} takes Q-{qid} and Q-{font} to the owner. Answer Q-{qid} and Q-{font} with answer "
+                         f"instead, and N-{nid} closes by itself.")
+        self.ok("mid", "cancel_task", {"task_id": f"T-{self.t3}", "reason": "not needed"}, self.t2)
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
+        self.assertEqual((row["answer"], row["question"], json.loads(row["questions"])), (None, font, [font]))
+        self.answer("manager", font, "Large.")
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
+        self.assertEqual((row["answered_by"], row["answer"]),
+                         ("Fleet", f"Closed: {hub.shown_role('manager')} answered it, so it needs nothing from you."))
+
+    def test_a_card_of_the_hubs_own_kinds_takes_one_question(self):
+        """Bug: a card of the hub's own kinds (here Add device) takes two questions, and its own route, which answers
+        or closes one question, leaves the other asker waiting."""
+        qid = self.up_to_manager()
+        font = self.ask("top", self.t1, question="Which font?")
+        self.assertEqual(self.refused("manager", "raise_needs_you", {
+            "title": "Enroll the phone again", "why": "Its signed yes needs it.", "what_to_do": "Press the first one",
+            "add_device": True, "options": ["Show the picture", "Not now"],
+            "question_ids": [f"Q-{qid}", f"Q-{font}"]}),
+            "question_ids of two questions or more go on a plain item: an item with needs_agent, sign_in, door_call, "
+            "door_host, github_app, add_device, github_key or key_swap_server takes its one question in question_id. "
+            "Nothing was raised.")
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 0)
+
+    def test_the_owners_job_joins_the_tasks_of_one_ask_a_line_of_follows_and_one_ticket(self):
+        """The job is the owner's job as his Tasks board groups it (HubState.jobKeys): his ask, else a duty case, else
+        the end of the job and follows links (P7 4.2). Bugs: the tasks of two agents for one message of the owner's
+        each get a card, and his phone rings twice for one job card; a card with no question but that ask goes up
+        beside it; a follow-up task's question goes up beside the card of the work that it follows; or the cases of
+        one ticket are two jobs, where his board shows one."""
+        one, two = self.create("manager", "solo"), self.create("manager", "lone")
+        hub.q("UPDATE tasks SET ask='message-1' WHERE id IN (?,?)", (one, two))
+        first, _ = self.raised(self.ask("solo", one, question="Which shelf?"))
+        aisle = self.ask("lone", two, question="Which aisle?")
+        for card in (dict(self.CARD, question_id=f"Q-{aisle}"), dict(self.CARD, ask=f"T-{two}")):
+            with self.subTest(card=card):
+                self.assertIn(f"Not raised: N-{first['id']} (Which colour?) is open on the same job",
+                              self.refused("manager", "raise_needs_you", card))
+        self.ok("manager", "raise_needs_you", self.CARD)       # no question and no ask: no job, as before
+        base, later = self.create("manager", "solo"), self.create("manager", "solo")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (base, later))
+        self.raised(self.ask("solo", base, question="Which box?"))
+        lid = self.ask("solo", later, question="Which lid?")
+        self.assertIn("is open on the same job",
+                      self.refused("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{lid}")))
+        # the cases of one duty and key are one thing until one comes back (repeated), as on the board
+        hub.q("INSERT INTO duty_cases(id,responsibility,key,title,source,state,opened,by,repeated) VALUES"
+              "(1,7,'t-1','A ticket','check','closed',1,'solo',0),(2,7,'t-1','A ticket','check','closed',2,'solo',0),"
+              "(3,7,'t-1','The ticket again','check','open',3,'solo',1)")
+        worked = [self.create("manager", "solo") for _ in range(4)]
+        for case, task in zip((1, 2, 3, None), worked):
+            hub.q("UPDATE tasks SET duty_case=? WHERE id=?", (case, task))
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (worked[1], worked[3]))
+        self.assertEqual([hub.task_job_key(t) for t in worked], [("case", 1), ("case", 1), ("case", 3), ("case", 1)])
+
+    def test_a_replace_of_one_of_two_cards_of_a_job_passes_and_the_refusal_names_each_card(self):
+        """Two open cards of one job (the second with also). Bugs (the readers of 27 November 2026, A-M2 and B-M1):
+        the call that the hub names under the first card, a replace with its own question, is refused because the
+        second card is open; the refusal of a third question names a replace of the first card only, which merges
+        another need; or a replace that leaves out an asker that still waits says nothing, and its task waits with
+        no card."""
+        qid = self.up_to_manager()
+        first, _ = self.raised(qid)
+        font = self.ask("top", self.t1, question="Which font?")
+        self.ok("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{font}", also="The font is another one."))
+        second = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
+        call = f"raise_needs_you(replaces=\"N-{first['id']}\", question_id=\"Q-{qid}\")"
+        self.assertIn(call, hub.need_again(first))
+        self.ok("manager", "raise_needs_you", dict(self.CARD, replaces=f"N-{first['id']}", question_id=f"Q-{qid}"))
+        again = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
+        logo = self.ask("mid", self.t2, question="Which logo?")
+        self.pass_up("top", logo, self.t1)
+        self.assertEqual(
+            self.refused("manager", "raise_needs_you", dict(self.CARD, question_id=f"Q-{logo}")),
+            f"Not raised: N-{second['id']} (Which colour?) and N-{again['id']} (Which colour?) are open on the same "
+            f"job, and one need is one card. If this is the same need as one of them, raise it in the place of that "
+            f"card, with replaces=\"N-{second['id']}\" and question_ids=[\"Q-{font}\", \"Q-{logo}\"] or "
+            f"replaces=\"N-{again['id']}\" and question_ids=[\"Q-{qid}\", \"Q-{logo}\"], so that the owner's one "
+            f"answer goes to each asker. If it is another need, raise it with also: what is different, in a few words.")
+        self.ok("manager", "raise_needs_you", dict(self.CARD, replaces=f"N-{second['id']}",
+                                                   question_ids=[f"Q-{font}", f"Q-{logo}"]))
+        both = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+        said = self.ok("manager", "raise_needs_you", dict(self.CARD, replaces=f"N-{both}", question_id=f"Q-{logo}"))
+        new = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+        self.assertIn(f"N-{both} took Q-{font} to the owner, and N-{new} does not: its asker waits with no card. "
+                      f"Answer it, or raise N-{new} again with replaces and it in question_ids.", said)
+
+    def test_a_card_of_two_askers_keeps_a_default_s_question_across_a_restart_and_its_task_s_end(self):
+        """A card of two askers where the second question has a default (P7 4.3 with owner API 1.341). Bugs: a
+        restart reads the card's first question only, so the default's question gets the restart's answer and leaves
+        the card, and the new session asks again; the end of the default's task closes the card that still waits for
+        the owner's decision; or the manager's line after the owner's answer gives the default's words for the asker
+        that got the answer, or none for the one whose task ended."""
+        qid = self.up_to_manager()
+        work = self.create("manager", "solo")
+        kept = self.ask("solo", work, default=self.DEFAULT)
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('manager','team',"
+              "'instruction',?,'owner','owner',?)", (self.OWNER_KEEPS, hub.now()))
+        self.ok("manager", "raise_needs_you", dict(self.CARD, question_ids=[f"Q-{qid}", f"Q-{kept}"],
+                                                   reason="decision", owner_words=self.OWNER_KEEPS,
+                                                   details=f"Until you answer, solo goes on with: {self.DEFAULT}."))
+        nid = hub.q1("SELECT MAX(id) id FROM needs")["id"]
+        self.ok("manager", "restart_task", {"task_id": f"T-{work}", "request_id": str(uuid.uuid4()),
+                                            "expected_attempt": 1, "reason": "a fresh session"})
+        with hub.LOCK:          # the helper's report of the stop (test_blocked_access.stop_confirmed)
+            hold = hub.q1("SELECT * FROM holds WHERE task=? ORDER BY id DESC LIMIT 1", (work,))
+            hub.settle_hold(hold, True, "interrupted and closed")
+            hub.restart_continue(hold["id"])
+        self.assertIsNone(self.question(kept)["answer"])
+        start = hub.q1("SELECT text FROM events WHERE agent='solo' AND kind='task' ORDER BY id DESC LIMIT 1")["text"]
+        self.assertIn(f"Your question Q-{kept} stays on the owner's card: do not ask again.", start)
+        self.ok("manager", "cancel_task", {"task_id": f"T-{work}", "reason": "not needed"})
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
+        self.assertEqual((row["answer"], json.loads(row["questions"])), (None, [qid, kept]))
+        code, receipt = self.request(f"/ui/needs/{nid}", self.command(answer="Green, always."))
+        self.assertEqual(code, 200, receipt)
+        manager = hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        self.assertIn(f"The hub gave it to w as the answer to Q-{qid}: do not pass it on again. It was for Q-{kept} "
+                      f"of solo, and T-{work} ended before this answer, so no session of solo reads it.", manager)
+        self.assertEqual(self.question(kept)["answer"], "Green, always.")
 
     def item(self, nid):
         code, state = self.request()

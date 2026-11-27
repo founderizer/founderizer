@@ -956,6 +956,9 @@ class Talk(NeedsCase):
         self.assertEqual(([v["id"] for v in self.item(3)["versions"]], self.item(2)["versions"],
                           self.item(3)["since"]), ([2], [], second["raised"]))
 
+    # each card of a question of one task beside an open one says that it is another need (P7 4.2)
+    ANOTHER = "Another question of the survey."
+
     def test_a_question_s_words_go_behind_details_with_no_code(self):
         task = hub.ins("INSERT INTO tasks(title, owner, requester, state, created) VALUES(?,?,?,?,?)",
                        ("Survey", "dev", "manager", "input-required", hub.now()))
@@ -971,7 +974,7 @@ class Talk(NeedsCase):
         qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
                       (task, "dev", "manager", "Which way do I fix the check?\r\nA) Add the schema.  \n\n\n\n"
                        "B) Skip the file.\n  - one\tpart\nMy suggestion: A.\n", hub.now()))
-        self.raise_item(question_id=f"Q-{qid}")
+        self.raise_item(question_id=f"Q-{qid}", also=self.ANOTHER)
         self.assertEqual(self.item(2)["details"], "Dev's question, in its own words:\n\"Which way do I fix the check?\n"
                                                   "A) Add the schema.\n\nB) Skip the file.\n  - one part\n"
                                                   "My suggestion: A.\"")
@@ -980,9 +983,9 @@ class Talk(NeedsCase):
         qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
                       (task, "dev", "manager", "Strip the seller's branding on import, or keep it?\nOption 1 is faster.",
                        hub.now()))
-        self.raise_item(question_id=f"Q-{qid}", details="The lead's proposal, as written:\n> **Strip the seller's "
-                                                         "branding** on import, or keep it? Option 1 is faster.\n\n"
-                                                         "I agree with option 1.")
+        self.raise_item(question_id=f"Q-{qid}", also=self.ANOTHER,
+                        details="The lead's proposal, as written:\n> **Strip the seller's branding** on import, or "
+                                "keep it? Option 1 is faster.\n\nI agree with option 1.")
         self.assertEqual(self.item(3)["details"].count("branding"), 1)
         self.assertNotIn("in its own words", self.item(3)["details"])
         # the asker's codes (RULES.md, "People read words, not codes"; on 25 November 2026, 42 of 85 question cards of a
@@ -1029,7 +1032,7 @@ class Talk(NeedsCase):
             """The details of the card of a new question of dev's with these words, and the question's row."""
             qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
                           (task, "dev", "manager", text, hub.now()))
-            self.raise_item(question_id=f"Q-{qid}", **extra)
+            self.raise_item(question_id=f"Q-{qid}", also=self.ANOTHER, **extra)
             return (self.item(hub.q1("SELECT MAX(id) n FROM needs")["n"])["details"],
                     hub.q1("SELECT text FROM questions WHERE id=?", (qid,))["text"])
 

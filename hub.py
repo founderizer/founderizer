@@ -536,6 +536,42 @@ CREATE TABLE IF NOT EXISTS conversation_messages(id INTEGER PRIMARY KEY, convers
 -- The tasks of a removed person's conversations, and their parts (person_remove). Their link to the conversation is
 -- gone with it, so this row is what says, at each later write of one of their sessions, that its words are not kept.
 CREATE TABLE IF NOT EXISTS removed_tasks(task INTEGER PRIMARY KEY, at REAL NOT NULL);
+-- P1's acts (p1-today.md section 4, piece T1): one thing that waits for one person, the record of P1, P2 and P7. A
+-- Core table, as a chat app's buttons work with no Teams. Its key `id` is 16 random hex characters, made and kept at
+-- the offer (act_offer_rows), never the number of a task, a message or a card, so a restore cannot make a key name
+-- another act. kind: question (a message_contact with waits; T1), draft, undo or decision (T2, T3, T6, P7). person:
+-- who may answer, and NULL for an act of the owner's chat (P5 A0); agent: whose act, and NULL for an act of a card
+-- with more than one asker (P7 2.1); conversation and cm: where, and the agent's message that carries it, a
+-- conversation_messages id only; task: the task that waits (for undo: the finished task); need: P7's card. options
+-- (JSON), recommended, undo_words, mail and hash: none for T1's question. state: open, answered (a press or typed
+-- words), ended (its task ended, its wait ended, a newer draft) or moved (P7). chosen, by, via, at: the option's
+-- number (none for typed words), 'P-<id>' or 'owner', app:<link>, chat:<account> or owner:<device>, and the time.
+-- started: the one task, duty or send of a press (act_started). An existing database gets both tables from these
+-- lines at its next start: no column of an older table is named.
+CREATE TABLE IF NOT EXISTS acts(id TEXT PRIMARY KEY, kind TEXT NOT NULL, person INTEGER, agent TEXT,
+  conversation INTEGER, cm INTEGER, task INTEGER, need INTEGER, options TEXT, recommended INTEGER, undo_words TEXT,
+  mail TEXT, hash TEXT, state TEXT NOT NULL, chosen INTEGER, by TEXT, via TEXT, at REAL, started INTEGER,
+  created REAL NOT NULL);
+-- one act for each thing that a press started, in each kind: an Undo task's id (T3), a duty's (W1) and a send's row
+-- (T6) are three series, so one number can stand in two kinds, and a press of one never fails for the other
+CREATE UNIQUE INDEX IF NOT EXISTS act_started ON acts(kind, started) WHERE started IS NOT NULL;
+-- the act of an agent's message: `read` for each message of a page, and the end or the answer of a wait
+-- (acts_close_rows: cm IN (...) AND conversation=?)
+CREATE INDEX IF NOT EXISTS act_of_message ON acts(cm);
+-- the open acts of a task, which each end of a task asks for (end_waits: task=? AND state='open')
+CREATE INDEX IF NOT EXISTS act_open_task ON acts(task) WHERE state='open';
+-- a person's acts, which their removal deletes by the key written at the source (person_remove: person=?)
+CREATE INDEX IF NOT EXISTS act_of_person ON acts(person);
+-- an agent's acts, which its delete takes with their presses and its rename moves (remove_rows: agent=?, and the
+-- loops of REMOVED_OWN and AGENT_COLUMNS)
+CREATE INDEX IF NOT EXISTS act_of_agent ON acts(agent);
+-- One press of an act (T2 writes them): the key is (via, request), as chat_in keys by (account, msg_id), because an
+-- app's request UUID, a Telegram callback id and a WhatsApp message id are different name spaces. code: the kept
+-- answer, which the same (via, request) gets again, also after a restart.
+CREATE TABLE IF NOT EXISTS act_presses(via TEXT NOT NULL, request TEXT NOT NULL, act TEXT NOT NULL, code TEXT NOT NULL,
+  at REAL NOT NULL, PRIMARY KEY(via, request));
+-- the presses of an act, which a removal deletes with the person's acts (person_remove: act IN (...))
+CREATE INDEX IF NOT EXISTS act_press_of_act ON act_presses(act);
 CREATE TABLE IF NOT EXISTS join_codes(id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, name TEXT NOT NULL,
   kind TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL, canceled REAL, address TEXT,
   key_sha256 TEXT);
@@ -4197,6 +4233,11 @@ def need_view(row, reads=None):
     # owner API 1.280: the task whose own mark an app draws on the answered card of a question, a door call or a
     # take-over
     view["task"] = need_task(row, None if reads is None else reads[2])
+    # owner API 1.376 (P7 4.3): each question that the card takes to the owner, the first of them in `question`. While
+    # the card is open, the ones that wait for its answer: an asker whose question was answered another way, or whose
+    # task ended with no default, has left it. [] for an item of no question
+    view["question_ids"] = need_question_ids(row)
+    view.pop("questions", None)
     # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos, resources}, else
     # null
     view["give"] = need_give_view(row)
@@ -4376,8 +4417,10 @@ def need_quote_name(m, qu, asking, above, raiser):
         row = read_row("SELECT * FROM needs WHERE id=? AND by=? AND conversation IS NULL", (number, raiser))
         if row is None:
             return None
-        asked = read_row("SELECT task FROM questions WHERE id=?", (row["question"],)) if row["question"] else None
-        tasks = [x for x in (asked["task"] if asked else None, row["door_task_id"], row["takeover_task"]) if x]
+        asked = [x["task"] for x in read_rows(f"SELECT task FROM questions WHERE id IN "
+                                              f"({','.join('?' * len(need_question_ids(row)))})",
+                                              need_question_ids(row))] if row["question"] else []
+        tasks = [x for x in (*asked, row["door_task_id"], row["takeover_task"]) if x]
         meant = bool(row["ask"] and asking and row["ask"] == asking["ask"]) or any(
             need_quote_work(read_row("SELECT * FROM tasks WHERE id=?", (x,)), asking, above) for x in tasks)
         return need_quote_named(row["title"] if meant else None)
@@ -10073,6 +10116,10 @@ def migrate():
                                               # "Fleet" the hub; else the agent that replaced or withdrew it
                   "secret": "TEXT",           # owner feature secret_requests: what request_secret asks for, no value
                   "question": "INTEGER",      # the question that the manager took to the owner (raise_needs_you)
+                  # P7 4.3 (owner API 1.376): on a card for two questions or more (question_ids), the JSON list of the
+                  # ones that still wait for the owner's answer, in the order of the raise; `question` is the first of
+                  # them (need_question_ids, question_needs_close). Null on every other item
+                  "questions": "TEXT",
                   "ask": "TEXT",              # owner feature asks: the owner's message whose work waits for this item
                   # DevOps plan 5.4 (D11, D22): the door call that the owner's yes lets through once, and his signed
                   # yes to it, which only the door reads (GET /door/approvals)
@@ -10466,6 +10513,16 @@ def migrate():
         # AUTONOMY.md P2 (lane L2): the tasks of one conversation, read for each message, fleet call and hook of it
         "CREATE INDEX IF NOT EXISTS task_of_conversation ON tasks(source_conversation) "
         "WHERE source_conversation IS NOT NULL",
+        # P1 T1 (p1-today.md section 9; its R1, S2): the two indexes of a member's `work`, here and not in SCHEMA
+        # because migrate() adds their columns. The tasks that open_work and ask_team opened from a person's
+        # conversations, with no conversation task, which is one row for each message: `work` reads "source_conversation
+        # IN (...) AND source_message IS NULL", whose second term is this index's own, so that SQLite takes it, and not
+        # task_of_conversation (the rowid, the task's id, is in each row of an index).
+        "CREATE INDEX IF NOT EXISTS task_work_of_conversation ON tasks(source_conversation, source_message) "
+        "WHERE source_conversation IS NOT NULL AND source_message IS NULL",
+        # ... and the messages of one task: `work`'s line of each task ("m.task=t.id", which is a term of this index's
+        # condition), which conversation_message_of found by a walk of the conversation's messages
+        "CREATE INDEX IF NOT EXISTS conversation_message_task ON conversation_messages(task) WHERE task IS NOT NULL",
         # the unknown outcomes, which owner_count and outcome_check_sweep read at each tick and each read of the count
         "CREATE INDEX IF NOT EXISTS outcome_unknown ON outcomes(task) WHERE state='unknown'",
     ]:
@@ -13814,9 +13871,10 @@ def restart_continue(hold_id):
     asked = [x["id"] for x in q("SELECT id FROM questions WHERE task=? AND answer IS NULL ORDER BY id", (tid,))]
     # owner API 1.341: a question with a default on an open card of the owner's stays open, and the new session gets
     # the owner's answer (the validation of 25 November 2026, R2-S2: told to ask again, it raised a second card)
-    kept = [x["id"] for x in q("SELECT DISTINCT qu.id FROM questions qu JOIN needs n ON n.question=qu.id WHERE "
-                               "qu.task=? AND qu.answer IS NULL AND qu.assumed IS NOT NULL AND n.answer IS NULL "
-                               "ORDER BY qu.id", (tid,))]
+    kept = [x["id"] for x in q(f"SELECT DISTINCT qu.id FROM questions qu JOIN needs n ON (n.question=qu.id OR EXISTS "
+                               f"(SELECT 1 FROM json_each({need_qs('n')}) j WHERE j.value=qu.id)) WHERE qu.task=? AND "
+                               f"qu.answer IS NULL AND qu.assumed IS NOT NULL AND n.answer IS NULL ORDER BY qu.id",
+                               (tid,))]
     asked = [x for x in asked if x not in kept]
     # A refused permission request stays refused: the new session is told, so that a restart is no way around it.
     refused = q("SELECT id, tool, input FROM prompts WHERE task=? AND kind<>'code' AND decision IN ('deny','expired') "
@@ -17552,10 +17610,60 @@ NEED_CLOSED_BY = "Fleet"        # needs.answered_by of an item that the hub clos
 
 def question_needs_close(where, args, why, t0):
     """Inside the caller's transaction: the open Needs-you items raised for the questions that `where` selects
-    (raise_needs_you question_id) close, as an item that the hub ends: it leaves Needs you, and no ping goes for it."""
+    (raise_needs_you question_id) close, as an item that the hub ends: it leaves Needs you, and no ping goes for it.
+    A card of several askers (question_ids, P7 4.3) stays open while one of its questions still waits: a question with
+    no answer whose task runs, or that has a default (end_waits keeps such a card). The questions that wait no more
+    leave its list, and `question` names the first one that waits, so that the owner's later answer goes to each asker
+    that still waits for it, and to no other (need_question_rows)."""
     in_transaction("question_needs_close")
-    DB.execute(f"UPDATE needs SET answer=?, answered=?, answered_by=? WHERE answer IS NULL AND question IN "
-               f"(SELECT id FROM questions WHERE {where})", (why, t0, NEED_CLOSED_BY, *args))
+    chosen, many, waits = f"SELECT id FROM questions WHERE {where}", need_qs("needs"), question_waits_sql("o")
+    for r in DB.execute(f"SELECT id, questions FROM needs WHERE answer IS NULL AND questions IS NOT NULL AND EXISTS "
+                        f"(SELECT 1 FROM json_each({many}) j WHERE j.value IN ({chosen}))", args).fetchall():
+        left = [x["id"] for x in DB.execute(f"SELECT o.id FROM json_each(?) j JOIN questions o ON o.id=j.value WHERE "
+                                            f"{waits} ORDER BY j.key", (r["questions"],)).fetchall()]
+        if left:                # that asker leaves the card, and the card stays for the others
+            DB.execute("UPDATE needs SET question=?, questions=? WHERE id=? AND answer IS NULL",
+                       (left[0], json.dumps(left), r["id"]))
+    DB.execute(f"UPDATE needs SET answer=?, answered=?, answered_by=? WHERE answer IS NULL AND (question IN ({chosen}) "
+               f"OR EXISTS (SELECT 1 FROM json_each({many}) j WHERE j.value IN ({chosen}))) AND NOT EXISTS "
+               f"(SELECT 1 FROM json_each({many}) j JOIN questions o ON o.id=j.value WHERE {waits})",
+               (why, t0, NEED_CLOSED_BY, *args, *args))
+
+
+def question_waits_sql(alias):
+    """SQL that holds while question row `alias` still waits for its card's answer (P7 4.3): no answer, and a default,
+    whose decision outlives its task (end_waits), or a task that runs. The one rule of question_needs_close and of a
+    replace that leaves an asker out (t_raise_needs_you)."""
+    return (f"{alias}.answer IS NULL AND ({alias}.assumed IS NOT NULL OR EXISTS (SELECT 1 FROM tasks k WHERE "
+            f"k.id={alias}.task AND k.{OPEN_TASK}))")
+
+
+def need_qs(alias):
+    """SQL of the list needs.questions of row `alias` for json_each, or NULL when its text is no JSON: a bad row then
+    reads as a card of its one question, as need_question_ids reads it, and stops no answer, no task's end and no
+    restart."""
+    return f"CASE WHEN json_valid({alias}.questions) THEN {alias}.questions END"
+
+
+def need_question_ids(row):
+    """The ids of the questions that Needs-you row `row` takes to the owner, in the order of its raise (P7 4.3, owner
+    API 1.376): needs.questions on a card of several askers, else its one question, else none. A question that waits no
+    more leaves that list (question_needs_close), so on an open card these are the askers that wait for the owner's
+    answer, and on an answered card the ones that it went to."""
+    keys = row.keys() if hasattr(row, "keys") else ()
+    many = row["questions"] if "questions" in keys else None
+    try:
+        ids = [int(x) for x in json.loads(many)] if many else []
+    except (ValueError, TypeError):
+        ids = []
+    one = row["question"] if "question" in keys else None
+    return ids or ([one] if one else [])
+
+
+def need_questions_said(ids):
+    """Question ids in words for an agent: "Q-4", "Q-4 and Q-7", "Q-4, Q-7 and Q-9"."""
+    named = [f"Q-{x}" for x in ids]
+    return named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
 
 
 def answer_rows(qu, t, text, by, t0, files=(), more="", via=None):
@@ -21230,8 +21338,8 @@ def need_give_door(agent, repo, level):
     if door_targets.vendor(repo):
         return None
     if resource_kept(f"repo:{repo}") == "fleet":
-        return (f"The door checks each commit to {repo}, which it syncs to a server or which an Operator holds, so "
-                f"Give does not give it: a grant would let a session commit around those checks. Give that part of "
+        return (f"The door checks each commit to {repo}, which it syncs to a server or which an Operator commits to, "
+                f"so Give does not give it: a grant would let a session commit around those checks. Give that part of "
                 f"the work to the agent that commits to it through the door.")
     if door_made(repo) and (agents().get(agent) or {}).get("servers"):
         return (f"The door made {repo}, and {shown_role(agent)} holds a server through the door, so Give does not "
@@ -21987,7 +22095,8 @@ def t_raise_needs_you(agent, a):
             raise ToolError(f"The title of this item is \"{fixed}\", word for word, as the owner approved it.")
         if a.get("options") is not None or a.get("multi") or details or door_call is not None or \
                 door_host is not None or github_app is not None or add_device is not None or \
-                github_key is not None or a.get("question_id") not in (None, "") or replaces is not None:
+                github_key is not None or a.get("question_id") not in (None, "") or \
+                a.get("question_ids") not in (None, []) or replaces is not None:
             raise ToolError("An item with a key_swap_server has the hub's two answers and the hub's details: leave "
                             "options, multi, details, question_id and replaces out, and give no other kind of item.")
         if q1("SELECT 1 FROM needs WHERE key_swap_server=? AND answer IS NULL", (key_swap_server,)):
@@ -22029,6 +22138,20 @@ def t_raise_needs_you(agent, a):
     if give and fixed:
         raise ToolError("needs_agent goes on an item for access, with no door_call, door_host, github_app, add_device, "
                         "github_key or key_swap_server.")
+    # P7 4.3 (owner API 1.376): one card for the questions of several askers that one answer settles, on a plain card
+    # only: the hub's own kinds of card carry the one question of their own route
+    asked_ids = need_question_refs(a)
+    if len(asked_ids) > 1 and (give is not None or fixed or sign_in):
+        raise ToolError("question_ids of two questions or more go on a plain item: an item with needs_agent, sign_in, "
+                        "door_call, door_host, github_app, add_device, github_key or key_swap_server takes its one "
+                        "question in question_id. Nothing was raised.")
+    # P7 4.2: the manager's own word that a second card of one job is another need. The hub matches no words of it
+    also = str(a.get("also") or "").strip()
+    if len(also) > NEED_ALSO_CHARS:
+        raise ToolError(f"also says in a few words what is different from the open item of the same job: at most "
+                        f"{NEED_ALSO_CHARS} characters. Nothing was raised.")
+    if also:
+        guard(agent, also)
     listed = json.loads(options) if options else ()
     # the hub's own title and step of a runtime's sign-in say "on your Mac" and name a server, which can be "deploy-1":
     # only the manager's words are read for fleet work
@@ -22063,15 +22186,29 @@ def t_raise_needs_you(agent, a):
             raise ToolError(f"Not raised: {NEED_GIVE_OPEN} items with Give wait for the owner already. Raise this one "
                             f"once the owner answered one of them or you withdrew one that is not needed "
                             f"(withdraw_need), or in the place of one, with replaces.")
-        qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None, reason=reason)
+        qus = [need_question(agent, f"Q-{x}", ignore=old["id"] if old else None, reason=reason) for x in asked_ids]
+        qu = qus[0] if qus else None
         # the owner sees what goes on while they decide only in the manager's own details, and a refusal rings
         # nothing, where a second card rings twice for one decision (the validation of 25 November 2026, R2-M2)
-        if qu and qu["assumed"] is not None and not default_held(details, qu["assumed"]):
-            coded = NEED_CODES.search(qu["assumed"]) is not None
-            words = NEED_CODES.sub(lambda m: f"<{m.group(0)} in plain words>", qu["assumed"])
-            raise ToolError(f"Not raised: details name what {qu['asker']} goes on with until the owner answers, so "
-                            f"that the owner sees it while they decide. Add it to details in these words"
-                            f"{', with each code in plain words' if coded else ''}: \"{words}\"")
+        for each in qus:
+            if each["assumed"] is not None and not default_held(details, each["assumed"]):
+                coded = NEED_CODES.search(each["assumed"]) is not None
+                words = NEED_CODES.sub(lambda m: f"<{m.group(0)} in plain words>", each["assumed"])
+                raise ToolError(f"Not raised: details name what {each['asker']} goes on with until the owner answers, "
+                                f"so that the owner sees it while they decide. Add it to details in these words"
+                                f"{', with each code in plain words' if coded else ''}: \"{words}\"")
+        # P7 4.2, one job, one open card: a second plain card of a job is refused until the manager says which it is,
+        # the same need (replaces) or another one (also). Its jobs are the owner's jobs of its questions and its ask
+        # (need_job_keys); a replace speaks for the jobs of the card that it takes the place of, so the call that the
+        # hub names under a card (need_replace_call) is never refused here. The refusal's own words say how
+        jobs = {task_job_key(x["task"]) for x in qus if x["task"] is not None} | ({("ask", ask)} if ask else set()) \
+            if give is None and not fixed and not sign_in else set()
+        beside = need_job_cards(jobs - (need_job_keys(old) if old else set()), old["id"] if old else None)
+        if beside and not also:
+            raise ToolError(need_job_refusal(beside, asked_ids))
+        # the askers of the card that this one replaces and that it leaves out, which still wait: the manager hears it
+        left_out = [x for x in (need_question_ids(old) if old else []) if x not in asked_ids and q1(
+            f"SELECT 1 FROM questions o WHERE o.id=? AND {question_waits_sql('o')}", (x,))]
         # owner API 1.285: each picture, checked under the lock that the item's own write holds, so that no message
         # and no other item takes one between this check and the take (need_takes_pictures)
         t0 = now()
@@ -22082,12 +22219,13 @@ def t_raise_needs_you(agent, a):
         # text, which can hold any address and any code, would stand beside the hub's step (F6, piece 1). A code of
         # the asker's that the question can mean is words (need_quote_words), and the details that quote the question
         # already hold those words, as need_words keeps codes out of them
-        shown = need_quote_words(qu, agent) if qu and door_script is None and not sign_in else None
-        if shown is not None and not words_held(details, shown):
-            words = clip_lines(shown, 1000)
-            gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
-            details = (details + "\n\n" if details else "") + \
-                f"{shown_role(qu['asker'])}'s question, in its own words:{gap}\"{words}\""
+        for each in qus if door_script is None and not sign_in else ():
+            shown = need_quote_words(each, agent)
+            if shown is not None and not words_held(details, shown):
+                words = clip_lines(shown, 1000)
+                gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
+                details = (details + "\n\n" if details else "") + \
+                    f"{shown_role(each['asker'])}'s question, in its own words:{gap}\"{words}\""
         # the task that a door's card is for, which hears his answer (need_door_task_rows): of each card of a door call;
         # the title names it only on the card of a run, whose title the owner's Mac signs under
         asking = door_asking_task(door_call, qu) if door_call else None
@@ -22097,8 +22235,8 @@ def t_raise_needs_you(agent, a):
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
                   "give_level,give_repos,give_resource,recommended,pictures,sign_in_agent,sign_in_runtime,"
-                  "sign_in_server) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "sign_in_server,questions) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, t0, agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
@@ -22107,13 +22245,14 @@ def t_raise_needs_you(agent, a):
                    give["resources"][0] if give and give["resources"] else None, recommended,
                    json.dumps([row["id"] for row in picture_files]) if picture_files else None,
                    sign_in["agent"] if sign_in else None, sign_in["runtime"] if sign_in else None,
-                   sign_in["server"] if sign_in else None))
+                   sign_in["server"] if sign_in else None,
+                   json.dumps([each["id"] for each in qus]) if len(qus) > 1 else None))
         need_takes_pictures(nid, picture_files, t0, old)
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
         # ask of the task whose question it carries to the owner
         if not ask and old:
             ask = old["ask"]
-        for source in (qu["task"] if qu else None, asking["id"] if asking else None):
+        for source in [each["task"] for each in qus] + [asking["id"] if asking else None]:
             if not ask and source:      # the task whose question it carries, or whose run the door refused
                 asking_task = q1("SELECT ask FROM tasks WHERE id=?", (source,))
                 ask = asking_task["ask"] if asking_task else None
@@ -22125,14 +22264,19 @@ def t_raise_needs_you(agent, a):
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
     if reason:
         log(agent, f"raised N-{nid} for the reason {reason}")      # what each card was for, to count them later
+    if beside:                  # P7 4.2: the manager's word that it is another need, for the record of the cards
+        others = ", ".join(f"N-{r['id']}" for r in beside)
+        log(agent, f"raised N-{nid} beside {others} of the same job: {also}")
     emit("owner", "notify", f"Needs you: {title}" + (f" · {door_task}" if door_task else ""))
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
-    if qu and qu["assumed"] is not None and not (old and old["question"] == qu["id"]) and \
-            q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (qu["task"],)):
-        # owner API 1.341, the validation of 25 November 2026 (R2-S1): the asker's running session reads it, with no
-        # turn of the manager and no message to route; its default ran from the ask, and rule 4 holds it now
-        emit(qu["asker"], "say", f"[hub] Your question Q-{qu['id']} is on the owner's card now, and their answer "
-                                 f"comes to this session. " + default_hold(qu["assumed"], "your"), task=qu["task"])
+    for each in qus:
+        if each["assumed"] is not None and not (old and each["id"] in need_question_ids(old)) and \
+                q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (each["task"],)):
+            # owner API 1.341, the validation of 25 November 2026 (R2-S1): the asker's running session reads it, with
+            # no turn of the manager and no message to route; its default ran from the ask, and rule 4 holds it now
+            emit(each["asker"], "say", f"[hub] Your question Q-{each['id']} is on the owner's card now, and their "
+                                       f"answer comes to this session. " + default_hold(each["assumed"], "your"),
+                 task=each["task"])
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". The owner's answer is the words of the one they press, or anything else they write "
              "instead.") if options else ""
@@ -22157,6 +22301,19 @@ def t_raise_needs_you(agent, a):
             linked = (f" It is for {ask}, and {ref} has ended: the owner's answer comes to you with the question and "
                       f"the default, for the follow-up work. N-{nid} closes by itself when {ask} is answered another "
                       f"way.")
+    if len(qus) > 1:            # P7 4.3: one card, several askers, and one answer for each of them
+        named = ", ".join(f"Q-{x['id']} of {x['asker']}" for x in qus[:-1]) + \
+            f" and Q-{qus[-1]['id']} of {qus[-1]['asker']}"
+        linked = (f" It is for {named}: the owner's answer goes to each asker as the answer of its question by itself. "
+                  f"When one of them is answered another way, or its task ends first with no default, that asker "
+                  f"leaves N-{nid}, which closes by itself when none is left.")
+        if any(x["assumed"] is None for x in qus):
+            linked += (" If an agent does the work of a question first, answer that question yourself with what was "
+                       "done, so that the owner does not do it again.")
+        if any(x["assumed"] is not None for x in qus):
+            linked += (f" A question with a default stays on N-{nid} when its task ends, and the owner's answer then "
+                       f"comes to you with the question and the default: do not answer such a question yourself, "
+                       f"unless the owner decided it another way.")
     door = (" When the owner answers yes, their app signs that yes to the door call, and the door lets that exact "
             "call through once: the agent sends the same call again." if door_call else "")
     if door_host:
@@ -22192,6 +22349,12 @@ def t_raise_needs_you(agent, a):
     if sign_in:
         door = (f" Its title and its step are the hub's: \"{title}\", and \"{todo}\" The hub closes N-{nid} by "
                 f"itself when it reads {sign_in['agent']} signed in to {runtime_label(sign_in['runtime'])}.")
+    if left_out:                # P7 4.3: a replace that drops an asker says so, as its task still waits for an answer
+        one = len(left_out) == 1
+        linked += (f" N-{old['id']} took {need_questions_said(left_out)} to the owner, and N-{nid} does not: "
+                   f"{'its asker waits' if one else 'their askers wait'} with no card. Answer "
+                   f"{'it' if one else 'them'}, or raise N-{nid} again with replaces and "
+                   f"{'it' if one else 'them'} in question_ids.")
     later = "" if qu or github_key or key_swap_server else (" If nothing needs it any more before the owner answers, "
                                                             "close it at once with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
@@ -22294,11 +22457,132 @@ def need_question(agent, ref, ignore=None, reason=None):
     # within 9 minutes): the card then takes the late-answer path to its raiser (need_kept_words)
     if not t or (t["state"] in TERMINAL and qu["assumed"] is None):
         raise ToolError(f"{tref(qu['task'])} has ended, so nothing waits for Q-{qid} any more.")
-    other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL AND id IS NOT ?", (qid, ignore))
+    other = q1(f"SELECT id FROM needs WHERE answer IS NULL AND id IS NOT ? AND (question=? OR EXISTS (SELECT 1 FROM "
+               f"json_each({need_qs('needs')}) j WHERE j.value=?))", (ignore, qid, qid))
     if other:
         raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: their answer goes to {qu['asker']} by "
                         f"itself.")
     return qu
+
+
+# P7 "Each decision goes to the right person", section 4 (the owner's yes of 26 November 2026, D145): one need is one
+# card. In a week of 161 cards, 42 were a second card for one need (needs-you-cards-week-survey.md).
+NEED_QUESTIONS_MOST = 5         # questions of one card (raise_needs_you question_ids)
+NEED_ALSO_CHARS = 300           # characters of raise_needs_you `also`: what a second card of one job is for
+# A plain card: the manager's own choice or step, of none of the hub's own kinds (the door's, Give, a key, a plan of
+# team changes, a sign-in, a key swap, a GitHub App or its key, Add device, a take-over, a join, a conversation's
+# item), each of which keeps its own rule of one card (door_card_open, sign_in_asked, need_replaced)
+NEED_PLAIN = ("n.kind IS NULL AND n.conversation IS NULL AND n.door_call IS NULL AND n.github_app IS NULL AND "
+              "n.add_device IS NULL AND n.github_key IS NULL AND n.key_swap_server IS NULL AND n.give_agent IS NULL "
+              "AND n.sign_in_agent IS NULL AND n.team_plan IS NULL AND n.run_command IS NULL")
+
+
+def need_question_refs(a):
+    """raise_needs_you's question_id and question_ids (P7 4.3) as one list of question ids, question_id first, with no
+    question twice, or a ToolError. need_question checks each one."""
+    refs = [] if a.get("question_id") in (None, "") else [a["question_id"]]
+    more = a.get("question_ids")
+    if more not in (None, []):
+        if not isinstance(more, list) or not all(isinstance(x, str) and x.strip() for x in more):
+            raise ToolError("question_ids is a list of the questions with you that one answer of the owner settles, "
+                            "for example [\"Q-4\", \"Q-7\"].")
+        refs += more
+    ids = []
+    for ref in refs:
+        qid = parse_id(ref, "question")
+        if qid not in ids:
+            ids.append(qid)
+    if len(ids) > NEED_QUESTIONS_MOST:
+        raise ToolError(f"One item takes at most {NEED_QUESTIONS_MOST} questions to the owner. Nothing was raised.")
+    return ids
+
+
+JOB_WALK = 50                   # links of one walk up a task's job and follows links (task_job_key)
+
+
+def task_job_key(tid):
+    """The job of task `tid` as the owner's Tasks board groups it (HubState.jobKeys in the apps' FleetCore/Jobs.swift),
+    as a key that compares (P7 4.2, and step 7 of P7 piece 3): ("ask", <request id>) for a task with an ask, the owner's
+    message that its work comes from; else ("case", <id>) for the duty case of the task, or of the first task on its
+    links that has one, by case_thing; else ("task", <id>), the task where its links end, `job` first, then `follows`.
+    The board joins a task of before owner API 1.226 under a case's task by its parent too; the hub does not. At most
+    JOB_WALK links; links in a loop, which no write makes, end at the smallest id that the walk passed, as on the
+    board. read_row only."""
+    row = read_row("SELECT id, ask, duty_case, job, follows FROM tasks WHERE id=?", (tid,))
+    if row is None:
+        return ("task", tid)
+    if row["ask"]:
+        return ("ask", row["ask"])
+    seen = []
+    while True:
+        if row["duty_case"] is not None:
+            return ("case", case_thing(row["duty_case"]))
+        seen.append(row["id"])
+        link = next((x for x in (row["job"], row["follows"]) if x is not None and x != row["id"]), None)
+        if link is None:
+            return ("task", row["id"])
+        if link in seen or len(seen) >= JOB_WALK:
+            return ("task", min(seen))
+        row = read_row("SELECT id, duty_case, job, follows FROM tasks WHERE id=?", (link,))
+        if row is None:
+            return ("task", link)
+
+
+def case_thing(case_id):
+    """The case that stands for case `case_id` in a job's key, as the apps group cases (DutyCaseLists.thing): the cases
+    of one duty and key, oldest first, are one thing until a case marked repeated begins the next. Here the first case
+    of that thing, else the case itself. read_row only."""
+    row = read_row("SELECT COALESCE((SELECT MAX(p.id) FROM duty_cases p WHERE p.responsibility=c.responsibility AND "
+                   "p.key=c.key AND p.repeated=1 AND p.id<=c.id), (SELECT MIN(p.id) FROM duty_cases p WHERE "
+                   "p.responsibility=c.responsibility AND p.key=c.key)) AS first FROM duty_cases c WHERE c.id=?",
+                   (case_id,))
+    return row["first"] if row and row["first"] is not None else case_id
+
+
+def need_job_keys(row):
+    """The jobs of Needs-you row `row` (P7 4.2), as task_job_key gives them: the job of the task of each question
+    that it takes, and the owner's ask that its work waits for (needs.ask). A card with neither has none, and the rule
+    of one open card does not reach it. read_row only."""
+    ids = need_question_ids(row)
+    tasks = [x["task"] for x in read_rows(f"SELECT task FROM questions WHERE id IN ({','.join('?' * len(ids))})",
+                                          ids)] if ids else []
+    ask = row["ask"] if "ask" in row.keys() else None
+    return {task_job_key(t) for t in tasks if t is not None} | ({("ask", ask)} if ask else set())
+
+
+def need_job_cards(keys, ignore=None):
+    """The open plain cards (NEED_PLAIN) of one of these jobs (need_job_keys; P7 4.2, "One job, one open card"),
+    oldest first, but card `ignore`: the one that the new card replaces. read_row only."""
+    if not keys:
+        return []
+    return [r for r in read_rows(f"SELECT n.* FROM needs n WHERE n.answer IS NULL AND n.id IS NOT ? AND (n.question "
+                                 f"IS NOT NULL OR n.ask IS NOT NULL) AND {NEED_PLAIN} ORDER BY n.id", (ignore,))
+            if need_job_keys(r) & keys]
+
+
+def need_job_refusal(cards, ids):
+    """The words of raise_needs_you's refusal of a second plain card on one job (P7 4.2): the open cards of that job,
+    and the ways on. The same need is one card: a replace of one of them, whose call names its questions and these
+    (ids), unless that card holds NEED_QUESTIONS_MOST already. Another need goes with also. The hub reads no words of
+    either card: the manager judges."""
+    ways, many = [], False
+    for r in cards:
+        held = need_question_ids(r)
+        joined = held + [x for x in ids if x not in held]
+        if len(joined) > NEED_QUESTIONS_MOST:
+            continue
+        many = many or len(joined) > 1
+        ways.append(f"replaces=\"N-{r['id']}\"" + (f" and question_id=\"Q-{joined[0]}\"" if len(joined) == 1 else
+                                                    f" and question_ids={json.dumps([f'Q-{x}' for x in joined])}"
+                                                    if joined else ""))
+    names = [f"N-{r['id']} ({clip(r['title'] or '', 80)})" for r in cards]
+    named = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    same = "" if not ways else (
+        (" If this is the same need, raise it with " if len(cards) == 1 else
+         " If this is the same need as one of them, raise it in the place of that card, with ") + " or ".join(ways) +
+        (", so that the owner's one answer goes to each asker." if many else "."))
+    return (f"Not raised: {named} {'is' if len(cards) == 1 else 'are'} open on the same job, and one need is one "
+            f"card.{same} If it is another need, raise it with also: what is different, in a few words.")
 
 
 def t_withdraw_need(agent, a):
@@ -22339,12 +22623,15 @@ def t_withdraw_need(agent, a):
         if need["answer"] is not None:
             raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
         # the card of a question with a default is the owner's decision, and the asker does not wait for it: when the
-        # owner decided it another way, its raiser closes it with that in why, and the question stays (round 4)
-        asked = read_row("SELECT * FROM questions WHERE id=?", (need["question"],)) if need["question"] else None
-        kept = asked is not None and asked["assumed"] is not None and asked["answer"] is None
-        if need["question"] and not kept and not question_session_ended(need["question"]):
-            raise ToolError(f"N-{nid} takes Q-{need['question']} to the owner. Answer Q-{need['question']} with "
-                            f"answer instead, and N-{nid} closes by itself.")
+        # owner decided it another way, its raiser closes it with that in why, and the question stays (round 4). A
+        # card of several askers (P7 4.3) is refused while one of its questions blocks a task that runs
+        held = {x: read_row("SELECT * FROM questions WHERE id=?", (x,)) for x in need_question_ids(need)}
+        kept = [x for x in held.values() if x is not None and x["assumed"] is not None and x["answer"] is None]
+        blocks = [x for x in held if x not in {k["id"] for k in kept} and not question_session_ended(x)]
+        if blocks:
+            said = need_questions_said(blocks)
+            raise ToolError(f"N-{nid} takes {said} to the owner. Answer {said} with answer instead, and N-{nid} "
+                            f"closes by itself.")
         if need["conversation"]:
             raise ToolError(f"N-{nid} is a question of a conversation, and the person waits for its answer.")
         waiters = [t for t in (need_secret(need) or {}).get("tasks") or []
@@ -22386,9 +22673,9 @@ def t_withdraw_need(agent, a):
                                      "It left the owner's Needs you with no notification, and its record keeps your "
                                      "reason. ")
             + (f"{theirs} is not told: tell it with message_agent when its work should know. " if theirs else "") +
-            (f"Q-{asked['id']} of {asked['asker']} stays open: when the owner decided it, answer Q-{asked['id']} with "
-             f"their decision, so that {asked['asker']} reads it. " if kept and read_row(
-                f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (asked["task"],)) else "") +
+            "".join(f"Q-{asked['id']} of {asked['asker']} stays open: when the owner decided it, answer "
+                    f"Q-{asked['id']} with their decision, so that {asked['asker']} reads it. " for asked in kept
+                    if read_row(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (asked["task"],))) +
             "Raise a new item only when the owner must do or decide something now.")
 
 
@@ -22455,9 +22742,10 @@ def need_answer_ways(need):
     ways = [(f"reply under the card with discuss_need(need=\"N-{nid}\", text=...), in plain words and in a few "
              f"sentences, when the request stays as it is", "reply there with discuss_need")]
     if need_replaceable(need):      # the new card takes the question along only when the raise names it again
-        asks = f", question_id=\"Q-{need['question']}\"" if need["question"] else ""
-        ways.append((f"raise it again with raise_needs_you(replaces=\"N-{nid}\"{asks}) when its words or options "
-                     f"change", "raise it again with raise_needs_you replaces" + (" and question_id" if asks else "")))
+        ids = need_question_ids(need)
+        ways.append((f"raise it again with {need_replace_call(need)} when its words or options change",
+                     "raise it again with raise_needs_you replaces" +
+                     (" and question_ids" if len(ids) > 1 else " and question_id" if ids else "")))
     if need["team_plan"]:
         ways.append(("make a new plan with change_team when its changes change: a new card of a plan takes this one's "
                      "place", "make a new plan with change_team"))
@@ -22480,8 +22768,8 @@ def need_wait_ways(need):
             f"Answer the owner in one of {'two' if len(ways) == 2 else 'three'} ways: " + "; ".join(ways[:-1]) +
             "; or " + ways[-1] + ".")
     if need["question"]:
-        said += (f" Answering Q-{need['question']} closes the card with no word to the owner: reply under it "
-                 f"first.")
+        said += (f" Answering {need_questions_said(need_question_ids(need))} closes the card with no word to the "
+                 f"owner: reply under it first.")
     return said
 
 
@@ -22502,7 +22790,16 @@ def need_again(need):
     a server's key swap or a plan of team changes), so the hub never names a call that it then refuses."""
     if not need_replaceable(need):
         return ""
-    return f" If the talk changes its options or its words, raise it again with raise_needs_you(replaces=\"N-{need['id']}\")."
+    return f" If the talk changes its options or its words, raise it again with {need_replace_call(need)}."
+
+
+def need_replace_call(need):
+    """raise_needs_you's call that takes the place of open item `need`, with each question that it takes to the owner,
+    so that the new card leaves no asker out (P7 4.3) and passes the rule of one open card for a job (P7 4.2)."""
+    ids = need_question_ids(need)
+    asks = "" if not ids else f", question_id=\"Q-{ids[0]}\"" if len(ids) == 1 else \
+        f", question_ids={json.dumps([f'Q-{x}' for x in ids])}"
+    return f"raise_needs_you(replaces=\"N-{need['id']}\"{asks})"
 
 
 def need_replaceable(need):
@@ -22626,9 +22923,10 @@ def open_items_line(agent, t):
     of 25 November 2026, round 2, R2-M1)."""
     if not t["goal_id"]:
         return ""
-    rows = q("SELECT n.id, n.title, n.question FROM needs n JOIN questions qu ON qu.id=n.question "
-             "JOIN tasks k ON k.id=qu.task WHERE n.by=? AND n.answer IS NULL AND qu.answer IS NULL AND k.goal_id=? "
-             "AND qu.assumed IS NULL ORDER BY n.id", (agent, t["goal_id"]))
+    rows = q(f"SELECT n.id, n.title, MIN(qu.id) question FROM needs n JOIN questions qu ON (qu.id=n.question OR "
+             f"EXISTS (SELECT 1 FROM json_each({need_qs('n')}) j WHERE j.value=qu.id)) JOIN tasks k ON k.id=qu.task "
+             f"WHERE n.by=? AND n.answer IS NULL AND qu.answer IS NULL AND k.goal_id=? AND qu.assumed IS NULL "
+             f"GROUP BY n.id ORDER BY n.id", (agent, t["goal_id"]))
     if not rows:
         return ""
     named = "; ".join(f"N-{r['id']} \"{clip(r['title'] or '', 80)}\", which takes Q-{r['question']} to the owner"
@@ -22784,20 +23082,23 @@ def need_look_hints(r):
         if need_unclarified(r) is None:
             hint += ": " + need_ways_said([way for _, way in need_answer_ways(r)])
             if r["question"]:
-                hint += f", as answering Q-{r['question']} closes the card with no word to them"
+                hint += (f", as answering {need_questions_said(need_question_ids(r))} closes the card with no word to "
+                         f"them")
         hints.append(hint)
-    kept = r["question"] and (read_row("SELECT assumed FROM questions WHERE id=?", (r["question"],)) or
-                              {"assumed": None})["assumed"] is not None
-    if kept and question_session_ended(r["question"]):
-        hints.append(f"the task that asked Q-{r['question']} ended: the owner's answer comes to you for the "
-                     f"follow-up work, and withdraw_need closes it when nothing needs it")
-    elif kept:              # owner API 1.341: the decision is the owner's, also when the work is done
-        hints.append(f"it takes Q-{r['question']}, a question with a default, to the owner: the decision is theirs, "
-                     f"so do not answer Q-{r['question']} yourself, also when the work is done, unless the owner "
-                     f"decided it another way, and the card stays open when that work ends")
-    elif r["question"]:
-        hints.append(f"it takes Q-{r['question']} to the owner: when the work has settled it, answer Q-{r['question']} "
-                     f"and the card closes")
+    ids = need_question_ids(r)
+    for qid in ids:                         # P7 4.3: each asker of a card of several, which leaves the card alone
+        asked = read_row("SELECT assumed FROM questions WHERE id=?", (qid,))
+        kept = asked is not None and asked["assumed"] is not None
+        if kept and question_session_ended(qid):
+            hints.append(f"the task that asked Q-{qid} ended: the owner's answer comes to you for the follow-up work, "
+                         f"and withdraw_need closes it when nothing needs it")
+        elif kept:              # owner API 1.341: the decision is the owner's, also when the work is done
+            hints.append(f"it takes Q-{qid}, a question with a default, to the owner: the decision is theirs, so do "
+                         f"not answer Q-{qid} yourself, also when the work is done, unless the owner decided it "
+                         f"another way, and the card stays open when that work ends")
+        else:
+            hints.append(f"it takes Q-{qid} to the owner: when the work has settled it, answer Q-{qid} and " +
+                         ("its asker leaves the card" if len(ids) > 1 else "the card closes"))
     if spec is not None:
         waiters = [t for t in spec.get("tasks") or []
                    if read_row(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
@@ -27526,13 +27827,10 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
         # (a note in a chat is the hub's words about his Needs clarification, which the agent acts on: SECRET_CLARIFIED)
         text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat and not note else "") + \
             note + pictured
-        asker = need_question_rows(need, value, t0, files, more=pictured,     # a question the manager took to him
+        given = need_question_rows(need, value, t0, files, more=pictured,     # a question the manager took to him
                                    via=request_via(hand) or ("connected" if hand == "connected" else None))
-        if asker:
-            text += (f" The hub gave it to {asker}" + (", with its files," if files else "") +
-                     f" as the answer to Q-{need['question']}: do not pass it on again.")
-        else:                   # a card of a question with a default whose asker no longer reads an answer
-            text += need_kept_words(need)
+        # and a card of a question with a default whose asker no longer reads an answer (need_kept_words)
+        text += need_given_words(need, given, bool(files))
         text += need_door_task_rows(need, chosen, value, t0)       # and the task that a door's card is for
     # owner feature need_takeover: his answer to a step on an agent's screen goes to the session of the task that
     # asked and waits for it, and that wait ends with it (secret_wait_moved)
@@ -28221,20 +28519,40 @@ def need_question_rows(need, value, t0, files=(), more="", via=None):
     that asks for a file does not get it": "Yes, fix both"). Until then the asker read his words alone, and the
     files stayed with the manager, whom read_attachment let open them, and the asker not.
     more: which picture the owner's choice has (need_picture_note), which the asker reads after the answer.
-    None too for a question whose task ended, whose card stays open only when it has a default (end_waits, owner API
+    Not for a question whose task ended, whose card stays open only when it has a default (end_waits, owner API
     1.341): no session of the asker reads an answer any more, so the question keeps the owner's answer as its record,
-    and the agent that raised the card reads it with the question and the default (need_kept_words)."""
+    and the agent that raised the card reads it with the question and the default (need_kept_words).
+    Returns [(asker, question id)] of each question that the answer went to: one card for several askers (P7 4.3,
+    question_ids) gives the one answer to each question on it, and none for an item of no question."""
     in_transaction("need_question_rows")
-    qid = need["question"] if "question" in need.keys() else None
-    qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
-    t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
-    if not qu or not t or qu["answer"] is not None:
-        return None
-    if t["state"] in TERMINAL:
-        DB.execute("UPDATE questions SET answer=?, answered=?, answered_by='owner' WHERE id=? AND answer IS NULL",
-                   (value, t0, qid))
-        return None
-    return qu["asker"] if answer_rows(qu, t, value, "owner", t0, files, more, via) else None
+    given = []
+    for qid in need_question_ids(need):
+        qu = read_row("SELECT * FROM questions WHERE id=?", (qid,))
+        t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
+        if not qu or not t or qu["answer"] is not None:
+            continue
+        if t["state"] in TERMINAL:
+            DB.execute("UPDATE questions SET answer=?, answered=?, answered_by='owner' WHERE id=? AND answer IS NULL",
+                       (value, t0, qid))
+        elif answer_rows(qu, t, value, "owner", t0, files, more, via):
+            given.append((qu["asker"], qid))
+    return given
+
+
+def need_given_words(need, given, files=False):
+    """The words after the owner's answer of card `need` for its raiser (owner_message_rows, the legacy board): to whom
+    the hub gave it (need_question_rows' list), and the words of each question with a default that no session of its
+    asker reads (need_kept_words). read_row only."""
+    if len(given) == 1:
+        said = (f" The hub gave it to {given[0][0]}" + (", with its files," if files else "") +
+                f" as the answer to Q-{given[0][1]}: do not pass it on again.")
+    elif given:                 # P7 4.3: one answer for each asker of the card
+        said = (" The hub gave it" + (", with its files," if files else "") + " to " +
+                " and to ".join(f"{asker} as the answer to Q-{qid}" for asker, qid in given) +
+                ": do not pass it on again.")
+    else:
+        said = ""
+    return said + need_kept_words(need, {qid for _, qid in given})
 
 
 def question_session_ended(qid):
@@ -28255,23 +28573,26 @@ def default_hold(default, whose):
             f"answer comes.")
 
 
-def need_kept_words(need):
+def need_kept_words(need, given=()):
     """The words for the agent that raised a card of a question with a default, with the owner's answer that reached no
     session of the asker (owner API 1.341; the validation of 25 November 2026, M1): the task that asked ended, before
     the raise or after it, and the card stayed open for the owner's decision (end_waits; a restart keeps the question
     open, restart_continue). So the raiser gives the follow-up work: the question, the default that the asker went on
     with, and the answer above; to the asker while it is on the team, else to the agent that does that work now
-    (R2-S3: an agent with no open task can be removed). "" for each other card. read_row only."""
-    qid = need["question"] if "question" in need.keys() else None
-    qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
-    if not qu or qu["assumed"] is None:
-        return ""
-    who = qu["asker"]
-    follow = (f"give {who} the follow-up work with it" if who in agents() else
-              f"give the follow-up work to the agent that does that work now: {who} is no longer on the team")
-    return (f" It was for Q-{qid} of {who}, and {tref(qu['task'])} ended before this answer, so no session of {who} "
-            f"reads it. {who} went on with its default: \"{qu['assumed']}\". The question: "
-            f"\"{clip(qu['text'], 300)}\". When this answer changes what {who} did, {follow}.")
+    (R2-S3: an agent with no open task can be removed). "" for each other card. given: the ids of the questions that
+    the answer reached (need_question_rows), which get none. read_row only."""
+    said = ""
+    for qid in need_question_ids(need):     # P7 4.3: each question of a card of several askers
+        qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid not in given else None
+        if not qu or qu["assumed"] is None:
+            continue
+        who = qu["asker"]
+        follow = (f"give {who} the follow-up work with it" if who in agents() else
+                  f"give the follow-up work to the agent that does that work now: {who} is no longer on the team")
+        said += (f" It was for Q-{qid} of {who}, and {tref(qu['task'])} ended before this answer, so no session of "
+                 f"{who} reads it. {who} went on with its default: \"{qu['assumed']}\". The question: "
+                 f"\"{clip(qu['text'], 300)}\". When this answer changes what {who} did, {follow}.")
+    return said
 
 
 def need_door_task_rows(need, chosen, value, t0):
@@ -28340,8 +28661,9 @@ def question_answer_request(qu):
     (owner_file_refused) and names (describe_task). read_row only."""
     if not qu or qu["answered_by"] != "owner" or qu["answered"] is None:
         return None
-    row = read_row("SELECT u.request_id FROM needs n JOIN ui_requests u ON u.need_id=n.id WHERE n.question=? AND "
-                   "n.answered=? ORDER BY u.created, u.request_id LIMIT 1", (qu["id"], qu["answered"]))
+    row = read_row(f"SELECT u.request_id FROM needs n JOIN ui_requests u ON u.need_id=n.id WHERE (n.question=? OR "
+                   f"EXISTS (SELECT 1 FROM json_each({need_qs('n')}) j WHERE j.value=?)) AND n.answered=? ORDER BY "
+                   f"u.created, u.request_id LIMIT 1", (qu["id"], qu["id"], qu["answered"]))
     return row["request_id"] if row else None
 
 
@@ -30075,6 +30397,9 @@ def end_waits(task_id):
                                                f"without it, or {wait_next(m['sender'])}.")
     q("UPDATE agent_messages SET wait_end=? WHERE sender_task=? AND waits=1 AND wait_end IS NULL",
       (f"{tref(task_id)} ended", task_id))
+    # P1 T1 (p1-today.md section 4, rule 9): each open act that this task waits on ends with it, so that no answer and
+    # no press reaches a task that is over. An `undo` act names its finished task, and stays (T3).
+    q("UPDATE acts SET state='ended', at=? WHERE task=? AND state='open' AND kind<>'undo'", (now(), task_id))
     # plan C11: a linked message that the task's session never read, told once to its sender
     for m in q("SELECT m.* FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE e.task=? AND e.read_at IS NULL "
                "AND m.waits IS NULL", (task_id,)):
@@ -30489,7 +30814,8 @@ def narrowed_tasks_settle():
     list left the open conversation task with none (c8373b797 gives it one), and such a task's result, the locked
     reply, then reached each session of the agent. Each gets the person of its reply's mark, and the readers that keep
     a narrowed pair's task apart (narrowed_from, history_scope_sql) hide it; its result stays, for the owner reads all.
-    The messages come first (CROSS JOIN): conversation_messages.task has no index. After conversation_task_end gives
+    The messages come first (CROSS JOIN), and each finds its task by the task's id: SQLite reads the messages that have
+    a task, through conversation_message_task (P1 T1), in this one run. After conversation_task_end gives
     every such task its person, a later run would only find a task of a time at All that rule 2 marked. Returns how
     many tasks it changed."""
     in_transaction("narrowed_tasks_settle")
@@ -31461,15 +31787,20 @@ def person_route(account, acc, person, m, t0, hit):
     # AUTONOMY.md P2 (lane L2): a message that answers an agent's message_contact with waits goes to the task that
     # waits for it; otherwise, in a conversation with the agent's tools, it is a conversation task's, and only that
     # conversation's session passes it on to open work (open_work with task, decision 40).
-    # a message with no words (a picture alone) answers no wait: it goes the conversation's own way, as any message
-    waited = conversation_waiting_rows(conv, person, cm, m["text"].strip(), t0) \
+    # a message with no words (a picture alone) answers no wait: it goes the conversation's own way, as any message.
+    # P1 T1: the members' app names the act that its words answer (m["answers"], teams_person_links.link_inbound), and
+    # the act keeps where the answer came from: app:<link>, or chat:<account>
+    waited = conversation_waiting_rows(conv, person, cm, m["text"].strip(), t0, m.get("answers"),
+                                       f"app:{m['sender']}" if account == BUILT_IN_ACCOUNT else f"chat:{account}") \
         if contacts_v2() and conv["state"] == "open" and m["text"].strip() else None
     if conv["state"] == "open" and waited is None:   # a conversation that the owner paused keeps it and wakes nobody
         DB.execute("UPDATE conversation_messages SET event=? WHERE id=?",
                    (conversation_signal(agent, conv["id"], t0), cm))
         if conversation_works(person, agent):
             conversation_task_rows(conv, person, cm, t0)
-        conversation_decided(conv, person, m["text"].strip(), cm, t0)
+        # P1 T1: words that name an act answer that act or nothing (UI-API.md 1.366): never a deputy's open card
+        if m.get("answers") is None:
+            conversation_decided(conv, person, m["text"].strip(), cm, t0)
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                (t0, agent, f"CM-{cm} from a {person['role']} in C-{conv['id']} through {account}"))
     return "stored"
@@ -32529,8 +32860,8 @@ def person_remove(pid, t0):
     (removed_conversation_tasks_end). The person's own rows go, as before: the person, their handles, their
     conversations and messages, their open questions, their reminders' history, their ignored messages, their wrong link
     codes, their Telegram invites (telegram_person_rows), the rows of their links to the Founderizer app, also with no
-    Teams file (links_gone_rows), and the history's rows of their records. No other record is
-    deleted: each row stays, with its times and its own id, and its words go, with the other values of the same field
+    Teams file (links_gone_rows), their acts (`acts`, by acts.person) and the presses of those acts (`act_presses`;
+    P1 T1, UI-API.md 1.366), and the history's rows of their records. No other record is deleted: each row stays, with its times and its own id, and its words go, with the other values of the same field
     (the owner, 18 November 2026: "I dont want to be missing info").
 
     Cleared with them since owner API 1.232 (the owner's "Yes, as recommended" of 19 November 2026 to the list of what
@@ -32661,6 +32992,11 @@ def person_remove(pid, t0):
             DB.execute("UPDATE session_credentials SET revoked=? WHERE kind='conversation' AND task=? AND "
                        "revoked IS NULL", (t0, cid))
             DB.execute("DELETE FROM kv WHERE k=?", (f"standing_told:{cid}",))      # L3: what its window was told
+        # P1 T1 (p1-today.md section 4): the person's acts, by the key written at the source (acts.person), and the
+        # presses of them, whose request ids are their chat's own, in this transaction with the person: an act names
+        # its person and its conversation, and a draft holds a mail's text (T6)
+        DB.execute("DELETE FROM act_presses WHERE act IN (SELECT id FROM acts WHERE person=?)", (pid,))
+        DB.execute("DELETE FROM acts WHERE person=?", (pid,))
         DB.execute("DELETE FROM conversations WHERE person=?", (pid,))
         history_forget_person(pid, cleared)     # AUTONOMY.md P6: and the history's index forgets
         # the first words of their messages from before they were a person (chat_ignored), by the sender that
@@ -32700,10 +33036,12 @@ def conversation_waits_end_rows(scope, args, why, t0, named=True):
     names nobody: a removed person's name stays in no task). Its task goes on without it, its session is told so, and
     no later message of that person reaches it as the answer."""
     in_transaction("conversation_waits_end_rows")
-    for w in DB.execute(f"SELECT m.id, m.waits, t.owner, p.name FROM conversation_messages m JOIN tasks t ON "
-                        f"t.id=m.waits JOIN conversations c ON c.id=m.conversation JOIN people p ON p.id=c.person "
+    for w in DB.execute(f"SELECT m.id, m.conversation, m.waits, t.owner, p.name FROM conversation_messages m JOIN "
+                        f"tasks t ON t.id=m.waits JOIN conversations c ON c.id=m.conversation JOIN people p ON "
+                        f"p.id=c.person "
                         f"WHERE m.waits IS NOT NULL AND m.conversation IN ({scope})", args).fetchall():
         DB.execute("UPDATE conversation_messages SET waits=NULL WHERE id=?", (w["id"],))
+        acts_close_rows(w["conversation"], [w["id"]], "ended", t0)     # P1 T1: its act, which no answer reaches
         if DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                       "waiting_on=?", (w["waits"], cm_ref(w["id"]))).rowcount:
             secret_rewait(w["waits"])       # the owner's secret holds it still (secret_requests)
@@ -33782,30 +34120,79 @@ def conversation_pass_rows(conv, person, tid, rows, t0):
                        f"The conversation's own session answers the person.\n{said}", t0, "{}"))
 
 
-def conversation_waiting_rows(conv, person, cm, text, t0):
+# ---- P1's acts (p1-today.md section 4, piece T1): one thing that waits for one person, in the table `acts`. T1
+# makes the `question` act of each message_contact that waits, with no options; T2 adds the options and the press.
+# The act ends with its wait: an answer (typed words, here; a press, T2), its task's end (end_waits), a wait that
+# no answer can reach now (conversation_waits_end_rows), and the person's removal, which deletes it. No clock ends
+# one.
+
+ACT_ID = re.compile(r"[0-9a-f]{16}")        # an act's key: 16 random hex characters, made and kept at the offer
+
+
+def act_offer_rows(kind, person, agent, conversation, cm, task, t0):
+    """Inside the caller's transaction: a new open act and its key. The key is random, never a number of a task, a
+    message or a card, so a restore that loses acts cannot make a device's key name another act."""
+    in_transaction("act_offer_rows")
+    key = secrets.token_hex(8)
+    while DB.execute("SELECT 1 FROM acts WHERE id=?", (key,)).fetchone():
+        key = secrets.token_hex(8)
+    DB.execute("INSERT INTO acts(id,kind,person,agent,conversation,cm,task,state,created) "
+               "VALUES(?,?,?,?,?,?,?,'open',?)", (key, kind, person, agent, conversation, cm, task, t0))
+    return key
+
+
+def acts_close_rows(conversation, cms, state, t0, by=None, via=None):
+    """Inside the caller's transaction: the open acts of the agent's messages `cms` of this conversation, whose waits
+    ended, are `answered` (by: 'P-<id>'; via: where the answer came from; no option for typed words) or `ended`. By
+    the messages and never by the task: one task can wait for two people, and one person's answer answers only their
+    own act; and by the conversation too, so that an act of another place whose `cm` holds the same number stays as
+    it is. An act that is no longer open stays as it is: one act, one answer."""
+    in_transaction("acts_close_rows")
+    for some in id_lists(list(cms)):
+        DB.execute(f"UPDATE acts SET state=?, by=?, via=?, at=? WHERE cm IN ({','.join('?' * len(some))}) AND "
+                   f"conversation=? AND state='open'", (state, by, via, t0, *some, conversation))
+
+
+def conversation_waiting_rows(conv, person, cm, text, t0, answers=None, via=None):
     """Inside chat_route's transaction: the person's message answers the oldest message_contact of this conversation
     that waits (conversation_messages.waits), and goes into the session of the task that waits for it, as one JSON
     string, which no line of the person's can end (AUTONOMY.md P2). The wait ends there. Returns the task, or None
     when nothing waits. Its header names what came with the words (conversation_header, from the row), which this
-    session does not open."""
+    session does not open.
+
+    P1 T1 (p1-today.md section 4, rule 10): `answers` is the key of an act that the person's app named (`send` of the
+    members' app). The words answer that act's wait, also when an older one waits, and no wait at all when that act
+    is not this person's open act of this conversation or its wait is over: then they go the conversation's own way,
+    as a message that answers nothing, and never to the oldest wait. The acts of the waits that end are `answered`
+    (by the person, from `via`), or `ended` for a narrowed task, which hears no word of the answer."""
     in_transaction("conversation_waiting_rows")
+    by, named = f"P-{person['id']}", ()
+    if answers is not None:
+        act = DB.execute("SELECT cm FROM acts WHERE id=? AND person=? AND conversation=? AND state='open'",
+                         (answers, person["id"], conv["id"])).fetchone()
+        if act is None:
+            return None
+        named = (act["cm"],)
     while True:
         # the connection's own read, which sees this transaction's writes: a wait that a narrowed task held is over
         asked = DB.execute(
             "SELECT m.id, m.waits, t.source_conversation, t.source_message FROM conversation_messages m JOIN tasks t "
             "ON t.id=m.waits WHERE m.conversation=? AND m.who='agent' AND m.waits IS NOT NULL AND "
-            f"{OPEN_TASK.replace('state', 't.state')} ORDER BY m.id LIMIT 1", (conv["id"],)).fetchone()
+            f"{OPEN_TASK.replace('state', 't.state')}{' AND m.id=?' if named else ''} ORDER BY m.id LIMIT 1",
+            (conv["id"], *named)).fetchone()
         if not asked:
             return None
         # each wait of that task in this conversation ends with the answer: its waiting_on names the newest of them
-        refs = [cm_ref(r["id"]) for r in DB.execute("SELECT id FROM conversation_messages WHERE conversation=? AND "
-                                                    "waits=?", (conv["id"], asked["waits"]))]
+        ids = [r["id"] for r in DB.execute("SELECT id FROM conversation_messages WHERE conversation=? AND waits=?",
+                                           (conv["id"], asked["waits"]))]
+        refs = [cm_ref(i) for i in ids]
         DB.execute("UPDATE conversation_messages SET waits=NULL WHERE conversation=? AND waits=?",
                    (conv["id"], asked["waits"]))
         DB.execute(f"UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                    f"waiting_on IN ({','.join('?' * len(refs))})", (asked["waits"], *refs))
         secret_rewait(asked["waits"])           # the owner's secret holds it still (secret_requests)
         if asked["source_conversation"] == conv["id"] and asked["source_message"] is not None:
+            acts_close_rows(conv["id"], ids, "answered", t0, by, via)
             return None         # this conversation's own task: the message reaches it there as every message does
         # a task that a narrowed person's words drive now reads no other person's words (person access plan, section
         # 5): it asked before the owner narrowed that pair, so its wait is over, it hears that the answer came, with
@@ -33813,8 +34200,10 @@ def conversation_waiting_rows(conv, person, cm, text, t0):
         scope = narrowed_task(asked["waits"])
         if scope is None or scope["person"] == conv["person"]:
             break
+        acts_close_rows(conv["id"], ids, "ended", t0)
         owner = DB.execute("SELECT owner FROM tasks WHERE id=?", (asked["waits"],)).fetchone()["owner"]
         DB.execute(EVENT, (owner, "say", asked["waits"], NARROWED_ANSWER.format(ref=cm_ref(asked["id"])), t0, "{}"))
+    acts_close_rows(conv["id"], ids, "answered", t0, by, via)
     row = DB.execute("SELECT * FROM conversation_messages WHERE id=?", (cm,)).fetchone()
     # the messages before it that the waiting session has not read (conversation_since): an answer may answer a
     # question that another session of the agent asked, and its reader then knows it as that answer
@@ -34361,6 +34750,8 @@ def t_message_contact(agent, a):
                 seen_row(key, conversation_seen_what(conv["id"]), cm)
             if waiting:
                 DB.execute("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (cm_ref(cm), t["id"]))
+                # P1 T1: each wait is one `question` act of this person, with options or none (T2 adds the options)
+                act_offer_rows("question", person["id"], agent, conv["id"], cm, t["id"], t0)
             DB.execute("UPDATE conversations SET last=? WHERE id=?", (t0, conv["id"]))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                        (t0, agent, f"{cm_ref(cm)} to P-{person['id']} in C-{conv['id']} from {tref(t['id'])}"))
@@ -40137,9 +40528,10 @@ def owner_file_refused(agent, aid, row, task, contact, closed, fenced=None):
                      (request,)) if request else None
     if steer and not message and task is not None and steer["task"] == task and steer["owner"] == agent:
         return None
-    asked = read_row("SELECT q.* FROM needs n JOIN questions q ON q.id=n.question WHERE n.id=?",
-                     (message["need_id"],)) if message and message["need_id"] is not None and not steer and \
-        task is not None else None
+    asked = read_row(f"SELECT q.* FROM needs n JOIN questions q ON q.id IN (SELECT n.question UNION SELECT value FROM "
+                     f"json_each({need_qs('n')})) WHERE n.id=? AND q.task=? AND q.asker=? ORDER BY q.id",
+                     (message["need_id"], task, agent)) if message and message["need_id"] is not None and \
+        not steer and task is not None else None
     if asked and asked["task"] == task and asked["asker"] == agent and question_answer_request(asked) == request:
         return None
     if contact:
@@ -50689,12 +51081,16 @@ def resource_kept(rid, team=None):
     if kind == "repo" and what.lower() in {str(r).lower() for r in door.get("gitops") or {}}:
         return "fleet"      # the door syncs it to a server (door_gitops): a direct token would go around its rules
     if kind == "repo" and not door_made(what) and any(
-            a.get("servers") and what.lower() in {str(r).lower() for r in a.get("repos") or {}}
-            for a in (team.get("agents") or {}).values() if isinstance(a, dict)):
+            a.get("servers") and door_commit_target(name, held, lv)
+            for name, a in (team.get("agents") or {}).items() if isinstance(a, dict)
+            for held, lv in (a.get("repos") or {}).items() if str(held).lower() == what.lower()):
         # a commit target of the door: a repository that an Operator (an agent that holds servers through the door)
-        # holds is a target of kind app or devops in the door's file (DoorAccess.operatorGitHub), whose commits the
-        # door checks (NEVER_PATHS: policy.hujson, .github/**, AGENTS.md); a direct write token would go around that
-        # (the Door area's read of the pool default). One that the door made stays as N3 gives it.
+        # holds at a level that may be one (door_commit_holds: write or deploy, or a level that the owner set) is a
+        # target of kind app or devops in the door's file (DoorAccess.operatorGitHub), whose commits the door checks
+        # (NEVER_PATHS: policy.hujson, .github/**, AGENTS.md); a direct write token would go around that (the Door
+        # area's read of the pool default). A read that the manager gave an Operator is no target, so it keeps
+        # nothing (a Mac app before the targets of UI-API 1.364 still makes it one: VAULT.md limit 32). One that the
+        # door made stays as N3 gives it.
         return "fleet"
     entry = (team.get("resources") or {}).get(rid)
     if isinstance(entry, dict) and entry.get("owner") is True:
@@ -50757,12 +51153,38 @@ def resource_standing(rid, team=None):
     return {"max": default_top(kind), "to": RESOURCE_AUDIENCE, "by": "default"}
 
 
+def own_hold_covers(agent, kind, what, level):
+    """This agent's own level of this thing when it holds it at this level or higher and can use it (card_holders, the
+    record that card_access reads), else None. A hold that no grant puts right (card_dead) or a repository that no
+    GitHub App reaches (team_repo_owner_step) is none: the owner's card is the route then, as card_access allows it.
+    It commits nothing, as grant_check needs."""
+    if level not in RESOURCE_LEVELS.get(kind, ()):
+        return None
+    own = next((h["level"] for h in card_holders(kind, what.lower() if kind == "repo" else what)
+                if h["agent"] == agent), None)
+    if not level_at_least(kind, own, level) or card_dead(kind, what) or (kind == "repo" and
+                                                                       team_repo_owner_step(what)):
+        return None
+    return own
+
+
+def nothing_to_give(agent, own, level):
+    """The refusal of a grant of a level that the agent holds already (own_hold_covers): nothing to give, and no route
+    (the repo-reach validator's D2)."""
+    return (f"{agent} holds it at {level} already: nothing to give." if own == level else
+            f"{agent} holds it at {own} already, which covers {level}: nothing to give.")
+
+
 def owner_level_route(agent, rid, kind, what, level):
     """The one route of a grant that needs the owner's own level, in the words of a refusal: the agent that holds it at
     that level already does that part of the work (card_access refuses the owner's card then, the owner, 29 October
     2026: asked only for what no agent holds), else the owner's card names the agent, which their Give settles (the
     coordinator's validator of 26 November 2026: a refusal that sends the manager to a card that card_access refuses
-    asks the owner nothing)."""
+    asks the owner nothing). The agent that asks holds it at that level itself: nothing to give, and no route (the
+    repo-reach validator's D2: card_access refuses that card too)."""
+    own = own_hold_covers(agent, kind, what, level)
+    if own:
+        return nothing_to_give(agent, own, level)
     held = [h["agent"] for h in card_holders(kind, what.lower() if kind == "repo" else what)
             if h["agent"] != agent and level_at_least(kind, h["level"], level if level in RESOURCE_LEVELS[kind]
                                                       else None)]
@@ -51220,10 +51642,14 @@ def grant_check(agent, rid, level, folder=False):
             return f"The door made {what}: give it at write at most, because nobody gets deploy there."
         return None
     if entry.get("max") and operator_needs_owner(a, kind, entry):
-        return (f"{agent} holds a server through the door, and the door commits for it to each repository that it "
-                f"holds, at any level: that is a write, so only the owner's own level of write or deploy on the row of "
-                f"{what} lets you give it. " + owner_level_route(agent, rid, kind, what, level))
+        return (f"{agent} holds a server through the door, and the door may commit for it to each repository that "
+                f"it holds, at any level (a Mac app from before the door's commit targets does): that is a write, so "
+                f"only the owner's own level of write or deploy on the row of {what} lets you give it. " +
+                owner_level_route(agent, rid, kind, what, level))
     if not entry.get("max"):
+        own = own_hold_covers(agent, kind, what, level)
+        if own:     # the agent's own hold settles it: no card, which card_access refuses (D2)
+            return nothing_to_give(agent, own, level)
         phrase = resource_phrase(kind, what)        # only its first letter: capitalize() would unmake MCP and a name
         # the owner is asked only for what no agent holds (the owner, 29 October 2026), so an agent that holds it and
         # can use it does that part, as raise_needs_you also says (card_access)
@@ -51263,7 +51689,8 @@ def grant_check(agent, rid, level, folder=False):
             # comes first, because a lower give does not do the work that the task named (the Door area's read)
             return (f"The default gives at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for "
                     f"{level}, which is the owner's own level. " + owner_level_route(agent, rid, kind, what, level) +
-                    f" Give {entry['max']} only if the work needs no more.")
+                    ("" if own_hold_covers(agent, kind, what, level) else
+                     f" Give {entry['max']} only if the work needs no more."))
         return (f"The owner allows at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for {level}. "
                 f"Give {entry['max']}, or ask the owner for {level}.")
     account, whole, _ = drive_grant(agent) if folder else (None, -1, {})
@@ -58948,10 +59375,16 @@ TOOLS = [
                         "for example Q-4: the item quotes its asker behind Details, the owner's answer and its files go back to it as the answer, "
                         "and the item closes by itself when the question is answered another way or, with no default, "
                         "its task ends"},
+        "question_ids": {"type": "array", "items": {"type": "string"}, "description": f"As question_id, for up to "
+                         f"{NEED_QUESTIONS_MOST} questions that one answer of the owner settles, on a plain item: one "
+                         f"item, and the answer goes to each asker"},
+        "also": {"type": "string", "description": "When an open item of yours is of the same job (a question of "
+                 "that work, or its ask) and this is another need: what is different, in a few words. Without it, "
+                 "or replaces of that item, the hub refuses this one"},
         "ask": {"type": "string", "description": "When work that the owner asked for waits for this item: a task "
                 "of that work, for example T-12, or the owner's message M-<n> itself when a task names it already. "
                 "The owner's apps then show that the thing they asked for waits for them. An item with a "
-                "question_id needs none"},
+                "question needs none"},
         "door_call": {"type": "string", "description": "The call hash that the door gave with its refusal of a "
                       "call that is the owner's (a delete of what no agent made through the door, an AWS delete, or "
                       "a host's run: a root script with no box): the owner's yes then lets that exact call through "
@@ -61214,8 +61647,8 @@ def overview_text(scope):
         rows = [r for r in rows if r["kind"] != JOIN_KIND]
     for r in rows:
         state = f'answered: "{r["answer"]}"' if r["answer"] is not None else "open"
-        out.append(f"  N-{r['id']} {r['title']}" + (f" (for Q-{r['question']})" if r["question"] else "") +
-                   f" -- {state}")
+        out.append(f"  N-{r['id']} {r['title']}" +
+                   (f" (for {need_questions_said(need_question_ids(r))})" if r["question"] else "") + f" -- {state}")
     if not rows:
         out.append("  none")
     rows = q("SELECT key, COUNT(*) c FROM outbox GROUP BY key ORDER BY key")
@@ -73542,7 +73975,8 @@ AGENT_COLUMNS = (
     ("needs", "give_agent"),       # the lane "Give on a card": the agent that an item's Give gives access to
     ("needs", "sign_in_agent"),    # F6, piece 1: the agent whose runtime's sign-in an item asks for (need_sign_in)
     ("link_codes", "agent"),                # Telegram (CHAT-APPS.md 19.4): the agent whose bot a person's invite opens
-    ("profile_orders", "agent"))            # F15 piece 2: the orders that put its profile in order with no card
+    ("profile_orders", "agent"),            # F15 piece 2: the orders that put its profile in order with no card
+    ("acts", "agent"))                      # P1 T1: whose act waits for a person (p1-today.md section 4)
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent",
@@ -74097,7 +74531,10 @@ AGENT_REMOVAL = {
     # a person's Telegram invite (CHAT-APPS.md 19.4): read by its code's hash, never by the agent's name, and it binds
     # its person, whom a delete does not touch; its link names a bot whose account leaves with its agent
     ("link_codes", "agent"): "stays",
-    ("profile_orders", "agent"): "delete"}      # F15 piece 2: the orders of its profile, which leaves with it
+    ("profile_orders", "agent"): "delete",      # F15 piece 2: the orders of its profile, which leaves with it
+    # P1 T1: its acts, which no press or answer reaches once it is gone, and never a new agent of its name; their
+    # presses go with them (remove_rows)
+    ("acts", "agent"): "delete"}
 REMOVAL_WHERE = {
     ("triggers", "agent"): "state='deleted'",       # remove_rows has put each of its rules in that state
     # an item that a conversation raised is that conversation's, and a conversation with no message is no history
@@ -74209,6 +74646,8 @@ def remove_rows(agent, t0, machine=None):
     for h in DB.execute(f"SELECT id, agent, text FROM history WHERE agent=? AND src IN ({','.join('?' * len(taken))})",
                         (agent, *taken)).fetchall():
         history_drop_row(h)
+    # P1 T1: the presses of its acts, which hold a person's request ids, before the acts go in the loop below
+    DB.execute("DELETE FROM act_presses WHERE act IN (SELECT id FROM acts WHERE agent=?)", (agent,))
     for table, column in REMOVED_OWN:
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (agent,))
     history_streams_back()
@@ -77678,12 +78117,24 @@ def door_app_id():
     return app_id if isinstance(app_id, str) and re.fullmatch(r"[1-9][0-9]{0,11}", app_id) else None
 
 
+def door_commit_target(name, repo, level):
+    """door_commit_holds' rule for one hold of one agent: True at write or deploy, or when the newest record of this
+    repository, in any case (LIKE folds ASCII case, as door_commit_holds lowers every row), is not of `level`. read_row
+    only, so resource_kept may call it inside a transaction and under LOCK."""
+    if level in ("write", "deploy"):
+        return True
+    rid = "repo:" + str(repo).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    row = read_row("SELECT level FROM resource_grants WHERE agent=? AND resource LIKE ? ESCAPE '\\' "
+                   "ORDER BY id DESC LIMIT 1", (name, rid))
+    return (row["level"] if row else None) != level
+
+
 def door_commit_records():
     """Each agent's newest record of each repository, from one read of resource_grants: {agent: {"repo:<owner/name in
     lower case>": level}}, a take-back's level None. door_view reads it once for all its agents (the table has no
     index on agent). Called with LOCK held."""
     newest = {}
-    for row in q("SELECT agent, resource, level FROM resource_grants WHERE resource LIKE 'repo:%' ORDER BY id"):
+    for row in read_rows("SELECT agent, resource, level FROM resource_grants WHERE resource LIKE 'repo:%' ORDER BY id"):
         newest.setdefault(row["agent"], {})[str(row["resource"]).lower()] = row["level"]
     return newest
 
@@ -77706,9 +78157,11 @@ def door_commit_holds(name, repos, newest=None):
     do not follow: each such hold whose newest record is of another level reads as the owner's own. Called with LOCK
     held."""
     if newest is None:
-        newest = {}     # each repository's newest record of this agent: a take-back (level NULL) or an older level
-        for row in q("SELECT resource, level FROM resource_grants WHERE agent=? AND resource LIKE 'repo:%' ORDER BY id",
-                     (name,)):  # that the hold no longer has is no record of the hold that stands now
+        # each repository's newest record of this agent: a take-back (level NULL) or an older level that the hold no
+        # longer has is no record of the hold that stands now
+        newest = {}
+        for row in read_rows("SELECT resource, level FROM resource_grants WHERE agent=? AND resource LIKE 'repo:%' "
+                             "ORDER BY id", (name,)):
             newest[str(row["resource"]).lower()] = row["level"]
     return sorted(repo for repo, level in repos.items()
                   if level in ("write", "deploy") or newest.get(f"repo:{str(repo).lower()}") != level)
@@ -95130,10 +95583,8 @@ class Handler(BaseHTTPRequestHandler):
                         DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?",
                                    (answer, t0, chosen, nid))
                         pictured = need_picture_note(row, chosen)   # owner API 1.285: the picture of that option
-                        asker = need_question_rows(row, answer, t0, more=pictured, via=request_via(board_hand()))
-                        passed = pictured + (f" The hub gave it to {asker} as the answer to Q-{row['question']}: do "
-                                             f"not pass it on again." if asker else need_kept_words(row)) + \
-                            need_door_task_rows(row, chosen, answer, t0)
+                        given = need_question_rows(row, answer, t0, more=pictured, via=request_via(board_hand()))
+                        passed = pictured + need_given_words(row, given) + need_door_task_rows(row, chosen, answer, t0)
                         # owner feature need_takeover: the answer to a step on an agent's screen goes to the task that
                         # waits for it, and ends that wait, as owner_message_rows does it
                         takeover = row["takeover_task"] if row["kind"] == "takeover" else None

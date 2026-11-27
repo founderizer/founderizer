@@ -409,9 +409,9 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertIn(f"A-{one['id']} proof.png", event["text"])
         self.assertIsNotNone(hub.q1("SELECT answered FROM needs WHERE id=?", (need,))["answered"])
 
-    def asked(self, question="Send me the signed contract, please."):
+    def asked(self, question="Send me the signed contract, please.", card=True):
         """A worker's task whose question the fleet manager takes to the owner (raise_needs_you question_id): the
-        task, its session's context, the question and the item."""
+        task, its session's context, the question and the item (None with card False: no item yet)."""
         text, failed = hub.call_tool("manager", "create_task", {"owner": "worker", "title": "File the contract",
                                                                 "done_when": "The contract is filed."})
         self.assertFalse(failed, text)
@@ -421,6 +421,8 @@ class Attachments(test_ui_api.OwnerAPI):
                                      context)
         self.assertFalse(failed, text)
         qid = hub.q1("SELECT id FROM questions WHERE task=?", (task,))["id"]
+        if not card:
+            return task, context, qid, None
         text, failed = hub.call_tool("manager", "raise_needs_you", {
             "title": "The signed contract", "why": "Only the owner has it", "what_to_do": "Drop the PDF on this card",
             "reason": "person", "question_id": f"Q-{qid}"})
@@ -473,6 +475,24 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertIn("The blue one.", said)
         self.assertNotIn("attached", said)
         self.assertNotIn("with its files", hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"])
+        # one card for the questions of two tasks (P7 4.3): the second task's session opens the files too (bug: a read
+        # of the card's questions takes its first one only, and the second task is refused the file that its answer
+        # names)
+        first, _, one_q, _ = self.asked("Which logo file?", card=False)
+        second, _, two_q, _ = self.asked("And the font file?", card=False)
+        text, failed = hub.call_tool("manager", "raise_needs_you", {
+            "title": "The logo and the font", "why": "Only the owner has them", "what_to_do": "Drop the files here",
+            "reason": "person", "question_ids": [f"Q-{one_q}", f"Q-{two_q}"]})
+        self.assertFalse(failed, text)
+        need = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+        brand = self.upload(PDF, mime="application/pdf", name="brand.pdf")
+        code, receipt = self.request(f"/ui/needs/{need}", self.command(answer="Both.", attachments=[brand["id"]]))
+        self.assertEqual(code, 200, receipt)
+        self.assertIn(f"with its files, to worker as the answer to Q-{one_q} and to worker as the answer to Q-{two_q}",
+                      hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"])
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (brand["id"],))
+        for tid in (first, second):
+            self.assertIsNone(hub.owner_file_refused("worker", brand["id"], row, tid, contact=True, closed=True), tid)
 
     def test_a_file_may_travel_without_a_caption(self):
         one = self.upload(PNG, name="mockup.png")

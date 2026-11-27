@@ -420,16 +420,43 @@ def next_step(what):
 
 
 SESSION_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+# The AI program of a session, by what that program gives its own processes, each sign proven on 26 November 2026
+# (the AI-session mark for every runtime, the feedback validator's S3): Claude Code gives CLAUDE_CODE_SESSION_ID to an
+# MCP server and a shell command alike; Codex (0.171.0) gives CODEX_THREAD_ID to a shell command only, and an MCP server
+# that it starts has no Codex variable but reads its name, "codex-mcp-client", in the client's initialize. Grok and
+# OpenCode gave no sign that was proven, so their sessions carry no mark: never a guessed one. The part before "/" is
+# a runtime of hub.MESSAGE_RUNTIMES. A known limit: a Codex that a Claude Code session starts has both variables, and
+# the outer Claude Code session names the command; no variable tells the inner one apart, so the order stays the best.
+# The MCP form's session is one for its server process, not one for each Codex thread, and a job that an AI session's
+# shell left running keeps that session's id. The Codex desktop app (com.openai.codex) carries Codex 0.171.0-alpha.13.2,
+# whose binary names both signs (read on 27 November 2026).
+SESSION_VARIABLES = (("CLAUDE_CODE_SESSION_ID", "claude-code"), ("CODEX_THREAD_ID", "codex"))
+SESSION_CLIENTS = {"codex-mcp-client": "codex"}
+CLIENT_SESSION = {}         # "label": this server's own session, from a client of SESSION_CLIENTS in its initialize
 
 
 def session_label():
     """`X-Fleet-Session` for every command: the AI session that runs this server or this shell call, as the hub keeps
     it with the request (hub.request_hand; the review of 20 November 2026, issue 4: the hub could not tell an AI
-    session's answer to the owner's card from the owner's own). Claude Code gives its session id to the processes that
-    it starts, an MCP server and a shell command alike. None outside such a session, or for an id that is no name."""
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
-    label = f"claude-code/{sid}" if sid else ""
-    return label if label and SESSION_NAME.fullmatch(label) else None
+    session's answer to the owner's card from the owner's own). The first of SESSION_VARIABLES that the environment
+    gives names it, with that session's own id; else, in an MCP server, the client of its initialize (`client_session`).
+    None outside such a session, or for an id that is no name."""
+    for variable, runtime in SESSION_VARIABLES:
+        sid = os.environ.get(variable, "").strip()
+        if sid:
+            label = f"{runtime}/{sid}"
+            return label if SESSION_NAME.fullmatch(label) else None
+    return CLIENT_SESSION.get("label")
+
+
+def client_session(info):
+    """The session of this MCP server from its client's initialize (`clientInfo`), for a runtime that gives its MCP
+    servers no session variable (SESSION_CLIENTS): the runtime, and an id of this server process's own, which the hub
+    keeps as the session's. Set once; a client of no known name sets nothing."""
+    name = info.get("name") if isinstance(info, dict) else None
+    runtime = SESSION_CLIENTS.get(name) if isinstance(name, str) else None
+    if runtime and "label" not in CLIENT_SESSION:
+        CLIENT_SESSION["label"] = f"{runtime}/mcp-{uuid.uuid4().hex}"
 
 
 def client_label():
@@ -6282,6 +6309,7 @@ def rpc(message):
     mid, method, params = message.get("id"), message.get("method"), message.get("params") or {}
     try:
         if method == "initialize":
+            client_session(params.get("clientInfo"))
             want = params.get("protocolVersion")
             result = {"protocolVersion": want if want in SUPPORTED else PROTOCOL,
                       "capabilities": {"tools": {"listChanged": False}},
