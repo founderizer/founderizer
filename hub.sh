@@ -36,6 +36,11 @@
 # goes onto the hub's server, as before. Such a fleet has no door on this server (HUB-INSTALL.md, "One server for
 # all"). Founderizer gives the word since version 0.1.249, when the owner chooses "1 server" for a new fleet.
 #
+# With FLEET_OWNER_ACCESS='ssh-ed25519 <key> [comment]', the public line of the fleet's owner access key (the copy of
+# the fleet holds its private half, owner-access.key), root's authorized_keys gets that line in step 15: a hub that
+# moves to a new server, which the owner's Mac did not make, can then be reached as root with that key, the way back
+# that each other server of the fleet already gives (HUB-INSTALL.md, "A hub that moves to a new server").
+#
 # With FLEET_SHAPE_STEP=one, two or each, the first team.json keeps the step of the fleet's servers that the owner
 # chose on the slider in Founderizer ("shape": {"step"}), so that both apps read one value. FLEET_SHAPE_STEP=one is
 # FLEET_HUB_SERVER=shared, and that word alone keeps the step one. It is a word of a hub's first install: for a hub
@@ -212,6 +217,36 @@ FLEET_SHAPE_STEP=$shape_step" ;;
 fi
 if [ "$hub_shared" = yes ] && [ "$manager_later" = yes ]; then
     stop "FLEET_HUB_SERVER=shared puts the manager on this server, so it does not go with FLEET_MANAGER_SERVER=later"
+fi
+# The public line of the fleet's owner access key (see the top): one Ed25519 public key, in OpenSSH's own form, and
+# nothing else. It is checked here, before the first step, so a wrong line stops the install before it changes anything.
+owner_access=${FLEET_OWNER_ACCESS:-}
+if [ -n "$owner_access" ]; then
+    access_rule="FLEET_OWNER_ACCESS is not the public line of one Ed25519 key: it is 'ssh-ed25519', then the key's 68 \
+characters, then one plain comment (letters, digits and @ . _ + : -, at most 100) or nothing, as 'ssh-keygen -y \
+-f owner-access.key' prints it from the fleet's copy. A \
+private key never goes in this word: if one went in, clear it from this shell's history (history -c) and from the \
+command line that you copied"
+    set -f      # the line is split into its words on purpose, and a * in it stays a *
+    # shellcheck disable=SC2086
+    set -- $owner_access
+    set +f
+    { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || stop "$access_rule"
+    [ "$1" = ssh-ed25519 ] && [ "${#2}" -eq 68 ] || stop "$access_rule"
+    case "$2" in
+        AAAAC3NzaC1lZDI1NTE5AAAAI*[!A-Za-z0-9+/]*) stop "$access_rule" ;;
+        AAAAC3NzaC1lZDI1NTE5AAAAI[A-P]*) owner_access="ssh-ed25519 $2" ;;       # 32 bytes: the 26th has no more
+        *) stop "$access_rule" ;;
+    esac
+    # The line keeps its own comment, which says whose key it is (the fleet's access key, or the Mac's own key).
+    if [ "$#" -eq 3 ]; then
+        case "$3" in
+            *[!A-Za-z0-9@._+:-]*) stop "$access_rule" ;;
+        esac
+        [ "${#3}" -le 100 ] || stop "$access_rule"
+        owner_access="$owner_access $3"
+    fi
+    set --
 fi
 caller_verifies=no      # the app that started this install runs verify itself as its next step (see the top)
 if [ "${FLEET_VERIFY:-}" = caller ]; then caller_verifies=yes; fi
@@ -926,6 +961,8 @@ harden() {      # this server's own hardening, the same as each server that join
                 # takes keys only would let its owner in through its provider's console alone.
     heading "this server's own hardening"
     if [ "$reclaim" = yes ]; then
+        [ -z "${owner_access:-}" ] || say "  a second claim leaves root's authorized_keys as it is: the word \
+FLEET_OWNER_ACCESS goes with the first install's line, not with --reclaim"
         if [ "$check" = yes ]; then
             plan "leave this server's SSH, npm and Tailscale settings, its swap, its memory limit and its restart \
 settings as they are: a second claim changes the owner's address and nothing else"
@@ -936,6 +973,8 @@ this step"
         return 0
     fi
     if [ "$check" = yes ]; then
+        [ -z "${owner_access:-}" ] || plan "run: python3 $tree/hubsetup.py owner-access --line '$owner_access', \
+which adds the fleet's owner access key to root's authorized_keys where it is not there yet"
         plan "run: python3 $tree/hubsetup.py harden --user $HUB_USER"
         plan "make SSH take keys only, with no X11 forwarding, through one file in sshd's own folder, which sshd \
 checks before it reloads (not where no account of this server has an SSH key, not when the session that runs it \
@@ -949,6 +988,11 @@ no such limit itself; and have this server restart by itself 10 seconds after a 
 fleet-watchdog.service loads at each start), each where this server has no such setting or watchdog of its own and \
 is no container. A part that cannot be done leaves this server as it was"
         return 0
+    fi
+    # Before the hardening, which then counts it as a key of this server (hubsetup.py has_ssh_key).
+    if [ -n "${owner_access:-}" ]; then
+        python3 "$tree/hubsetup.py" owner-access --line "$owner_access" </dev/null \
+            || say "  root's authorized_keys did not get the fleet's owner access key: the lines above say why"
     fi
     python3 "$tree/hubsetup.py" harden --user "$HUB_USER" </dev/null \
         || say "  the hardening of this server did not finish: the lines above say why"

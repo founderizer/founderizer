@@ -1772,13 +1772,46 @@ class DoorCalls(Access):
         """The coordinator, 7 November 2026: the manager's and an agent's first request for a door key were both
         refused for want of env, which no agent reads. The hub names the key in the vault after its door name. A name
         that the request gives and that breaks a rule gets that rule (F18), never the words for a name that is too
-        long, which are about the hub's own name."""
+        long, which are about the hub's own name. A setting whose name starts with the app's own name does not repeat
+        it (the supervisor's finding of 26 November 2026: DOOR_APP_ACME_CRM_ACME_CRM_REPORT_READ_KEY on the owner's
+        screen)."""
         for door, env in (("Cloudflare:Acme", "DOOR_CLOUDFLARE_ACME_KEY"),
-                          ("app:shop:STRIPE_SECRET_KEY", "DOOR_APP_SHOP_STRIPE_SECRET_KEY")):
+                          ("app:shop:STRIPE_SECRET_KEY", "DOOR_APP_SHOP_STRIPE_SECRET_KEY"),
+                          ("app:acme-crm:ACME_CRM_REPORT_READ_KEY", "DOOR_APP_ACME_CRM_REPORT_READ_KEY"),
+                          ("app:shop:SHOPIFY_TOKEN", "DOOR_APP_SHOP_SHOPIFY_TOKEN")):
             with self.subTest(door=door):
                 hub.t_request_secret("manager", {"kind": "api_key", "door": door, "why": "a test", "details": STEPS})
                 nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
                 self.assertEqual(hub.need_secret(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))["env"], env)
+        # Two settings never share one name: app:shop:SHOP_TOKEN takes DOOR_APP_SHOP_TOKEN, so app:shop:TOKEN, whose
+        # only name that is, must give env; app:crm:X_KEY holds DOOR_APP_CRM_X_KEY, so app:crm:CRM_X_KEY takes the whole
+        # name; a request again of an open card's door name joins that card (the Door area's readers). Bug: the second
+        # setting joins the first one's card, or gets "nothing to type" for the other's key.
+        hub.q("DELETE FROM needs WHERE kind='secret'")      # one asker waits for five cards at most
+        for door, env in (("app:shop:SHOP_TOKEN", "DOOR_APP_SHOP_TOKEN"), ("app:crm:X_KEY", "DOOR_APP_CRM_X_KEY"),
+                          ("app:crm:CRM_X_KEY", "DOOR_APP_CRM_CRM_X_KEY")):
+            with self.subTest(door=door):
+                hub.t_request_secret("manager", {"kind": "api_key", "door": door, "why": "a test", "details": STEPS})
+                nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
+                self.assertEqual(hub.need_secret(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))["env"], env)
+        self.assertEqual(hub.door_request_env("app:crm:CRM_X_KEY"), "DOOR_APP_CRM_CRM_X_KEY")    # its open card's name
+        with self.assertRaisesRegex(hub.ToolError, "already has the vault's name for app:shop:TOKEN: give env"):
+            hub.t_request_secret("manager", {"kind": "api_key", "door": "app:shop:TOKEN", "why": "a test",
+                                             "details": STEPS})
+        # an open card of the old long name keeps its name for a request again (the card that the owner saw), and a
+        # key of the catalog holds its name as an open card does
+        hub.q("DELETE FROM needs WHERE kind='secret'")
+        hub.t_request_secret("manager", {"kind": "api_key", "door": "app:crm:CRM_Y_KEY", "env": "DOOR_APP_CRM_CRM_Y_KEY",
+                                         "why": "a test", "details": STEPS})
+        self.assertEqual(hub.door_request_env("app:crm:CRM_Y_KEY"), "DOOR_APP_CRM_CRM_Y_KEY")
+        hub.q("DELETE FROM needs WHERE kind='secret'")
+        held = "bws://0000aaaa-0000-4000-8000-000000000077"
+        hub.TEAM.setdefault("logins", {})[held] = {"title": "DOOR_APP_SHOP_TOKEN", "kind": "api_key",
+                                                    "env": "DOOR_APP_SHOP_TOKEN"}
+        self.addCleanup(hub.TEAM["logins"].pop, held, None)
+        with self.assertRaisesRegex(hub.ToolError, "already has the vault's name for app:shop:TOKEN: give env"):
+            hub.t_request_secret("manager", {"kind": "api_key", "door": "app:shop:TOKEN", "why": "a test",
+                                             "details": STEPS})
         with self.assertRaisesRegex(hub.ToolError, "give env, a shorter name"):
             hub.t_request_secret("manager", {"kind": "api_key", "door": "app:shop:" + "A" * 60 + "_KEY",
                                              "why": "a test"})

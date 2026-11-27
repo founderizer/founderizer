@@ -1,6 +1,8 @@
 """A task's output reaches the configuration ref through the hub (helper feature task_outputs, 25 October 2026): when
 an agent delivers, its helper sends the files of outputs/T-<id>/, and the hub commits only those, signed by the agent,
-before the task closes. In-process hub, temporary Git repositories and a helper thread; no fleet or AI calls."""
+before the task closes. A running task sends its folder the same way before it delivers (report_progress outputs,
+helper feature outputs_early, 25 November 2026), and its checkout keeps its newer work over each move. In-process hub,
+temporary Git repositories and a helper thread; no fleet or AI calls."""
 import base64
 import contextlib
 import hashlib
@@ -19,6 +21,7 @@ from unittest.mock import patch
 import fleet
 import hub
 import lifecycle
+from leftovers import scratch_home
 from test_ui_api import OwnerAPI
 
 TEAM = {"hub": {"machine": "hub", "port": 8765},
@@ -28,9 +31,13 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
 VPS = TEAM["addresses"]["vps"]
 
 
+def setUpModule():
+    scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
+
+
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for cls in (HelperFiles, Checkout, Delivery, BytesSearch, TaskNumbers, Revision):
+    for cls in (HelperFiles, Checkout, Delivery, Early, BytesSearch, TaskNumbers, Revision):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -136,8 +143,8 @@ class HelperFiles(unittest.TestCase):
 
 
 class Checkout(unittest.TestCase):
-    """lifecycle.follow_config_ref and a Fleet update (Lifecycle.apply) once the hub took in a delivered task's files:
-    the untracked copies give way."""
+    """lifecycle.follow_config_ref and a Fleet update (Lifecycle.apply) once the hub took in a task's files: the copies
+    with the same bytes give way, and the agent's newer work stays as it is over the move."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="fleet-outputs-checkout-"))
@@ -150,7 +157,9 @@ class Checkout(unittest.TestCase):
         work = self.root / "hub"
         if not work.exists():
             git("clone", "-q", "-b", hub.CONFIG_BRANCH, str(self.root / "origin.git"), str(work))
-        write(work, files)
+        write(work, {path: data for path, data in files.items() if data is not None})
+        for path in [path for path, data in files.items() if data is None]:
+            (work / path).unlink()              # a file that the send no longer holds leaves the ref
         git("add", "-A", cwd=work)
         git("commit", "-q", "-m", "delivered", cwd=work)
         git("push", "-q", "origin", "HEAD:" + hub.CONFIG_BRANCH, cwd=work)
@@ -176,11 +185,15 @@ class Checkout(unittest.TestCase):
         self.assertEqual((self.kit / "outputs/T-3/report.md").read_text(), "# Report\n")
         self.assertEqual(git("status", "--porcelain", cwd=self.kit), "?? outputs/T-4/")
 
-    def test_a_file_with_other_bytes_stays_and_the_checkout_says_why(self):
+    def test_a_file_with_other_bytes_is_newer_work_that_stays_over_the_move(self):
+        """The agent writes on after a send of its folder (report_progress outputs): the move that brings the send
+        neither stops at the newer file, as it did, nor writes the sent bytes over it."""
         write(self.kit, {"outputs/T-3/report.md": "my own"})
-        self.hub_commits({"outputs/T-3/report.md": "# Report\n"})
-        self.assertIn("git merge failed", lifecycle.follow_config_ref(str(self.kit)))
+        head = self.hub_commits({"outputs/T-3/report.md": "# Report\n"})
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), head)
         self.assertEqual((self.kit / "outputs/T-3/report.md").read_text(), "my own")
+        self.assertFalse(os.path.exists(self.kit / ".git" / lifecycle.OUTPUTS_ASIDE))
 
     def test_the_next_fleet_update_after_a_delivery_takes_the_files_back_tracked(self):
         """26 October 2026, release 2026.11.53: the update merged over the untracked copy of a file that its helper
@@ -194,18 +207,107 @@ class Checkout(unittest.TestCase):
         self.assertEqual((self.kit / "outputs/T-1/route-check.md").read_text(), "# Route\n")
         self.assertEqual(git("status", "--porcelain", cwd=self.kit), "?? outputs/T-2/")
 
-    def test_a_fleet_update_over_a_file_with_other_bytes_fails_and_names_it(self):
+    def test_a_fleet_update_keeps_a_tasks_newer_file_and_moves(self):
+        """Before, an update over a file with other bytes failed (machine_failed) until the file changed: with a send
+        before delivery, that is every update while a task writes on after its send."""
         write(self.kit, {"outputs/T-1/route-check.md": "my own"})
         self.hub_commits({"outputs/T-1/route-check.md": "# Route\n"})
-        restarted, state, detail = self.update(self.hub_commits({"knowledge/services.md": "# Services\n"}))
-        self.assertEqual((restarted, state), (False, "failed"))
-        self.assertIn("git merge failed", detail)
-        self.assertIn("outputs/T-1/route-check.md", detail)
+        update = self.hub_commits({"knowledge/services.md": "# Services\n"})
+        self.assertEqual(self.update(update), (True, "updating", "Updating Fleet while idle."))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), update)
         self.assertEqual((self.kit / "outputs/T-1/route-check.md").read_text(), "my own")
 
+    def test_a_sent_folder_that_the_agent_changes_never_stops_the_moves(self):
+        """Each send of a running task's folder comes back to its checkout tracked, and the agent changes and removes
+        its files after a send. The checkout moves on each time (before, a changed tracked file stopped every later
+        move: "the checkout has its own changes"), keeps the agent's newer bytes and its removals (also of a file that
+        the move changes and does not remove), and is clean again once the last send holds what the folder holds."""
+        out = "outputs/T-5/"
+        write(self.kit, {out + "a.md": "one", out + "b.md": "bee", out + "d.md": "dee"})
+        self.hub_commits({out + "a.md": "one", out + "b.md": "bee", out + "d.md": "dee"})     # the first send
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual(git("status", "--porcelain", cwd=self.kit), "")
+        write(self.kit, {out + "a.md": "two", out + "b.md": "bee two"})
+        (self.kit / out / "d.md").unlink()
+        self.hub_commits({out + "a.md": "two", out + "b.md": "bee two", out + "d.md": None})   # the second send
+        write(self.kit, {out + "a.md": "three", out + "c.md": "sea"})            # the agent writes on after it
+        (self.kit / out / "b.md").unlink()
+        head = self.hub_commits({"knowledge/services.md": "# Services\n"})     # data: code needs a signed release
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), head)
+        self.assertEqual((self.kit / "knowledge/services.md").read_text(), "# Services\n")
+        self.assertEqual((self.kit / out / "a.md").read_text(), "three")
+        self.assertFalse((self.kit / out / "b.md").exists())
+        self.assertFalse((self.kit / out / "d.md").exists())
+        self.assertEqual(git("status", "--porcelain", cwd=self.kit),               # git() strips the first space
+                         f"M {out}a.md\n D {out}b.md\n?? {out}c.md")
+        self.hub_commits({out + "a.md": "three", out + "b.md": None, out + "c.md": "sea"})    # the delivery
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual(git("status", "--porcelain", cwd=self.kit), "")
+        self.assertFalse(os.path.exists(self.kit / ".git" / lifecycle.OUTPUTS_ASIDE))
 
-class Delivery(OwnerAPI):
-    """deliver_result asks the session's helper for the files, and the hub commits them before the task closes."""
+    def test_a_move_that_fails_gives_the_agent_its_files_back(self):
+        """A file with the bytes that the move brings leaves its place for the merge too: when the merge then fails
+        (here an untracked file outside outputs/ that the move would write over), the agent still finds it, and its
+        next send does not take it off the ref."""
+        out = "outputs/T-7/"
+        write(self.kit, {out + "a.md": "sent", "knowledge/notes.md": "mine"})
+        self.hub_commits({out + "a.md": "sent", "knowledge/notes.md": "the hub's"})
+        self.assertIn("git merge failed", lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual((self.kit / out / "a.md").read_text(), "sent")
+        self.assertFalse(os.path.exists(self.kit / ".git" / lifecycle.OUTPUTS_ASIDE))
+
+    def test_what_a_stop_left_aside_goes_back_only_where_git_left_the_file(self):
+        """A stop of the helper between give_way_to and put_back left the agent's newer file only in the git folder:
+        the next move puts it back, but not over a file that the agent wrote again since, and that copy is kept."""
+        out = "outputs/T-6/"
+        write(self.kit, {out + "a.md": "sent", out + "b.md": "sent"})
+        self.hub_commits({out + "a.md": "sent", out + "b.md": "sent"})
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        aside = self.kit / ".git" / lifecycle.OUTPUTS_ASIDE / "kept"
+        write(aside, {out + "a.md": "newer", out + "b.md": "newer"})
+        write(self.kit, {out + "b.md": "written again"})
+        self.hub_commits({"knowledge/services.md": "# Services\n"})
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        self.assertEqual((self.kit / out / "a.md").read_text(), "newer")
+        self.assertEqual((self.kit / out / "b.md").read_text(), "written again")
+        left = self.kit / ".git" / lifecycle.OUTPUTS_LEFT / out
+        self.assertEqual((left / "b.md.1").read_text(), "newer")
+        self.assertFalse(os.path.exists(self.kit / ".git" / lifecycle.OUTPUTS_ASIDE))
+        write(aside, {out + "b.md": "newest"})                  # a second stop, and the agent writes again
+        write(self.kit, {out + "b.md": "written a third time"})
+        lifecycle.put_back_now(str(self.kit))                   # the helper's start, or its next send
+        self.assertEqual((left / "b.md.1").read_text(), "newer")
+        self.assertEqual((left / "b.md.2").read_text(), "newest")
+        self.assertEqual(lifecycle.left_copies(str(self.kit), "T-6"),
+                         [f".git/{lifecycle.OUTPUTS_LEFT}/{out}b.md.1", f".git/{lifecycle.OUTPUTS_LEFT}/{out}b.md.2"])
+
+    def test_the_helpers_send_puts_back_what_a_stop_left_and_names_the_left_copies(self):
+        """A stop of the helper in the middle of a move left the agent's newer file in the git folder: its next send
+        of the folder takes it from its place, not the old bytes, and names the copies that a move could not put
+        back."""
+        out = "outputs/T-8/"
+        write(self.kit, {out + "a.md": "sent"})
+        self.hub_commits({out + "a.md": "sent"})
+        self.assertIsNone(lifecycle.follow_config_ref(str(self.kit)))
+        write(self.kit / ".git" / lifecycle.OUTPUTS_ASIDE / "kept", {out + "a.md": "newer"})
+        write(self.kit / ".git" / lifecycle.OUTPUTS_LEFT, {out + "b.md.1": "older"})
+        sent = []
+
+        def http(method, path, body, timeout=0):
+            sent.append(body)
+            return 200, {"taken": True}
+        helper = type("Stub", (), {"agent": "vps", "say": lambda self, text: None})()
+        with patch.object(fleet, "KIT", str(self.kit)), patch.object(fleet, "http", http):
+            fleet.Helper.send_outputs(helper, {"task": "T-8", "outputs": "token"})
+        self.assertEqual([(f["path"], base64.b64decode(f["data"])) for f in sent[0]["files"]],
+                         [(out + "a.md", b"newer")])
+        self.assertEqual((sent[0]["folder"], sent[0]["left"]), (True, [f".git/{lifecycle.OUTPUTS_LEFT}/{out}b.md.1"]))
+
+
+class Outputs(OwnerAPI):
+    """The fixture of Delivery and Early: a hub, its configuration ref, the agent's own checkout and its helper. It
+    holds no test of its own."""
 
     def setUp(self):
         super().setUp()
@@ -264,6 +366,10 @@ class Delivery(OwnerAPI):
 
     def origin(self, *args):
         return git(*args, cwd=self.root / "origin.git")
+
+
+class Delivery(Outputs):
+    """deliver_result asks the session's helper for the files, and the hub commits them before the task closes."""
 
     def test_the_files_are_committed_by_the_agent_before_the_task_closes(self):
         """Also a file that .gitignore names (run.log): before, git refused it, and the whole delivery with it."""
@@ -548,6 +654,273 @@ class Delivery(OwnerAPI):
         first = hub.commit_outputs("vps", t, files)
         self.assertEqual(hub.commit_outputs("vps", t, files), first)
         self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), first)
+
+
+class Early(Outputs):
+    """A running task sends its outputs folder before it delivers (report_progress outputs; gap G3 of the fleet
+    workspace review): another agent reads the files on the configuration ref while the task runs, each send replaces
+    the folder there, and the delivery sends the last version."""
+
+    def setUp(self):
+        super().setUp()
+        self.features(["mcp_program", "task_outputs", "outputs_early"])
+        for held in (hub.OUTPUTS, hub.OUTPUTS_NEWEST):          # another test's late delivery of a task 1
+            keep = patch.dict(held, clear=True)
+            keep.start()
+            self.addCleanup(keep.stop)
+        self.out = f"outputs/{self.ref}/"
+        self.copies = []                    # the helper's copies that a move could not put back (lifecycle.left_copies)
+
+    def sender(self, before=None):
+        """The agent's helper for the next request of the hub: it sends the folder as it is then, and says whether
+        the folder is on its machine, as fleet.Helper.send_outputs does."""
+        seen = (hub.q1("SELECT MAX(id) AS n FROM events") or {"n": 0})["n"] or 0
+
+        def run():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                row = hub.q1("SELECT extra FROM events WHERE agent='vps' AND kind='outputs' AND id>? ORDER BY id DESC "
+                             "LIMIT 1", (seen,))
+                if row:
+                    extra = json.loads(row["extra"])
+                    if before:
+                        before()
+                    self.answers.append(self.request("/helper/outputs/vps", self.body(extra), source=VPS))
+                    return
+                time.sleep(0.05)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 15)
+        return thread
+
+    def body(self, extra):
+        files, skipped = fleet.collect_outputs(str(self.checkout), extra["task"])
+        return {"outputs": extra["outputs"], "task": extra["task"], "files": files, "skipped": skipped,
+                "folder": fleet.output_folder_held(str(self.checkout), extra["task"]), "left": self.copies}
+
+    def send(self, note="Half of the report."):
+        return hub.call_tool("vps", "report_progress", {"task_id": self.ref, "note": note, "outputs": True},
+                             ("test-generation", self.ref, 1))
+
+    def sent(self, note="Half of the report."):
+        self.sender()
+        text, error = self.send(note)
+        self.assertFalse(error, text)
+        return text
+
+    def held(self):
+        return self.origin("ls-tree", "-r", "--name-only", hub.CONFIG_BRANCH, self.out).split()
+
+    def test_a_running_task_sends_its_folder_and_another_agent_reads_it(self):
+        """13 November 2026: an agent needed outputs/T-526/gsc-alert-decision.md while T-526 ran, and the manager had
+        to tell the other agent to deliver early. The same files again make no commit."""
+        out = self.out
+        write(self.checkout, {out + "decision.md": "# Decision\n"})
+        text = self.sent()
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertEqual(text, f"Noted. Your helper sent {out} to the configuration ref as {commit[:12]}: "
+                               f"{out}decision.md. Others read a file with git fetch origin, then git show "
+                               f"origin/config:{out}<file>. Each later send, and your delivery, replaces the folder "
+                               f"there.")
+        self.assertEqual(self.origin("show", f"{hub.CONFIG_BRANCH}:{out}decision.md"), "# Decision")
+        self.assertEqual(self.origin("log", "-1", "--format=%an%n%s", hub.CONFIG_BRANCH),
+                         f"Fleet agent vps\nvps sent {self.ref}: 1 file of its output")
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (self.task,))["state"], "working")
+        self.assertEqual(hub.q1("SELECT text FROM notes WHERE task=?", (self.task,))["text"], "Half of the report.")
+        self.copies = [f".git/{lifecycle.OUTPUTS_LEFT}/{out}decision.md.1"]
+        self.assertEqual(self.sent("Again."), f"Noted. Nothing changed since your last send: the configuration ref "
+                                              f"holds {out} as {commit[:12]}: {out}decision.md. Your machine keeps "
+                                              f"copies that a move of your checkout could not put back, because you "
+                                              f"wrote the file again: {self.copies[0]}.")
+        self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), commit)
+
+    def test_a_later_send_replaces_the_folder_and_the_delivery_sends_the_last_version(self):
+        """A file that left the folder leaves the configuration ref too, so a reader never takes a stale one; an
+        empty folder clears it (a removed draft never reads as delivered output); the delivery's result reads as
+        before."""
+        out = self.out
+        write(self.checkout, {out + "a.md": "one", out + "b.md": "bee"})
+        self.sent()
+        self.assertEqual(self.held(), [out + "a.md", out + "b.md"])
+        write(self.checkout, {out + "a.md": "two"})
+        (self.checkout / out / "b.md").unlink()
+        self.assertIn(f": {out}a.md. Removed from it: {out}b.md. Others read", self.sent())
+        self.assertEqual(self.held(), [out + "a.md"])
+        self.assertEqual(self.origin("log", "-1", "--format=%s", hub.CONFIG_BRANCH),
+                         f"vps sent {self.ref}: 1 file of its output, 1 removed")
+        (self.checkout / out / "a.md").unlink()
+        text = self.sent()
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertEqual(text, f"Noted. The configuration ref holds no file of {out} now ({commit[:12]}). Removed "
+                               f"from it: {out}a.md.")
+        self.assertEqual(self.held(), [])
+        write(self.checkout, {out + "a.md": "three"})
+        self.sender()
+        text, error = self.deliver(where_output_is=out + "a.md")
+        self.assertFalse(error, text)
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertEqual(text, f"Delivered. {self.ref} is completed. Its files are on the configuration ref as "
+                               f"{commit[:12]}: {out}a.md. You are done with it: stop now and end your turn; your "
+                               f"session closes when it ends.")
+        self.assertEqual(self.origin("show", f"{hub.CONFIG_BRANCH}:{out}a.md"), "three")
+        self.assertEqual(self.origin("log", "-1", "--format=%s", hub.CONFIG_BRANCH),
+                         f"vps delivered {self.ref}: 1 file of its output")
+        text, error = self.send()
+        self.assertTrue(error, text)
+        self.assertIn("already completed", text)                   # a task that ended takes no send
+
+    def test_a_machine_without_the_folder_keeps_the_earlier_send_and_names_it(self):
+        """An agent that moved to another machine: its delivery there finds no folder, and the early files stay on
+        the ref, named in the result, instead of leaving it."""
+        out = self.out
+        write(self.checkout, {out + "a.md": "one"})
+        self.sent()
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        shutil.rmtree(self.checkout / "outputs")
+        self.sender()
+        text, error = self.deliver(where_output_is=out + "a.md")
+        self.assertFalse(error, text)
+        self.assertIn(f"Delivered. {self.ref} is completed. The agent's machine holds nothing of its own in {out}, so "
+                      f"the configuration ref keeps the files of an earlier send: {out}a.md.", text)
+        self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), commit)
+
+    def test_a_send_with_nothing_to_add_or_remove_runs_no_git(self):
+        """Before sends before delivery, a delivery with no file used no git: a screen task's folder, which holds only
+        the computer-use/ that Fleet makes by itself. A short fault of git must not refuse such a delivery now either."""
+        write(self.checkout, {f"{self.out}computer-use/capture-1.png": b"x"})
+        with patch.object(hub, "outputs_held", side_effect=AssertionError("git")), \
+                patch.object(hub, "commit_outputs", side_effect=AssertionError("git")):
+            self.assertEqual(self.sent(), f"Noted. No file of {self.out} was sent, so the configuration ref is as it "
+                                          f"was.")
+            self.sender()
+            text, error = self.deliver(where_output_is="the screen")
+        self.assertFalse(error, text)
+        self.assertEqual(text, f"Delivered. {self.ref} is completed. You are done with it: stop now and end your turn; "
+                               f"your session closes when it ends.")
+
+    def test_a_hub_with_no_mark_of_the_folder_reads_the_ref(self):
+        """The marks of what the ref holds go at each start (a restored database would keep stale ones), and with
+        none an empty folder of the agent's still takes the files of its earlier send off the ref."""
+        out = self.out
+        write(self.checkout, {out + "a.md": "one"})
+        self.sent()
+        hub.settle_task_numbers()                               # the hub's start, after a restore
+        self.assertIsNone(hub.kv_get(hub.OUTPUTS_SENT + str(self.task)))
+        (self.checkout / out / "a.md").unlink()
+        self.assertIn(f"Removed from it: {out}a.md.", self.sent())
+        self.assertEqual(self.held(), [])
+
+    def test_an_older_helper_is_asked_for_nothing_and_the_answer_says_so(self):
+        """Its checkout would track the sent files and then stop moving at the agent's next change of one."""
+        self.features(["mcp_program", "task_outputs"])
+        write(self.checkout, {f"{self.out}report.md": "x"})
+        before = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        text, error = self.send()
+        self.assertFalse(error, text)
+        self.assertEqual(text, f"Noted. Not sent: your machine's helper cannot send {self.out} before delivery yet. "
+                               f"It takes the release that can by itself; until then, deliver_result sends the "
+                               f"folder.")
+        self.assertIsNone(hub.q1("SELECT id FROM events WHERE kind='outputs'"))
+        self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), before)
+        self.assertEqual(hub.q1("SELECT text FROM notes WHERE task=?", (self.task,))["text"], "Half of the report.")
+
+    def test_one_attempt_sends_its_folder_a_counted_number_of_times(self):
+        """Each send that commits keeps each changed file in the ref's history for good: a count, no clock, ends them
+        in one attempt. A refused send and one that changes nothing do not count, and a waiting delivery of an earlier
+        attempt, or one that went late, refuses none."""
+        key = hub.OUTPUTS_EARLY_SENDS + str(self.task)
+        hub.kv_set(key, f"1:{hub.OUTPUTS_EARLY_MAX - 2}")
+        hub.OUTPUTS["now"] = {"agent": "vps", "task": self.task, "attempt": 1, "answer": None, "gave_up": False,
+                              "late": False, "early": False}
+        self.assertEqual(self.send()[0], f"Noted. Not sent: your delivery of {self.ref} sends {self.out} now.")
+        hub.OUTPUTS["now"].update(attempt=0)                     # a delivery of an earlier attempt
+        hub.OUTPUTS["late"] = {"agent": "vps", "task": self.task, "attempt": 1, "answer": None, "gave_up": False,
+                               "late": True, "early": False}
+        write(self.checkout, {f"{self.out}a.md": "one"})
+        self.assertIn("Your helper sent", self.sent())
+        self.assertIn("Nothing changed since your last send", self.sent())
+        self.assertEqual(hub.kv_get(key), f"1:{hub.OUTPUTS_EARLY_MAX - 1}")
+        write(self.checkout, {f"{self.out}a.md": "two"})
+        self.assertIn("Your helper sent", self.sent())
+        text, error = self.send()
+        self.assertFalse(error, text)
+        self.assertEqual(text, f"Noted. Not sent: this attempt sent {self.out} {hub.OUTPUTS_EARLY_MAX} times already. "
+                               f"Send it again with deliver_result.")
+
+    def test_files_that_come_after_the_wait_land_while_the_task_runs_and_its_session_hears(self):
+        """Plan C7, as for a delivery: no clock refuses them."""
+        out = self.out
+        write(self.checkout, {out + "a.md": "one"})
+        helper = self.sender(before=lambda: time.sleep(1))
+        with patch.object(hub, "OUTPUTS_WAIT", 0.3):
+            text, error = self.send()
+        self.assertFalse(error, text)
+        self.assertEqual(text, f"Noted. Your helper has not sent {out} yet: the hub commits it when it comes, and a "
+                               f"message here names the commit.")
+        helper.join(15)
+        self.assertEqual(self.answers, [(200, {"taken": True})])
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertEqual(self.held(), [out + "a.md"])
+        said = hub.q1("SELECT text, task FROM events WHERE agent='vps' AND kind='say' ORDER BY id DESC LIMIT 1")
+        self.assertEqual(said["task"], self.task)
+        self.assertIn(f"[hub] The files of {out} that you sent with report_progress came after that call. Your helper "
+                      f"sent {out} to the configuration ref as {commit[:12]}: {out}a.md.", said["text"])
+        self.assertNotIn(self.task, hub.OUTPUTS_NEWEST)
+
+    def test_a_late_send_lands_nothing_after_a_later_send_attempt_owner_hold_or_end(self):
+        """An older folder never lands over a newer one, and files that come after the task moved on (a later
+        attempt, another owner, a Stop or a Pause, its end) stay out."""
+        out = self.out
+        write(self.checkout, {out + "a.md": "old"})
+        with patch.object(hub, "OUTPUTS_WAIT", 0.3):
+            self.assertFalse(self.send()[1])
+        first = json.loads(hub.q1("SELECT extra FROM events WHERE kind='outputs' ORDER BY id LIMIT 1")["extra"])
+        old = self.body(first)
+        write(self.checkout, {out + "a.md": "new"})
+        self.sent()
+        commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertFalse(hub.outputs_waiting(first["outputs"], "vps"))      # its helper is not asked any more
+        self.assertEqual(self.request("/helper/outputs/vps", old, source=VPS), (200, {"taken": False}))
+        hub.ins("INSERT INTO holds(task,kind,by,state,created,attempt) VALUES(?,'pause','owner','released',?,1)",
+                (self.task, hub.now()))
+        moves = (("UPDATE tasks SET attempt=2 WHERE id=?", "UPDATE tasks SET attempt=1 WHERE id=?"),
+                 ("UPDATE tasks SET owner='other' WHERE id=?", "UPDATE tasks SET owner='vps' WHERE id=?"),
+                 ("UPDATE holds SET state='requested' WHERE task=?", "UPDATE holds SET state='released' WHERE task=?"),
+                 ("UPDATE tasks SET state='canceled' WHERE id=?", None))
+        for move, back in moves:
+            with patch.object(hub, "OUTPUTS_WAIT", 0.3):
+                self.assertFalse(self.send()[1], move)
+            late = json.loads(hub.q1("SELECT extra FROM events WHERE kind='outputs' ORDER BY id DESC LIMIT 1")["extra"])
+            hub.q(move, (self.task,))
+            write(self.checkout, {out + "a.md": "after the move"})
+            self.assertEqual(self.request("/helper/outputs/vps", self.body(late), source=VPS), (200, {"taken": True}),
+                             move)
+            self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), commit, move)
+            if back:
+                hub.q(back, (self.task,))
+        self.assertEqual(self.origin("show", f"{hub.CONFIG_BRANCH}:{out}a.md"), "new")
+        self.assertIsNone(hub.q1("SELECT id FROM events WHERE agent='vps' AND kind='say'"))
+
+    def test_the_commits_of_one_folder_land_one_at_a_time_and_in_the_order_of_their_sends(self):
+        """A send whose files came first but whose commit waits behind another's (OUTPUTS_COMMIT) lands nothing once
+        a newer send of the folder began (OUTPUTS_NEWEST): else the older folder would land over the newer one."""
+        out, t = self.out, hub.get_task(self.task)
+        before = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        answer = {"files": {out + "a.md": b"older"}, "skipped": [], "folder": True}
+        said = []
+        hub.OUTPUTS_NEWEST[self.task] = "older"
+        with hub.OUTPUTS_COMMIT:
+            commit = threading.Thread(target=lambda: said.append(hub.outputs_sentence("vps", t, answer, early="older")))
+            commit.start()
+            commit.join(0.5)
+            self.assertTrue(commit.is_alive())                      # it waits for the commit before it
+            hub.OUTPUTS_NEWEST[self.task] = "newer"                  # a newer send began meanwhile
+        commit.join(15)
+        self.assertEqual(said, [None])
+        self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), before)
+        hub.OUTPUTS_NEWEST[self.task] = "older"
+        self.assertIn("Your helper sent", hub.outputs_sentence("vps", t, answer, early="older"))
+        self.assertEqual(self.held(), [out + "a.md"])
 
 
 class BytesSearch(unittest.TestCase):

@@ -1117,6 +1117,144 @@ def put_file(path, text, mode, uid=None, gid=None):
         raise
 
 
+OWNER_ACCESS_NOTE = re.compile(r"[A-Za-z0-9@._+:-]{1,100}")   # a line's own comment, which step 15 keeps as it is
+# The first 19 bytes of every Ed25519 public key in SSH's own form: the length and name of its kind, then the length of
+# its 32 bytes (RFC 8709).
+ED25519_START = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
+
+
+def owner_access_key(line):
+    """The key of a public line of one Ed25519 key ("ssh-ed25519 <base64> [comment]"), as base64, or None for any
+    other text: another kind of key, options before the key, a key of another length, two lines."""
+    parts = str(line).split()
+    if len(parts) not in (2, 3) or parts[0] != "ssh-ed25519" or "\n" in str(line).strip():
+        return None
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except ValueError:
+        return None
+    if len(blob) != len(ED25519_START) + 32 or not blob.startswith(ED25519_START):
+        return None
+    if len(parts) == 3 and not OWNER_ACCESS_NOTE.fullmatch(parts[2]):
+        return None
+    return base64.b64encode(blob).decode()         # its one form: an older Python takes some forms that sshd does not
+
+
+def owner_access(line, root=""):
+    """As root: the fleet's owner access key in root's authorized_keys, once (hub.sh's word FLEET_OWNER_ACCESS). Its
+    private half is in the fleet's copy, so a hub that moved to a server that the owner's Mac did not make can be
+    reached as root with it, as each other server of the fleet can (OwnerAccessKey, OwnerAccessSweep). It adds one
+    line with its own plain comment (OWNER_ACCESS_NOTE), or with none, and changes no other line, no mode of a file
+    that is there, and no setting of sshd.
+    A line that holds the key after its kind, with any options or comment, is the key already. The key then counts
+    for the hardening of step 15 (has_ssh_key), as each key line does."""
+    key = owner_access_key(line)
+    note = "".join(" " + word for word in str(line).split()[2:3])     # the line's own comment, kept as it is
+    if key is None:
+        raise Stop("FLEET_OWNER_ACCESS is not the public line of one Ed25519 key, so root's authorized_keys stays as it "
+                   "is")
+    folder = root + "/root/.ssh"
+    path = folder + "/authorized_keys"
+    if not os.path.lexists(folder):
+        os.makedirs(root + "/root", exist_ok=True)       # root's home: always there on a server, not in a test's folder
+        os.mkdir(folder, 0o700)
+        os.chmod(folder, 0o700)
+    named = "SHA256:" + base64.b64encode(hashlib.sha256(base64.b64decode(key)).digest()).decode().rstrip("=")
+    # The folder and the file are opened as themselves and never through a link, and the file never waits (a FIFO in
+    # its place): it is read and written through that one descriptor, and only when it is a plain file.
+    try:
+        at = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Stop(f"{folder} could not be opened as a folder of its own ({e.strerror}), so root's keys stay as they are"
+                   ) from None
+    try:
+        fd = os.open("authorized_keys", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600,
+                     dir_fd=at)
+    except OSError as e:
+        raise Stop(f"{path} could not be opened as a file of its own ({e.strerror}), so root's keys stay as they are"
+                   ) from None
+    finally:
+        os.close(at)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Stop(f"{path} is not a plain file, so root's keys stay as they are")
+    with os.fdopen(fd, "r+b") as f:
+        text = f.read().decode("utf-8", errors="replace")
+        held = [found for found in map(held_line, text.split("\n")) if found and found[0] == key]
+        if held:
+            limited = any(options for _key, options in held)
+            say(f"  root's authorized_keys has the fleet's owner access key already ({named})"
+                + ("; its line keeps its own options, which limit root's login with it" if limited else ""))
+            return
+        f.write((("\n" if text and not text.endswith("\n") else "") +
+                 f"ssh-ed25519 {key}{note}\n").encode())
+    say(f"  root's authorized_keys has the fleet's owner access key now ({named}, which `ssh-keygen -lf` of the copy's "
+        f"key file shows too)")
+
+
+# The options that sshd takes before a key in authorized_keys (sshd(8), AUTHORIZED_KEYS FILE FORMAT). A line whose
+# options are not all of these is a line that sshd refuses, so its key is not there.
+SSHD_KEY_OPTIONS = {"agent-forwarding", "cert-authority", "command", "environment", "expiry-time", "from",
+                    "no-agent-forwarding", "no-port-forwarding", "no-pty", "no-user-rc", "no-x11-forwarding",
+                    "permitlisten", "permitopen", "port-forwarding", "principals", "pty", "no-touch-required",
+                    "verify-required", "restrict", "tunnel", "user-rc", "x11-forwarding"}
+
+
+def split_options(options):
+    """The options of one line, split at each comma outside double quotes, or None when a quote is not closed. A
+    backslash goes with a double quote after it, inside or outside quotes, as sshd's sshkey_advance_past_options."""
+    parts, quoted, start, i = [], False, 0, 0
+    while i < len(options):
+        if options[i] == "\\" and options[i + 1:i + 2] == '"':
+            i += 1
+        elif options[i] == '"':
+            quoted = not quoted
+        elif options[i] == "," and not quoted:
+            parts.append(options[start:i])
+            start = i + 1
+        i += 1
+    if quoted:
+        return None
+    return parts + [options[start:]]
+
+
+def held_line(line):
+    """(the Ed25519 key, its options) of one line of authorized_keys as sshd reads it, or None: for a comment, a blank
+    line, a line of another kind, a line whose options sshd refuses, and a cert-authority line, whose key signs
+    certificates and logs nobody in. Words are cut at spaces and tabs only."""
+    text = line.lstrip(" \t")
+    if not text or text.startswith("#"):
+        return None
+    options = ""
+    if not text.startswith(("ssh-ed25519 ", "ssh-ed25519\t")):
+        quoted, i = False, 0
+        while i < len(text) and (quoted or text[i] not in " \t"):
+            if text[i] == "\\" and text[i + 1:i + 2] == '"':
+                i += 1
+            elif text[i] == '"':
+                quoted = not quoted
+            i += 1
+        if quoted:
+            return None
+        options, text = text[:i], text[i:].lstrip(" \t")
+        parts = split_options(options)
+        if parts is None:
+            return None
+        names = [re.match(r"([A-Za-z0-9-]+)(=\".*\")?$", part, re.S) for part in parts]
+        if not all(names) or any(m.group(1).lower() not in SSHD_KEY_OPTIONS for m in names):
+            return None
+        if any(m.group(1).lower() == "cert-authority" for m in names):
+            return None
+    words = re.split(r"[ \t]+", text.strip(" \t"))
+    return (words[1], options) if len(words) >= 2 and words[0] == "ssh-ed25519" else None
+
+
+def held_key(line):
+    """The Ed25519 login key of one line of authorized_keys, or None (held_line)."""
+    found = held_line(line)
+    return found[0] if found else None
+
+
 def has_ssh_key(root=""):
     """Whether an account of this server logs in with an SSH key: a key line in root's authorized_keys or in that of a
     user in /home. Without one, a server whose SSH takes keys only would let nobody in. Any key line counts, also one
@@ -4742,6 +4880,10 @@ def cmd_tcp(args):
     hub_tcp(check=args.check)
 
 
+def cmd_owner_access(args):
+    owner_access(args.line)
+
+
 def cmd_agent_list(args):
     """One line for each agent of this machine: its name, its runtime and its OS user. The installers read it, so
     it prints nothing else."""
@@ -4909,6 +5051,10 @@ def main(argv=None):
     hd.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     hd.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     hd.set_defaults(fn=cmd_harden)
+    oa = sub.add_parser("owner-access", help="as root: the fleet's owner access key in root's authorized_keys, where "
+                                             "it is not there (hub.sh's word FLEET_OWNER_ACCESS)")
+    oa.add_argument("--line", required=True, help="the key's public line: 'ssh-ed25519 <base64> [comment]'")
+    oa.set_defaults(fn=cmd_owner_access)
     tc = sub.add_parser("tcp")
     tc.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     tc.set_defaults(fn=cmd_tcp)

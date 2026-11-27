@@ -373,6 +373,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
             "task_outputs",         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
             "chat_turns",           # it sends its owner chat's turn ends to the hub (fleet.Helper.report_chat_turns)
+            # its checkout keeps a running task's own outputs over each move (give_way_to), so the hub asks it for the
+            # folder before delivery too (report_progress outputs)
+            "outputs_early",
             "status_now",           # it reports at once when the hub asks (event status_now, report_soon)
             "chat_warm",            # it starts the owner chat before a message when the hub says so (keep_chat)
             "conversation_reads",   # a conversation's event stays until its session reads it (plan C5)
@@ -2283,27 +2286,157 @@ def checkout_branch(kit, run=None):
     return out if code == 0 and BRANCH_NAME.fullmatch(out) else None
 
 
-def give_way_to(kit, target, run=None):
-    """Make room for a fast-forward to `target`: a file of outputs/ that this checkout holds untracked and that
-    `target` adds with the same bytes is removed, and the merge brings it back tracked. It is one that the hub took
-    in from here, a task's output that this helper sent when its agent delivered (helper feature task_outputs). A
-    file with other bytes stays, and the merge then says why it cannot; but a name that .gitignore names (run.log)
-    is one that git writes over without a word, so the delivered bytes take its place. Every fast-forward of a
-    checkout that delivers goes through this: the task-start sync (follow_config_ref) and the Fleet update
-    (Lifecycle.apply)."""
-    run = run or _run
+# give_way_to sets a task's own files aside here, in the checkout's git folder, while a fast-forward runs: kept/<path>
+# holds a file's bytes, gone/<path> marks a file that the agent removed (put_back puts both back). A copy that put_back
+# cannot put back, because the agent wrote the file again meanwhile, goes to OUTPUTS_LEFT as <path>.<n>, a name of its
+# own that nothing writes over or removes, and each later send of that task names it (left_copies).
+OUTPUTS_ASIDE = "fleet-outputs-aside"
+OUTPUTS_LEFT = "fleet-outputs-left"
+# One step on outputs/ at a time in this process: a move (give_way_to, the merge, put_back), and the put_back of the
+# helper's start and of each send of a folder (put_back_now), which must not put files back in the middle of a merge.
+OUTPUTS_MOVE = threading.RLock()
 
+
+def outputs_aside(kit, run=None, name=OUTPUTS_ASIDE):
+    """The folder `name` of this checkout's git folder (OUTPUTS_ASIDE or OUTPUTS_LEFT), or None."""
+    code, out, _ = (run or _run)(["git", "-C", kit, "rev-parse", "--git-path", name], timeout=60)
+    return os.path.join(kit, out.strip()) if code == 0 and out.strip() else None
+
+
+def outputs_path(kit, path):
+    """True for a path of outputs/ that names a place inside the checkout itself: no folder of it is a symbolic link
+    to another place."""
+    full = os.path.join(kit, path)
+    return path.startswith("outputs/") and ".." not in path.split("/") and \
+        os.path.realpath(full) == os.path.join(os.path.realpath(kit), *path.split("/"))
+
+
+def give_way_to(kit, target, run=None):
+    """Make room in outputs/ for a fast-forward to `target`. The agent's tasks write their files there, and its helper
+    sends them to the hub (helper feature task_outputs): when the agent delivers, and while a task runs (report_progress
+    outputs, helper feature outputs_early). So the ref brings back files that this checkout holds, maybe changed since.
+    Each file of outputs/ that the move changes and that this checkout does not hold as HEAD does is the agent's work:
+    it is set aside in the checkout's git folder first (OUTPUTS_ASIDE: its bytes, or the mark that the agent removed
+    it), then goes back to HEAD's state, so that the merge can move it, and put_back puts the agent's version back
+    after the merge, also after a merge that failed; after a stop in between, at the helper's start, before
+    its next send of a folder, or at the next move (put_back_now). So the move changes
+    nothing of that work, and a file with the bytes that `target` brings ends tracked and clean. A file that the agent
+    removed before the move that brings it, and that HEAD does not hold, cannot be told from another task's new file:
+    the merge brings it. A path that is not a plain file here, or that git cannot read, or that cannot be set aside,
+    stays, and the merge then says why it cannot move. Every fast-forward of a checkout that delivers goes through
+    this: the task-start sync (follow_config_ref) and the Fleet update (Lifecycle.apply)."""
+    with OUTPUTS_MOVE:
+        _give_way_to(kit, target, run or _run)
+
+
+def _give_way_to(kit, target, run):
     def git(*args):
         code, out, _ = run(["git", "-C", kit, *args], timeout=60)
         return out.strip() if code == 0 else None
 
-    added = git("diff", "--name-only", "--diff-filter=A", "-z", "HEAD", target, "--", "outputs/")
-    for path in (added or "").split("\0"):
+    put_back(kit, run)
+    aside = outputs_aside(kit, run)
+    if not aside:
+        return                          # no git folder to keep the agent's work in: the merge says what stops it
+    # each changed path with its blob at HEAD and at target, in one read: ":<mode> <mode> <blob> <blob> <how>", path
+    raw = (git("diff", "--raw", "-z", "--no-abbrev", "--no-renames", "HEAD", target, "--", "outputs/") or "").split("\0")
+    for meta, path in zip(raw[0::2], raw[1::2]):
         full = os.path.join(kit, path)
-        blob = path and os.path.isfile(full) and not os.path.islink(full) and git("hash-object", "--", path)
-        if blob and blob == git("rev-parse", f"{target}:{path}"):
+        parts = meta.split()
+        if len(parts) != 5 or not outputs_path(kit, path) or os.path.lexists(full) and \
+                (os.path.islink(full) or not os.path.isfile(full)):
+            continue
+        head = None if set(parts[2]) == {"0"} else parts[2]
+        here = os.path.isfile(full)
+        mine = git("hash-object", "--", path) if here else None
+        if here and not mine or mine == head:
+            continue                    # unreadable, or as HEAD holds it: the merge moves it
+        keep = os.path.join(aside, "kept" if here else "gone", path)
+        try:
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            if here:
+                shutil.copyfile(full, keep)
+            else:
+                open(keep, "wb").close()
+        except OSError:
+            continue
+        if head:
+            git("checkout", "-q", "HEAD", "--", path)
+        else:
             with contextlib.suppress(OSError):
                 os.remove(full)
+
+
+def put_back(kit, run=None):
+    """Put back what give_way_to set aside in the checkout's git folder: a kept file's bytes, and the removal of a gone
+    one; then that folder goes. After the merge, also when it failed, and before the next one, for what a stop in
+    between left there: in each case only where git left the file as HEAD holds it (or left none where HEAD holds
+    none). A file that the agent wrote again meanwhile stays as the agent wrote it, and the kept copy goes to
+    OUTPUTS_LEFT under a name of its own: of two versions of the agent's work, neither is thrown away."""
+    with OUTPUTS_MOVE:
+        _put_back(kit, run or _run)
+
+
+def put_back_now(kit, run=None):
+    """put_back outside a move: at the helper's start and before each send of a folder, so that a stop of the helper
+    between give_way_to and put_back never leaves a task's files old or missing until the next move, nor sends them
+    so. Never raises: a fault leaves the files where they are, and the next move tries again."""
+    try:
+        put_back(kit, run)
+    except Exception:        # noqa: BLE001
+        pass
+
+
+def left_copies(kit, ref, run=None):
+    """The copies of task `ref`'s files that a move could not put back (OUTPUTS_LEFT), relative to the checkout, in
+    name order: each send of the task's folder names them to the agent."""
+    other = outputs_aside(kit, run, OUTPUTS_LEFT)
+    base = os.path.join(other, "outputs", ref) if other else None
+    if not base or not os.path.isdir(base):
+        return []
+    return sorted(os.path.relpath(os.path.join(here, name), kit).replace(os.sep, "/")
+                  for here, _dirs, names in os.walk(base) for name in names)
+
+
+def _put_back(kit, run):
+    aside = outputs_aside(kit, run)
+    if not aside or not os.path.isdir(aside):
+        return
+    for kind in ("kept", "gone"):
+        base = os.path.join(aside, kind)
+        for here, _dirs, names in os.walk(base):
+            for name in names:
+                keep = os.path.join(here, name)
+                path = os.path.relpath(keep, base).replace(os.sep, "/")
+                full = os.path.join(kit, path)
+                if not outputs_path(kit, path) or os.path.islink(full) or \
+                        os.path.lexists(full) and not os.path.isfile(full):
+                    left = False
+                else:
+                    code, head, _ = run(["git", "-C", kit, "rev-parse", "--verify", "--quiet", f"HEAD:{path}"],
+                                        timeout=60)
+                    if os.path.isfile(full):
+                        done, mine, _ = run(["git", "-C", kit, "hash-object", "--", path], timeout=60)
+                        left = code == 0 and done == 0 and mine.strip() == head.strip()
+                    else:
+                        left = code != 0
+                try:
+                    if left and kind == "kept":
+                        os.makedirs(os.path.dirname(full), exist_ok=True)
+                        shutil.copyfile(keep, full)
+                    elif left and os.path.isfile(full):
+                        os.remove(full)
+                    elif not left and kind == "kept":
+                        other = outputs_aside(kit, run, OUTPUTS_LEFT)
+                        if other:
+                            os.makedirs(os.path.dirname(os.path.join(other, path)), exist_ok=True)
+                            n = 1
+                            while os.path.lexists(os.path.join(other, f"{path}.{n}")):
+                                n += 1
+                            os.rename(keep, os.path.join(other, f"{path}.{n}"))
+                except OSError:
+                    pass
+    shutil.rmtree(aside, ignore_errors=True)
 
 
 SKILLS_CHARS = 6000         # the most that the list of an agent's skills adds to a session's start; the rest are counted
@@ -2710,7 +2843,8 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
 def take(kit, target, run=None, floor=None, room=False, starts=None):
     """Move this checkout onto `target` when may_take lets it: a fast-forward, and the floor raised to the release it
     then runs. `target` is read once, as one commit, and that commit is the one checked and the one taken, so a fetch
-    in between moves nothing unchecked. room: first remove the outputs that it brings back tracked (give_way_to).
+    in between moves nothing unchecked. room: first make room for the outputs that it brings back tracked, and keep
+    the agent's newer work there over the move (give_way_to, put_back).
     starts: the role of the program that runs from this checkout (START_PROGRAMS: the helper's update and task-start
     sync, the server service's update), or None for a mover that starts nothing from it (the hub's own update, which
     has its larger check, the installers, the owner's MCP server, a new agent's checkout). With a role, a move that
@@ -2727,9 +2861,14 @@ def take(kit, target, run=None, floor=None, room=False, starts=None):
         (start_problem(kit, commit, starts, run, floor=floor) if starts else None)
     if problem:
         return problem
-    if room:
-        give_way_to(kit, commit, run)
-    code, out, err = _git(kit, run, "merge", "-q", "--ff-only", commit, timeout=120)
+    with OUTPUTS_MOVE if room else contextlib.nullcontext():
+        if room:
+            give_way_to(kit, commit, run)
+        try:
+            code, out, err = _git(kit, run, "merge", "-q", "--ff-only", commit, timeout=120)
+        finally:
+            if room:
+                put_back(kit, run)      # a task's newer outputs, also when the merge failed
     if code != 0:
         return "git merge failed: " + (err or out.strip())[-200:]
     keep_floor(kit, floor, run)
@@ -2741,7 +2880,8 @@ def follow_config_ref(kit, run=None, floor=None, starts=None):
     may_take lets it. The hub commits the owner's team.json, profiles and knowledge there, so an agent reads the
     current RULES.md, its profile and the owner's knowledge, while code reaches this machine only with a signed
     release. Returns None when the checkout follows the ref, else the one reason why it stays as it is: a checkout
-    with its own changes is never touched. An origin without the ref is a Fleet before the split of 2026-10-17, and
+    with its own changes is never touched, but for outputs/, where a running task's work stays as it is over the move
+    (give_way_to). An origin without the ref is a Fleet before the split of 2026-10-17, and
     is brought up to date as it was before, under the same check. starts: as take's, for each move that this makes,
     the one onto the ref's branch too. A checkout that keeps its revision for a release that did not start here also
     takes no later data of the ref, until a release that starts here."""
@@ -2754,7 +2894,8 @@ def follow_config_ref(kit, run=None, floor=None, starts=None):
     code, _, err = git("fetch", "-q", "origin")
     if code != 0:
         return "git fetch failed: " + err[-200:]
-    if git("status", "--porcelain", "--untracked-files=no")[1]:
+    # a change of outputs/ is a task's work, which the move keeps (give_way_to; helper feature outputs_early)
+    if git("status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude)outputs/")[1]:
         return "the checkout has its own changes, so it stays where it is"
     if git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/" + CONFIG_BRANCH)[0] != 0:
         return take(kit, "@{upstream}", run, floor, starts=starts)

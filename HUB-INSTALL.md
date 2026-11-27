@@ -277,7 +277,10 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 14. **Security updates:** unattended security updates on, and the pending ones once.
     It never restarts the server; it says when a restart is needed.
 15. **This server's own hardening** (`hubsetup.py harden`), the same as each server that joins
-    gets from its join line. SSH takes keys only, with no X11 forwarding: one file in sshd's own
+    gets from its join line. With the word `FLEET_OWNER_ACCESS` (see "A hub that moves to a new
+    server") root's `authorized_keys` first gets the fleet's owner access key, once, with no other
+    change (`hubsetup.py owner-access`), and the hardening below counts it as a key of the server.
+    SSH takes keys only, with no X11 forwarding: one file in sshd's own
     folder, which sshd checks before it reloads. It is not written where no account of the server
     has an SSH key, because that server would then let nobody in, and not where OpenSSH does not
     run. It is not written either when the session that runs the step logged in over SSH with a
@@ -699,6 +702,66 @@ after its commit. Three things it does need:
   committed, so on a hub that runs the claim refuses to go on without it;
 - **the hub's own address and port** (`--port N` when it is not 8765), as `team.json` has
   them: they are how the claim knows that the file is this hub's own.
+
+### A hub that moves to a new server
+
+No command moves a hub: a move is this line on a new server, then a restore of the fleet's
+copy there (Settings › Backup, or `python3 hub.py --restore <copy>`). The owner's Mac did not
+make that server, so it holds none of the Mac's keys, and the hub's own user `fleet` takes no
+SSH key at all. Every root step of the Mac (the central vault, one server for all) then has no
+way in.
+
+The fleet's way back is its owner access key: one Ed25519 key for the fleet, whose private half
+is in the owner's keychain and in each copy that the Founderizer app saved (the zip's member
+`owner-access.key`; a copy from the owner tool `take_backup` has none), and whose public half
+is a line of root's `authorized_keys` on each other server of the fleet. That private key opens
+root on every server of the fleet, so it never goes to the new server, also not inside the copy:
+
+1. On the Mac, take its public line and its fingerprint in a folder that only you can read,
+   which goes in every case:
+
+   ```sh
+   (umask 077; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT HUP INT TERM && unzip -p <copy>.zip owner-access.key > "$d/k" && ssh-keygen -y -f "$d/k" && ssh-keygen -lf "$d/k")
+   ```
+
+2. Install the new server with that line in the word `FLEET_OWNER_ACCESS`, as root:
+
+   ```sh
+   FLEET_OWNER_ACCESS='ssh-ed25519 AAAAC3Nz… founderizer-owner-access' sh hub.sh
+   ```
+
+3. On the Mac, make a duplicate of the copy with that member taken out, and restore that
+   duplicate, never the copy itself:
+
+   ```sh
+   cp <copy>.zip <copy>-to-restore.zip && zip -d <copy>-to-restore.zip owner-access.key || rm -f <copy>-to-restore.zip
+   ! zipinfo -1 <copy>-to-restore.zip 2>/dev/null | grep -qx owner-access.key || { rm -f <copy>-to-restore.zip; echo 'the key is still in it'; }
+   ```
+
+   `zip -d` keeps each other member as it was, so the hub's restore takes the duplicate. When
+   it fails, or the key is still in the duplicate, the lines remove the duplicate: then restore
+   nothing, and never the copy itself. This way needs a copy that the app saved from the start.
+   Give that duplicate to Settings › Backup, or to `hub.py --restore` on the server, and
+   remove it from the server afterwards.
+
+The installer checks the word before the first step: `ssh-ed25519`, the key's 68 characters of
+an Ed25519 key, and at most one plain comment after them (letters, digits and @ . _ + : -, at
+most 100); it stops on any other form. Step 15 adds the line to root's `authorized_keys` once,
+with its own comment (the one that `ssh-keygen -y` printed, which says whose key it is), and
+says the key's SHA-256 fingerprint, the one that step 1 printed. A line that holds the same key
+already is left as it is, also with options of its own, which the step names because they limit
+root's login with the key; no other line changes. The hardening of step 15 then counts that line
+as a key of the server: SSH takes keys only after it, also on a server where password login
+worked before, unless the install itself runs in an SSH session that logged in with a password.
+The way in is then the copy's key, another key of root's, or the provider's console. No released
+Founderizer app logs in with this key yet: root's way in with it
+is `ssh -i` with the copy's key file, in the same folder as step 1:
+
+```sh
+(umask 077; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT HUP INT TERM && unzip -p <copy>.zip owner-access.key > "$d/k" && ssh -a -o AddKeysToAgent=no -o IdentitiesOnly=yes -i "$d/k" root@<the new server's Tailscale address>)
+```
+
+A second claim (`--reclaim`) leaves step 15 out, and the word with it, and says so.
 
 ## The central vault
 

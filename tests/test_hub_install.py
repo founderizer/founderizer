@@ -10,6 +10,7 @@ operator to host the unmodified Claude Code only while each end user signs in th
 operator never collects, stores or intermediates the credential. So the installer may not sign in for the customer,
 and no Founderizer login may be a provider's own site.
 """
+import base64
 import contextlib
 import datetime
 import hashlib
@@ -101,7 +102,7 @@ def load_tests(loader, _tests, _pattern):
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
                 Harden, HardenMemory, HardenRestart, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate,
-                ReleasesReach, PortStep):
+                ReleasesReach, PortStep, OwnerAccess):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -2323,6 +2324,187 @@ class PortStep(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual([line for line in out.splitlines() if line.startswith(("LOCK", "CLAIM"))],
                          ["CLAIM: fd 9 closed", "CLAIM: no mark"])
+
+
+class OwnerAccess(unittest.TestCase):
+    """The word FLEET_OWNER_ACCESS of hub.sh (HUB-INSTALL.md, "A hub that moves to a new server"): a hub that moves to
+    a new server, which the owner's Mac did not make, gives root the fleet's owner access key, whose other half is in
+    the fleet's copy, so the Mac's root steps (the central vault) can reach it again. Only a public line of one Ed25519
+    key counts, and it goes in once, with its own plain comment, beside the lines that are there."""
+
+    KEY = base64.b64encode(hubsetup.ED25519_START + bytes(range(32))).decode()
+    LINE = f"ssh-ed25519 {KEY} founderizer-owner-access\n"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.keys = Path(self.root, "root/.ssh/authorized_keys")
+
+    def check(self, word):
+        """The word's check at the top of hub.sh, with the line that it keeps, or its stop."""
+        text = SCRIPT.read_text()
+        start = text.index("owner_access=${FLEET_OWNER_ACCESS:-}\n")
+        block = text[start:text.index("caller_verifies=no", start)]
+        return run_shell(block + 'say "kept: $owner_access"\n', extra=f"FLEET_OWNER_ACCESS={shlex.quote(word)}\n")
+
+    def test_a_moved_hubs_root_gets_the_fleets_key_once_beside_its_other_lines(self):
+        """A bug here leaves a moved hub with no way in for the Mac's root steps, or adds the key at each run, or
+        changes a line that the server's maker put there."""
+        self.keys.parent.mkdir(parents=True)
+        self.keys.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIProviderKeyOfTheServer maker")   # no new line at its end
+        hubsetup.owner_access(f"ssh-ed25519 {self.KEY} founderizer@Example-Mac.local", root=self.root)
+        # the line keeps its own comment: it says whose key it is (here a Mac's own), and a removal by the fleet's
+        # comment never takes a key that is not the fleet's
+        self.assertEqual(self.keys.read_text(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIProviderKeyOfTheServer maker\n"
+                                                f"ssh-ed25519 {self.KEY} founderizer@Example-Mac.local\n")
+        hubsetup.owner_access(f"ssh-ed25519 {self.KEY}", root=self.root)
+        self.assertEqual(self.keys.read_text().count(self.KEY), 1, "a second run adds it again")
+        self.keys.write_text("")
+        hubsetup.owner_access(f"ssh-ed25519 {self.KEY}", root=self.root)
+        self.assertEqual(self.keys.read_text(), f"ssh-ed25519 {self.KEY}\n", "a line with no comment gets none")
+        # The same key with options of the server's own, which the server's maker wrote, is the key already.
+        self.keys.write_text(f'from="100.64.0.0/10" ssh-ed25519 {self.KEY} kept\n')
+        hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(self.keys.read_text(), f'from="100.64.0.0/10" ssh-ed25519 {self.KEY} kept\n')
+        # A key only in a line that is a comment, or as another key's comment, is not there.
+        other = base64.b64encode(hubsetup.ED25519_START + bytes(32)).decode()
+        self.keys.write_text(f"# ssh-ed25519 {self.KEY}\nssh-ed25519 {other} {self.KEY}\n")
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said):
+            hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(self.keys.read_text(), f"# ssh-ed25519 {self.KEY}\nssh-ed25519 {other} {self.KEY}\n" + self.LINE)
+        # It names the key by the fingerprint that `ssh-keygen -lf` gives, so a person can compare it with the copy's.
+        blob = base64.b64decode(self.KEY)
+        self.assertIn("SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("="), said.getvalue())
+
+    def test_the_hardening_counts_it_as_a_key_of_the_server(self):
+        """Step 15 takes keys only where a key line is there: with the word, a server that had no key now has one, so
+        its password login ends (HUB-INSTALL.md says so). A bug here would let that change go unseen."""
+        self.assertFalse(hubsetup.has_ssh_key(root=self.root))
+        hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertTrue(hubsetup.has_ssh_key(root=self.root))
+
+    def test_a_link_or_a_fifo_in_roots_place_changes_nothing(self):
+        """root's authorized_keys as a link to another file, or as a FIFO: the line never goes into the file that the
+        link names, and the step never waits on a FIFO."""
+        target = Path(self.root, "elsewhere")
+        target.write_text("kept\n")
+        self.keys.parent.mkdir(parents=True)
+        self.keys.symlink_to(target)
+        with self.assertRaisesRegex(hubsetup.Stop, "could not be opened as a file of its own"):
+            hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(target.read_text(), "kept\n")
+        self.keys.unlink()
+        os.mkfifo(self.keys)
+        with self.assertRaisesRegex(hubsetup.Stop, "is not a plain file"):
+            hubsetup.owner_access(self.LINE, root=self.root)
+        # A link in the place of root's folder is not followed either.
+        self.keys.unlink()
+        self.keys.parent.rmdir()
+        elsewhere = Path(self.root, "folder")
+        elsewhere.mkdir()
+        self.keys.parent.symlink_to(elsewhere)
+        with self.assertRaisesRegex(hubsetup.Stop, "could not be opened as a folder of its own"):
+            hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_only_a_login_key_after_the_options_is_the_key(self):
+        """The key in a quoted option, as an RSA line's comment, or as a cert-authority (which logs nobody in) is not
+        root's login key: a bug here leaves the moved hub with no way in while the step says that the key is there."""
+        other = base64.b64encode(hubsetup.ED25519_START + bytes(32)).decode()
+        for held in (f'command="echo ssh-ed25519 {self.KEY}" ssh-ed25519 {other}',
+                     f"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ ssh-ed25519 {self.KEY}", f"cert-authority ssh-ed25519 {self.KEY}",
+                     # sshd's own reading: a backslash goes with the quote after it, and an option it does not know
+                     # makes it refuse the line
+                     f'command="a\\" ssh-ed25519 {self.KEY} "', f'",cert-authority ssh-ed25519 {other}; a\\" b" ssh-ed25519 {self.KEY}',
+                     f"bogus ssh-ed25519 {self.KEY}", f'command="unclosed ssh-ed25519 {self.KEY}'):
+            with self.subTest(held=held):
+                self.keys.parent.mkdir(parents=True, exist_ok=True)
+                self.keys.write_text(held + "\n")
+                hubsetup.owner_access(self.LINE, root=self.root)
+                self.assertEqual(self.keys.read_text(), held + "\n" + self.LINE)
+        self.assertEqual(hubsetup.held_key(f'restrict,command="a b" ssh-ed25519 {self.KEY} c'), self.KEY)
+        self.assertEqual(hubsetup.held_key(f'from="10.0.0.1"\tssh-ed25519\t{self.KEY}'), self.KEY)
+        # A quote after a backslash stays inside the option, also before a space, as sshd reads it.
+        self.assertEqual(hubsetup.held_key(f'command="echo \\"a b\\"" ssh-ed25519 {self.KEY}'), self.KEY)
+        # A key that is there with options of its own stays as it is, and the step says that they limit it.
+        self.keys.write_text(f'from="100.64.0.0/10" ssh-ed25519 {self.KEY}\n')
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said):
+            hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(self.keys.read_text(), f'from="100.64.0.0/10" ssh-ed25519 {self.KEY}\n')
+        self.assertIn("its line keeps its own options, which limit root's login with it", said.getvalue())
+
+    def test_the_command_hands_its_line_to_the_step(self):
+        """`hubsetup.py owner-access --line` is the one way hub.sh reaches the step."""
+        with patch.object(hubsetup, "owner_access") as step:
+            hubsetup.main(["owner-access", "--line", self.LINE.strip()])
+        step.assert_called_once_with(self.LINE.strip())
+
+    def test_a_server_with_no_keys_gets_a_folder_and_a_file_that_only_root_reads(self):
+        """sshd refuses keys from a file or folder that others can write, and a key file that others read says who
+        may log in: a bug here makes a line that sshd never takes."""
+        hubsetup.owner_access(self.LINE, root=self.root)
+        self.assertEqual(self.keys.read_text(), self.LINE)
+        self.assertEqual(self.keys.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.keys.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_only_one_public_ed25519_key_counts(self):
+        """The word goes into root's keys, so text that is not one public key of the fleet's kind changes nothing:
+        a bug here lets an install line put options, a second line or another kind of key into root's keys."""
+        other = base64.b64encode(b"\x00\x00\x00\x07ssh-rsa" + bytes(40)).decode()
+        short = base64.b64encode(hubsetup.ED25519_START + bytes(31)).decode()
+        for bad in ("", "ssh-ed25519", f"ssh-rsa {self.KEY}", f"ssh-ed25519 {other}", f"ssh-ed25519 {short}",
+                    f'from="*" ssh-ed25519 {self.KEY}', f"ssh-ed25519 {self.KEY} a b", f"ssh-ed25519 {self.KEY[:-1]}*",
+                    f"ssh-ed25519 {self.KEY} it's", f"ssh-ed25519 {self.KEY} " + "a" * 101, f"ssh-ed25519 {self.KEY} a$(id)",
+                    f"ssh-ed25519 {self.KEY}\nssh-ed25519 {self.KEY}", "ssh-ed25519 " + self.KEY[:-2] + "==",
+                    f"ssh-ed25519 {self.KEY[:-1]}", f"ssh-ed25519 {self.KEY}A",
+                    f"ssh-ed25519 {self.KEY[:25]}Z{self.KEY[26:]}"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(hubsetup.owner_access_key(bad))
+                with self.assertRaises(hubsetup.Stop):
+                    hubsetup.owner_access(bad, root=self.root)
+                self.assertFalse(self.keys.exists())
+                code, out = self.check(bad) if bad else (1, "")
+                if bad:
+                    self.assertEqual(code, 1, out)
+                    self.assertIn("FLEET_OWNER_ACCESS is not the public line of one Ed25519 key", out)
+                    self.assertNotIn("kept:", out)
+        # Most real keys hold "+" or "/": a key of both passes the shell and the step alike.
+        signs = base64.b64encode(hubsetup.ED25519_START + bytes([0xfb, 0xff] * 16)).decode()
+        self.assertTrue("+" in signs and "/" in signs)
+        self.assertEqual(hubsetup.owner_access_key(f"ssh-ed25519 {signs}"), signs)
+        for good, kept in ((self.LINE.strip(), self.LINE.strip()), (f"ssh-ed25519 {self.KEY}", f"ssh-ed25519 {self.KEY}"),
+                           (f"ssh-ed25519 {signs} c", f"ssh-ed25519 {signs} c")):
+            code, out = self.check(good)
+            self.assertEqual((code, out.strip().splitlines()[-1]), (0, f"Founderizer: kept: {kept}"), out)
+        self.assertEqual(self.check("")[1].strip(), "Founderizer: kept:", "no word is no key")
+
+    def test_the_hardening_step_adds_it_first_and_a_second_claim_leaves_it_out(self):
+        """It goes in before the hardening, which then counts it as a key of this server, from root's own copy of the
+        installer, and the check runs nothing. A second claim changes the owner's address and nothing else."""
+        body = shell_function(SCRIPT, "harden")
+        kept = f"ssh-ed25519 {self.KEY}"
+        ran = f'tree=/tree\nowner_access={shlex.quote(kept)}\npython3() {{ echo "ran $*"; }}\n'
+        code, out = run_shell(body + "\nharden\n", extra=ran + "reclaim=no\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("ran ")],
+                         [f"ran /tree/hubsetup.py owner-access --line {kept}", "ran /tree/hubsetup.py harden --user fleet"])
+        code, out = run_shell(body + "\nharden\nsay went on\n",
+                              extra=ran.replace('echo "ran $*"', '[ "$2" = harden ] || return 1') + "reclaim=no\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("root's authorized_keys did not get the fleet's owner access key: the lines above say why", out)
+        self.assertIn("Founderizer: went on", out)
+        code, out = run_shell(body + "\nharden\n", extra=ran + "reclaim=no\ncheck=yes\n")
+        self.assertNotIn("\nran ", out)
+        self.assertIn(f"would run: python3 /tree/hubsetup.py owner-access --line '{kept}', which adds the fleet's owner "
+                      f"access key to root's authorized_keys", out)
+        code, out = run_shell(body + "\nharden\n", extra=ran.replace(shlex.quote(kept), "''") + "reclaim=no\n")
+        self.assertEqual([line for line in out.splitlines() if line.startswith("ran ")],
+                         ["ran /tree/hubsetup.py harden --user fleet"], "a word that is set and empty is no key")
+        code, out = run_shell(body + "\nharden\n", extra=ran + "reclaim=yes\n")
+        self.assertNotIn("ran ", out)
+        self.assertIn("a second claim leaves root's authorized_keys as it is: the word FLEET_OWNER_ACCESS goes", out)
 
 
 class Harden(unittest.TestCase):

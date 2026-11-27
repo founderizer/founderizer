@@ -5224,8 +5224,9 @@ def check_grants(agent):
 
 
 # ---------------------------------------------------------------- task outputs (helper feature task_outputs)
-# When its agent delivers a task, the hub asks this helper for the files of outputs/T-<id>/ and commits them to the
-# configuration ref (the hub's deliver_outputs): a checkout over git:// cannot push. The limits are the hub's own.
+# When its agent delivers a task, or sends the task's folder before (report_progress outputs), the hub asks this helper
+# for the files of outputs/T-<id>/ and commits them to the configuration ref in place of the folder's files there (the
+# hub's deliver_outputs): a checkout over git:// cannot push. The limits are the hub's own.
 # computer-use/ stays here: Fleet saves every screenshot of a screen task there by itself, and the agent copies the
 # one that shows the result into the folder.
 OUTPUT_FILES = 100
@@ -5298,6 +5299,20 @@ def collect_outputs(kit, ref):
             total += len(data)
             files.append({"path": path, "data": base64.b64encode(data).decode("ascii")})
     return files, skipped
+
+
+def output_folder_held(kit, ref):
+    """True when outputs/<ref>/ is the agent's own folder on this machine: there, and empty or holding a name other
+    than computer-use/, which Fleet makes by itself for a screen task (Python's cache and names that start with a dot
+    do not count). So a machine where the agent never worked on the task (an agent that moved) says False."""
+    root = os.path.join(kit, "outputs", ref)
+    if os.path.islink(root) or not os.path.isdir(root):
+        return False
+    try:
+        names = [name for name in os.listdir(root) if not name.startswith(".") and name != OUTPUT_CACHE]
+    except OSError:
+        return False
+    return names != [OUTPUT_CAPTURES]
 
 
 class Helper:
@@ -7907,20 +7922,27 @@ class Helper:
             raise Refused(f"the hub did not take the answer about {command} ({code})")
 
     def send_outputs(self, extra):
-        """The agent delivered a task, and the hub asks for the files of its outputs folder, which it commits to the
-        configuration ref (helper feature task_outputs). The delivery waits for them, so they go at once and in this
-        loop. A hub that does not answer leaves the event pending, and the next poll sends the files again while the
-        delivery still waits; a refusal is logged and ends it, because the same files would be refused again."""
+        """The agent delivered a task, or sends its folder before (report_progress outputs), and the hub asks for the
+        files of its outputs folder, which it commits to the configuration ref (helper features task_outputs and
+        outputs_early). The agent's call waits for them, so they go at once and in this loop. A hub that does not
+        answer leaves the event pending, and the next poll sends the files again while the call still waits; a
+        refusal is logged and ends it, because the same files would be refused again."""
         ref, token = extra.get("task"), extra.get("outputs")
         if not (isinstance(ref, str) and re.fullmatch(r"T-[1-9][0-9]*", ref) and isinstance(token, str)):
             raise Refused("invalid outputs request")
+        lifecycle.put_back_now(KIT)     # what a stop of a move left aside, so that the folder goes as the agent has it
         files, skipped = collect_outputs(KIT, ref)
+        # folder: the agent's own work is in the task's folder here, so a send with no file in it clears the folder on
+        # the ref; a machine without it (an agent that moved, where Fleet made only computer-use/) changes nothing
+        # there (the hub's outputs_sentence). left: the copies that a move could not put back (lifecycle.left_copies)
         code, data = http("POST", f"/helper/outputs/{self.agent}",
-                          {"outputs": token, "task": ref, "files": files, "skipped": skipped}, timeout=120)
+                          {"outputs": token, "task": ref, "files": files, "skipped": skipped,
+                           "folder": output_folder_held(KIT, ref), "left": lifecycle.left_copies(KIT, ref)},
+                          timeout=120)
         if code != 200:
             self.say(f"{ref}: the hub refused the output files ({code}): {str(data.get('error') or '')[:200]}")
         elif not data.get("taken"):
-            self.say(f"{ref}: the delivery no longer waits for its output files")
+            self.say(f"{ref}: the hub no longer waits for these output files")
         else:
             self.say(f"{ref}: sent {len(files)} output file(s)" + (f", {len(skipped)} not sent" if skipped else ""))
 
@@ -11746,6 +11768,7 @@ def cmd_run(args):
     except BlockingIOError:
         die(f"another {agent} helper is already running")
     claim_checkout(agent)
+    lifecycle.put_back_now(KIT)         # a task's files that a stop in the middle of a move left aside
     h = Helper(agent, conf)
     threading.Thread(target=empty_trash, args=(agent,), name="empty-trash", daemon=True).start()
     if not ensure_session(h.session):

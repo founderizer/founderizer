@@ -607,6 +607,8 @@ class Columns(unittest.TestCase):
         "takeover_tries:": "a take-over's stop (an event)", "takeover_told:": "the owner's held answer (an event)",
         "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_name_who:": "a KPI's standing item (lanes/agent-kpis.md)",
+        "outputs_sent:": "a task: the digest and commit of its folder on the configuration ref (UI-API.md 1.365)",
+        "outputs_early:": "a task: the attempt and count of its sends before delivery (UI-API.md 1.365)",
         "kpi_link_step:": "a KPI's standing item (lanes/agent-kpis.md)",
         "kpi_resetup_step:": "a KPI's standing item (lanes/agent-kpis.md)",
         "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}
