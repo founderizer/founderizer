@@ -3,6 +3,7 @@ individual tasks to be done but in the thing I asked for to be done", and "if I 
 too"). A task names the owner's own message that it comes from (tasks.ask), that message gets the few words that the
 owner's apps show for it (ui_requests.asked), a follow-up and a subtask take the ask of their task, and a Needs-you
 item names the ask whose work waits for it (needs.ask). In-process, against the hub of test_ui_api."""
+import hashlib
 import json
 import unittest
 import uuid
@@ -351,8 +352,9 @@ class Asks(OwnerAPI):
         self.assertIn("set ask to that message (M-<n>)", tools["create_task"]["description"])
         self.assertLessEqual({"ask", "asked"}, set(tools["create_task"]["inputSchema"]["properties"]))
         self.assertIn("ask", tools["raise_needs_you"]["inputSchema"]["properties"])
+        self.assertLessEqual({"ask", "asked"}, set(tools["tell_owner"]["inputSchema"]["properties"]))
         chat = {t["name"]: t for t in hub.tools_for("solo", CHAT)}
-        self.assertIn("asked", chat["start_task"]["inputSchema"]["properties"])
+        self.assertLessEqual({"ask", "asked"}, set(chat["start_task"]["inputSchema"]["properties"]))
         self.assertNotIn("asked", chat["start_task"]["inputSchema"].get("required", []))
 
 
@@ -513,10 +515,488 @@ class Jobs(Asks):
         self.assertIn("jobs", state["ui_features"])
 
 
+class FollowUps(Asks):
+    """A message that goes on with an earlier ask of the owner's is on that ask's card (the owner, 25 November 2026:
+    "Sometimes I will be asking about related tasks repeatedly, so the system should catch that", "it needs to feel
+    more natural", and "Yes, this" to the pictures of ~/dev/founderizer-plans/my-asks-tracking-2026-11-25/). The agent
+    that reads it joins it with `ask`; a question that takes no task gets a name with `asked`; a wrong join goes back by
+    the same words; a message that the owner writes on the card is on it for sure. Each test names the bug it stops: a
+    follow-up that stays a card of its own, a question that never shows, a split that leaves the message or its work on
+    the old card, a join to another agent's ask that nobody of it works on."""
+
+    def row(self, message):
+        return hub.q1("SELECT * FROM ui_requests WHERE request_id=?", (message["request_id"],))
+
+    def card(self, request_id):
+        """GET /ui/mobile/asks/<id> of this generation: (status, answer)."""
+        return self.request(f"/ui/mobile/asks/{request_id}?db={hub.kv_get('db_id')}")
+
+    def named(self, text, asked, recipient="manager"):
+        """An ask of the owner's to the manager, named by its first task (for the solo worker), as its row."""
+        message = self.says(recipient, text=text)
+        self.create(ask=f"M-{message['event_id']}", asked=asked)
+        return message
+
+    def test_a_follow_up_is_on_the_earlier_card_and_its_work_rides_with_it(self):
+        first = self.named("Make sure we charge nobody for the failed auto-orders.", "Charge nobody for failed orders")
+        later = self.says(text="Are they refunded yet?")
+        said = self.ok("manager", "tell_owner", {"text": "Leo checks it now.", "in_reply_to": f"M-{later['event_id']}",
+                                                 "ask": f"M-{first['event_id']}"})
+        self.assertIn(f"on the card of M-{first['event_id']} (\"Charge nobody for failed orders\")", said)
+        self.assertEqual(self.row(later)["ask"], first["request_id"])
+        task, _ = self.create(ask=f"M-{later['event_id']}")      # its first task needs no name: the card has one
+        # and the message takes the card's, which the apps that read no follow-up yet show for its work
+        self.assertEqual((task["ask"], self.asked(later)), (later["request_id"], "Charge nobody for failed orders"))
+        fees = self.says(text="And the fees?")                  # a name that it gives is checked as any name is
+        self.ok("manager", "tell_owner", {"text": "Checking.", "in_reply_to": f"M-{fees['event_id']}",
+                                          "ask": f"M-{first['event_id']}"})
+        self.assertIn("plain words", self.refused("manager", "create_task", {
+            "owner": "solo", "title": "Check the fees", "done_when": "Done.", "why": "It suits it.",
+            "ask": f"M-{fees['event_id']}", "asked": "The fees of T-4"}))
+        code, state = self.request()
+        self.assertEqual(code, 200)
+        self.assertIn("ask_follow_ups", state["ui_features"])
+        self.assertEqual({m["request_id"]: m["ask"] for m in state["messages"]},
+                         {first["request_id"]: None, later["request_id"]: first["request_id"],
+                          fees["request_id"]: first["request_id"]})
+        # never onto itself, nor the first message onto its own follow-up
+        lone = self.says(text="Something else.")
+        self.assertIn("first message of that ask itself", self.refused(
+            "manager", "tell_owner", {"text": "Yes.", "in_reply_to": f"M-{lone['event_id']}",
+                                      "ask": f"M-{lone['event_id']}"}))
+        self.refused("manager", "tell_owner", {"text": "Yes.", "in_reply_to": f"M-{first['event_id']}",
+                                               "ask": f"M-{later['event_id']}"})
+        self.assertIsNone(self.row(lone)["ask"])
+        # nor onto a message with no name, which has no card: both would show on none
+        then = self.says(text="And for the other shop?")
+        self.assertIn("has no name", self.refused("manager", "tell_owner", {
+            "text": "Yes.", "in_reply_to": f"M-{then['event_id']}", "ask": f"M-{lone['event_id']}"}))
+
+    def test_a_question_gets_a_name_and_a_wrong_join_goes_back_with_its_work(self):
+        question = self.says(text="Who looks after ads in our fleet?")
+        said = self.ok("manager", "tell_owner", {"text": "The Browser Agent, each morning.",
+                                                 "in_reply_to": f"M-{question['event_id']}",
+                                                 "asked": "Who looks after ads"})
+        self.assertIn("show their message as \"Who looks after ads\"", said)
+        self.assertEqual(self.asked(question), "Who looks after ads")
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], 0)
+        coded = self.says(text="And the ads of T-4?")
+        self.assertIn("plain words", self.refused("manager", "tell_owner", {
+            "text": "Yes.", "in_reply_to": f"M-{coded['event_id']}", "asked": "The ads of T-4"}))
+        self.assertIn("not both", self.refused("manager", "tell_owner", {
+            "text": "Yes.", "in_reply_to": f"M-{coded['event_id']}", "asked": "Ads",
+            "ask": f"M-{question['event_id']}"}))
+        # the same words to a second message, with a name: that message's own answer, not a repeat of the first's
+        both = [self.says(text=f"Who pays for {what}?") for what in ("hosting", "ads")]
+        for one, name in zip(both, ("Who pays for hosting", "Who pays for ads")):
+            self.ok("manager", "tell_owner", {"text": "The shop does.", "in_reply_to": f"M-{one['event_id']}", "asked": name})
+        self.assertEqual([self.asked(m) for m in both], ["Who pays for hosting", "Who pays for ads"])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE in_reply_to IN (?,?)",
+                                tuple(m["request_id"] for m in both))["n"], 2)
+        # joined by mistake, with work filed under it, then taken back by words: the work goes back with it
+        later = self.says(text="Also change the shop's banner.")
+        self.ok("manager", "tell_owner", {"text": "On it.", "in_reply_to": f"M-{later['event_id']}",
+                                          "ask": f"M-{question['event_id']}"})
+        task, _ = self.create(ask=f"M-{later['event_id']}")
+        self.ok("manager", "tell_owner", {"text": "That is a thing of its own.", "in_reply_to": f"M-{later['event_id']}",
+                                          "asked": "Change the shop's banner"})
+        self.assertEqual((self.row(later)["ask"], self.asked(later)), (None, "Change the shop's banner"))
+        card = self.card(later['request_id'])[1]        # its own card, with its work
+        self.assertEqual((card["id"], [t["id"] for t in card["tasks"]]), (later["request_id"], [task["id"]]))
+        # his correction goes with its message: joined onto a card by mistake, then taken back
+        fixed = self.says(text="Also change the shop's logo.", replaces_request_id=later["request_id"])
+        self.ok("manager", "tell_owner", {"text": "On it.", "in_reply_to": f"M-{fixed['event_id']}",
+                                          "ask": f"M-{question['event_id']}"})
+        self.assertEqual(hub.ask_first(fixed["request_id"]), question["request_id"])
+        self.ok("manager", "tell_owner", {"text": "That is a thing of its own.", "in_reply_to": f"M-{fixed['event_id']}",
+                                          "asked": "Change the shop's banner"})
+        self.assertEqual(hub.ask_first(fixed["request_id"]), later["request_id"])
+        self.assertIn(fixed["request_id"], [m["request_id"] for m in self.card(
+            later['request_id'])[1]["messages"]])
+        # a card of its own with a name keeps that name, and the answer says the name that stays
+        said = self.ok("manager", "tell_owner", {"text": "Still the Browser Agent.",
+                                                 "in_reply_to": f"M-{question['event_id']}", "asked": "Ads owner"})
+        self.assertIn("show their message as \"Who looks after ads\"", said)
+        self.assertEqual(self.asked(question), "Who looks after ads")
+
+    def test_a_worker_s_follow_up_opens_its_task_on_the_earlier_card(self):
+        first = self.says("solo", text="Check the disk of the shop's server.")
+        self.ok("solo", "start_task", {"title": "Check the disk", "done_when": "Done.", "asked": "Check the shop's disk",
+                                       "in_reply_to": first["request_id"]}, context=CHAT)
+        later = self.says("solo", text="And clean it if it is full.")
+        self.ok("solo", "start_task", {"title": "Clean the disk", "done_when": "Done.", "in_reply_to": later["request_id"],
+                                       "ask": f"M-{first['event_id']}"}, context=CHAT)
+        self.assertEqual(self.row(later)["ask"], first["request_id"])
+        self.assertEqual(hub.q1("SELECT ask FROM tasks ORDER BY id DESC LIMIT 1")["ask"], later["request_id"])
+        # the join wrote the message's reply; the worker still takes a wrong one back by words, with its task
+        plain = self.says("solo", text="And empty its log folder.")     # a plain reply, then the same words with ask
+        reply = {"text": "The log folder is empty.", "in_reply_to": plain["request_id"]}
+        self.ok("solo", "tell_owner", reply, context=CHAT)
+        said = self.ok("solo", "tell_owner", dict(reply, ask=f"M-{first['event_id']}"), context=CHAT)
+        self.assertIn("already saved", said)
+        self.assertIn(f"on the card of M-{first['event_id']}", said)
+        self.assertEqual(self.row(plain)["ask"], first["request_id"])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE in_reply_to=?",
+                                (plain["request_id"],))["n"], 1)
+        split = {"text": "That is a job of its own.", "in_reply_to": later["request_id"], "asked": "Clean the shop's disk"}
+        before = hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE agent='solo'")["n"]
+        self.ok("solo", "tell_owner", split, context=CHAT)
+        self.assertEqual((self.row(later)["ask"], self.asked(later)), (None, "Clean the shop's disk"))
+        reports = hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE agent='solo'")["n"]
+        self.assertEqual(reports, before + 1)       # other words on an answered message go out: no repeat of its reply
+        self.assertIn("already saved", self.ok("solo", "tell_owner", split, context=CHAT))   # a retry sends nothing
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE agent='solo'")["n"], reports)
+
+    def test_another_agent_s_ask_only_while_a_task_of_it_is_open(self):
+        first = self.named("Link the KPIs of each agent.", "Link each agent's KPIs")       # its task is solo's
+        task = hub.q1("SELECT id FROM tasks ORDER BY id DESC LIMIT 1")["id"]
+        other = self.says("w", text="And the KPIs?")
+        self.assertIn("the owner's ask to", self.refused("w", "tell_owner", {
+            "text": "I do not know.", "in_reply_to": other["request_id"], "ask": f"M-{first['event_id']}"},
+            context=CHAT))
+        later = self.says("solo", text="Are the KPIs still in progress?")
+        self.ok("solo", "tell_owner", {"text": "Six of seven are linked.", "in_reply_to": later["request_id"],
+                                       "ask": f"M-{first['event_id']}"}, context=CHAT)
+        self.assertEqual(self.row(later)["ask"], first["request_id"])
+        with hub.transaction():
+            hub.DB.execute("UPDATE tasks SET state='completed' WHERE id=?", (task,))
+        again = self.says("solo", text="And now?")
+        self.refused("solo", "tell_owner", {"text": "All seven.", "in_reply_to": again["request_id"],
+                                            "ask": f"M-{first['event_id']}"}, context=CHAT)
+        self.assertIn("the owner's ask to", self.refused(       # nor by its own earlier follow-up on that ask
+            "solo", "tell_owner", {"text": "All seven.", "in_reply_to": again["request_id"],
+                                   "ask": f"M-{later['event_id']}"}, context=CHAT))
+        self.assertIsNone(self.row(again)["ask"])
+        self.request("/ui/messages", self.command(recipient="solo", text="Any news?"))
+        self.assertNotIn("Link each agent's KPIs", self.ok("solo", "read_messages", {}, context=CHAT))
+        # the manager stays on top: it joins onto an ask that ANY open task is under (Needs-you, 25 November 2026)
+        direct = self.says("w", text="Fix the shop's banner.")
+        self.ok("w", "start_task", {"title": "Fix the banner", "done_when": "Done.", "asked": "Fix the shop's banner",
+                                    "in_reply_to": direct["request_id"]}, context=CHAT)
+        about = self.says(text="Is the banner fixed?", read=False)
+        self.assertIn("Fix the shop's banner", self.ok("manager", "read_messages", {}))      # its read offers it
+        self.ok("manager", "tell_owner", {"text": "It is in work.", "in_reply_to": f"M-{about['event_id']}",
+                                          "ask": f"M-{direct['event_id']}"})
+        self.assertEqual(self.row(about)["ask"], direct["request_id"])
+        with hub.transaction():
+            hub.DB.execute("UPDATE tasks SET state='completed' WHERE ask=?", (direct["request_id"],))
+        late = self.says(text="And the logo?")
+        self.assertIn("only while a task under it is open", self.refused("manager", "tell_owner", {
+            "text": "Done.", "in_reply_to": f"M-{late['event_id']}", "ask": f"M-{direct['event_id']}"}))
+
+    def test_a_message_written_on_a_card_is_on_it_for_sure(self):
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        later = self.says(text="How many were hit?", ask=first["request_id"], read=False)
+        self.assertEqual(self.row(later)["ask"], first["request_id"])
+        self.assertIn(f"card of their ask M-{first['event_id']} (\"Charge nobody for failed orders\")",
+                      hub.q1("SELECT text FROM events WHERE id=?", (later["event_id"],))["text"])
+        third = self.says(text="Thanks.", ask=later["request_id"], read=False)     # a follow-up names the same card
+        self.assertEqual(self.row(third)["ask"], first["request_id"])
+        # a correction written on the card names the message that it corrects, not the card, so it goes where that
+        # message goes (a bug it stops: it kept the card's ask, and stayed behind when the message left the card). A
+        # read message: an unread one is changed in place (edit_in_place), with no correction row
+        self.ok("manager", "read_messages", {})
+        fixed = self.says(text="Thanks a lot.", ask=first["request_id"], replaces_request_id=third["request_id"],
+                          read=False)
+        self.assertEqual((self.row(fixed)["ask"], hub.ask_first(fixed["request_id"])),
+                         (third["request_id"], first["request_id"]))
+        # a card that takes no more messages to this agent refuses no correction, which ignores the card (a bug it
+        # stops: the correction got a 409)
+        logs = self.says("solo", text="Check the logs.")
+        with hub.transaction():
+            hub.DB.execute("UPDATE tasks SET state='completed' WHERE owner='solo'")
+        code, _ = self.request("/ui/messages", self.command(recipient="solo", text="And?", ask=first["request_id"]))
+        self.assertEqual(code, 409)
+        fixed = self.says("solo", text="Check the logs of May.", ask=first["request_id"],
+                          replaces_request_id=logs["request_id"], read=False)
+        self.assertEqual(self.row(fixed)["ask"], logs["request_id"])
+        code, _ = self.request("/ui/messages", self.command(recipient="w", text="And?", ask=first["request_id"]))
+        self.assertEqual(code, 409)             # no ask of w's, and no task of it is w's
+        code, _ = self.request("/ui/messages", self.command(text="And?", ask=f"M-{first['event_id']}"))
+        self.assertEqual(code, 400)
+
+    def test_the_read_lists_the_owner_s_recent_asks_that_the_message_may_go_on_with(self):
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        self.says(text="Thanks.")                                       # no name: no ask
+        disk = self.says("w", text="Check the disk.")
+        self.ok("w", "start_task", {"title": "Check the disk", "done_when": "Done.", "asked": "Check the shop's disk",
+                                    "in_reply_to": disk["request_id"]}, context=CHAT)
+        for n in range(11):
+            self.named(f"Thing {n}.", f"Do thing {n}")
+        self.request("/ui/messages", self.command(text="Are they refunded yet?"))
+        said = self.ok("manager", "read_messages", {})
+        self.assertIn("The owner's recent asks: M-", said)
+        self.assertIn("\"Do thing 10\"", said)
+        self.assertNotIn("Check the shop's disk", said)                 # another agent's ask that it holds no task of
+        self.assertEqual(said.count("\"Do thing"), 10)                  # at most ten, the newest
+        # solo holds open tasks of the manager's asks: its read lists them, under their first message's name
+        self.request("/ui/messages", self.command(recipient="solo", text="Any news?"))
+        said = self.ok("solo", "read_messages", {}, context=CHAT)
+        self.assertIn("\"Do thing 10\"", said)
+        self.assertNotIn(f"\"Charge nobody for failed orders\"", said)  # the newest ten, by their last move
+        # a read with no message of the owner's has no block
+        self.assertNotIn("recent asks", self.ok("manager", "read_messages", {}))
+        # a task session's read: the owner's steer starts "[owner" too, but it has no tell_owner: no block
+        task = hub.q1("SELECT id FROM tasks WHERE owner='solo' ORDER BY id DESC LIMIT 1")["id"]
+        with hub.transaction():
+            hub.DB.execute("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), task))
+        code, steered = self.request(f"/ui/tasks/{task}/steer", self.command(text="Keep it short."))
+        self.assertEqual(code, 200, steered)
+        said = self.ok("solo", "read_messages", {"task_id": hub.tref(task)}, task=task)
+        self.assertIn("Keep it short.", said)
+        self.assertNotIn("recent asks", said)
+
+    def test_a_task_s_plain_result_is_an_answer_on_his_list_and_on_the_card(self):
+        """His list and card say what the work came to: the newest result that its requester accepted. The bugs it
+        stops: the newest answer stays an older reply after its task ended; an older result stands over a newer reply
+        or a newer result; a result that its check refused ("Fixed", taken back) or that nobody checked yet stands as
+        the answer; a part's result stands as the answer, which the card shows under its task only; a result that later
+        work follows (it puts that result right) stands as the answer."""
+        first = self.named("Check the disk.", "Check the disk")
+        self.ok("manager", "tell_owner", {"text": "Solo checks it.", "in_reply_to": f"M-{first['event_id']}"})
+        disk = hub.q1("SELECT id FROM tasks ORDER BY id DESC LIMIT 1")["id"]
+        logs, part = (self.create(ask=f"M-{first['event_id']}")[0]["id"] for _ in range(2))
+        t0 = hub.now()
+
+        def ended(task, plain, at, accepted=1, parent=None):
+            with hub.transaction():
+                hub.DB.execute("UPDATE tasks SET state='completed', delivered=?, plain=?, accepted=?, parent=? "
+                               "WHERE id=?", (at, plain, accepted, parent, task))
+
+        def answer():
+            said = self.request()[1]["owner_asks"][0]["answer"]
+            return said["text"], said["agent"]
+
+        def on_card(task):      # the card's plain words of a task: only where they stand as an answer
+            return {t["id"]: t["plain"] for t in self.card(first["request_id"])[1]["tasks"]}[task]
+
+        ended(disk, "The disk has 41% free.", t0 + 60)
+        self.assertEqual(answer(), ("The disk has 41% free.", "solo"))
+        self.assertEqual(on_card(disk), "The disk has 41% free.")
+        ended(logs, "The logs take 3 GB.", t0 + 120)                    # a newer result is the newer answer
+        self.assertEqual(answer()[0], "The logs take 3 GB.")
+        for check in (0, None):                                         # refused, or not checked yet: no answer
+            ended(logs, "The logs take 3 GB.", t0 + 120, accepted=check)
+            self.assertEqual((answer()[0], on_card(logs)), ("The disk has 41% free.", None))
+        ended(part, "Half of it is old logs.", t0 + 180, parent=disk)   # a part of the disk's task
+        self.assertEqual((answer()[0], on_card(part)), ("The disk has 41% free.", None))
+        ended(logs, "The logs take 3 GB.", t0 + 120)                    # accepted after all: the newest answer
+        with hub.transaction():         # a later task that follows it, which somebody canceled, put nothing right
+            hub.DB.execute("UPDATE tasks SET state='canceled', parent=NULL, follows=?, plain=NULL, accepted=NULL "
+                           "WHERE id=?", (logs, part))
+        self.assertEqual(answer()[0], "The logs take 3 GB.")
+        with hub.transaction():         # in work, it puts that result right: no answer until it says its own
+            hub.DB.execute("UPDATE tasks SET state='working' WHERE id=?", (part,))
+        self.assertEqual((answer()[0], on_card(logs)), ("The disk has 41% free.", None))
+        ended(disk, "The disk has 41% free.", t0 - 60)                  # a reply after the result is the newer answer
+        self.assertEqual(answer()[0], "Solo checks it.")
+
+    def test_the_manager_s_same_words_again_with_ask_make_the_join_and_send_nothing_twice(self):
+        """The bugs it stops: the manager's retry with ask writes a second report, which goes to the chat app again;
+        and the same words as its newest report, to a message that it names by its request id and that has no answer
+        yet, make the join and are told as saved, so that message stays unanswered."""
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        later = self.says(text="Are they refunded yet?")
+        self.ok("manager", "tell_owner", {"text": "Leo checks it.", "in_reply_to": f"M-{later['event_id']}"})
+        # other words on a message that has its answer (a report with no link), and the same call again
+        move = {"text": "That goes on with the refunds.", "in_reply_to": f"M-{later['event_id']}",
+                "ask": f"M-{first['event_id']}"}
+        self.assertIn("has no link", self.ok("manager", "tell_owner", move))
+        again = self.ok("manager", "tell_owner", move)      # it writes no report, so it says nothing of one's link
+        self.assertIn("already saved", again)
+        self.assertIn(f"on the card of M-{first['event_id']}", again)
+        self.assertNotIn("no link", again)
+        self.assertEqual(self.row(later)["ask"], first["request_id"])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE text=?", (move["text"],))["n"], 1)
+        # two messages read, the same words to each, the second named by its request id with ask
+        shop = self.says(text="Is the shop up?", read=False)
+        fees = self.says(text="And the fees of May?")
+        self.ok("manager", "tell_owner", {"text": "Leo looks.", "in_reply_to": f"M-{shop['event_id']}"})
+        said = self.ok("manager", "tell_owner", {"text": "Leo looks.", "in_reply_to": fees["request_id"],
+                                                 "ask": f"M-{first['event_id']}"})
+        self.assertNotIn("already saved", said)
+        self.assertEqual(self.row(fees)["ask"], first["request_id"])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports WHERE in_reply_to=?",
+                                (fees["request_id"],))["n"], 1)
+
+    def test_the_phones_chat_gives_each_message_its_ask(self):
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        later = self.says(text="Are they refunded yet?")
+        self.ok("manager", "tell_owner", {"text": "Leo checks it.", "in_reply_to": f"M-{later['event_id']}",
+                                          "ask": f"M-{first['event_id']}"})
+        items = self.request("/ui/mobile/chat/manager")[1]["items"]
+        self.assertEqual({i["id"]: i["ask"] for i in items if i["kind"] == "message"},
+                         {first["request_id"]: None, later["request_id"]: first["request_id"]})
+
+    def test_an_ask_that_names_no_message_is_no_ask(self):
+        lone = self.says(text="Check the disk.")
+        with hub.transaction():
+            hub.DB.execute("UPDATE ui_requests SET ask=? WHERE request_id=?", (str(uuid.uuid4()), lone["request_id"]))
+        self.assertEqual(hub.ask_first(lone["request_id"]), lone["request_id"])
+        one, two = self.says(text="One."), self.says(text="Two.")
+        with hub.transaction():         # a loop, which no join writes, stops at its hops
+            hub.DB.execute("UPDATE ui_requests SET ask=? WHERE request_id=?", (two["request_id"], one["request_id"]))
+            hub.DB.execute("UPDATE ui_requests SET ask=? WHERE request_id=?", (one["request_id"], two["request_id"]))
+        self.assertEqual(hub.ask_first(one["request_id"]), two["request_id"])     # one hop, then the loop ends
+        self.request("/ui/messages", self.command(text="And?"))
+        self.ok("manager", "read_messages", {})
+        self.assertEqual(self.request()[0], 200)
+
+    def test_his_list_holds_his_own_named_asks_with_their_follow_ups_and_newest_answer(self):
+        """The Mac's window of messages holds about three days of the owner's fleet, so the hub builds the list. A bug
+        it stops: an ask of his own that drops off, an AI session's ask or a word with no name that comes onto it, a
+        follow-up on its own row, or an answer cut before the mask."""
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        later = self.says(text="Are they refunded yet?")
+        self.ok("manager", "tell_owner", {"text": "Leo checks it now. " + "More words. " * 40,
+                                          "in_reply_to": f"M-{later['event_id']}", "ask": f"M-{first['event_id']}"})
+        self.says(text="Thanks.")                                            # no name: no ask
+        session = self.command(text="Rank the new runtimes.")                # an AI session's ask: on the board only
+        code, _ = self.request("/ui/messages", session, {"Content-Type": "application/json",
+                                                         "X-Fleet-Client": "founderizer-mcp/1/test"})
+        self.assertEqual(code, 200)
+        self.ok("manager", "read_messages", {})
+        self.create(ask=f"M-{hub.q1('SELECT event_id FROM ui_requests WHERE request_id=?', (session['request_id'],))['event_id']}",
+                    asked="Rank the new runtimes")
+        old = self.named("Check the old disk.", "Check the old disk")       # old, with its task open: still on it
+        gone = self.named("Check the older logs.", "Check the older logs")   # old, and ended: not on it
+        with hub.transaction():
+            hub.DB.execute("UPDATE ui_requests SET created=created-20*86400 WHERE request_id IN (?,?)",
+                           (old["request_id"], gone["request_id"]))
+            hub.DB.execute("UPDATE tasks SET state='completed' WHERE ask=?", (gone["request_id"],))
+        password = "Across-The-Cut-4242-Login"          # a login across the cut of an answer, registered after it
+        self.ok("manager", "tell_owner", {"text": "The old disk is fine. " + "w " * 136 + password + " and more.",
+                                          "in_reply_to": f"M-{old['event_id']}"})
+        hub.ins("INSERT INTO secrets(salt,hash,len) VALUES(?,?,?)",
+                ("cut-salt", hashlib.sha256(("cut-salt" + password).encode()).hexdigest(), len(password)))
+        # rows of before the hand was kept (21 November 2026): his app's label is his hand, an AI session's is not
+        before = self.named("Check the backups.", "Check the backups")
+        bot = self.named("Rank the old runtimes.", "Rank the old runtimes")
+        with hub.transaction():
+            for row, client in ((before, "founderizer-swift/0.1.400"), (bot, "founderizer-mcp/1/test")):
+                hub.DB.execute("UPDATE ui_requests SET hand=NULL, client=? WHERE request_id=?", (client, row["request_id"]))
+        code, state = self.request()
+        self.assertEqual(code, 200)
+        listed = {a["id"]: a for a in state["owner_asks"]}
+        self.assertEqual(set(listed), {first["request_id"], old["request_id"], before["request_id"]})
+        mine = listed[first["request_id"]]
+        self.assertEqual((mine["name"], mine["agent"], mine["messages"], mine["open"]),
+                         ("Charge nobody for failed orders", "manager", [first["request_id"], later["request_id"]], True))
+        self.assertTrue(mine["answer"]["text"].startswith("Leo checks it now."))
+        self.assertLessEqual(len(mine["answer"]["text"]), hub.OWNER_ASK_WORDS)
+        self.assertNotIn(password[:6], json.dumps(state))                  # cut after the mask: no part of it
+        self.assertEqual(list(state)[-1], "owner_asks")                     # after every key of before
+        code, phone = self.request("/ui/mobile")
+        self.assertEqual((code, {a["id"] for a in phone["asks"]}), (200, set(listed)))
+        # his own follow-up that goes on with an AI session's ask puts that ask on his list
+        follow = self.says(text="And the GPU ones?")
+        event = hub.q1("SELECT event_id FROM ui_requests WHERE request_id=?", (session["request_id"],))["event_id"]
+        self.ok("manager", "tell_owner", {"text": "Yes, those too.", "in_reply_to": f"M-{follow['event_id']}",
+                                          "ask": f"M-{event}"})
+        mine = {a["id"]: a for a in self.request()[1]["owner_asks"]}
+        self.assertEqual(mine[session["request_id"]]["messages"], [session["request_id"], follow["request_id"]])
+        with hub.transaction():         # and an old one of his, while a task of the ask is open
+            hub.DB.execute("UPDATE ui_requests SET created=created-20*86400 WHERE request_id=?", (follow["request_id"],))
+        self.assertIn(session["request_id"], {a["id"] for a in self.request()[1]["owner_asks"]})
+
+    def test_his_list_reads_nothing_more_for_a_message_that_is_no_ask_of_his(self):
+        """Hub core, 25 November 2026: the list is read inside the hub's lock at each state read, and on his hub 290 of
+        373 messages in 14 days came from AI sessions. A bug it stops: a read for each such message (about 760 point
+        reads at each state read before)."""
+        self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+
+        def reads():
+            ran = []
+            hub.DB.set_trace_callback(ran.append)
+            try:
+                with hub.LOCK:
+                    hub.owner_asks_rows(hub.now())
+            finally:
+                hub.DB.set_trace_callback(None)
+            return len([sql for sql in ran if sql.lstrip().upper().startswith("SELECT")])
+        few = reads()
+        sent = []
+        for n in range(12):
+            body = self.command(text=f"Rank runtime {n}.")
+            code, _ = self.request("/ui/messages", body,
+                                   {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-mcp/1/test"})
+            self.assertEqual(code, 200)
+            sent.append(body["request_id"])
+        self.ok("manager", "read_messages", {})
+        for request, kind in zip(sent, ("fast", "cheap", "small", "large", "local", "remote")):     # six with a name
+            event = hub.q1("SELECT event_id FROM ui_requests WHERE request_id=?", (request,))["event_id"]
+            self.ok("manager", "tell_owner", {"text": f"Noted: the {kind} ones.", "in_reply_to": f"M-{event}",
+                                              "asked": f"Rank the {kind} runtimes"})
+            self.assertEqual(self.asked({"request_id": request}), f"Rank the {kind} runtimes")
+        self.assertEqual(reads(), few)
+
+    def test_an_ask_s_card_gives_its_messages_answers_and_tasks_and_a_join_moves_its_follow_ups(self):
+        first = self.named("Make sure we charge nobody.", "Charge nobody for failed orders")
+        middle = self.says(text="And the fees?")
+        last = self.says(text="And the emails?")
+        self.ok("manager", "tell_owner", {"text": "Noted.", "in_reply_to": f"M-{middle['event_id']}",
+                                          "asked": "Charge no fees"})          # a card of its own first, with a name
+        self.ok("manager", "tell_owner", {"text": "Yes.", "in_reply_to": f"M-{last['event_id']}",
+                                          "ask": f"M-{middle['event_id']}"})
+        self.assertEqual(self.row(last)["ask"], middle["request_id"])
+        self.ok("manager", "tell_owner", {"text": "Mia stops them.", "in_reply_to": f"M-{middle['event_id']}",
+                                          "ask": f"M-{first['event_id']}"})
+        self.assertEqual((self.row(middle)["ask"], self.row(last)["ask"]), (first["request_id"],) * 2)
+        fees, _ = self.create(ask=f"M-{middle['event_id']}")
+        code, card = self.card(last['request_id'])         # a follow-up's id opens the same card
+        self.assertEqual(code, 200)
+        self.assertEqual((card["id"], card["name"], card["agent"]),
+                         (first["request_id"], "Charge nobody for failed orders", "manager"))
+        self.assertEqual([m["request_id"] for m in card["messages"]],
+                         [first["request_id"], middle["request_id"], last["request_id"]])
+        self.assertEqual({r["text"] for r in card["reports"]}, {"Noted.", "Yes."})
+        self.assertIn(fees["id"], [t["id"] for t in card["tasks"]])
+        self.assertLessEqual(set(hub.MOBILE_HEAD), set(card["tasks"][0]))
+        # a correction is on the card of the message that it corrects, also a correction of a correction, however many
+        fixed = self.says(text="And the emails of May?", replaces_request_id=last["request_id"])
+        for month in ("June", "July", "August", "September", "October"):
+            fixed = self.says(text=f"And the emails of {month}?", replaces_request_id=fixed["request_id"])
+        self.assertEqual((fixed["ask"], hub.ask_first(fixed["request_id"])), (last["request_id"], first["request_id"]))
+        said = {m["request_id"]: m for m in self.card(first['request_id'])[1]["messages"]}
+        self.assertEqual(said[fixed["request_id"]]["replaces_request_id"], fixed["replaces_request_id"])  # marked as one
+        self.assertIsNone(said[first["request_id"]]["replaces_request_id"])
+        # a later report that took a message's turn with no words of that turn is no answer to it (turn_word)
+        with hub.transaction():
+            hub.DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn,turn_word) "
+                           "VALUES(?,?,?,?,?,?,?)", ("Unrelated news.", "", hub.now() + 5, "manager", None,
+                                                    first["request_id"], None))
+        code, card = self.card(first['request_id'])
+        self.assertNotIn("Unrelated news.", [r["text"] for r in card["reports"]])
+        self.assertNotEqual(self.request()[1]["owner_asks"][0]["answer"]["text"], "Unrelated news.")
+        said = {m["request_id"]: (m["hand"], m["runtime"]) for m in self.request()[1]["messages"]}
+        self.assertEqual([(m["hand"], m["runtime"]) for m in card["messages"]],      # who sent each, as the chat says
+                         [said[m["request_id"]] for m in card["messages"]])
+        self.assertFalse([m for m in card["messages"] if "session" in m])
+        self.assertEqual(self.card(uuid.uuid4())[0], 404)
+        self.assertEqual(self.request(f"/ui/mobile/asks/{first['request_id']}?db=other")[0], 409)
+        self.assertTrue(hub.device_may(f"/ui/mobile/asks/{first['request_id']}", "GET"))   # the phone reads it too
+
+    def test_each_read_of_his_asks_goes_by_an_index(self):
+        """Hub core, 25 November 2026: a read under the hub's lock goes through an index, and the hub runs no ANALYZE.
+        A later change that loses one (another condition, a dropped index) fails here, with its plan."""
+        plans = {hub.ASKS_RECENT_READ: (("manager", 0.0, 10), ("ui_request_recipient",)),
+                 hub.ASKS_OPEN_READ: (("solo",), ("task_owner_open", "task_owner_state")),
+                 hub.ASK_FOLLOW_UPS_READ: (("x",), ("ui_requests_ask",)),
+                 hub.ASK_CORRECTIONS_READ.format("?,?"): (("x", "y"), ("ui_requests_ask",)),
+                 hub.ASK_REPLY_READ: (("manager", "x"), ("owner_reply_identity",)),
+                 hub.ASK_TURN_READ: (("x",), ("owner_report_turn",)),
+                 hub.ASK_TASKS_READ.format("?,?"): (("x", "y"), ("task_ask",)),
+                 hub.ASK_RESULT_READ.format("?,?"): (("x", "y") * 3, ("task_ask",))}
+        for sql, (args, indexes) in plans.items():
+            plan = " | ".join(r["detail"] for r in hub.q("EXPLAIN QUERY PLAN " + sql, args))
+            self.assertTrue(any(index in plan for index in indexes), f"{sql}: {plan}")
+
+
 # unittest runs only this file's cases, not the ones it inherits from the owner API's.
 def load_tests(_loader, _tests, _pattern):
     return unittest.TestSuite([*(Asks(name) for name in Asks.__dict__ if name.startswith("test_")),
-                               *(Jobs(name) for name in Jobs.__dict__ if name.startswith("test_"))])
+                               *(Jobs(name) for name in Jobs.__dict__ if name.startswith("test_")),
+                               *(FollowUps(name) for name in FollowUps.__dict__ if name.startswith("test_"))])
 
 
 if __name__ == "__main__":

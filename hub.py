@@ -272,7 +272,7 @@ CREATE TABLE IF NOT EXISTS evidence(id INTEGER PRIMARY KEY, case_id TEXT, kind T
 CREATE TABLE IF NOT EXISTS ui_requests(request_id TEXT PRIMARY KEY, kind TEXT, need_id INTEGER,
   text TEXT, event_id INTEGER NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
   recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT, edits TEXT, connection INTEGER, hand TEXT,
-  session TEXT);
+  session TEXT, ask TEXT);
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   mime TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
   message TEXT, kept REAL, knowledge TEXT);
@@ -2221,6 +2221,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # with one card for each job): tasks[].job, the task whose job a task joins,
                                     # tasks[].job_name, the name of a job on its first task, and tasks[].plain, a
                                     # result in plain words, of GET /ui/state
+               "ask_follow_ups",    # the owner, 25 November 2026 ("Yes, this" to round 2 of "Your asks"): messages[].ask,
+                                    # the first message of the ask that a follow-up goes on with, and `ask` of POST
+                                    # /ui/messages, the card that he wrote a message on (UI-API.md 1.360)
                "need_give",         # the owner, 19 November 2026 (his picks of the mockup of a card for access): an
                                     # item that carries its grant, needs[].give, whose first option, Give, makes it
                                     # at his press (UI-API.md, "Give on a card")
@@ -5262,6 +5265,208 @@ def ask_names(heads):
         named)}
 
 
+OWNER_ASKS_DAYS = 14            # an ask with a message of these days, or with an open task, is on his list
+OWNER_ASKS_MAX = 60             # at most so many: the open ones, then the newest that ended
+OWNER_ASKS_HARD = 100           # and never more, also of open ones (Needs-you: the state passed 8 MiB once)
+OWNER_ASK_WORDS = 300           # the start of its newest answer, which his list shows under its name
+OWNER_ASKS_PER_AGENT = 200      # messages of one agent that the list reads at most, the newest first
+# The reads of his asks, each by an index (Hub core, 25 November 2026); test_asks prints their plans
+ASK_HEAD = "request_id, event_id, recipient, asked, created, ask, hand, client, origin"      # a message, for an ask
+ASKS_RECENT_READ = (f"SELECT {ASK_HEAD} FROM ui_requests WHERE recipient=? AND created>? AND kind='message' "
+                    "AND (asked IS NOT NULL OR ask IS NOT NULL) ORDER BY created DESC LIMIT ?")  # ui_request_recipient
+ASK_HEAD_READ = f"SELECT {ASK_HEAD} FROM ui_requests WHERE request_id=? AND kind='message'"   # by its key
+ASKS_OPEN_READ = ("SELECT DISTINCT ask, last_activity, created FROM tasks WHERE owner=? AND state NOT IN (" +
+                  ",".join(f"'{s}'" for s in TERMINAL) + ") AND ask IS NOT NULL")  # task_owner_open: OPEN_TASK's words
+ASK_FOLLOW_UPS_READ = ("SELECT request_id, recipient, hand, client, origin, created FROM ui_requests WHERE ask=? AND "
+                       "kind='message' "
+                       "ORDER BY created, request_id")                              # ui_requests_ask
+# A report that took a message's turn answers it only when it is words of the runtime turn that read it (turn_word,
+# owner API 1.190: 14 of the manager's 190 reports stood under a message that they did not answer); the apps' `turn`
+ASK_REPLY_READ = ("SELECT id, text, created, agent, in_reply_to, turn_word AS turn FROM owner_reports WHERE agent=? "
+                  "AND in_reply_to=?")                                              # owner_reply_identity
+ASK_TURN_READ = ("SELECT id, text, created, agent, in_reply_to, turn_word AS turn FROM owner_reports WHERE turn=? "
+                 "AND turn_word=turn ORDER BY id DESC")                             # owner_report_turn
+ASK_TASKS_READ = "SELECT * FROM tasks WHERE ask IN ({}) ORDER BY id"                # task_ask
+# The plain words of the newest result of an ask's tasks, which are an answer to it too (README of the design, "the
+# newest of an agent's reply or the plain result"), as the Mac's list reads it (AskedRow): only a result that its
+# requester accepted (a refused one keeps its words and its state, and only accepted says so: a "Fixed" that its check
+# took back is worse than none, the Mac's AskedCard), not a part's of another task of the ask, which the card shows
+# under that task and not as an answer, and not one that a later task of the ask follows, which nobody canceled: that
+# work put it right (the validators' reads of 26 November 2026; the Mac's AskResult is the same rule)
+ASK_RESULT_READ = ("SELECT plain AS text, COALESCE(delivered, last_activity, created) AS at, owner AS agent FROM tasks "
+                   "WHERE ask IN ({0}) AND state IN (" + ",".join(f"'{s}'" for s in TERMINAL) + ") AND accepted=1 AND "
+                   "plain IS NOT NULL AND plain != '' AND NOT EXISTS (SELECT 1 FROM tasks p WHERE p.id=tasks.parent AND "
+                   "p.ask IN ({0})) AND NOT EXISTS (SELECT 1 FROM tasks f WHERE f.ask IN ({0}) AND f.follows=tasks.id "
+                   "AND f.state!='canceled') ORDER BY at DESC, id DESC LIMIT 1")    # task_ask each time, and the key
+
+
+# A correction names the head of its chain of corrections (correction_head), and a join moves none (ask_join_rows), so
+# it goes wherever that message goes; the card reads them one step further, by ui_requests_ask
+ASK_CORRECTIONS_READ = ("SELECT request_id, recipient, hand, client, origin, created FROM ui_requests WHERE ask IN ({}) "
+                        "AND replaces_request_id IS NOT NULL AND kind='message'")
+
+
+def ask_follow_rows(first):
+    """The rows of the messages that go on with the ask whose first message this is (ui_requests_ask): its follow-ups,
+    which a join moves onto the first message, and the corrections of each message of it (ASK_CORRECTIONS_READ, a step
+    for each correction of a correction), in the order he wrote them."""
+    rows = [r for r in read_rows(ASK_FOLLOW_UPS_READ, (first,)) if r["request_id"] != first]
+    seen, step = {first} | {r["request_id"] for r in rows}, [first] + [r["request_id"] for r in rows]
+    for _ in range(ASK_CORRECTIONS):
+        more = [r for r in read_rows(ASK_CORRECTIONS_READ.format(",".join("?" * len(step))), step)
+                if r["request_id"] not in seen]
+        if not more:
+            break
+        rows += more
+        seen |= {r["request_id"] for r in more}
+        step = [r["request_id"] for r in more]
+    return sorted(rows, key=lambda r: (r["created"], r["request_id"]))
+
+
+def correction_head(request_id):
+    """The message at the head of the chain of corrections that ends in this one, which a correction of it names as its
+    ask: its tasks name that message too (ask_message). A correction of a correction names it as well, so ask_first
+    needs one hop to it, however many there are."""
+    for _ in range(ASK_CORRECTIONS):
+        row = read_row("SELECT replaces_request_id FROM ui_requests WHERE request_id=? AND kind='message'", (request_id,))
+        if not row or not row["replaces_request_id"]:
+            break
+        request_id = row["replaces_request_id"]
+    return request_id
+
+
+def ask_message_rows(first, recipient):
+    """[(request id, recipient)] of the messages of the ask whose first message this is (recipient: its agent), in the
+    order he wrote them: it, then the messages that go on with it (ask_follow_rows)."""
+    return [(first, recipient)] + [(r["request_id"], r["recipient"]) for r in ask_follow_rows(first)]
+
+
+def ask_messages(first):
+    """The request ids of the messages of the ask whose first message this is (ask_message_rows)."""
+    return [m for m, _ in ask_message_rows(first, None)]
+
+
+def ask_by_his_hand(row):
+    """His own hand wrote this message (OWNER_FORCE_HANDS), for his list "Asked by me" only. A row of before the hand
+    was kept (21 November 2026) has none, and goes by what request_hand reads now: a chat app's message (origin) or
+    the label of an app of his (OWNER_DEVICE_LABELS). Hub core, 25 November 2026: 17 messages of his own on his hub in
+    14 days had no hand. owner_force still gives no hand no force."""
+    if row["hand"] is not None:
+        return row["hand"] in OWNER_FORCE_HANDS
+    return bool(row["origin"]) or str(row["client"] or "").startswith(OWNER_DEVICE_LABELS)
+
+
+def ask_answer(messages):
+    """The newest answer to one of these messages [(request id, recipient)], {text (its start), at, agent}, or None:
+    the agent's report that is linked to it, or that took its turn (owner_reply_identity, owner_report_turn), or the
+    plain words of the newest result of a task of it that its requester accepted (ASK_RESULT_READ)."""
+    best = None
+    for m, to in messages:
+        for r in ([read_row(ASK_REPLY_READ, (to, m))] if to else []) + [read_row(ASK_TURN_READ, (m,))]:
+            if r and (best is None or r["created"] > best["created"]):
+                best = r
+    done = read_row(ASK_RESULT_READ.format(",".join("?" * len(messages))), [m for m, _ in messages] * 3)
+    if done and (best is None or done["at"] > best["created"]):
+        return {"text": done["text"], "at": done["at"], "agent": done["agent"]}
+    # whole here: scrub masks a login in a text as a whole, so the answer is cut after it (owner_asks_cut)
+    return {"text": best["text"] or "", "at": best["created"], "agent": best["agent"]} if best else None
+
+
+def owner_asks_rows(t0):
+    """On the state's read connection (state_moment), or inside the caller's lock: the asks of the owner's list "Asked
+    by me" (owner feature ask_follow_ups; the owner,
+    25 November 2026, "Yes, this" to round 2 of ~/dev/founderizer-plans/my-asks-tracking-2026-11-25/), the newest move
+    first, every open one and then the newest that ended, at most OWNER_ASKS_MAX. An ask is on it when his own hand
+    wrote its first message or a follow-up of it in those days (ask_by_his_hand: an app's screen, an enrolled device, a
+    chat app; his AI sessions' asks stay on the board, until he goes on with one himself), it has a name (its first task's `asked`, or tell_owner's for a question), and a message of it
+    came in OWNER_ASKS_DAYS days or an open task has it. Each: its first message (id, event_id, agent, name, created),
+    `messages` (the request ids of it, which the tasks' `ask` names), `answer` (ask_answer) and `open`. The reads go by
+    ui_request_recipient and task_owner_open for each agent (OWNER_ASKS_PER_AGENT counts only named messages and
+    follow-ups, so that a busy AI session pushes none of his asks off), and by keys and ui_requests_ask for each ask:
+    the hub holds no message list of its own for this, because the Mac's window of messages holds about three days.
+    A message that names no earlier one is its own first, and its row is its head: one that is no ask of his (an AI
+    session's, a word with no name) costs no read more (Hub core, 25 November 2026: 290 of 373 messages in 14 days on
+    his hub came from AI sessions, about 760 point reads at each state read before)."""
+    since, moved, open_, heads, his = t0 - OWNER_ASKS_DAYS * 86400, {}, set(), {}, set()
+    for name in agents():
+        for r in read_rows(ASKS_RECENT_READ, (name, since, OWNER_ASKS_PER_AGENT)):
+            if r["ask"]:
+                first = ask_first(r["request_id"])
+                if ask_by_his_hand(r):      # his own follow-up puts the ask on his list, also an AI session's ask
+                    his.add(first)
+            elif r["asked"] and ask_by_his_hand(r):
+                first = heads.setdefault(r["request_id"], r)["request_id"]
+            else:
+                continue
+            moved[first] = max(moved.get(first, 0), r["created"])
+        for t in read_rows(ASKS_OPEN_READ, (name,)):
+            first = t["ask"] if t["ask"] in heads else ask_first(t["ask"])
+            open_.add(first)
+            moved.setdefault(first, 0)
+    rows = []
+    for first in moved:
+        head = heads.get(first) or read_row(ASK_HEAD_READ, (first,))
+        if not head or not head["asked"]:
+            continue
+        follow = ask_follow_rows(first)
+        # his: its first message, or a follow-up of his (in the window, or older under an open task)
+        if not (first in his or ask_by_his_hand(head) or any(ask_by_his_hand(f) for f in follow)):
+            continue
+        messages = [(first, head["recipient"])] + [(f["request_id"], f["recipient"]) for f in follow]
+        answer = ask_answer(messages)
+        rows.append({"id": first, "event_id": head["event_id"], "agent": head["recipient"], "name": head["asked"],
+                     "created": head["created"], "messages": [m for m, _ in messages], "answer": answer,
+                     "open": first in open_,
+                     "moved": max(moved[first], head["created"], answer["at"] if answer else 0)})
+    rows.sort(key=lambda r: (r["moved"], r["event_id"]), reverse=True)
+    kept = [r for r in rows if r["open"]][:OWNER_ASKS_HARD]
+    return kept + [r for r in rows if not r["open"]][:max(0, OWNER_ASKS_MAX - len(kept))]
+
+
+def owner_asks_cut(asks):
+    """His list after scrub: each answer on one line, cut to OWNER_ASK_WORDS characters. Cut after the mask, as
+    mobile_cut does, so that no part of a login that lay across the cut reaches an app."""
+    for ask in asks or []:
+        if ask.get("answer"):
+            ask["answer"]["text"] = clip(ask["answer"]["text"], OWNER_ASK_WORDS - len("..."))   # with its "...": at most 300
+    return asks
+
+
+def ask_card(first):
+    """GET /ui/mobile/asks/<id> after ui_allowed: the card of one ask of the owner's, as its page shows it (owner feature
+    ask_follow_ups): its messages with their words, who sent each (message_hand, as the chat gives it) and the message
+    that each corrects (replaces_request_id, as the chat gives it, so a correction is marked as one), the reports
+    that answer them, and the heads of its tasks (as the phone's, MOBILE_HEAD, with each result's plain words), each
+    list in time order. (status, answer, headers)."""
+    with LOCK:
+        first = ask_first(first)
+        head = read_row("SELECT request_id, recipient, asked FROM ui_requests WHERE request_id=? AND kind='message'", (first,))
+        if not head:
+            return 404, {"error": "There is no such ask."}, None
+        ids = ask_messages(first)
+        marks = ",".join("?" * len(ids))
+        messages = read_rows(f"SELECT request_id, event_id, text, created, client, origin, recipient, hand, session, "
+                             f"replaces_request_id FROM ui_requests WHERE request_id IN ({marks}) ORDER BY created, "
+                             f"request_id", ids)
+        reports = [r for m in messages for r in [read_row(ASK_REPLY_READ, (m["recipient"], m["request_id"]))]
+                   + read_rows(ASK_TURN_READ, (m["request_id"],)) if r]
+        tasks = read_rows(ASK_TASKS_READ.format(marks), ids)
+    reports = sorted({r["id"]: r for r in reports}.values(), key=lambda r: r["id"])
+    # each result's plain words only where they stand as an answer by ASK_RESULT_READ's rule, so that no app's card
+    # says what his list does not (the validator's round 6, 26 November 2026)
+    held = {t["id"] for t in tasks}
+    followed = {t["follows"] for t in tasks if t["state"] != "canceled"}
+    stands = {t["id"] for t in tasks if t["state"] in TERMINAL and t["accepted"] == 1 and t["plain"]
+              and t["parent"] not in held and t["id"] not in followed}
+    return 200, scrub({"db": kv_get("db_id"), "id": first, "agent": head["recipient"], "name": head["asked"],
+                       "messages": [dict({k: m[k] for k in m.keys() if k not in ("hand", "session")},
+                                         origin=bool(m["origin"]), **message_hand(m["hand"], m["session"]))
+                                    for m in messages],
+                       "reports": [dict(r) for r in reports],
+                       "tasks": [dict({k: t[k] for k in MOBILE_HEAD}, limit=None,
+                                      plain=t["plain"] if t["id"] in stands else None) for t in tasks]}), None
+
+
 def ended_mark():
     """Owner API 1.166: a short value that changes whenever the answer of GET /ui/mobile/ended would: a task that ends,
     and a check or an activity of one that ended (its count, its newest id, its accepted marks, its newest check and
@@ -6124,6 +6329,7 @@ def mobile_cut(answer):
     for agent in answer["agents"]:
         if agent["last"]:
             agent["last"]["preview"] = agent["last"]["preview"][:MOBILE_PREVIEW]
+    owner_asks_cut(answer.get("asks"))      # owner feature ask_follow_ups: the answers of his list, after the mask too
     return answer
 
 
@@ -6158,7 +6364,8 @@ def mobile_chat(agent, since):
                    "attachments": [f for f in files.get(r["request_id"], [])
                                    if f["id"] not in skill_gives(message_skills_read(r["skills"]))],
                    "answer_to": r["need_id"] if r["kind"] == "answer" else None,
-                   "skills": message_skills_read(r["skills"])}, **message_hand(r["hand"], r["session"]))
+                   "skills": message_skills_read(r["skills"]),
+                   "ask": r["ask"]}, **message_hand(r["hand"], r["session"]))     # as GET /ui/state's messages give it
              for r in said]
     reports = q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))
     carried = carried_files("report", [r["id"] for r in reports])      # CHAT-APPS.md 20: an agent's files
@@ -9793,7 +10000,10 @@ def migrate():
                         "skills": "TEXT",
                         # the review of 20 November 2026, issue 4: the hand that sent it (request_hand) and the AI
                         # session that it names (X-Fleet-Session); null for a row of before
-                        "hand": "TEXT", "session": "TEXT"},             # and `device`: placeless, below
+                        "hand": "TEXT", "session": "TEXT",
+                        # owner feature asks: the request id of the first message of the ask that this message goes
+                        # on with (a follow-up), NULL for none; a first message that is gone is no ask (readers)
+                        "ask": "TEXT"},                                 # and `device`: placeless, below
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -10060,6 +10270,9 @@ def migrate():
     for statement in [
         "CREATE UNIQUE INDEX IF NOT EXISTS owner_reply_identity ON owner_reports(agent,in_reply_to) WHERE in_reply_to IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS owner_report_turn ON owner_reports(turn) WHERE turn IS NOT NULL",
+        # owner feature ask_follow_ups: the follow-ups of an ask, and the tasks of its messages (ask_messages, ask_card)
+        "CREATE INDEX IF NOT EXISTS ui_requests_ask ON ui_requests(ask) WHERE ask IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS task_ask ON tasks(ask) WHERE ask IS NOT NULL",
         # owner feature chat_stop: an agent's reports that name no message, newest last (chat_read_waiting, at each read
         # of the state for each agent whose press of Stop can be given)
         "CREATE INDEX IF NOT EXISTS owner_report_unnamed ON owner_reports(agent, created) WHERE in_reply_to IS NULL",
@@ -10465,6 +10678,11 @@ def t_read_messages(agent, a):
                 # owner feature chat_stop: an owner chat's answer names its messages in the same first line, so that
                 # its helper finds what a cut turn read in the chat's own conversation file (fleet.read_ids)
                 head = "Unread messages: " + ", ".join(f"M-{r['id']}" for r in rows) + ".\n\n"
+            # owner feature asks: what their message may go on with, in an owner chat's read and the manager's only (a
+            # task session's steer or answer starts "[owner" too, and it has no tell_owner or start_task; the Needs-you
+            # area's read, 25 November 2026)
+            if (chat_context(agent) or role_of(agent) == "manager") and any(r["text"].startswith("[owner") for r in rows):
+                head += asks_block(agent)
         key = secret_key()
     with logins_held(key):
         team = mask_message(team)
@@ -10524,6 +10742,53 @@ OWNER_CHAT_GUIDANCE = ("Owner-chat guidance: answer with tell_owner, short like 
                        "task, a duty or a case by what it is about, never by its code (T-61, R-3). When you make "
                        "work of an owner message, give create_task ask=M-<n> of that message, and on its first task "
                        "asked: the thing to be done, as a short verb phrase.\n\n")
+ASKS_BLOCK_DAYS = 14            # the owner's asks that moved in these days, which a new message of theirs may go on with
+ASKS_BLOCK_ITEMS = 10           # at most so many of them in a read
+ASKS_BLOCK_CHARS = 420          # and so many characters of lines: with its sentences ~600 (Needs-you, 25 November 2026)
+
+
+def asks_block(agent):
+    """The owner's asks that their unread message may go on with, for the read that gives it (owner feature asks; the
+    Needs-you area, 25 November 2026: in the read, never in the start text or the owner chat's instructions, which the
+    prompt cache holds): their asks to this agent that moved in the last ASKS_BLOCK_DAYS days, and the asks of its open
+    tasks (for the manager, of every open task in the fleet: it may join any of them, ask_card_of), his own asks first
+    and then the newest move, each under its first message's name, at most ASKS_BLOCK_ITEMS of them in
+    ASKS_BLOCK_CHARS characters; "" for none. The reads go by the indexes ui_request_recipient (recipient, created) and
+    task_owner_state (owner, state, id), and each message by its key."""
+    since, moved, heads, held = now() - ASKS_BLOCK_DAYS * 86400, {}, {}, set()
+    for r in read_rows(ASKS_RECENT_READ, (agent, since, ASKS_BLOCK_ITEMS * 6)):
+        if not r["ask"]:            # its own first: its row is its head, and no read more
+            heads[r["request_id"]] = r
+        first = ask_first(r["request_id"]) if r["ask"] else r["request_id"]
+        moved[first] = max(moved.get(first, 0), r["created"])
+    # its own open tasks; for the manager, every agent's (ask_card_of)
+    for name in (list(agents()) if role_of(agent) == "manager" else [agent]):
+        for t in read_rows(ASKS_OPEN_READ, (name,)):
+            first = t["ask"] if t["ask"] in heads else ask_first(t["ask"])
+            held.add(first)
+            moved[first] = max(moved.get(first, 0), t["last_activity"] or t["created"] or 0)
+    named = []
+    for first, at in moved.items():
+        row = heads.get(first) or read_row(ASK_HEAD_READ, (first,))
+        # a message with no name is no ask (a word, or one that nothing filed yet), and only an ask that ask_to_join
+        # takes is listed: the agent's own, one that an open task of its own is under, or for the manager one that
+        # any open task is under
+        if row and row["asked"] and (row["recipient"] == agent or first in held):
+            named.append((ask_by_his_hand(row), at, row["event_id"], row["asked"]))
+    lines, size = [], 0
+    # his own asks first (most named asks come from his AI sessions: the validator's read of 25 November 2026), then
+    # the newest move first, then the newest message
+    for _his, at, event_id, asked in sorted(named, reverse=True):
+        line = f"M-{event_id} \"{asked}\" ({time.strftime('%d %b', time.gmtime(at))})"
+        if len(lines) == ASKS_BLOCK_ITEMS or size + len(line) > ASKS_BLOCK_CHARS:
+            break
+        lines.append(line)
+        size += len(line) + 2
+    if not lines:
+        return ""
+    tools = "tell_owner" if role_of(agent) == "manager" else "tell_owner or start_task"
+    return ("The owner's recent asks: " + "; ".join(lines) + f". If their message goes on with one, give its M-<n> as "
+            f"ask to {tools}. A question that takes no task: tell_owner asked, its name.\n\n")
 
 
 # ---------------------------------------------------------------- what an agent holds, and what it has left
@@ -16467,6 +16732,97 @@ def ask_message(agent, ref):
     return row
 
 
+# **A message that goes on with an earlier ask is on that ask's card** (the owner, 25 November 2026: "Sometimes I will
+# be asking about related tasks repeatedly, so the system should catch that", then "it needs to feel more natural" and
+# "Yes, this" to its pictures, ~/dev/founderizer-plans/my-asks-tracking-2026-11-25/). The agent that reads the message
+# judges it, from the block of the owner's recent asks that its read gives (asks_block), and says so with `ask` on
+# tell_owner or start_task; a message that the owner writes on the card itself carries it (POST /ui/messages `ask`).
+# The message keeps its own row and its own tasks: only ui_requests.ask names the first message of the ask that it
+# goes on with. So a task of the message goes where the message goes, and a wrong join that the agent takes back
+# (tell_owner asked) takes its tasks back too. Nothing reads tasks by their ask.
+ASK_HOPS = 4                    # links of ask that ask_first follows: a join writes the first message, so one is usual
+
+
+def ask_first(request_id):
+    """The first message of the ask that this message is part of: the message that its `ask` names, followed at most
+    ASK_HOPS times, else the message itself. An `ask` that names no message of the owner's (a restored older copy, a
+    later sweep) is no ask: the message is then its own (Hub core, 25 November 2026)."""
+    seen = {request_id}
+    for _ in range(ASK_HOPS):
+        row = read_row("SELECT ask FROM ui_requests WHERE request_id=?", (request_id,))
+        later = row["ask"] if row else None
+        if not later or later in seen or not read_row("SELECT 1 FROM ui_requests WHERE request_id=? AND "
+                                                      "kind='message'", (later,)):
+            break
+        seen.add(later)
+        request_id = later
+    return request_id
+
+
+def ask_join_rows(message, first):
+    """Inside the caller's transaction: `message` goes on with the ask whose first message is `first`, and so do the
+    follow-ups that went on with it (ui_requests_ask), so that one step of ask finds every message of an ask."""
+    in_transaction("ask_join_rows")
+    # a correction stays on the message that it corrects, and goes with it (the readers of 25 November 2026)
+    DB.execute("UPDATE ui_requests SET ask=? WHERE request_id=? OR (ask=? AND replaces_request_id IS NULL)",
+               (first, message, message))
+
+
+def ask_to_join(agent, ref, message):
+    """The first message of the earlier ask that `ref` names, for `message` (a request id) that goes on with it, or a
+    ToolError. `ref` is M-<n> or a request UUID of a message of the owner's: one to this agent that it has read, or one
+    to another agent. Either way the ask is judged by its FIRST message (ask_card_of): an ask of the owner's to this
+    agent, or one that an open task of this agent's has (the owner asked the Fleet Manager on Sunday and the lead that
+    works on it on Tuesday). So an agent's own follow-up that went onto another agent's ask opens that ask to it only
+    while it holds an open task of it (the Needs-you area's read, 25 November 2026)."""
+    try:
+        row = ask_message(agent, ref)       # one to this agent that it read (a correction: its chain's first)
+    except ToolError:
+        named = ASK_REF.match(str(ref))
+        try:
+            key = ("u.event_id=?", int(named.group(1))) if named else ("u.request_id=?",
+                                                                       str(uuid.UUID(str(ref).strip())))
+        except (ValueError, AttributeError, TypeError):
+            key = None
+        row = read_row("SELECT u.* FROM ui_requests u WHERE u.kind='message' AND " + key[0], (key[1],)) if key else None
+        if not row or row["recipient"] == agent:        # none, or one of its own that it has not read
+            raise ToolError("ask names an earlier message of the owner's: one to you that you have read, or the "
+                            "first message of an ask that an open task of yours is under, as your read of their asks "
+                            "gives it (M-<n>).") from None
+    first = ask_card_of(row["request_id"], agent)
+    if first is None:
+        head = read_row(ASK_HEAD_READ, (ask_first(row["request_id"]),)) or row
+        raise ToolError(f"M-{head['event_id']} is the owner's ask to {shown_role(head['recipient'])}: you can go on "
+                        f"with it only while a task {'' if role_of(agent) == 'manager' else 'of yours '}under it is "
+                        f"open.")
+    if first == message:
+        raise ToolError("ask names an earlier ask of the owner's: the message that you answer is the first message of "
+                        "that ask itself.")
+    head = read_row(ASK_HEAD_READ, (first,))
+    if not head or not head["asked"]:       # no card in the owner's apps: the two would show on none
+        raise ToolError(f"M-{head['event_id'] if head else row['event_id']} has no name, so it has no card to go on: "
+                        f"give the message that you answer its own name with asked.")
+    return first
+
+
+def ask_card_of(request_id, recipient):
+    """The first message of the ask whose card the owner wrote a message on, for that message to `recipient`, or None:
+    the card is an ask of the owner's to that agent, or one that an open task of that agent's has; for the manager,
+    one that any open task is under (it stays on top of all work: the Needs-you area, 25 November 2026)."""
+    first = ask_first(request_id)
+    row = read_row("SELECT recipient FROM ui_requests WHERE request_id=? AND kind='message'", (first,))
+    if not row:
+        return None
+    if row["recipient"] == recipient:
+        return first
+    if role_of(recipient) == "manager":     # it stays on top of all work: any open task under the ask (Needs-you,
+        ids = ask_messages(first)           # 25 November 2026), by task_ask
+        return first if read_row(f"SELECT 1 FROM tasks WHERE ask IN ({','.join('?' * len(ids))}) AND state NOT IN "
+                                 f"{ENDED_STATES} LIMIT 1", ids) else None
+    held = read_rows(f"SELECT ask FROM tasks WHERE owner=? AND state NOT IN {ENDED_STATES} AND ask IS NOT NULL", (recipient,))
+    return first if any(ask_first(t["ask"]) == first for t in held) else None
+
+
 def task_ask(agent, a, follows, parent, goal_id=None, job=None):
     """(the ask of a new task, the name that the task gives that ask or None), or a ToolError. The caller names the
     owner's message with `ask`, and with `asked` when it is the first task of that message. Without `ask`, a task
@@ -16510,11 +16866,22 @@ def task_ask(agent, a, follows, parent, goal_id=None, job=None):
         raise ToolError(chat_stop_refusal(stopped))
     if message["asked"]:
         return message["request_id"], None      # the name that its first task gave it stays
+    first = ask_first(message["request_id"])
+    if first != message["request_id"]:
+        # it goes on with an earlier ask, whose name the card has: a good name that the agent gives, else the card's,
+        # is the message's name for the apps that read no follow-up yet (the readers of 25 November 2026)
+        wrong = asked_words(name) if name else None
+        if wrong:
+            raise ToolError(wrong)
+        card = read_row("SELECT asked FROM ui_requests WHERE request_id=?", (first,))
+        return message["request_id"], (name or (card["asked"] if card else None))
     if not name:
         raise ToolError(f"This is the first task of the owner's message M-{message['event_id']}: give asked too, "
                         f"the thing to be done as a short verb phrase of at most {ASKED_CHARS} characters, for "
                         f"example \"Move the shop to the new server\": never the message's first words, a yes, a "
-                        f"code or an agent's name. The owner reads it as the name of this work in their apps.")
+                        f"code or an agent's name. The owner reads it as the name of this work in their apps. If the "
+                        f"message goes on with an earlier ask of theirs, join it first with tell_owner ask (that "
+                        f"ask's M-<n>); then this task needs no asked.")
     wrong = asked_words(name)
     if wrong:
         raise ToolError(wrong)
@@ -26286,7 +26653,12 @@ def t_start_task(agent, a):
     # title (ask_name_of): start_task asked for no name before, and it refuses no title now. A correction of a
     # message that is an ask already belongs to that ask (ask_message).
     ask = ask_message(agent, source["request_id"])["request_id"]
-    asked = asked or ask_name_of(title)
+    # owner feature asks: a message that goes on with an earlier ask of the owner's is on that ask's card, its task too
+    # (by the head of its corrections, which the task's ask names, so that the task goes onto the card with it); it
+    # takes the card's name, which the apps that read no follow-up yet show (the validator's M1, 25 November 2026)
+    first = ask_to_join(agent, a.get("ask"), ask) if a.get("ask") not in (None, "") else None
+    card = read_row("SELECT asked FROM ui_requests WHERE request_id=?", (first,)) if first else None
+    asked = asked or (card["asked"] if card else None) or ask_name_of(title)
     route, why_not = wakeups.wake_route(wake_org(), agent)        # authority() and the agent active, at each step
     if route is None or route["kind"] != "task":
         raise ToolError(f"No task can be opened for you: {why_not or 'there is no line to request it'}")
@@ -26311,6 +26683,8 @@ def t_start_task(agent, a):
         tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
                                      "needs": needs, "goal": "", "goal_id": None, "parent": parent, "step": None,
                                      "follows": follows, "case_id": None, "why": why, "ask": ask, "asked": asked})
+        if first:
+            ask_join_rows(ask, first)
         # **The sentence before the task becomes the reply now** (after_task_words; the chat's rules since 13
         # November 2026, fleet.chat_command): a request for work got its first words only after this call, which
         # the model wrote for 5 to 8 seconds.
@@ -26328,12 +26702,23 @@ def t_start_task(agent, a):
     return text
 
 
+def report_again(agent, text, about, ids):
+    """The agent's newest report when this call has its words, `about` and files and no message of the owner's was
+    read since it: the same call again, which is told as saved and sends nothing twice (RULES.md, rule 9); else None."""
+    last = q1("SELECT * FROM owner_reports WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
+    if last and (last["text"], last["about"], report_file_ids(last["id"])) == (text, about, sorted(ids)) and not q1(
+            "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' "
+            "AND u.need_id IS NULL AND e.read_at>? LIMIT 1", (agent, last["created"])):
+        return last
+    return None
+
+
 def t_tell_owner(agent, a):
     text = str(a.get("text") or "").strip()
     about = str(a.get("about") or "").strip()
     if not text or len(text) > 16000 or len(about) > 500:
         raise ToolError("A report needs 1 to 16000 characters; about is at most 500 characters.")
-    guard(agent, text, about)
+    guard(agent, text, about, str(a.get("asked") or ""))     # asked: a name in the owner's apps (owner feature asks)
     ids = chat_files_ids(a.get("files"))        # CHAT-APPS.md 20: a report with the same words and files is the same
     chat_files_check_session(agent, ids)
     reply, role = a.get("in_reply_to"), agents()[agent].get("role")
@@ -26384,22 +26769,31 @@ def t_tell_owner(agent, a):
     #   it, is the same call again: it is told as saved, and nothing is saved or sent twice. With a message read since,
     #   the same words are a report of their own.
     note, also, turn, word = "", None, None, None
+    # owner feature asks: a call that gives ask or asked. The same words again (a retry, or words that the agent had
+    # said before it learned that the message goes on with an ask) send nothing twice, and the join is made all the same
+    # (the validator, 25 November 2026: it got "already saved", and the message stayed off the card).
+    joins, saved = bool(a.get("ask") not in (None, "") or str(a.get("asked") or "").strip()), None
     if role == "manager":
         if isinstance(reply, str) and not reply.strip():
             reply = None        # an empty field is no name
-        last = q1("SELECT * FROM owner_reports WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
-        if last and (last["text"], last["about"], report_file_ids(last["id"])) == (text, about, sorted(ids)) and not q1(
-                "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' "
-                "AND u.need_id IS NULL AND e.read_at>? LIMIT 1", (agent, last["created"])):
+        last = report_again(agent, text, about, ids)
+        if last and not joins:
             return f"Report R-{last['id']} already saved. No duplicate was sent."
+        saved = last["id"] if last else None
     named = OWNER_MESSAGE.fullmatch(reply.strip()) if role == "manager" and isinstance(reply, str) else None
+    # the manager named the message itself, as M-<n> or by its request id, and not the hub's own choice below
+    chosen = role == "manager" and isinstance(reply, str)
     if named:
         m = owner_chat_message(agent, int(named.group(1)))
         if m and m["read_at"] is None:
             raise ToolError(f"Read {named.group(0)} before you answer it: call read_messages.")
         old = owner_report(agent, m["request_id"]) if m else None
         if old and (old["text"], old["about"], report_file_ids(old["id"])) == (text, about, sorted(ids)):
-            return f"Report R-{old['id']} already saved. No duplicate was sent."
+            if not joins:
+                return f"Report R-{old['id']} already saved. No duplicate was sent."
+            saved = old["id"]
+        if not old:
+            saved = None        # the message has no answer yet, so the same words are its own answer, not a repeat
         reply, also = (None, m["request_id"]) if old else (m["request_id"] if m else None, None)
         if reply is None:
             note = (f" {named.group(0)} has its answer already, so this report has no link." if old else
@@ -26433,11 +26827,23 @@ def t_tell_owner(agent, a):
         if not source or source["recipient"] != agent or source["kind"] != "message" or source["read_at"] is None:
             raise ToolError("Read this agent's owner message before replying; another agent's message cannot be answered.")
         old = q1("SELECT * FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, reply))
-        if old:
-            if (old["text"], old["about"], report_file_ids(old["id"])) != (text, about, sorted(ids)):
-                raise ToolError("This owner message already has a different reply. Do not replace it.")
-            return f"Report R-{old['id']} already saved. No duplicate was sent."
-        if before:
+        if old and (old["text"], old["about"], report_file_ids(old["id"])) == (text, about, sorted(ids)):
+            if not joins:
+                return f"Report R-{old['id']} already saved. No duplicate was sent."
+            saved = old["id"]
+        if not old and chosen:
+            saved = None        # as for M-<n>: the message that it named has no answer yet, so these are its words
+        if old and joins:
+            # owner feature asks: a message that has its reply (a join writes one) still takes another card, or its own
+            # back after a wrong join, as the manager's `also` does: this report is linked to none (the Needs-you
+            # area's read, 25 November 2026: a worker could not take a wrong join back). The same call again (a cut
+            # turn, a retry) is told as saved, as the manager's is (report_again), and sends nothing twice.
+            last = report_again(agent, text, about, ids)
+            saved = last["id"] if last else saved
+            reply, also = None, reply
+        elif old:
+            raise ToolError("This owner message already has a different reply. Do not replace it.")
+        if before and reply is not None:
             # **The sentence before the task is shown at once, and it is the reply only when the task exists**
             # (early_word). The reply is what ends the hub's giving of an owner message (the poll and read_messages
             # give it while it has none). A reply before start_task would end that with no task: a turn that is cut
@@ -26461,12 +26867,54 @@ def t_tell_owner(agent, a):
                 note = (" It is not the reply to the owner's message yet: call start_task with the same in_reply_to "
                         "now, which makes it the reply. If you open no task, reply with tell_owner without "
                         "before_task.")
+    # owner feature asks: `ask` puts the message that this answers on the card of an earlier ask of the owner's
+    # (ask_to_join), and `asked` gives it a card of its own: a question that takes no task, or a message that was put
+    # on a card by mistake, which then takes its tasks back with it
+    target, join = reply or also or turn, a.get("ask")
+    named_ask = " ".join(str(a.get("asked") or "").split())
+    first, joined = None, ""        # joined: the join's own words, which a repeat says alone (it writes no report)
+    if joins:
+        if join not in (None, "") and named_ask:
+            raise ToolError("Give ask or asked, not both: ask puts the owner's message on an earlier ask's card, "
+                            "asked gives it a card of its own.")
+        if not target or a.get("in_reply_to") in (None, ""):
+            raise ToolError("ask and asked are about the owner's message that this reply answers: give in_reply_to.")
+        target = ask_message(agent, target)["request_id"]   # a correction: the head of its chain, which its tasks name
+        wrong = asked_words(named_ask) if named_ask else None
+        if wrong:
+            raise ToolError(wrong)
+        first = ask_to_join(agent, join, target) if not named_ask else None
+        card = read_row("SELECT event_id, asked FROM ui_requests WHERE request_id=?", (first,)) if first else None
+        own = read_row("SELECT ask, asked FROM ui_requests WHERE request_id=?", (target,)) if named_ask else None
+        if own and own["ask"] is None and own["asked"]:
+            named_ask = own["asked"]        # a card of its own with a name: it keeps that name (as the write below)
+        if own and own["ask"]:              # a join moved this message's own follow-ups too, and they stay there
+            joined += (" Messages that went on with it before it was joined stay on that card: take each one back "
+                       "the same way if it is not about that ask.")
+        joined += (f" The owner's apps show their message on the card of M-{card['event_id']}"
+                   + (f" (\"{card['asked']}\")." if card["asked"] else ".")) if card else \
+            f" The owner's apps show their message as \"{named_ask}\"."
+        note += joined
+
+    def join_rows():
+        in_transaction("join_rows")
+        if first:
+            ask_join_rows(target, first)
+        elif named_ask:     # off the card that it was on, with this name; else the name that it has stays
+            DB.execute("UPDATE ui_requests SET asked=CASE WHEN ask IS NOT NULL OR asked IS NULL THEN ? ELSE asked "
+                       "END, ask=NULL WHERE request_id=?", (named_ask, target))
+
+    if saved:               # the same words again: the join alone
+        with transaction():
+            join_rows()
+        return f"Report R-{saved} already saved. No duplicate was sent.{joined}"
     chat = chat_source(agent, reply or also, about)  # owner feature chat_apps: the reply goes back to that chat
     t0 = now()
     rows = chat_files_rows(agent, ids, chat["origin"]["app"] if chat else None, t0)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,turn,turn_word) "
                          "VALUES(?,?,?,?,?,?,?)", (text, about, t0, agent, reply, turn, word)).lastrowid
+        join_rows()
         files = chat_files_carry(rows, t0, report=rid)
         failure = queued_failure(chat_answer(agent, chat, rid, text, t0, files)) if chat else None
     if failure:
@@ -26866,7 +27314,7 @@ def message_about_reads(rows):
 
 
 def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None,
-                       about=None, mentions=(), unsure=(), hand=None, skills=()):
+                       about=None, mentions=(), unsure=(), hand=None, skills=(), ask=None):
     """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
@@ -26895,6 +27343,11 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     line = message_about_words(recipient, about) if about else ""
     if line:
         text += "\n" + line
+    card = read_row("SELECT event_id, asked FROM ui_requests WHERE request_id=?", (ask,)) if ask else None
+    if card:            # owner feature asks: written on the card of an earlier ask, which it goes on with
+        text += (("\nThe owner wrote this" if request_via(hand) is None else "\nThis was written")
+                 + f" on the card of their ask M-{card['event_id']}"
+                 + (f" (\"{card['asked']}\")" if card["asked"] else "") + ": it goes on with it.")
     tags = tag_words(recipient, mentions, unsure) if mentions or unsure else ""
     if tags:
         text += "\n" + tags
@@ -26951,7 +27404,7 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
         via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
     text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via,
                               about=message_about_read(previous["about"]), mentions=mentions, unsure=unsure,
-                              hand=hand, skills=skills)
+                              hand=hand, skills=skills, ask=previous["ask"])   # written on a card: it still says so
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
     DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=?,hand=?,session=?,skills=? WHERE request_id=?",
@@ -26966,7 +27419,8 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None,
-                       pictured="", mentions=(), unsure=(), session=None, skills=(), place=NO_OWNER_PLACE):
+                       pictured="", mentions=(), unsure=(), session=None, skills=(), place=NO_OWNER_PLACE,
+                       ask=None):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -27007,7 +27461,7 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via,
                                   about=about, mentions=mentions, unsure=unsure, hand=hand,
-                                  skills=skills) + (note or "")
+                                  skills=skills, ask=ask) + (note or "")
     else:
         mark = f" via {capp_via(via)}" if via else f" via {request_via(hand)}" if request_via(hand) else ""
         text = f"[owner{mark}] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
@@ -27057,13 +27511,17 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection,about,mentions,hand,session,skills,device) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about,mentions,hand,session,skills,device,ask) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
                 replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
                 json.dumps(about) if about and need is None else None,
                 json.dumps(list(mentions)) if mentions and need is None else None, hand, session,
-                json.dumps(list(skills)) if skills and need is None else None, place))
+                json.dumps(list(skills)) if skills and need is None else None, place,
+                # owner feature asks: a correction names the head of its chain of corrections, and is on that message's
+                # card wherever a join or a split moves it, also when he wrote it on a card (the readers of 25 November
+                # 2026: the card showed the words that he corrected, and not the new ones)
+                (correction_head(replaces) if replaces else ask) if need is None else None))
     for f in [f["id"] for f in files] + (skill_gives(skills) if need is None else []):
         DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
@@ -58128,15 +58586,14 @@ TOOLS = [
         "why": {"type": "string", "description": "One line, at most 300 characters: why this agent suits the task "
                                                  "(expertise, access, availability)"},
         "ask": {"type": "string", "description": "M-<n> of the owner's own message to you that this work comes "
-                                                 "from, as read_messages gave it; or of their answer to a Needs-you "
-                                                 "item of that work. Leave it out for work that no message of the "
-                                                 "owner's began, and for a task with follows"},
+                                                 "from (read_messages), or of their answer to a Needs-you item of "
+                                                 "it. Leave it out for work that no message of theirs began, and "
+                                                 "with follows"},
         "asked": {"type": "string", "description": "Only on the first task of that message: the thing to be done, "
-                                                   "as a short verb phrase of at most 40 characters, for example "
-                                                   "\"Move the shop to the new server\". Never the message's first "
-                                                   "words, a yes, a code or an agent's name. A message that asks "
-                                                   "for more than one thing: name them together. The owner reads "
-                                                   "it as the name of this work"}},
+                                                   "a short verb phrase of at most 40 characters (\"Move the shop "
+                                                   "to the new server\"), never the message's first words, a yes, "
+                                                   "a code or an agent's name; for several things, all of them. "
+                                                   "The owner reads it as this work's name"}},
        ["owner", "title", "done_when"])),
     ("manager", "cancel_task", t_cancel_task,
      "Cancel a task that you requested and that is not finished yet, or one that an agent of yours gave its peer (the "
@@ -59214,23 +59671,25 @@ TOOLS = [
     *[("all", name, {"see_triggers": t_see_triggers, "save_trigger": t_save_trigger,
                      "change_trigger": t_change_trigger}[name], desc, schema) for name, desc, schema in wakeups.TOOL_SPECS],
     ("all", "tell_owner", t_tell_owner,
-     "Send a reply to this agent's owner chat: the answer first, and short (RULES.md, \"Short, like a text to a "
-     "friend\"). Worker chat replies require "
-     "in_reply_to from read_messages. Task workers still report through their task tools; managers may also post "
+     "Reply in this agent's owner chat: the answer first, and short (RULES.md, \"Short, like a text to a "
+     "friend\"). A worker's reply needs "
+     "in_reply_to from read_messages. Task workers report through their task tools; managers may also post "
      "checked results. No notification. Name a task or a duty by what it is about, never by its code (T-61, R-3), and "
      "an agent by its name; a code goes in about.",
      S({"text": STR, "files": CHAT_FILES_FIELD,
-        "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
-                                                   "message you are answering (M-<id>), the goal (G-<id>) and the "
-                                                   "tasks it came from"},
-        "in_reply_to": {"type": "string", "description": "The message of the owner's that this answers: its "
-                                                         "request_id in a worker's or a lead's chat, and for the "
-                                                         "manager the M-<id> that read_messages gives it"},
-        "before_task": {"type": "boolean", "description": "Only in a worker's or a lead's owner chat, and only for "
-                                                          "the one sentence that says what you will do before you "
-                                                          "call start_task for the same message: the owner reads it "
-                                                          "at once, and start_task makes it the reply to their "
-                                                          "message"}},
+        "about": {"type": "string", "description": "For the owner's record: the message that this answers "
+                                                   "(M-<id>), and the goal (G-<id>) and tasks behind it"},
+        "in_reply_to": {"type": "string", "description": "The owner's message that this answers: its request_id "
+                                                         "in a worker's or a lead's chat; the manager's M-<id> from "
+                                                         "read_messages"},
+        "before_task": {"type": "boolean", "description": "A worker's or a lead's owner chat only: the one "
+                                                          "sentence of what you will do, before start_task for the "
+                                                          "same message. The owner reads it at once; start_task "
+                                                          "makes it the reply"},
+        "ask": {"type": "string", "description": "M-<n> of the owner's earlier ask (your read lists them) that "
+                                                 "the message you answer goes on with: it joins its card"},
+        "asked": {"type": "string", "description": "A short name, for a message that takes no task or that "
+                                                   "ask joined wrongly: its own card"}},
        ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, only as RULES.md says (\"Write to the owner only when it changes what they do\" and "
@@ -59257,18 +59716,17 @@ TOOLS = [
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in their own words to do work: open it as a task of "
      "your own. First tell the owner what you will do, with tell_owner(text, in_reply_to, before_task=true) and one "
-     "sentence that does not say that a task is open: call only tell_owner in that step, and call this when it "
-     "returns, with the same in_reply_to. The owner then reads your sentence while you write this call, and this call "
-     "makes it the reply to their message. It runs in its own task session, with the agent that gives you your tasks "
-     "as its requester (your lead or the manager), which checks the result. That session has no browser and no "
-     "screen unless you give "
-     "needs: browser for work that must click, type or sign in on a web page, screen for work in an app on your "
+     "sentence, not that a task is open, alone in that step; when it returns, this, with the same "
+     "in_reply_to. The owner reads your sentence while you write this call, which makes it the reply. It runs in "
+     "its own task session; the agent that gives you tasks (your lead or the manager) is its requester and checks "
+     "the result. Its session has no browser or screen unless you give "
+     "needs: browser to click, type or sign in on a web page, screen for an app on your "
      "machine's own screen. Give one only when the work cannot be done without it or the owner's words ask for it: "
-     "a browser or screen task holds the desktop of your machine while it is open. Give it in this call, because "
-     "the task cannot get it later. The hub refuses one that you do not hold, and one while that desktop is busy "
-     "with another such task. Its result comes back into this chat by itself when it ends: "
-     "tell them then with message_owner. Give in_reply_to, the request UUID of the owner's message: one message is "
-     "one task, and a message from another agent starts nothing.",
+     "a browser or screen task holds the desktop of your machine while it is open. Give it now: "
+     "the task cannot get it later. The hub refuses one that you do not hold, or while that desktop is busy. "
+     "Its result comes back here by itself: "
+     "tell them then with message_owner. in_reply_to: the request UUID of the owner's message. One message is "
+     "one task; another agent's message starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "needs": {"type": "string", "enum": ["none", "browser", "screen"],
@@ -59276,12 +59734,13 @@ TOOLS = [
                                  "without your MCP servers. Leave it out for work that needs neither"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
                                                          "work: the one that your sentence before this call named"},
-        "asked": {"type": "string", "description": "Give it: the thing to be done, as a short verb phrase of at "
-                                                   "most 40 characters, for example \"Check the disk of the shop's "
-                                                   "server\", with no code and no agent's name. The owner reads it "
-                                                   "as the name of this work in their apps, and the title inside "
-                                                   "it, so write the title in plain words too. Without it, the hub "
-                                                   "makes the name from the title"}},
+        "asked": {"type": "string", "description": "The thing to be done, a short verb phrase of at most 40 "
+                                                   "characters (\"Check the disk of the shop's server\"), with no "
+                                                   "code and no agent's name: the owner's apps show it as this "
+                                                   "work's name, and the title inside it, so write that plainly "
+                                                   "too. Without it, the hub makes it from the title"},
+        "ask": {"type": "string", "description": "M-<n> of the owner's earlier ask (your read lists them) that "
+                                                 "this message goes on with: it joins its card"}},
        ["title", "done_when", "in_reply_to"])),
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
@@ -85055,6 +85514,7 @@ def phone_mobile(query):
         # this answer's (live_changes). Until 11 November 2026 the build held LOCK for all its statements: 138 on a
         # copy of the first fleet's records, and 148 on one with 2.3 times its rows.
         result = dict(mobile_state(generation, at), token=token, owner_computer=None)
+        result["asks"] = owner_asks_rows(at)     # owner feature ask_follow_ups: the phone's "Asked by me"
     # Owner API 1.273: after the moment, so a change of the key's file that this answer does not hold moves the token
     # past this answer's (keep_owner_computer, then changed()), and the phone's GET /ui/wait wakes for it.
     result["owner_computer"] = owner_computer()
@@ -85614,6 +86074,17 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         about = message_about_given(about) if need_id is None else None
         if about is None:
             return (400, {"error": MESSAGE_ABOUT_SHAPE})
+    # owner feature asks: the card that the owner wrote a chat message on, as the request_id of its ask's first message
+    # (POST /ui/messages `ask`): the message goes on with that ask. Null is none.
+    card = data.get("ask")
+    if card is not None:
+        try:
+            if need_id is not None or not isinstance(card, str):
+                raise ValueError()
+            card = str(uuid.UUID(card))
+        except (ValueError, AttributeError):
+            return (400, {"error": "ask is the request_id of the owner's message whose card this message was written "
+                                   "on"})
     # owner feature agent_tags: the tags that the app found in the words of a chat message; [] says that it read them
     # and found none. No key, and null, are no reading: the hub reads the words itself (tags_found).
     mentions = data.get("mentions")
@@ -85937,6 +86408,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             return (e.status, refusal_body(e))
         # owner feature message_skills: the use, then the gifts, as stored; an answer to a Needs-you item has none
         skills = ([use] if use else []) + (gifted or [])
+        if card is not None and replaces:
+            card = None         # a correction goes where the message that it corrects goes, whatever card it came from
+        if card is not None:    # (owner_message_rows), so a card that no longer takes messages refuses no correction
+            card = ask_card_of(card, recipient)
+            if card is None:
+                return (409, {"error": "That card is not an ask of yours that this agent works on: send the message "
+                                       "in its chat."})
         created = now()
         # T3 Code idea 5: a message from the enrolled phone says so in its header. ui_allowed checked the
         # device's key for this address, so the class comes from the request and not from the client's label:
@@ -85959,7 +86437,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
                                               files=rows, chosen=None if ticked is not None else choice,
                                               device=via, connection=connection, about=about,
                                               session=session, place=owner_place(device),
-                                              mentions=mentions, unsure=unsure, skills=skills,
+                                              mentions=mentions, unsure=unsure, skills=skills, ask=card,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
                                               need_words_note(need, choice, ticked, value, hand),
@@ -87984,6 +88462,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self.json(*phone_ended(query))
 
+    def ui_ask(self, first, query):
+        """GET /ui/mobile/asks/<id>?db=<generation>: the card of one ask of the owner's, for the Mac and the phone
+        (ask_card); under /ui/mobile, so a phone's credential reaches it (DEVICE_PATHS). A read of another generation
+        is 409, as the phone's other reads are."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, refusal_words.answer("hub_changed"))
+        return self.json(*ask_card(first))
+
     def ui_mobile_task(self, task_id, query):
         """GET /ui/mobile/task/<id>: one task in full, with its notes after the cursor, its holds and its outcomes
         (phone_task)."""
@@ -88247,6 +88735,7 @@ class Handler(BaseHTTPRequestHandler):
             grant_records = q("SELECT ts, resource, agent, level, by FROM resource_grants")      # owner API 1.236
             grant_team = team_read()            # the team of this moment, for the titles of those records' resources
             result["messages"] = result["reports"] = None      # their places: they are made after the lock
+            owner_asks = owner_asks_rows(at)        # owner feature ask_follow_ups: "Asked by me", last in the answer
             result["chat_apps"] = {"paused": chat_paused(), "problems": chat_problems()}
             goals = q("SELECT * FROM goals ORDER BY id")
             goals_read = goal_reads() if goals else None    # each table once for all the goals, and none for no goal
@@ -88333,7 +88822,11 @@ class Handler(BaseHTTPRequestHandler):
         result["owner_computer"] = owner_computer()
         # Owner API 1.275: last too; the Mac's door round starts at once for each new value (DoorAccess.roundDue)
         result["door_grant_waits"] = door_grant_waits()
-        return self.json(200, InParts(scrub(result)))
+        # owner feature ask_follow_ups: his list, after every key of before; its answers cut after the mask
+        result["owner_asks"] = owner_asks
+        result = scrub(result)
+        owner_asks_cut(result["owner_asks"])
+        return self.json(200, InParts(result))
 
     def ui_machines(self, query):
         """Machine status, Fleet revision and update state for every agent (owner API 1.2)."""
@@ -93215,6 +93708,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_mobile_task(int(parts[3]), query)
         if parts == ["ui", "mobile", "ended"]:
             return self.ui_mobile_ended(query)
+        if len(parts) == 4 and parts[:3] == ["ui", "mobile", "asks"]:  # owner feature ask_follow_ups: an ask's card
+            return self.ui_ask(parts[3], query)
         if parts == ["ui", "owner", "devices"]:
             return self.ui_owner_devices(query)
         if parts == ["ui", "connect"]:                 # the connected apps (the MCP address build spec, section 3)

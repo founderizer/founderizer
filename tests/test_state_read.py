@@ -534,7 +534,8 @@ class SameBytes(StateCase):
                                 "ui_features", "repository", "tasks", "notes", "permissions", "holds", "outcomes",
                                 "needs", "agents",
                                 "messages", "reports", "chat_apps", "goals", "responsibilities", "steers", "secrets",
-                                "knowledge", "owner_computer", "door_grant_waits"])  # 1.273, 1.275: new keys last
+                                "knowledge", "owner_computer", "door_grant_waits",
+                                "owner_asks"])  # 1.273, 1.275, 1.360: new keys last
 
     def test_the_rows_of_the_five_tables_become_dicts_after_the_lock(self):
         """Each row of the five tables is made into a dict once, by the thread of the read, and never while that thread
