@@ -116,7 +116,10 @@ class Restart(unittest.TestCase):
     def said(self, words):
         return sum(1 for line in list(self.lines) if words in line)
 
-    def wait_for(self, check, failure, most=90):
+    def wait_for(self, check, failure, most=120):
+        """Until `check` holds, the hub process ends (at once) or `most` seconds pass: each wait here is for a start
+        of hub.py, and a first start took more than 90 seconds in a sandbox of the test server with a slow disk
+        (test_error_reports, 27 November 2026: its migration commits each schema step alone)."""
         deadline = time.monotonic() + most
         while time.monotonic() < deadline:
             if check():

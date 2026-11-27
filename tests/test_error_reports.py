@@ -561,9 +561,9 @@ class OnTheHub(OwnerAPI):
         funnel = unittest.mock.patch.object(errorreports, "FUNNEL", False)
         funnel.start()
         self.addCleanup(funnel.stop)
-        # no code of a restart, and no version read at HEAD, of an earlier test
-        hub._error_report.update(runs=None, code=None, head=None)
-        self.addCleanup(hub._error_report.update, runs=None, code=None, head=None)
+        # no code of a restart, no version read at HEAD and no take of fault_flush, of an earlier test
+        hub._error_report.update(runs=None, code=None, head=None, flushed=None)
+        self.addCleanup(hub._error_report.update, runs=None, code=None, head=None, flushed=None)
 
     def sweep(self, t0):
         with hub.LOCK:
@@ -627,15 +627,57 @@ class OnTheHub(OwnerAPI):
         self.sweep(t0 + 3 * errorreports.DAY)
         self.assertEqual(len(self.sent), 2)
 
-    def fault(self, words, error=KeyError):
+    def fault(self, words, error=KeyError, t0=None):
         """A fault of the hub at one place, of class `error` (each class is a fault of its own), counted at the hub's
-        clock (hub.now, which clock() moves) and stored as a pass of the tick stores it."""
+        clock (hub.now, which clock() moves) and stored as a pass of the tick stores it: the pass that began at `t0`,
+        when the fault came during it (a step of the tick that failed), else one that begins now."""
         try:
             fail_with(error(words))
         except error:
             diagnostics.record("hub", clock=lambda: hub.now())
         with hub.LOCK:
-            hub.fault_flush(hub.now())
+            hub.fault_flush(hub.now() if t0 is None else t0)
+
+    def count(self, error=KeyError, at=None):
+        """A fault of the hub, of class `error`, that its thread counts now with the time that it read at `at` (else the
+        hub's clock now), and that no pass of the tick has stored yet."""
+        try:
+            fail_with(error(canary()))
+        except error:
+            diagnostics.record("hub", clock=lambda: hub.now() if at is None else at)
+
+    def waits(self, meanwhile):
+        """hub.LOCK as the next take from outside finds it after its wait: `meanwhile`, what came during the wait, runs
+        once just before that take."""
+        lock, pending = hub.LOCK, [meanwhile]
+
+        class Waits:
+            def acquire(self, *args, **kwargs):
+                if pending and not lock._is_owned():
+                    pending.pop()()
+                return lock.acquire(*args, **kwargs)
+
+            __enter__ = acquire
+
+            def __exit__(self, *exc):
+                lock.release()
+
+            def __getattr__(self, name):
+                return getattr(lock, name)
+        return unittest.mock.patch.object(hub, "LOCK", Waits())
+
+    def tick(self):
+        """A whole pass of the hub's tick, with files of this test's own (as test_diagnostics runs one), and the send
+        of its report."""
+        home = os.path.join(self.tmp.name, "fleet-home")
+        with patch.dict(hub.CFG, {"google_file": os.path.join(home, "google.json"),
+                                  "mcp_file": os.path.join(home, "mcp.json"),
+                                  "github_app": os.path.join(home, "github-app.pem"),
+                                  "attachment_dir": os.path.join(home, "attachments")}):
+            hub.tick()
+        thread = hub._error_report["thread"]
+        if thread is not None:
+            thread.join(10)
 
     def refusal(self):
         """A refused call of one of the hub's own tools (diagnostics.view keeps no other)."""
@@ -646,17 +688,24 @@ class OnTheHub(OwnerAPI):
         with hub.LOCK:
             hub.fault_flush(hub.now())
 
-    def stall(self):
-        """A stall of the hub (a thread that held the others 2 s), as the stall watch counts it."""
+    def stall(self, took=2.0, t0=None):
+        """A stall of the hub (a thread that held the others `took` s), as the stall watch counts it, and stored as
+        fault() stores a fault: by the pass that began at `t0`, else by one that begins now; with `t0` False, by none
+        yet (the next pass of the tick stores it)."""
         watch = diagnostics.Watch(cpu=lambda ids: None, wall=lambda: hub.now(), out=io.StringIO())
-        watch.stall("hold", "a thread", (("hub.py", 1),), 2.0)
-        with hub.LOCK:
-            hub.fault_flush(hub.now())
+        watch.stall("hold", "a thread", (("hub.py", 1),), took)
+        if t0 is not False:
+            with hub.LOCK:
+                hub.fault_flush(hub.now() if t0 is None else t0)
 
     def clock(self):
         """The hub's clock from now on, which the test moves (`at[0] += seconds`): the faults, the passes and the
-        reports all read it, so a report's stamp is never ahead of the next pass, as at the real clock."""
-        at = [hub.now()]
+        reports all read it, so a report's stamp is never ahead of the next pass, as at the real clock. It starts just
+        ahead of the real clock, at 0.7 ms past a second: a report rounds its times to the millisecond, and a time of
+        the test's clock is often a fault's time and a report's stamp at once, so a hub that compared the rounded time
+        with the stamp held the fault of a report again in the next one (the flaky test of 27 November 2026), and at
+        the real clock only about half of the runs showed it."""
+        at = [int(hub.now()) + 1.0007]
         patcher = unittest.mock.patch.object(hub, "now", lambda: at[0])
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -701,13 +750,17 @@ class OnTheHub(OwnerAPI):
         received asks for one early report, which holds it, and the same fault counted again asks for none, also
         hours after that report: a hub that asked at each count, or again after each report that went, would spend
         the early reports of each day on one thread that fails at each pass. A stall and a refused call ask for none:
-        the privacy page says that a report goes about once a day, sooner only when something breaks."""
+        the privacy page says that a report goes about once a day, sooner only when something breaks. A stall that a
+        pass stores after its t0 keeps how long it lasted, in the report and in Report a problem's rows (UI-API
+        1.284), also though its times move to that t0."""
         at = self.clock()
         self.switch(True)
         self.sweep(hub.now())                   # the day's report
         at[0] += 10
         self.refusal()
-        self.stall()
+        t0 = hub.now()
+        at[0] += 41                             # a hold of 40 s during the pass that began at t0, seen after t0
+        self.stall(40.0, t0=t0)
         self.assertIsNone(hub.kv_get("error_reports_early_at"))
         at[0] += 10
         self.fault(canary())
@@ -719,20 +772,29 @@ class OnTheHub(OwnerAPI):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual([f["class"] for f in self.sent[1][1]["faults"]], ["KeyError", "StallHold"])
         self.assertEqual((len(hub.error_report_earlies()), hub.kv_get("error_reports_early_at")), (1, None))
+        (stall,) = [f for f in self.sent[1][1]["faults"] if f["class"] == "StallHold"]
+        (row,) = self.request("/ui/diagnostics?db=test-generation")[1]["stalls"]
+        self.assertEqual((round(stall["last"] - stall["first"]), round(row["last"] - row["first"])), (40, 40))
 
     def test_the_faults_ask_for_two_early_reports_a_day_at_most_and_one_an_hour(self):
         """The four early reports of a day are for every cause (the plan's 3.3). A fault asks for one only while fewer
         than two went, and none in the last hour, so the faults' own asks take two of the four at most and leave room
         for a failed restart, a release that does not start or timers that stop; a hub without the limit spent the
         four in some 20 seconds on a burst (the review of 25 November 2026). A fault that comes while that holds asks
-        for nothing, and goes in the next report that goes. (The report before a restart has its own rule: the test
-        of a new kind of fault before a restart.)"""
+        for nothing, and goes in the next report that goes. A fault that the pass of a report counts after that
+        report's stamp, its t0 (a step of the tick that fails), goes in that report and not again in the next one,
+        whose faults begin at the stamp; and one whose thread read the clock before a pass took the counts, and that
+        it counts only after the report of that pass went, goes in the next report, also when that pass took no
+        count. (The report before a restart has its own rule: the test of a new kind of fault before a restart.)"""
         at = self.clock()
         self.switch(True)
         self.sweep(hub.now())                   # the day's report
         at[0] += 10
-        self.fault(canary(), KeyError)          # the faults' first early report
-        self.sweep(hub.now())
+        t0 = hub.now()
+        at[0] += 0.2                            # during the pass that began at t0
+        self.fault(canary(), KeyError, t0=t0)   # the faults' first early report
+        self.sweep(t0)
+        self.assertEqual([f["class"] for f in self.sent[-1][1]["faults"]], ["KeyError"])
         at[0] += 10
         self.fault(canary(), ValueError)        # 10 s later: it waits for the next report
         self.sweep(hub.now())
@@ -741,14 +803,75 @@ class OnTheHub(OwnerAPI):
         self.fault(canary(), OSError)           # an hour after the first: the second, which holds both
         self.sweep(hub.now())
         self.assertEqual([f["class"] for f in self.sent[-1][1]["faults"]], ["OSError", "ValueError"])
+        self.count(TypeError, at[0] - 1)        # read before that pass took the counts, and counted after its report
         at[0] += hub.FAULT_EARLY_GAP
         self.fault(canary(), IndexError)        # two went: it waits for the next report...
         self.sweep(hub.now())
         self.assertEqual(len(self.sent), 3)
+        at[0] += 1
         with hub.LOCK:
-            hub.error_report_early("a test")    # ...which another cause still gets
+            hub.error_report_early("a test")    # ...which another cause still gets...
+            hub.fault_flush(hub.now())          # ...in a pass that takes no count
         self.sweep(hub.now())
-        self.assertEqual((len(self.sent), [f["class"] for f in self.sent[-1][1]["faults"]]), (4, ["IndexError"]))
+        self.assertEqual((len(self.sent), [f["class"] for f in self.sent[-1][1]["faults"]]),
+                         (4, ["IndexError", "TypeError"]))
+        self.count(ZeroDivisionError, at[0] - 0.5)      # read before that take, and counted after its report
+        at[0] += 5
+        with hub.LOCK:
+            hub.error_report_early("a test")
+            hub.fault_flush(hub.now())
+        self.sweep(hub.now())
+        self.assertEqual([f["class"] for f in self.sent[-1][1]["faults"]], ["ZeroDivisionError"])
+        rows = hub.q("SELECT first, last FROM faults")
+        self.assertTrue(rows and all(r["first"] <= r["last"] for r in rows))     # also of the counts that moved
+
+    def test_the_time_of_a_pass_is_read_under_the_lock_and_never_goes_back(self):
+        """The time that bounds what a report holds (the t0 of fault_flush, a report's stamp) is read under LOCK, after
+        each bound that a holder of LOCK wrote: the owner's yes, the stamp of a report. A tick that read it before its
+        wait for LOCK dated a fault of that wait before the owner's yes, and the fault went in no report; and a report
+        before a restart that waited while the tick's report went took that report's stamp for one of a clock that was
+        ahead, and sent again all that came since the yes (the review of 27 November 2026). It also comes after the
+        time of the pass before when the wall clock steps back: a fault and a stall counted while the clock is behind
+        the last stamp go in exactly one report, the stall with its length. With the wall clock's time, they were
+        before that stamp, and went in no report."""
+        at = self.clock()
+
+        def a_yes_and_a_fault():                # while the tick waits for LOCK
+            at[0] += 1
+            with hub.LOCK:
+                hub.set_error_reports(True)
+            at[0] += 1
+            self.count()
+        with self.waits(a_yes_and_a_fault):
+            self.tick()
+        self.assertIn("KeyError", [f["class"] for f in self.sent[-1][1]["faults"]])     # the day's report
+        sent = len(self.sent)
+        at[0] += 10
+        self.fault(canary(), ValueError)        # it asks for an early report
+
+        def the_ticks_report():                 # while the report before a restart waits for LOCK
+            at[0] += 1
+            self.sweep(hub.now())
+        with self.waits(the_ticks_report):
+            body = hub.error_report_before_restart("c" * 40, "d" * 40)
+        self.assertEqual((len(self.sent), [f["class"] for f in self.sent[-1][1]["faults"]], body),
+                         (sent + 1, ["ValueError"], None))      # what the tick's report held goes no more
+        sent = len(self.sent)
+        at[0] -= 60                             # the wall clock steps back, behind the last stamp
+        self.count(OSError)
+        self.stall(40.0, t0=False)
+        self.tick()                             # no report: an early report went less than an hour ago
+        at[0] += 120                            # past that stamp again
+        for _ in range(2):
+            with hub.LOCK:
+                hub.error_report_early("a test")
+            self.tick()
+            at[0] += 10
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent[sent:]],
+                         [["OSError", "StallHold"], []])
+        stall = self.sent[sent][1]["faults"][1]
+        (row,) = self.request("/ui/diagnostics?db=test-generation")[1]["stalls"]
+        self.assertEqual((round(stall["last"] - stall["first"]), round(row["last"] - row["first"])), (40, 40))
 
     def test_a_new_kind_of_fault_goes_before_a_restart_past_the_four_early_reports(self):
         """The validator's day of 25 November 2026: a fault that comes back in each code, and a release with new code
@@ -1979,7 +2102,10 @@ class StartAndStop(unittest.TestCase):
                                     pass_fds=fds, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     cwd=ROOT, env=dict(os.environ, HOME=str(self.root)))
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
-        deadline = time.monotonic() + 90     # as test_hub_keeps_port gives a start on this Mac
+        # until the hub is up or its process ends: a first start in a sandbox of the test server with a slow disk took
+        # more than 90 seconds (27 November 2026: its migration commits each schema step alone), as
+        # test_hub_keeps_port gives it
+        deadline = time.monotonic() + 120
         while (self.root / "out.txt").read_text().count("Founderizer hub on") < self.starts or \
                 self.kv("error_reports_running") != "1":
             self.assertIsNone(proc.poll(), (self.root / "out.txt").read_text())

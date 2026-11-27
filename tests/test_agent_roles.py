@@ -153,9 +153,9 @@ class Roles(Capacity):
         self.assertEqual([n for n, text in tools.items() if "an agent by its role" in text], [])
 
     def test_the_phone_reads_each_agent_s_role(self):
-        """And each agent's spelling, where the owner gave one, on the phone and on the Mac (owner feature
-        agent_spelling), with the feature name that tells an app to read it. Bugs: a view leaves it out, and that app
-        shows "deva"; it gives null for an agent with none, which the agreed views leave out; or it gives a value that
+        """And each agent's spelling, where the owner gave one, on the phone and on the Mac, also on its Team page
+        (GET /ui/team; owner feature agent_spelling), with the feature name that tells an app to read it. Bugs: a view
+        leaves it out, and that app shows "deva"; it gives null for an agent with none, which the agreed views leave out; or it gives a value that
         a team.json written by hand holds and that is no spelling of the name ("Nova" for seo), or the name in small
         letters, which is no spelling either."""
         self.assertEqual(self.respell("deva", "DeVa")[0], 200)
@@ -172,6 +172,11 @@ class Roles(Capacity):
             self.assertEqual((said["deva"].get("spelling"), "spelling" in said["seo"], "spelling" in said["big"]),
                              ("DeVa", False, False))
             self.assertIn("agent_spelling", view["ui_features"])
+        code, team = self.request("/ui/team?db=test-generation")      # team.json at the hub's revision
+        self.assertEqual(code, 200, team)
+        lines = {line["agent"]: line for line in team["lines"]}
+        self.assertEqual((lines["deva"].get("spelling"), "spelling" in lines["seo"], "spelling" in lines["big"]),
+                         ("DeVa", False, False))
 
 
 if __name__ == "__main__":

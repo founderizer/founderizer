@@ -178,7 +178,34 @@ class TeamChanges(Remove):
         self.assertEqual(self.card()["recommended"], "Yes: remove Scout and its service on box")
         self.assertIn("the first marked as the answer that you recommend", said)
         self.add_plan()
-        self.assertEqual(self.card()["recommended"], "Yes: add nova, Customer Support 2, on box2")
+        self.assertEqual(self.card()["recommended"], "Yes: add Nova, Customer Support 2, on box2")
+
+    def test_a_yes_names_each_change_in_words_and_never_a_count(self):
+        """The owner's card of 26 November 2026 ("Yes: add nico, ..., and 1 more change": "what do you mean by "1 more
+        change"??? very confusing!"). Bugs: an add's yes leaves out the plan's other change, or says it as a count; a
+        line change that only makes an agent a lead reads as a move that does not happen; a plan whose long words do
+        not fit drops the first change's detail before the others', drops the other changes with no word, or says
+        one short phrase twice."""
+        self.box2()
+        self.plan([{"kind": "add", "server": "box2", "names": ["nova", "lia"], "title": "Customer Support 2",
+                    "runtime": "codex", "profile": SECTIONS},
+                   {"kind": "lines", "lines": [{"agent": "scout", "role": "worker", "reports_to": "lead"}]}],
+                  title="Add a second Support agent on box2?")
+        self.assertEqual(json.loads(self.card()["options"]),
+                         ["Yes: add Nova, Customer Support 2, on box2; also make Scout report to Lead",
+                          "Yes: add Lia, Customer Support 2, on box2; also make Scout report to Lead", "No"])
+        hub.q("DELETE FROM needs WHERE team_plan IS NOT NULL")
+        self.plan([{"kind": "lines", "lines": [{"agent": "scout", "role": "lead"}]}], title="Let Scout lead?")
+        self.assertEqual(json.loads(self.card()["options"]), ["Yes: make Scout a lead", "No"])
+        # the ladder itself, on a plan that the fixture cannot make: long words, then short words, then the pointer
+        long_head = (0, "remove Support and its service on " + "b" * 40, "remove Support")
+        files = [(1, f"change the knowledge file {c * 30}.md", "change a knowledge file") for c in "xy"]
+        said = hub.team_plan_options({"phrases": [long_head] + files, "names": []})[0]
+        self.assertEqual(said, f"Yes: remove Support and its service on {'b' * 40}; also change 2 knowledge files")
+        many = [(1, f"change the profile of Agent{i}", f"change the profile of Agent{i}") for i in range(9)]
+        said = hub.team_plan_options({"phrases": [long_head] + many, "names": []})[0]
+        self.assertEqual(said, f"Yes: remove Support and its service on {'b' * 40}; also more under Details")
+        self.assertLessEqual(len(said), hub.NEED_OPTION_CHARS)
 
     def test_no_closes_the_card_and_changes_nothing(self):
         """Bug: an off-by-one makes No a yes."""
@@ -1063,7 +1090,7 @@ class TeamChanges(Remove):
         mail = self.MAIL
         self.mailbox_plan()
         card = self.card()
-        self.assertEqual(json.loads(card["options"])[0], "Yes: add nova, Customer Support 2, on box2, with Gmail, "
+        self.assertEqual(json.loads(card["options"])[0], "Yes: add Nova, Customer Support 2, on box2, with Gmail, "
                                                          "Drive, an MCP server and a repository")
         for line in (f"Gmail of {mail} (send)", f"Google Drive of {mail} (read)", "the MCP server Acme CRM (use)",
                      "the GitHub repository acme/web (write and deploy)"):
@@ -1203,8 +1230,9 @@ class TeamChanges(Remove):
             self.assertNotIn("You cannot use it", str(refused.exception))
 
     def test_a_fold_names_its_removal_and_lands_in_one_commit(self):
-        """Bug: the yes of a fold reads as a line change while it removes an agent, or the removal comes before the
-        move of the agents that report to it, or the two parts land apart."""
+        """Bug: the yes of a fold reads as a line change while it removes an agent, or it says the line change as a
+        count ("and 1 more change", which the owner could not read on 26 November 2026), or the removal comes before
+        the move of the agents that report to it, or the two parts land apart."""
         team, sha, lines = hub.team_view(hub.kit_revision(fresh=True))
         hub.save_lines(sha, [dict(line, reports_to="lead") if line["agent"] == "scout" else line for line in lines])
         with self.assertRaises(hub.ToolError) as refused:
@@ -1212,7 +1240,7 @@ class TeamChanges(Remove):
         self.assertIn("Change the reporting lines first", str(refused.exception))
         self.plan([{"kind": "lines", "lines": [{"agent": "scout", "role": "worker"}]},
                    {"kind": "remove", "agent": "lead"}], title="Fold the lead?")
-        self.assertEqual(json.loads(self.card()["options"]), ["Yes: remove Lead, and 1 more change", "No"])
+        self.assertEqual(json.loads(self.card()["options"]), ["Yes: remove Lead; also make Scout report to Manager", "No"])
         self.assertIn("nothing on vps, which has no server service, so its files there stay", self.card()["details"])
         before = self.head()
         status, answer = self.press(0)
@@ -1230,7 +1258,7 @@ class TeamChanges(Remove):
         self.add_plan()
         nid = self.card()["id"]
         self.assertEqual(json.loads(self.card()["options"]),
-                         ["Yes: add nova, Customer Support 2, on box2", "Yes: add lia, Customer Support 2, on box2", "No"])
+                         ["Yes: add Nova, Customer Support 2, on box2", "Yes: add Lia, Customer Support 2, on box2", "No"])
         real = hub.commit_kit_file
 
         def commit_then_stop(*args, **kwargs):

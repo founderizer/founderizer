@@ -108,7 +108,7 @@ subprocess.Popen([sys.executable, os.path.abspath(__file__), "--guard", TMP, str
                  start_new_session=True)
 os.close(GONE)
 HUBS = []           # every hub this run started
-HUB_START_TRIES = 600       # readings of a new hub's /health, a tenth of a second apart, while its process lives
+HUB_START_SECONDS = 120     # at most, for a new hub's first answer to /health while its process lives
 
 
 def finish():
@@ -182,12 +182,15 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
                             env=dict(os.environ, HOME=TMP))
     HUBS.append(proc)
     base = f"http://127.0.0.1:{port}"
-    # The wait for the hub's first answer ends when the hub answers or when its process ended, and at HUB_START_TRIES
-    # readings at the latest. Until 14 November 2026 it ended after 80 readings, about 8 seconds. A hub's start makes
-    # its database, and on a slow disk that alone took 8 to 9 seconds (a test server of 13 November 2026, measured
-    # there; 0.6 seconds with the database in memory). So this self-test said "the hub did not start" on a server that
-    # was in order, and its verify said NOT READY: selftest.
-    for _ in range(HUB_START_TRIES):
+    # The wait for the hub's first answer ends when the hub answers or when its process ended, and after
+    # HUB_START_SECONDS at the latest. Until 14 November 2026 it ended after 80 readings, about 8 seconds. A hub's start
+    # makes its database, and on a slow disk that alone took 8 to 9 seconds (a test server of 13 November 2026,
+    # measured there; 0.6 seconds with the database in memory). So this self-test said "the hub did not start" on a
+    # server that was in order, and its verify said NOT READY: selftest. Until 27 November 2026 it ended after 600
+    # readings, about 60 seconds, and a run in a sandbox of the test server (test_publish's) said "the hub did not
+    # start" on main: a new hub's first migration commits each schema step alone, and one fsync on that disk took 80 ms.
+    deadline = time.monotonic() + HUB_START_SECONDS
+    while True:
         try:
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(base + "/health", timeout=1).read()
             return proc, base
@@ -195,9 +198,10 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
             if proc.poll() is not None:
                 print(f"the hub did not start: its process ended with status {proc.returncode}")
                 sys.exit(1)
+            if time.monotonic() > deadline:
+                print("the hub did not start")
+                sys.exit(1)
             time.sleep(0.1)
-    print("the hub did not start")
-    sys.exit(1)
 
 
 # The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's own with

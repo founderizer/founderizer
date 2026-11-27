@@ -109,10 +109,13 @@ class TeamAtStartup(unittest.TestCase):
         url = f"http://127.0.0.1:{port}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         # A hub with no compiled copy of hub.py (a fresh tree, or tests that run with python3 -B) compiles it first:
-        # 6.5 seconds on the Mac, and more than the ten seconds of 100 tries on a busy Linux server of two cores. So
-        # 600 refused connections (no port yet) count, and only 3 other faults (a port that takes the connection and
-        # gives no answer in 5 seconds), so that a hub that hangs holds the test line for seconds, not for minutes. A
-        # hub that ends ends the wait at once.
+        # 6.5 seconds on the Mac, and more than the ten seconds of 100 tries on a busy Linux server of two cores. A
+        # start in a sandbox of the test server took more than the 60 seconds of 600 refused connections (27 November
+        # 2026, on main): a new hub's first migration commits each schema step alone, and one fsync on that disk took
+        # 80 ms. So refused connections (no port yet) count for 120 seconds, and only 3 other faults (a port that takes
+        # the connection and gives no answer in 5 seconds), so that a hub that hangs holds the test line for seconds,
+        # not for minutes. A hub that ends ends the wait at once.
+        deadline = time.monotonic() + 120
         refused = others = 0
         while True:
             self.assertIsNone(started.poll(), f"the hub did not start: {(root / 'out.txt').read_text()}")
@@ -125,10 +128,10 @@ class TeamAtStartup(unittest.TestCase):
                     refused += 1
                 else:
                     others += 1
-                if refused >= 600 or others >= 3:
+                if time.monotonic() > deadline or others >= 3:
                     self.fail(f"the hub never answered /health ({refused} refused, {others} other faults): "
                               f"{(root / 'out.txt').read_text()}")
-                time.sleep(0.1)
+                time.sleep(0.2)
         return url, (root / "out.txt").read_text(), root / "hub.db"
 
     def page(self, url, path="/board"):

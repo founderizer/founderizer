@@ -7594,6 +7594,20 @@ def fault_flush(t0):
     counted again (a thread that fails at each pass) asks for nothing more. No second record of what went is kept:
     the row's last time and the report's own `since` say it.
 
+    Each count is stored with a last time after the take of the pass before and not after t0. t0 is the stamp of the
+    report that this pass may send (error_report_sweep, error_report_before_restart), which the next report takes as
+    its `since`, so each count goes in exactly one report. A count after t0 (made after the pass read t0 and before
+    this take) is dated t0: with its own time, the next report held it again. A count whose thread read the clock
+    before the take of the pass before and counted only after it is dated just after that take: with its own time, it
+    was before the stamp of a report that went then, and went in no report; so is a count of a wall clock that stepped
+    back behind that take. The callers take t0 from fault_pass_time: under LOCK, after each bound that a holder of
+    LOCK wrote (the owner's yes, the stamp of a report), so a count after such a bound keeps a time after it, and
+    after the take before, also when the wall clock stepped back. A report that left out what came after its stamp,
+    in place of these dates, would hold no fault that a step of the tick raises at each pass, because that fault's row
+    always ends after the pass began (the review of 27 November 2026). Only such counts get a time other than their
+    own, and such a count moves as a whole, its first time with its last: a stall's row says how long it lasted
+    (UI-API 1.284).
+
     A fault asks only while fewer than FAULT_EARLY_MOST early reports of any cause went in the last DAY, and none in
     the last FAULT_EARLY_GAP, both read from the early reports that went (error_report_earlies): so the faults' own
     asks take at most two of the errorreports.EARLY_MOST, and a burst of faults asks once. The report before each
@@ -7610,6 +7624,7 @@ def fault_flush(t0):
     stored; a write that the database refused asks for nothing, because it stored nothing that a report could
     carry."""
     taken = diagnostics.pending()
+    before, _error_report["flushed"] = _error_report["flushed"], t0     # the take before, and this one: also when empty
     if not taken:
         return
     code = diagnostics.code_id()
@@ -7624,12 +7639,17 @@ def fault_flush(t0):
     except sqlite3.Error:       # no ask: the counts below are still stored
         yes = since = None
     new = 0
+    # just after the take before; the t0 of fault_pass_time is always after it, and only a test's second pass at the
+    # same time gives none
+    after = math.nextafter(before, math.inf) if before is not None and before < t0 else None
     # Quiet: no app waits for this. System status reads health on its own clock, and a refusal that comes back every
     # pass must not wake every app and the phone's badge each time (the review of 14 November 2026).
     try:
         with area("quiet"), transaction():
             DB.execute("DELETE FROM faults WHERE code != ? OR last < ?", (code, t0 - FAULT_DAYS * 86400))
             for f in taken:
+                last = min(f["last"], t0) if after is None else max(min(f["last"], t0), after)     # (above)
+                f["first"], f["last"] = min(f["first"] + (last - f["last"]), last), last      # moved as a whole
                 sig = diagnostics.signature(f["kind"], f["program"], f["name"], f["frames"])
                 if yes is not None and f["kind"] == "fault" and f["last"] > since:
                     old = DB.execute("SELECT last FROM faults WHERE sig=?", (sig,)).fetchone()     # its primary key
@@ -7649,6 +7669,17 @@ def fault_flush(t0):
         return
     if new:
         error_report_early(f"{new} fault(s) of the hub that our side has not received")
+
+
+def fault_pass_time():
+    """Under LOCK: the t0 of a pass of fault_flush, which is also the stamp of the report of that pass (tick,
+    error_report_before_restart). Read under LOCK, it comes after each bound that a holder of LOCK wrote: the owner's
+    yes, the stamp of a report. It comes after the take before too (_error_report["flushed"]), so that the takes and
+    the stamps only go forward, also when the wall clock steps back: a count of the step dates after the take before
+    (fault_flush), and a stamp of the step after the stamp before. Then the day's report, and each wait that compares
+    a stamp with this time, comes later by the size of the step."""
+    t, before = now(), _error_report["flushed"]
+    return t if before is None or t > before else math.nextafter(before, math.inf)
 
 
 def thread_fault(args, default=threading.excepthook):
@@ -7682,8 +7713,9 @@ def fault_rows():
 # (error_report_before_restart).
 # the one send that may run at a time; the last error_report_look; after a restart onto new code that did not
 # start, the code that this process still runs: {"revision", "version", "at"} (error_report_runs_old); and, once a
-# restart onto new code began, the version of the code that this process runs until it ends (error_report_restarting)
-_error_report = {"thread": None, "looked": None, "runs": None, "code": None}
+# restart onto new code began, the version of the code that this process runs until it ends (error_report_restarting);
+# and the t0 of the last take of fault_flush
+_error_report = {"thread": None, "looked": None, "runs": None, "code": None, "flushed": None}
 RESTART_REPORT_WAIT = 10        # seconds that the restart onto new code waits for the report before it
 # Past the day's errorreports.EARLY_MOST early reports, the reports before a restart onto new code that may still go in
 # a DAY, each only for a new kind of fault (error_report_before_restart). As many as the early reports: with them, at
@@ -7776,6 +7808,11 @@ def error_report_body(since, version=None, taken=None, restarting=False):
         rows = fault_rows()
     except sqlite3.Error:       # a database that refused the table at the start: the facts go alone
         rows = []
+    # After `since` as the times are stored, the comparison of fault_flush, and not in errorreports.report: view rounds
+    # each time to the millisecond, and a rounded time against the whole stamp of the report before held a fault of
+    # that report's own last moment again about one time in two (a rounding up), and left out one of the half
+    # millisecond after it (a rounding down): the flaky test of 27 November 2026.
+    rows = [r for r in rows if isinstance(r["last"], (int, float)) and r["last"] > (since or 0)]
     view = diagnostics.view(rows, tools={tool[1] for tool in TOOLS})
     version = version or (_error_report["runs"]["version"] if _error_report["runs"] else
                           _error_report.get("code") or running_version())
@@ -7790,8 +7827,8 @@ def error_report_body(since, version=None, taken=None, restarting=False):
         print_fault()
         funnel = None
     return errorreports.report(fleet_id(), version, errorreports.system_words(), diagnostics.code_id(),
-                               len(TEAM.get("agents") or {}), len(server_names()), view, since, health=health,
-                               funnel=funnel)
+                               len(TEAM.get("agents") or {}), len(server_names()), view, 0, health=health,
+                               funnel=funnel)       # 0: the rows are already those after `since`
 
 
 # ---- the funnel in the report (the SMB audit's Q8, the owner's "Go ahead" of 25 November 2026: "Five funnel counts
@@ -8589,8 +8626,8 @@ def error_report_before_restart(pinned, reached):
     its row is failed (its version is one more floor: error_health_release). The restart waits RESTART_REPORT_WAIT
     seconds at most for its send, which goes on in its thread; one that did not end is tried again after RETRY. The
     report's body, else None."""
-    t0 = now()
     with LOCK:
+        t0 = fault_pass_time()      # under LOCK, after the stamp of a report that went while this waited
         if not error_reports_on():      # nothing is kept or sent while the owner has error reports off
             return None
         kv_set("error_reports_restart", json.dumps({"to": reached, "at": t0}))
@@ -51880,26 +51917,52 @@ def team_details_fit(details):
 def team_plan_options(ctx):
     """The card's options, each in at most NEED_OPTION_CHARS characters, and No: one yes for each name of a new agent,
     else one yes. A yes names an add or a removal first, whatever the order of the plan, because those are what a
-    press does that the owner most needs to see; the other changes follow as a count, and a cut drops the words of
-    the head and never the head itself."""
-    phrases = ctx["phrases"]            # [(rank, long words, short words)]: rank 0 for an add or a removal
-    head, more = min(phrases, key=lambda p: p[0]), len(phrases) - 1
-    tail = f", and {more} more change{'s' if more > 1 else ''}" if more > 0 else ""
+    press does that the owner most needs to see, and then, after "; also", each other change in words, never as a
+    count (the owner, 26 November 2026, of "Yes: add nico, ..., and 1 more change": "what do you mean by "1 more
+    change"??? very confusing!"). The first words that fit: the first change's longest words with the long words of
+    the rest, then with their short words, then its shorter words in the same two ways; else its longest words that
+    fit with "; also more under Details", which always fits. Equal short words of two changes say it once ("change 2
+    knowledge files"). An agent is named as the owner's apps name it (agent_name, with the owner's spelling)."""
+    phrases = sorted(ctx["phrases"], key=lambda p: p[0])     # stable: the rest in the plan's order
+    add = ctx.get("add_phrase")
+    tail = "; also more under Details"
 
-    def yes(long, short):
-        return next((w for w in (f"Yes: {long}{tail}", f"Yes: {short}{tail}", f"Yes: {short}")
-                     if len(w) <= NEED_OPTION_CHARS), f"Yes: {short}"[:NEED_OPTION_CHARS])
+    def joined(words):
+        return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+    def shorts(rest):
+        words = [p[2] for p in rest]
+        return [f"change {words.count(w)} knowledge files" if w == "change a knowledge file" and words.count(w) > 1
+                else w for i, w in enumerate(words) if w not in words[:i]]
+
+    def yes(heads, rest):
+        if not rest:
+            tries = heads
+        else:
+            tries = [f"{h}; also {joined(r)}" for h in heads for r in ([p[1] for p in rest], shorts(rest))] + \
+                [f"{h}{tail}" for h in heads]
+        return next((f"Yes: {w}" for w in tries if len(f"Yes: {w}") <= NEED_OPTION_CHARS),
+                    f"Yes: {heads[-1]}{tail if rest else ''}"[:NEED_OPTION_CHARS])
     if ctx["names"]:
-        add = ctx["after"]["added"]
+        add_to = ctx["after"]["added"]
+        agents_now = (ctx.get("team") or {}).get("agents") or {}
         # each yes says what it does: the apps that the press gives its new agent too (team_add_access)
-        kinds = [resource_parts(rid)[0] for rid, _ in add.get("access") or []]
+        kinds = [resource_parts(rid)[0] for rid, _ in add_to.get("access") or []]
         said = [one if kinds.count(k) == 1 else f"{kinds.count(k)} {many}"
                 for k, one, many in (("gmail", "Gmail", ""), ("drive", "Drive", ""), ("tool", "an MCP server",
                                      "MCP servers"), ("repo", "a repository", "repositories")) if k in kinds]
         apps = f", with {', '.join(said[:-1]) + ' and ' + said[-1] if len(said) > 1 else said[0]}" if said else ""
-        return [yes(f"add {n}, {add['title']}, on {add['server']}{apps}", f"add {n}{apps}") for n in ctx["names"]] + \
-            ["No"]
-    return [yes(head[1], head[2]), "No"]
+        rest = [p for p in phrases if p is not add]
+        return [yes([f"add {agent_name(n, agents_now)}, {add_to['title']}, on {add_to['server']}{apps}",
+                     f"add {agent_name(n, agents_now)} on {add_to['server']}{apps}",
+                     f"add {agent_name(n, agents_now)}{apps}"], rest)
+                for n in ctx["names"]] + ["No"]
+    return [yes([phrases[0][1], phrases[0][2]], phrases[1:]), "No"]
+
+
+def joined_names(names):
+    """Names in a sentence: "Scout", "Scout and Nova", "Scout, Nova and Lia"."""
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
 def team_lines(ctx, c):
@@ -51952,11 +52015,22 @@ def team_lines(ctx, c):
     ctx["facts"].append(["lines", before])
     ctx["parts"].append("**Reporting lines**\n\n" + "\n".join(out))
     ctx["said"].append("changed the reporting lines of " + ", ".join(x[0] for x in before))
-    first = before[0][0]
-    ctx["phrases"].append((1, f"{team_said_role(team, first)} reports to "
-                              f"{team_said_role(team, team['agents'][first].get('reports_to') or mgr)}"
-                           if len(before) == 1 else f"change the reporting lines of {len(before)} agents",
-                           "change the reporting lines"))
+    # the words of the line change: the new role when it changes, and whom each agent reports to (the readers of 27
+    # November 2026: "make Scout report to Manager" hid that Scout became a lead)
+    ups = {team["agents"][x[0]].get("reports_to") or mgr for x in before}
+    roles = [(x[0], team["agents"][x[0]]["role"], x[1]) for x in before]
+    if len(before) == 1:
+        n, role, was = roles[0]
+        up, said = next(iter(ups)), team_said_role(team, roles[0][0])
+        moved = (before[0][2] or mgr) != up
+        words = (f"make {said} a {role}" + (f" under {team_said_role(team, up)}" if moved else "") if role != was else
+                 f"make {said} report to {team_said_role(team, up)}")
+    elif len(ups) == 1 and all(role == was for _, role, was in roles):
+        words = (f"make {joined_names([team_said_role(team, n) for n, _, _ in roles])} report to "
+                 f"{team_said_role(team, next(iter(ups)))}")
+    else:
+        words = f"change the reporting lines of {len(before)} agents"
+    ctx["phrases"].append((1, words, "change the reporting lines"))
 
 
 def team_remove(ctx, c):
@@ -52032,7 +52106,7 @@ def team_remove(ctx, c):
          if keys or gitops else ""))
     ctx["said"].append(f"removed {n}")
     ctx["phrases"].append((0, f"remove {role} and its service on {server}" if serviced else f"remove {role}",
-                           f"remove {n}"))
+                           f"remove {agent_name(n, team['agents'])}"))
 
 
 def team_add(ctx, c):
@@ -52151,7 +52225,8 @@ def team_add(ctx, c):
         (f"\n- Its expertise: {', '.join(tags)}." if tags else "") +
         "\n- Its whole profile:\n\n" + team_quote(whole))
     ctx["said"].append(f"added {chosen} on {server}")
-    ctx["phrases"].append((0, f"add {chosen}, {title}, on {server}", f"add {chosen}"))
+    ctx["add_phrase"] = (0, f"add {chosen}, {title}, on {server}", f"add {chosen}")
+    ctx["phrases"].append(ctx["add_phrase"])        # the yes of each name names its own (team_plan_options)
 
 
 def team_profile(ctx, c):
@@ -52227,7 +52302,7 @@ def team_profile(ctx, c):
                         f"\n\nIt takes effect at the start of the next session of {role}.")
     ctx["facts"].append(["profile", n, view["sha256"]])
     ctx["said"].append(f"changed the profile of {n}")
-    ctx["phrases"].append((1, f"change the profile of {role}", f"change the profile of {n}"))
+    ctx["phrases"].append((1, f"change the profile of {role}", f"change the profile of {agent_name(n, team['agents'])}"))
 
 
 def team_settings(ctx, c):
@@ -52266,7 +52341,7 @@ def team_settings(ctx, c):
     ctx["said"].append(f"changed the title or the expertise of {n}")
     ctx["phrases"].append((1, f"change the title of {role}" if "expertise" not in c else
                               f"change the expertise of {role}" if "title" not in c else
-                              f"change the title and expertise of {role}", f"change the settings of {n}"))
+                              f"change the title and expertise of {role}", f"change the settings of {agent_name(n, team['agents'])}"))
 
 
 def team_owner_file(ctx, c):
@@ -52318,7 +52393,7 @@ def team_owner_file(ctx, c):
     ctx["parts"].append(f"**The owner file {path}**\n\n" + "\n\n".join(out))
     ctx["facts"].append(["owner_file", path, hashlib.sha256(before).hexdigest(), readers])
     ctx["said"].append(f"changed {path}")
-    ctx["phrases"].append((1, f"change the owner file {path.rsplit('/', 1)[-1]}", "change an owner file"))
+    ctx["phrases"].append((1, f"change the knowledge file {path.rsplit('/', 1)[-1]}", "change a knowledge file"))
 
 
 # F15 pieces 1 and 2 (the owner, 22 November 2026: "This should happen autoamtically under the hood with no impact at
@@ -66295,8 +66370,11 @@ def tick():
         step(report_question_sweep, t0)     # and the questions about a report that waited for one
         step(case_reminder_notices, t0)     # and the times that a session whose Shell box is off set for its case
         step(manager_flag_update, t0)
-        step(fault_flush, t0)               # the lane "Bug reports": what diagnostics.py counted in this pass
-        step(error_report_sweep, t0)        # the lane "Error reports": the day's report, while the owner has it on
+        # Read here, under LOCK: t0 came before the wait for LOCK, and so may come before a bound that a holder of LOCK
+        # wrote meanwhile (the owner's yes, the stamp of a report), which a count dated t0 would then be before.
+        t1 = fault_pass_time()
+        step(fault_flush, t1)               # the lane "Bug reports": what diagnostics.py counted in this pass
+        step(error_report_sweep, t1)        # the lane "Error reports": the day's report, while the owner has it on
         step(licence_sweep, t0)             # Founderizer for Teams: the licence's own poll, only with a licence
         step(tick_changes, t0)
         # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). It moves
@@ -90196,6 +90274,9 @@ class Handler(BaseHTTPRequestHandler):
                             vault_create=a.get("vault_create") is True,             # create_login, off by default
                             vault_create_grant=vault_create_grant(line["agent"], team) if a else None,
                             runtime_switch=runtime_switch(line["agent"], team))     # owner feature runtime_switch
+                spelled = agent_spelling(line["agent"], team["agents"])     # owner feature agent_spelling, as on
+                if spelled:                                                 # /ui/state: only where there is one
+                    line["spelling"] = spelled
             machines = machine_readiness(team)
             covered = protected_logins()        # owner feature secrets: the catalog, its masks and its grants
             grants = {}

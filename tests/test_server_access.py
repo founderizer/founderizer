@@ -1087,6 +1087,16 @@ class DoorTokens(Access):
         # commits, whose push the repository's jobs run beside their secrets.
         team["agents"]["studio"]["repos"] = {"acme/site": "read"}
         self.write_team(team)
+        # what the App reaches, read here to its end: the hub reads it in a thread of its own, which can still run at a
+        # card's check below ("the hub cannot tell yet whether acme/site exists"), as a fast disk showed (Release, 27
+        # November 2026). A reading in flight ends first, on the hub's own signal, and no new one starts while fresh
+        self.addCleanup(hub.GITHUB_REACH.update, at=None, reach=None, reading=False, error=None)
+        StubDoor.answers["/github/reach"] = (200, {"pages": {}, "all": [], "repos": ["acme/site"], "many": [],
+                                                   "install": None})
+        with hub.GITHUB_REACH_DONE:
+            self.assertTrue(hub.GITHUB_REACH_DONE.wait_for(lambda: not hub.GITHUB_REACH["reading"], 30))
+        hub.github_reach_refresh()
+        self.assertEqual(hub.github_repo_known("acme/site"), ("reached", None))
         self.assertIsNone(hub.grant_check("studio", "repo:acme/site", "read"))
         said = hub.grant_check("vps", "repo:acme/site", "read")
         self.assertIn("only the owner's own level of write", said)

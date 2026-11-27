@@ -548,6 +548,8 @@ class OnTheHub(OwnerAPI):
                           ("github_app", "github-app.pem"), ("attachment_dir", "attachments")):
             hub.CFG[key] = os.path.join(self.tmp.name, "fleet-home", name)
             self.addCleanup(hub.CFG.pop, key, None)
+        hub._error_report.update(flushed=None)      # no take of fault_flush of an earlier test
+        self.addCleanup(hub._error_report.update, flushed=None)
 
     def fault(self, times=1):
         words = canary()
@@ -674,7 +676,7 @@ class OnTheHub(OwnerAPI):
         with open(hub.__file__, encoding="utf-8") as f:
             source = f.read()
         self.assertEqual(source.count("traceback.print_exc()"), 1)      # only print_fault's own
-        self.assertIn("step(fault_flush, t0)", source)
+        self.assertIn("step(fault_flush, t1)", source)
         start = inspect.getsource(hub.main)                           # read at the start, and a dying thread
         self.assertIn("diagnostics.code_id()", start)
         self.assertIn("threading.excepthook = thread_fault", start)
@@ -697,7 +699,7 @@ class OnTheHub(OwnerAPI):
                 except KeyError:
                     diagnostics.record("hub", clock=lambda: at)
             with hub.LOCK:
-                hub.fault_flush(hub.now())
+                hub.fault_flush(at)         # their own pass: a later one moves a count from before its take
         first = round(hub.now() - 120, 3)
         burst(2, first)
         burst(1, first + 60)
@@ -844,7 +846,7 @@ class OnTheHub(OwnerAPI):
             w.look(0.001, 1.0)
             if second % 5 == 4:
                 with hub.LOCK:
-                    hub.fault_flush(hub.now())
+                    hub.fault_flush(clock[1])   # at the watch's clock: a pass dates no count after its t0
         later = [0.0, hub.now() - 10]
         w = diagnostics.Watch(cpu=lambda ids: None, clock=lambda: later[0], wall=lambda: later[1],
                               process=lambda: 0.0, out=io.StringIO())
