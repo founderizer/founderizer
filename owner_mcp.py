@@ -331,6 +331,12 @@ NOT_TOOLS = {
     "/ui/vault/pin": "a statement signed with the owner's own key, which only their app on their Mac holds",
     "/ui/servers/{}/key-swap-reading": "what the owner's Mac app read as root of a server's vault, after its own step "
                                        "there over the owner's own SSH: no agent reads a vault as root",
+    "/ui/servers/made": "a record of a server that the owner's app made, as a statement that its own key signed, "
+                        "which only the app holds; its records are no tool's to read either (F17's SP1)",
+    "/ui/servers/made/swept": "the owner's app's own mark that it moved the records of its files, which only the app "
+                              "writes (F17's SP1)",
+    "/ui/servers/{}/install-ended": "the owner's app's own word that its install of a server reached its last step, "
+                                    "which only the app's install writes (F17's SP1)",
     "/ui/servers/shape": "the step of the fleet's servers, which the owner chooses on the slider of their app: the "
                          "app moves the agents for it, and for one server it runs root's part on the hub's server "
                          "over the owner's own SSH (hubsetup.py one-server)",

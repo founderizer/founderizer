@@ -76,6 +76,8 @@ from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SCREEN_RUNTI
     validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
 from vault import owner_signed_twice      # owner feature door_calls: a phone's yes, as the door checks it
+from vault import canonical as vault_canonical, owner_key as vault_owner_key, owner_signed     # F17's SP1: the form of
+                                          # a server-made's key and text
 import wakeups
 from desktop import Frames
 import atrest       # the cipher that seals the hub's Google file at rest (UI-API.md 1.202)
@@ -704,6 +706,16 @@ CREATE TABLE IF NOT EXISTS place_hosts(machine TEXT NOT NULL, host TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS faults(sig TEXT PRIMARY KEY, kind TEXT NOT NULL, program TEXT NOT NULL,
   name TEXT NOT NULL, frames TEXT NOT NULL, errno INTEGER, http INTEGER, count INTEGER NOT NULL,
   first REAL NOT NULL, last REAL NOT NULL, code TEXT NOT NULL);
+-- F17 design A, Setup's piece SP1 (server_made_keep): one server that a client of the owner's made at a provider, as
+-- the statement server-made that the client's key signed, with that key and its `by` (SHA-256 of its 65 bytes). The
+-- hub keeps text and signature as they came and proves nothing with them. The server's name is in `statement` alone,
+-- as it was signed: no column has a name that a rename would have to move. One row for each server and signer.
+CREATE TABLE IF NOT EXISTS server_made(statement TEXT NOT NULL, signature TEXT NOT NULL, key TEXT NOT NULL,
+  by TEXT NOT NULL, provider TEXT NOT NULL, id TEXT NOT NULL, use TEXT NOT NULL, received REAL NOT NULL,
+  UNIQUE(provider, id, by));
+CREATE INDEX IF NOT EXISTS server_made_by ON server_made(by);
+-- The `by` of each key whose client said that it moved the records of its own files (server_made_swept_keep).
+CREATE TABLE IF NOT EXISTS server_made_swept(by TEXT PRIMARY KEY, received REAL NOT NULL);
 
 """
 TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other")
@@ -2269,10 +2281,15 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "task_limit",        # owner API 1.330: each task's `limit` in GET /ui/state, GET /ui/mobile and GET
                                     # /ui/mobile/task/<id> is its own wait (held_task_limit); an app reads a task's wait
                                     # from it alone, and from its agent's `limit` on a hub without this name
-               "agent_spelling"]    # the owner, 25 November 2026 ("it doesn't let me use upper case the first letter
+               "agent_spelling",    # the owner, 25 November 2026 ("it doesn't let me use upper case the first letter
                                     # of the bot"): agents[].spelling of GET /ui/state and GET /ui/mobile, kept in
                                     # team.json, and the `spelling` of the routes that add and rename an agent
                                     # (UI-API.md 1.339)
+               "server_made"]       # F17 design A, Setup's piece SP1 (the owner's rule of 22 November 2026, "my mac is
+                                    # just a client"): the signed records of the servers that clients made (GET and
+                                    # POST /ui/servers/made, POST /ui/servers/made/swept) and the mark of an install's
+                                    # end (POST /ui/servers/<server>/install-ended, servers[].install_ended of GET
+                                    # /ui/servers); nothing on the owner's screen (UI-API.md 1.362)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -71612,6 +71629,9 @@ def servers_view():
                     # differ from the SSH user. Always an object, so a row without the key is a hub from before it.
                     "access": {"ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22)}
                                if ways.get("ssh_user") else None},
+                    # F17's SP1: the address that a client's install of this server reached at its last step, while
+                    # the server is at it (install_ended_keep); a plain mark that proves nothing
+                    "install_ended": install_ended_view(name, team),
                     # owner API 1.183, Part B of the changed key swap: the word (the app's reading), the owner's wish,
                     # the agents whose keys with a site hold a switch for the owner's word, and the app's last
                     # reading's reason and time
@@ -72382,6 +72402,209 @@ def prepare_server_agent(server, body):
     return {"agent": agent, "server": server, "runtime": runtime, "job": job}
 
 
+# ---------------------------------------------------------------- the records server-made: their rule (Hub core)
+#
+# F17 design A, Setup's piece SP1 (the owner's rule of 22 November 2026: "my mac is just a client ... we can't rely
+# on the current mac!"). Each server that a client of the owner's made at a provider, as the statement server-made
+# that the client's key signed (server_made_statement), which the hub keeps for every client of the fleet and, from
+# P4, for its keeper. **The hub's copy proves nothing**: a reader counts a row only by a key of its own anchors that
+# signed its text, never by the `key` that the row names. So the hub keeps the rows as they came, and its rule is about
+# room and order only:
+#
+# - A row is never deleted: not by a removal of its server (the keeper's remove needs its record after the server
+#   left the fleet), not by a rename (a row holds the name that was signed, in its statement, and no other), not by a
+#   new generation. A restore of a copy brings back that copy's rows and marks: a row written after the copy is gone,
+#   and its client, which keeps each statement that it signed, sends it again.
+# - **A row has no end.** It says that its client made the server, and not that the server is the fleet's still: the
+#   hub can show the row of a server that the owner removed and kept for other work. Nothing in SP1 lists or deletes a
+#   server by a row; a reader that will (P1, SP7) needs a signed end, which the hub cannot hold back.
+# - One row for each server and signer (UNIQUE provider, id, by): a repeat keeps the first, also in a full table.
+# - Room: at most SERVER_MADE_EACH rows for one signer and SERVER_MADE_SIGNERS signers, so SERVER_MADE_MOST in all. A
+#   signer that has a row keeps its own room. **A new signer gets none while SERVER_MADE_SIGNERS signers have rows**, and
+#   a caller with the owner's access can fill that room with keys that it throws away, for good: no row is deleted, and
+#   the hub knows no list of the owner's keys before P1. A full table refuses the new row (409, words and no code) and
+#   says so once in the hub's log for each kind of full; the diagnosis does not count it.
+# - Reads are bound (server_made_rows): a read under LOCK reads at most SERVER_MADE_MOST rows.
+
+SERVER_MADE_EACH = 256                  # rows of one signer
+SERVER_MADE_SIGNERS = 16                # signers
+SERVER_MADE_MOST = SERVER_MADE_EACH * SERVER_MADE_SIGNERS      # 4,096 rows
+SERVER_MADE_FULL = []                   # kinds of full that a keep met, for server_made_full_say
+SERVER_MADE_FULL_SAID = set()           # the kinds of full that this process said in its log
+
+
+def server_made_keep(row):
+    """Inside the caller's transaction: keeps one record {statement, signature, key, by, provider, id, use, received},
+    which server_made_statement checked. True when kept; False when a record of the same server by the same signer is
+    there, which stays. Raises Refusal(409) when the record has no room (the section's rule)."""
+    in_transaction("server_made_keep")
+    if read_rows("SELECT 1 FROM server_made WHERE provider=? AND id=? AND by=?",
+                 (row["provider"], row["id"], row["by"])):
+        return False
+    mine = read_rows("SELECT COUNT(*) AS n FROM server_made WHERE by=?", (row["by"],))[0]["n"]
+    signers = read_rows("SELECT COUNT(DISTINCT by) AS n FROM server_made")[0]["n"]
+    full = "signer" if mine >= SERVER_MADE_EACH else "signers" if not mine and signers >= SERVER_MADE_SIGNERS else None
+    if full:
+        SERVER_MADE_FULL.append(full)       # said in the log after the caller's transaction (server_made_full_say)
+        raise Refusal(409, "The hub holds no more records of servers made by this key." if full == "signer" else
+                      "The hub holds the records of servers made by as many keys as it keeps.")
+    DB.execute("INSERT INTO server_made(statement,signature,key,by,provider,id,use,received) VALUES(?,?,?,?,?,?,?,?)",
+               tuple(row[k] for k in ("statement", "signature", "key", "by", "provider", "id", "use", "received")))
+    return True
+
+
+def server_made_full_say():
+    """The hub's log, once in this process for each kind of full that a keep met (never a name or an id)."""
+    while SERVER_MADE_FULL:
+        kind = SERVER_MADE_FULL.pop()
+        if kind not in SERVER_MADE_FULL_SAID:
+            SERVER_MADE_FULL_SAID.add(kind)
+            log("hub", "the records of servers that clients made are full: "
+                + (f"one key has {SERVER_MADE_EACH}" if kind == "signer" else f"{SERVER_MADE_SIGNERS} keys have records"))
+
+
+def server_made_rows():
+    """The records, oldest first, at most SERVER_MADE_MOST. A read that commits nothing."""
+    return [dict(r) for r in read_rows("SELECT statement, signature, key, by, provider, id, use, received "
+                                       "FROM server_made ORDER BY rowid LIMIT ?", (SERVER_MADE_MOST,))]
+
+
+def server_made_swept_keep(by, received):
+    """Inside the caller's transaction: the client whose key has this `by` moved its files' records. True when new.
+    It can only keep a client from reading its files again, never make one sign. Only for a key that has a record here
+    (Refusal 409), so there are at most SERVER_MADE_SIGNERS marks, and none stands without the records that it ends."""
+    in_transaction("server_made_swept_keep")
+    if not read_rows("SELECT 1 FROM server_made WHERE by=? LIMIT 1", (by,)):
+        raise Refusal(409, "The hub holds no record of a server that this key made.")
+    if read_rows("SELECT 1 FROM server_made_swept WHERE by=?", (by,)):
+        return False
+    DB.execute("INSERT INTO server_made_swept(by, received) VALUES(?,?)", (by, received))
+    return True
+
+
+def server_made_swept_rows():
+    """The `by` of each such mark, at most SERVER_MADE_SIGNERS. A read that commits nothing."""
+    return [r["by"] for r in read_rows("SELECT by FROM server_made_swept ORDER BY rowid LIMIT ?", (SERVER_MADE_SIGNERS,))]
+
+
+# ---------------------------------------------------------------- the records server-made: their routes (Setup)
+#
+# POST /ui/servers/made keeps one record, GET /ui/servers/made serves them all with the fleet's id and the marks, and
+# POST /ui/servers/made/swept keeps a client's mark (UI-API.md, "the records of the servers that clients made"). The
+# form of a record is the statement of FleetCore's ServerMade, with exactly its fields, of this fleet, and its key
+# must have signed it (our own ECDSA, before LOCK). That check keeps the table clean and proves nothing to a reader.
+# No agent, no device and no tool of the owner's MCP server reads these routes (NOT_TOOLS), and the hub's log names no
+# server, provider or id of a record: the fleet manager reads that log.
+
+SERVER_MADE_FIELDS = frozenset({"v", "kind", "fleet", "at", "machine", "provider", "id", "use"})
+SERVER_MADE_PROVIDERS = ("hetzner", "digitalocean", "vultr", "akamai")       # FleetCore's CloudProvider
+SERVER_MADE_USES = ("hub", "agent")                                          # FleetCore's CloudServerUse
+SERVER_MADE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")                           # FleetCore's CloudServers.isID
+SERVER_MADE_LONGEST = 4096                                                   # characters of one statement
+SERVER_MADE_AHEAD = 86400       # seconds that a statement's time may be after the hub's clock (vault.PIN_AHEAD)
+SIGNER_BY = re.compile(r"[0-9a-f]{64}")
+
+
+def server_made_by(key):
+    """`by`: SHA-256 of the key's 65 bytes, lower-case hex (FleetCore's ServerMade.by; the form of a client-end's keys
+    in F17 design A). ValueError for a text that is not such a key in standard, padded base64."""
+    if not isinstance(key, str):
+        raise ValueError("key must be the client's public key")
+    try:
+        vault_owner_key(key)
+    except ValueError:
+        raise ValueError("key is no uncompressed P-256 point in standard base64") from None
+    return hashlib.sha256(base64.b64decode(key)).hexdigest()
+
+
+def server_made_statement(data):
+    """The record of POST /ui/servers/made, {statement, signature, key, by, provider, id, use}, or ValueError:
+    `statement` is exactly the canonical text of a server-made of this fleet, and `key` signed it. Run before LOCK."""
+    extra = sorted(set(data) - {"request_id", "db", "statement", "signature", "key"})
+    if extra:
+        raise ValueError(f"unknown field {extra[0]}")
+    statement, signature, key = data.get("statement"), data.get("signature"), data.get("key")
+    if not isinstance(statement, str) or not isinstance(signature, str) or len(statement) > SERVER_MADE_LONGEST \
+            or len(signature) > 256:
+        raise ValueError("a record needs its statement and its signature")
+    by = server_made_by(key)
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or vault_canonical(said) != statement:
+        raise ValueError("the statement is not in its canonical form")
+    if set(said) != SERVER_MADE_FIELDS or said["kind"] != "server-made" or type(said["v"]) is not int \
+            or said["v"] != 1 or type(said["at"]) is not int or not 0 <= said["at"] <= now() + SERVER_MADE_AHEAD \
+            or said["fleet"] != fleet_id() or not isinstance(said["machine"], str) \
+            or not SERVER_NAME.fullmatch(said["machine"]) or said["provider"] not in SERVER_MADE_PROVIDERS \
+            or not isinstance(said["id"], str) or not SERVER_MADE_ID.fullmatch(said["id"]) \
+            or said["use"] not in SERVER_MADE_USES:
+        raise ValueError("the statement is not a record server-made of this fleet")
+    if not owner_signed({"owner_keys": [key]}, statement, signature):
+        raise ValueError("the key did not sign this statement")
+    return {"statement": statement, "signature": signature, "key": key, "by": by, "provider": said["provider"],
+            "id": said["id"], "use": said["use"]}
+
+
+def server_made_add(body):
+    """POST /ui/servers/made, under LOCK: keeps the record (server_made_keep). Its log line names no server."""
+    try:
+        with transaction():
+            kept = server_made_keep(dict(body, received=now()))
+    finally:
+        server_made_full_say()
+    log("owner", f"{'kept' if kept else 'had'} a record of a server that a client made (its key {body['by'][:12]})")
+    return {"kept": kept, "by": body["by"]}
+
+
+def server_made_swept(body):
+    """POST /ui/servers/made/swept, under LOCK: the client's mark that it moved its files' records."""
+    with transaction():
+        kept = server_made_swept_keep(body["by"], now())
+    return {"kept": kept, "by": body["by"]}
+
+
+def server_made_view():
+    """GET /ui/servers/made, under LOCK: the records, the fleet's id and the marks."""
+    return {"fleet": fleet_id(), "records": server_made_rows(), "swept": server_made_swept_rows()}
+
+
+# ---------------------------------------------------------------- the end of an install, as a client saw it (Setup)
+#
+# F17's SP1, the plan validator's answer 2: the address that a client's install of a server reached at its last
+# step, which "Use this server" reads (FleetCore's CloudExisting.reuse, `finished`), so that another client knows it
+# too. A plain mark, not a record server-made: it proves nothing, no reader takes it as proof, and it never skips the
+# vault's pin, a delete's check or a seal. A wrong mark makes the app place an agent on a server whose last steps may
+# not have run, or install again, and the hub's own list decides placement already. The hub takes only the server's
+# own address in team.json; Remove deletes the mark, and a rename moves it (INSTALL_ENDED_KV).
+
+INSTALL_ENDED = "install_ended:"        # + the server: {"address", "at"}
+INSTALL_ENDED_KV = (INSTALL_ENDED,)
+
+
+def install_ended_keep(server, body):
+    """POST /ui/servers/<server>/install-ended: the mark of the end of a client's install of this server, at the
+    address that team.json has for it now."""
+    team = TEAM
+    if server not in server_names(team):
+        raise Refusal(404, code="no_such_server")
+    if (team.get("addresses") or {}).get(server) != body["address"]:
+        raise Refusal(409, f"{server} is not at that address in your fleet.")
+    kv_set(INSTALL_ENDED + server, json.dumps({"address": body["address"], "at": now()}))
+    return {"server": server, "address": body["address"]}
+
+
+def install_ended_view(name, team):
+    """The address of the mark of this server's install, while team.json has it at that address; else None."""
+    try:
+        said = json.loads(kv_get(INSTALL_ENDED + name) or "null")
+    except ValueError:
+        return None
+    address = said.get("address") if isinstance(said, dict) else None
+    return address if address and address == (team.get("addresses") or {}).get(name) else None
+
+
 def remove_server(server, body):
     """POST /ui/servers/<server>/remove: a server with no agent leaves Fleet: its address, entry and access leave
     team.json, the hub forgets its key and reading, and its open jobs end. It can join again with a new code."""
@@ -72418,7 +72641,8 @@ def remove_server(server, body):
         DB.execute("DELETE FROM first_stores WHERE machine=?", (server,))      # C9: only this opens its keep again
         DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=? WHERE server=? AND state IN "
                    "('queued','running','needs_owner')", (t0, server))
-        for prefix in KEY_SWAP_KV + DESKTOP_KV:     # the key swap's and the desktop sweep's records of the server
+        # the key swap's and the desktop sweep's records of the server, and the mark of its install's end (F17's SP1)
+        for prefix in KEY_SWAP_KV + DESKTOP_KV + INSTALL_ENDED_KV:
             DB.execute("DELETE FROM kv WHERE k=?", (prefix + server,))
         DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE key_swap_server=? AND answer IS NULL",
                    ("Closed by the hub: the server left the fleet", t0, "hub", server))
@@ -73802,8 +74026,8 @@ def rename_machine_rows(old, new):
     for table, column in MACHINE_COLUMNS:
         DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
     # the key swap's records of the server: its reading, its asks, a press, and the item that asks for its word; and
-    # the desktop sweep's (DESKTOP_KV)
-    for prefix in KEY_SWAP_KV + DESKTOP_KV:
+    # the desktop sweep's (DESKTOP_KV); and the mark of its install's end (INSTALL_ENDED_KV)
+    for prefix in KEY_SWAP_KV + DESKTOP_KV + INSTALL_ENDED_KV:
         DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
     DB.execute("UPDATE needs SET key_swap_server=? WHERE key_swap_server=?", (new, old))
@@ -88466,6 +88690,49 @@ class Handler(BaseHTTPRequestHandler):
             return {"base_sha256": base, "step": step}
         return self.ui_command("servers/shape", read, set_shape, kit=True)
 
+    def ui_servers_made(self):
+        """POST /ui/servers/made (feature server_made, F17's SP1): one record of a server that a client made, as its
+        key signed it. The form and the signature are checked here, before LOCK (server_made_statement)."""
+        return self.ui_command("servers/made", server_made_statement, server_made_add)
+
+    def ui_servers_made_read(self, query):
+        """GET /ui/servers/made (feature server_made): the records, the fleet's id and the clients' marks. Not scrubbed:
+        each value is of a fixed form that its write checked, and a signature must reach its reader as it was made."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, refusal_words.answer("hub_changed"))
+        with LOCK:
+            view = server_made_view()
+        return self.json(200, dict(db=generation, **view), {"Cache-Control": "no-store"})
+
+    def ui_servers_made_swept(self):
+        """POST /ui/servers/made/swept {by} (feature server_made): the client whose key has this `by` moved its files'
+        records, so it reads them no more."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "by"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            by = data.get("by")
+            if not (isinstance(by, str) and SIGNER_BY.fullmatch(by)):
+                raise ValueError("by must be the SHA-256 of a client's key")
+            return {"by": by}
+        return self.ui_command("servers/made/swept", read, server_made_swept)
+
+    def ui_server_install_ended(self, server):
+        """POST /ui/servers/<server>/install-ended {address} (feature server_made): the end of a client's install of
+        this server, at its address in team.json (install_ended_keep)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "address"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            address = data.get("address")
+            if not (isinstance(address, str) and 0 < len(address) <= 253):
+                raise ValueError("address must be the server's address")
+            return {"address": address}
+        return self.ui_command(f"servers/{server}/install-ended", read, lambda body: install_ended_keep(server, body))
+
     def ui_servers_grant(self):
         """POST /ui/servers/grant (owner feature server_access): Read or Fix on one server for one agent, or null."""
         def read(data):
@@ -92984,6 +93251,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_machines(query)
         if parts == ["ui", "servers"]:
             return self.ui_servers(query)
+        if parts == ["ui", "servers", "made"]:       # feature server_made (F17's SP1)
+            return self.ui_servers_made_read(query)
         if parts == ["join"]:
             return self.join_script()
         if len(parts) >= 2 and parts[0] == "code":         # owner feature code_over_hub_port
@@ -93886,6 +94155,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers_grant()
         if parts == ["ui", "servers", "shape"]:      # owner features fleet_shape and hub_shared_later
             return self.ui_servers_shape()
+        if parts == ["ui", "servers", "made"]:       # feature server_made (F17's SP1): one signed record
+            return self.ui_servers_made()
+        if parts == ["ui", "servers", "made", "swept"]:      # feature server_made: a client's mark
+            return self.ui_servers_made_swept()
+        if len(parts) == 4 and parts[:2] == ["ui", "servers"] and parts[3] == "install-ended":      # server_made
+            return self.ui_server_install_ended(parts[2])
         if parts == ["ui", "door"]:                  # DevOps plan 13, item 1: the app writes the door's entry
             return self.ui_door_save()
         if parts == ["ui", "door", "secrets"]:       # DevOps plan 13, item 4: the hub gets its tokens from the door

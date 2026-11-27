@@ -544,6 +544,8 @@ class Columns(unittest.TestCase):
 
     NOT_AGENTS = {
         ("agent_keys", "agent"): "the key follows the name only with its server's job (hub.rename_rows)",
+        ("server_made", "by"): "the SHA-256 of the client key that signed a server's record (F17 SP1)",
+        ("server_made_swept", "by"): "the SHA-256 of a client key whose files' records moved (F17 SP1)",
         ("attachments", "name"): "a file", ("calls", "name"): "a tool", ("chat_ignored", "sender"): "a chat handle",
         ("chat_ignored", "name"): "a person", ("chat_in", "sender"): "a chat handle", ("chat_out", "sender"): "a chat handle",
         ("chat_out", "recipient"): "a Discord user", ("chat_status", "name"): "a bot",
@@ -578,6 +580,7 @@ class Columns(unittest.TestCase):
              "give_agent", "sign_in_agent",             # the agent of a card's Give, and of a card's sign-in (F6)
              "checker"}                                 # the agent that checks an unknown outcome (owner API 1.324)
     NOT_AGENT_KV = {
+        "install_ended:": "a server: the mark of its install's end (hub.INSTALL_ENDED, F17 SP1)",
         "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "check_running:": "a machine check",
         "check_after:": "a machine check", "check_probe:": "a machine check",
         "check_queued:": "a machine check", "chat_removed:": "a chat app account",

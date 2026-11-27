@@ -66,7 +66,8 @@ def sha(text):
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Servers, ServerService, TeamAtStartup, InstallRetries,
-                                                    JoinLineStops, CodeOverHubPort, HomeReading)
+                                                    JoinLineStops, CodeOverHubPort, HomeReading, ServerMadeRecords,
+                                                    ServerMadeRoutes)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -3246,3 +3247,184 @@ class HomeReading(ServerService):
         self.assertEqual(hub.homes_view("scout")["agents"][0]["more"], 2)
         self.assertEqual(hub.home_reading_checked({"read": 10 ** 400, "items": []})[0],
                          {"error": "a reading of another shape"})       # no OverflowError for the whole post
+
+
+class ServerMadeRecords(Servers):
+    """F17's SP1: the rule of the records of the servers that clients made (server_made_keep), and the mark of an
+    install's end. No record here is signed: the routes' check is ServerMadeRoutes'."""
+
+    def keep(self, by="a" * 64, id="1001", statement="{}"):
+        row = {"statement": statement, "signature": "s", "key": "k", "by": by, "provider": "hetzner", "id": id,
+               "use": "agent", "received": 1.0}
+        with hub.transaction():
+            return hub.server_made_keep(row)
+
+    def rows(self):
+        with hub.LOCK:
+            return hub.server_made_rows()
+
+    def test_a_record_stays_as_it_was_signed_after_a_rename_and_after_its_server_left(self):
+        """The keeper's remove (design A's SP7) needs the record of a server after Remove took it out of the fleet, and
+        a record is what its client signed. A bug here: Remove deletes the proof, or a rename changes a signed record
+        (names come back, so a rename by name would also change the record of a removed server)."""
+        self.joined("box", "linux", source=OTHER, user="fleet", ssh_port=22)
+        self.assertTrue(self.keep(statement="signed as box"))
+        self.assertTrue(self.keep(id="1002", statement="signed as box too"))
+        before = self.rows()
+        with hub.transaction():
+            hub.rename_machine_rows("box", "box-2")
+        self.assertEqual(self.rows(), before)
+        status, receipt = self.owner("/ui/servers/box/remove", base_sha256=self.team_sha())
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.rows(), before)
+        with self.assertRaises(RuntimeError):           # its write is the caller's transaction's
+            hub.server_made_keep({})
+
+    def test_one_signer_cannot_take_the_room_of_another_and_nothing_is_deleted(self):
+        """A record past the room of its signer, or of a new signer past the room of signers, is refused; a repeat is
+        none, also in a full room (an answer that was lost), and a full table deletes nothing. A bug here: a caller that
+        signs with keys of its own takes the room of a signer that has records, a send whose answer was lost is refused
+        for ever, or the hub makes room by deleting a server's proof."""
+        a, b, c = "a" * 64, "b" * 64, "c" * 64
+        with patch.object(hub, "SERVER_MADE_EACH", 2), patch.object(hub, "SERVER_MADE_SIGNERS", 2), \
+                patch.object(hub, "SERVER_MADE_FULL_SAID", set()):
+            self.assertEqual([self.keep(a, "1"), self.keep(a, "1"), self.keep(a, "2")], [True, False, True])
+            for by, id in ((a, "3"), (a, "4")):
+                with self.assertRaises(hub.Refusal) as refused:
+                    self.keep(by, id)
+                self.assertEqual(refused.exception.status, 409)
+                hub.server_made_full_say()
+            self.assertFalse(self.keep(a, "1"))         # a repeat in a full room
+            self.assertTrue(self.keep(b, "1"))          # a new signer while there is room for one
+            with self.assertRaises(hub.Refusal):
+                self.keep(c, "1")
+            hub.server_made_full_say()
+            self.assertTrue(self.keep(b, "2"))          # b's own room stays
+        self.assertEqual(sorted((r["by"][0], r["id"]) for r in self.rows()),
+                         [("a", "1"), ("a", "2"), ("b", "1"), ("b", "2")])
+        said = [r["what"] for r in hub.q("SELECT what FROM log WHERE what LIKE '%servers that clients made are full%'")]
+        self.assertEqual(len(said), 2, said)            # once for each kind of full
+
+    def test_a_clients_mark_stands_only_beside_a_record_of_its_key(self):
+        """The mark that a client moved its files' records is kept once, and only for a key that has a record here. A
+        bug here: marks with no record fill the list, or a hub with none of a Mac's records (restored from an older
+        copy) tells it that all of them are there."""
+        def sweep(by):
+            with hub.transaction():
+                return hub.server_made_swept_keep(by, 1.0)
+        with self.assertRaises(hub.Refusal) as refused:
+            sweep("a" * 64)
+        self.assertEqual(refused.exception.status, 409)
+        self.keep("a" * 64)
+        self.assertEqual([sweep("a" * 64), sweep("a" * 64)], [True, False])
+        with hub.LOCK:
+            self.assertEqual(hub.server_made_swept_rows(), ["a" * 64])
+
+    def test_the_mark_of_an_installs_end_is_the_servers_own_and_goes_with_it(self):
+        """The mark of a client's install of a server holds only the server's own address, a rename takes it along, and
+        Remove takes it. A bug here: a renamed server is installed again, or the mark of a removed server comes back for
+        a new server with that name at the same address, and the app places an agent there with no install."""
+        self.joined("box", "linux", source=OTHER, user="fleet", ssh_port=22)
+        self.assertEqual(self.servers()[1]["box"]["install_ended"], None)
+        self.assertEqual(self.owner("/ui/servers/box/install-ended", address=NEW)[0], 409)
+        self.assertEqual(self.owner("/ui/servers/nowhere/install-ended", address=OTHER)[0], 404)
+        status, receipt = self.owner("/ui/servers/box/install-ended", address=OTHER)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.servers()[1]["box"]["install_ended"], OTHER)
+        self.assertIsNone(hub.install_ended_view("box", {"addresses": {"box": NEW}}))       # it has another address now
+        with hub.transaction():
+            hub.rename_machine_rows("box", "box-2")
+        self.assertEqual(hub.install_ended_view("box-2", {"addresses": {"box-2": OTHER}}), OTHER)
+        self.assertIsNone(hub.install_ended_view("box", {"addresses": {"box": OTHER}}))
+        with hub.transaction():
+            hub.rename_machine_rows("box-2", "box")
+        self.assertEqual(self.owner("/ui/servers/box/remove", base_sha256=self.team_sha())[0], 200)
+        self.joined("box", "linux", source=OTHER, user="fleet", ssh_port=22)
+        self.assertEqual(self.servers()[1]["box"]["install_ended"], None)
+
+
+VECTORS = os.path.join(ROOT, "app", "vectors")          # the apps' folder, which the published repository never has
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(VECTORS, "server-made.json")),
+                     "the apps' folder app/ is not in this tree (the published repository has none)")
+class ServerMadeRoutes(Servers):
+    """F17's SP1: POST and GET /ui/servers/made, with the records of app/vectors/server-made.json, which FleetCore's
+    ServerMade reads too."""
+
+    def setUp(self):
+        super().setUp()
+        self.vector = json.loads(Path(VECTORS, "server-made.json").read_text())
+        hub.kv_set("fleet_id", self.vector["fleet"])
+
+    def sign(self, statement, label=None):
+        """(signature, key) of a statement: by the vector's key, or by a key of `label`, with make_vectors.py's own
+        P-256 code (vault.py's arithmetic, an RFC 6979 nonce)."""
+        import importlib.util
+        import vault
+        spec = importlib.util.spec_from_file_location("make_vectors_for_test_servers",
+                                                      os.path.join(VECTORS, "make_vectors.py"))
+        made = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(made)
+        d = int(self.vector["private_scalar_hex"], 16) if label is None else made.scalar(label, vault.P256_N)
+        return made.b64(made.der(*made.ecdsa_sign(vault, d, statement))), made.point_b64(vault, d)
+
+    def made(self, statement=None, signature=None, key=None, **more):
+        return self.owner("/ui/servers/made", statement=self.vector["statement"] if statement is None else statement,
+                          signature=self.vector["signature"] if signature is None else signature,
+                          key=self.vector["public_key"] if key is None else key, **more)
+
+    def made_read(self):
+        status, view = self.request("/ui/servers/made?db=test-generation", source=OWNER)
+        self.assertEqual(status, 200, view)
+        return view
+
+    def test_the_hub_keeps_a_signed_record_once_and_serves_it_as_it_came(self):
+        """The record of app/vectors/server-made.json, which FleetCore's ServerMade writes and reads, is taken, kept
+        once for its server and signer, and served byte for byte, with the fleet's id and a client's mark. A bug here:
+        the hub refuses the Mac's own form, keeps a second record of a lost answer, or changes the signed text. The
+        hub's log names no server, provider or id: the fleet manager reads it."""
+        self.assertIn("server_made", self.request("/ui/state", source=OWNER)[1]["ui_features"])
+        self.assertEqual(self.owner("/ui/servers/made/swept", by=self.vector["by"])[0], 409)     # no record of it yet
+        status, receipt = self.made()
+        self.assertEqual((status, receipt["kept"], receipt["by"]), (200, True, self.vector["by"]), receipt)
+        status, again = self.made()                     # another request with the same record: an answer that was lost
+        self.assertEqual((status, again["kept"]), (200, False), again)
+        view = self.made_read()
+        self.assertEqual((view["db"], view["fleet"], view["swept"]), ("test-generation", self.vector["fleet"], []))
+        self.assertEqual([{k: v for k, v in r.items() if k != "received"} for r in view["records"]],
+                         [{"statement": self.vector["statement"], "signature": self.vector["signature"],
+                           "key": self.vector["public_key"], "by": self.vector["by"], "provider": "hetzner",
+                           "id": "58213977", "use": "agent"}])
+        status, swept = self.owner("/ui/servers/made/swept", by=self.vector["by"])
+        self.assertEqual((status, swept["kept"]), (200, True), swept)
+        self.assertEqual(self.made_read()["swept"], [self.vector["by"]])
+        self.assertEqual(self.owner("/ui/servers/made/swept", by="not a by")[0], 400)
+        # another key of the owner's, with a statement of its own
+        text = self.vector["statement"].replace("58213977", "58213990")
+        signature, key = self.sign(text, "another of the owner's keys")
+        self.assertEqual(self.made(text, signature, key)[1]["kept"], True)
+        self.assertEqual(len(self.made_read()["records"]), 2)
+        logged = " ".join(r["what"] for r in hub.q("SELECT what FROM log"))
+        for value in ("58213977", "58213990", "worker-3", "hetzner"):
+            self.assertNotIn(value, logged)
+
+    def test_a_record_that_is_no_signed_server_made_of_this_fleet_is_refused(self):
+        """Each refused text and signature of the vector, another fleet's record, a key that is no point, a field more,
+        and a time more than a day ahead: refused, and nothing kept. A bug here: the hub's list fills with records
+        that no reader can count, or the form that the keeper checks later differs from the one that the hub took."""
+        for case in self.vector["refused_statements"]:
+            signature, key = self.sign(case["statement"])           # signed by the right key, of the wrong form
+            status, refused = self.made(case["statement"], signature, key)
+            self.assertEqual(status, 400, (case["name"], refused))
+        for case in self.vector["refused_signatures"]:
+            self.assertEqual(self.made(signature=case["signature"])[0], 400, case["name"])
+        self.assertEqual(self.made(key=self.vector["other_public_key"])[0], 400)    # another key did not sign it
+        self.assertEqual(self.made(key="BAAA")[0], 400)
+        self.assertEqual(self.made(project="example")[0], 400)
+        ahead = self.vector["statement"].replace("1790000000", str(int(time.time()) + 2 * 86400))
+        self.assertEqual(self.made(ahead, *self.sign(ahead))[0], 400)
+        hub.kv_set("fleet_id", "fedcba9876543210")                 # the vector's fleet is another fleet now
+        self.assertEqual(self.made()[0], 400)
+        hub.kv_set("fleet_id", self.vector["fleet"])
+        self.assertEqual(self.made_read()["records"], [])
