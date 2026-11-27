@@ -20903,7 +20903,8 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
     stale generation, a replay of this request, or a press with a signed statement, which the answer's own path refuses.
     A (status, answer) refuses the press, and then no answer is written: from a client that shows no Details (a phone,
     a connected app: the Mac and a PC show what Give gives), or an item whose agent is gone, which the hub closes. Else
-    {repos}: the repositories whose level the press raised, none when the agent held them already. Whatever the answer
+    {repos}: the repositories whose level the press raised, else those whose record the same press again wrote after a
+    stop (the repeat rule below), none when the agent held them already and their records say so. Whatever the answer
     does next, the manager hears the grant at once, as after every grant of the owner's (save_agent_repos).
 
     F6 piece 2: an item of one gmail:, drive: or tool: gives it through the same path (resource_hold_set, the one
@@ -20943,6 +20944,7 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
     rid = give["resources"][0] if give["resources"] else None
     kind, thing = resource_parts(rid) if rid else ("repo", None)
     refused, given_before = [], [None]     # given_before: the agent's level of the thing before this press
+    repos_before = {}                      # the agent's level of each of the card's repositories before it
 
     def give_levels(team):
         known_agents(team, [agent])
@@ -20959,6 +20961,8 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
             raised[:] = [rid]
             return resource_hold_set(a, kind, thing, level)
         held = dict(a.get("repos") or {})
+        repos_before.clear()
+        repos_before.update({r: held.get(r) for r in repos})
         raised[:] = [r for r in repos if not level_at_least("repo", held.get(r), level)]
         for repo in raised:
             held[repo] = level
@@ -21010,20 +21014,26 @@ def need_give_press(need_id, request_id, db, connection, address, signed, device
         return {"repos": [], "resources": [rid]}
     if rid:
         return {"repos": [], "resources": []}
-    if raised:
-        # the owner's record of each repository that the press raised, as the other kinds get one (resource_record):
-        # so a Give at read stays a read and never becomes the door's commits for an Operator (door_commit_holds, the
-        # Door area's readers of 26 November 2026)
+    # The owner's record of each repository that the press raised, as the other kinds get one (resource_record), so a
+    # Give at read stays a read and never becomes the door's commits for an Operator (door_commit_holds, the Door
+    # area's readers of 26 November 2026); and of each one that holds exactly the card's level already with no record
+    # that says so: the repeat rule above, for repositories, when the hub stopped after this card's commit and before
+    # its records and the Mac sends the same press again, and one rule for each repository of a card, whether another
+    # of its repositories was raised or not (the repo-reach validator's read of 26 November 2026)
+    recorded = [r for r in repos if r not in raised and repos_before.get(r) == level and
+                not level_at_least("repo", resource_recorded(f"repo:{r}", agent), level)]
+    gave = raised or recorded
+    if gave:
         with transaction():
-            for repo in raised:
+            for repo in raised + recorded:
                 resource_record(f"repo:{repo}", agent, level, "owner", result["revision"])     # the page's own id
-        pages = github_unreached(raised)
+        pages = github_unreached(gave)
         emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
-             f"{level} access to {', '.join(raised)} now. An agent gets the change in its next task session." +
+             f"{level} access to {', '.join(gave)} now. An agent gets the change in its next task session." +
              (f" The fleet's GitHub App does not reach {', '.join(sorted(pages))} yet: tell the owner in one line "
               f"that they add it at {pages[sorted(pages)[0]]}." if pages else "") +
-             door_round_next(door_lacks(agent, raised)))
-    return {"repos": list(raised)}
+             door_round_next(door_lacks(agent, gave)))
+    return {"repos": list(gave)}
 
 
 def need_give_note(need, choice, gave):
@@ -76900,17 +76910,38 @@ def door_app_id():
     return app_id if isinstance(app_id, str) and re.fullmatch(r"[1-9][0-9]{0,11}", app_id) else None
 
 
-def door_commit_holds(name, repos):
+def door_commit_records():
+    """Each agent's newest record of each repository, from one read of resource_grants: {agent: {"repo:<owner/name in
+    lower case>": level}}, a take-back's level None. door_view reads it once for all its agents (the table has no
+    index on agent). Called with LOCK held."""
+    newest = {}
+    for row in q("SELECT agent, resource, level FROM resource_grants WHERE resource LIKE 'repo:%' ORDER BY id"):
+        newest.setdefault(row["agent"], {})[str(row["resource"]).lower()] = row["level"]
+    return newest
+
+
+def door_commit_holds(name, repos, newest=None):
     """The repositories of this agent's holds that the door may make commit targets of when the agent is an Operator
     (DoorAccess.operatorGitHub; the Door area's read of 26 November 2026): each hold at write or deploy, and each hold
-    that no record of the hub's names (resource_grants), which is the owner's own from their page or from before the
-    records. A read that the manager gave (the pool default gives a repository at read only) and a read of the owner's
-    Give are no commit target, since the door commits with its own token: else a read would become a write the day the
-    agent gets a server, or while its business has no ready host. Called with LOCK held."""
-    newest = {}         # each repository's newest record of this agent: a take-back (level NULL) or an older level
-    for row in q("SELECT resource, level FROM resource_grants WHERE agent=? AND resource LIKE 'repo:%' ORDER BY id",
-                 (name,)):  # that the hold no longer has is no record of the hold that stands now
-        newest[str(row["resource"]).lower()] = row["level"]
+    whose newest record of the hub's (resource_grants) is not of the level that it holds now, which is the owner's own
+    from their page (the page writes no record) or from before the records. A read that the manager gave (the pool
+    default gives a repository at read only) and a read of the owner's Give are no commit target, since the door
+    commits with its own token: else a read would become a write the day the agent gets a server, or while its
+    business has no ready host. newest: this agent's map of door_commit_records, else one read for this agent.
+
+    Who sets a level decides, so whoever makes the owner's page write records for repositories (save_repo and
+    save_agent_repos, the K1 item) changes this rule in the same change: else each read that the owner sets on the page
+    matches its own record and stops being a commit target, against the supervisor's decision that the owner's own read
+    stays one. Known limits (UI-API 1.364): a record that a stop of the hub left out (a Give gets it at the same press
+    again while its card is open; need_look_sweep closes the card about NEED_GIVE_WAIT after it reads the level), a
+    database older than its team.json, and a revert or an undo of team.json to an older state, whose holds the records
+    do not follow: each such hold whose newest record is of another level reads as the owner's own. Called with LOCK
+    held."""
+    if newest is None:
+        newest = {}     # each repository's newest record of this agent: a take-back (level NULL) or an older level
+        for row in q("SELECT resource, level FROM resource_grants WHERE agent=? AND resource LIKE 'repo:%' ORDER BY id",
+                     (name,)):  # that the hold no longer has is no record of the hold that stands now
+            newest[str(row["resource"]).lower()] = row["level"]
     return sorted(repo for repo, level in repos.items()
                   if level in ("write", "deploy") or newest.get(f"repo:{str(repo).lower()}") != level)
 
@@ -76929,6 +76960,7 @@ def door_view():
         app = github_app()
     with CENTRAL_LOCK:      # LOCK, then CENTRAL_LOCK, as vault_view takes them
         status = CENTRAL["status"]
+    records = door_commit_records()
     return {"door": {"address": door["address"], "port": door.get("port", DOOR_PORT)} if door.get("address") else None,
             # Only for an agent that holds servers now (door_holders): one that lost its last server keeps its name
             # in team.json, so that it has its keys again when the app gives it a server again, but not at the door.
@@ -76936,7 +76968,7 @@ def door_view():
                             for name, c in sorted((door.get("credentials") or {}).items())},
             "agents": {name: {"address": addresses[a["machine"]], "user": users.get(name),
                               "repos": dict(sorted((a.get("repos") or {}).items())),
-                              "targets": door_commit_holds(name, a.get("repos") or {})}
+                              "targets": door_commit_holds(name, a.get("repos") or {}, records.get(name, {}))}
                        for name, a in sorted(agents().items()) if a.get("machine") in addresses},
             # plan 13, item 4: the hub's own App key, which the app moves to the door, and whether the hub is linked
             "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,

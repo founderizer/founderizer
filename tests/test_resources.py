@@ -1282,6 +1282,72 @@ class Resources(OwnerAPI):
             self.assertEqual(self.request(f"/ui/needs/{site}", self.command(choice=0))[0], 200)
         self.assertEqual(self.committed()["agents"]["dev"]["repos"].get("beta/site"), "write")
 
+    def test_who_set_a_repository_level_decides_the_doors_commit_targets(self):
+        """The door commits for an Operator with its own token, so a repository is its commit target only when the level
+        is the owner's own (door_commit_holds): a read of the owner's Give is none, a level that the owner set on the
+        agent's page is one, and a Give whose hub stopped before its record gets the record at the same press again.
+        Bugs: a Give at read writes no row and reads as a page grant; the rule asks for no row at all in place of a row
+        of another level, so a hold that the owner lowered on the page from a recorded write is no target; the press
+        again after a stop writes no row, so that Give at read stays a commit target for good."""
+        self.reaches("acme/web", "acme/api", "acme/docs", "acme/site", "acme/blog")     # a Give needs the App's reach
+
+        def give(nid):
+            self.assertIsInstance(nid, int, nid)
+            code, said = self.request(f"/ui/needs/{nid}", self.command(choice=0))
+            self.assertEqual(code, 200, said)
+        give(self.give_card())      # a recorded write: the owner's Give at write of acme/web
+        code, said = self.request("/ui/team/repos", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                     "base_sha256": self.pool()["sha256"], "repo": "acme/web",
+                                                     "agent": "dev", "level": "read"})
+        self.assertEqual(code, 200, said)    # lowered to read on the agent's page: the owner's own read, no row
+        read = self.give_card(title="Let Dev read acme/api", why="Its fix needs to read acme/api.",
+                              needs_access="repo:acme/api", needs_level="read", options=["No"])
+        self.assertIsInstance(read, int, read)
+        give(read)
+        held = self.committed()["agents"]["dev"]["repos"]
+        self.assertEqual(held, {"acme/api": "read", "acme/web": "read"})
+        self.assertEqual(hub.door_commit_holds("dev", held), ["acme/web"])
+        self.assertEqual(hub.door_commit_holds("dev", held, hub.door_commit_records().get("dev", {})), ["acme/web"])
+        # a stop between a Give's commit and its record: the same press again writes the record, one commit in all
+        card = self.give_card(title="Let Dev read acme/docs", why="Its fix needs to read acme/docs.",
+                              needs_access="repo:acme/docs", needs_level="read", options=["No"])
+        self.assertIsInstance(card, int, card)
+        real, stopped = hub.resource_record, []
+
+        def stops(*args, **kw):
+            if not stopped:
+                stopped.append(args)
+                raise RuntimeError("the hub stopped")
+            return real(*args, **kw)
+        press, before = self.command(choice=0), self.commits()
+        with patch.object(hub, "resource_record", stops), self.assertRaises(RuntimeError):
+            hub.phone_submit(press, "founderizer-swift/1/test", card, device=None)
+        held = self.committed()["agents"]["dev"]["repos"]
+        self.assertEqual((self.commits(), held["acme/docs"]), (before + 1, "read"))
+        self.assertEqual(hub.door_commit_holds("dev", held), ["acme/docs", "acme/web"])
+        code, receipt = self.request(f"/ui/needs/{card}", press)
+        self.assertEqual(code, 200, receipt)
+        row = hub.q1("SELECT level, by FROM resource_grants WHERE resource='repo:acme/docs' AND agent='dev' "
+                     "ORDER BY id DESC LIMIT 1")
+        self.assertEqual((self.commits(), row["level"], row["by"]), (before + 1, "read", "owner"))
+        self.assertEqual(hub.door_commit_holds("dev", held), ["acme/web"])
+        self.assertIn("The hub gave it at this press", hub.q1("SELECT text FROM events WHERE id=?",
+                                                               (receipt["event_id"],))["text"])
+        # one rule for each repository of a card: one that holds the card's level already with no record gets the
+        # owner's record also when the press raises another (else it stayed a target only because of the other); the
+        # page gives it after the card is up, since a card for a level that dev holds is refused at its raise
+        both = self.give_card(title="Let Dev read acme/site and acme/blog", why="Its fix needs to read both.",
+                              needs_access="repo:acme/site,repo:acme/blog", needs_level="read", options=["No"])
+        self.assertIsInstance(both, int, both)
+        code, said = self.request("/ui/team/repos", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                     "base_sha256": self.pool()["sha256"], "repo": "acme/site",
+                                                     "agent": "dev", "level": "read"})
+        self.assertEqual(code, 200, said)
+        give(both)
+        held = self.committed()["agents"]["dev"]["repos"]
+        self.assertEqual((held["acme/site"], held["acme/blog"]), ("read", "read"))
+        self.assertEqual(hub.door_commit_holds("dev", held), ["acme/web"])
+
     def test_a_give_card_for_several_repositories_closes_by_itself_once_given_another_way(self):
         """And a card for a mailbox, once the owner gave it on its own page (F6 piece 2). Believable bug: a card that
         stays open, so that its press gives what the agent holds already, or that closes before the agent holds it."""
