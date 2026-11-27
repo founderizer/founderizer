@@ -1458,14 +1458,16 @@ host.
     A repository that the door made keeps new-projects plan N3: the manager
     gives it up to write to an agent that holds no server, and its workflow files go through the door. An agent that
     holds a server through the door gets any other repository only under the owner's own level of write or deploy,
-    because the door commits for it to each repository that it holds, at any level. That check is at the grant only:
-    the owner's app gives each tagged server to its DevOps agent by itself, and nothing checks then the repositories
-    that the agent already holds, so a read that the default gave before becomes the door's commits once the agent
-    has a server. The check reads the agent's servers in `team.json`, which an Operator whose business has no ready
-    host does not have yet, though the door already treats it as an Operator; and an owner's Give at read to an
-    Operator gives the door's commits too. These known limits close in the Door area's next piece (the hub names to the
-    Mac app the holds that may be commit targets); on 26 November 2026 the one such hold of the owner's fleet, a read
-    of a repository that another agent holds at deploy, was no commit target. Holds at write or deploy that the
+    because the door commits for it to each repository that it holds, at any level. That check is at the grant only.
+    Since the Door area's commit targets (`door_commit_holds`, owner API 1.364), the hub names to the Mac app as commit
+    targets only a hold at write or deploy, or one whose newest `resource_grants` row is not of the level that it holds
+    now. So a read that the default or the manager gave, and an owner's Give at read, stay reads, also once the agent
+    has a server and also for an Operator whose business has no ready host. The owner's page writes no row, so a read
+    that the owner sets there stays a commit target (the supervisor's decision of 26 November 2026), also when it lowers
+    a write that a row records. Known limits: a row that a stop of the hub left out (the same Give press, or the same
+    grant_access request, again writes it), a database older than its `team.json`, and a revert or an undo of
+    `team.json` to an older state: each such hold whose newest row is of another level, or that no row names, reads as
+    the owner's own and is a commit target. Holds at write or deploy that the
     default gave from hub 2026.11.812 to this release stay as they are (none on the owner's fleet). On 26 November
     2026 the default had given no repository at write or deploy since it came (hub 2026.11.812), so nothing was taken
     back. The hub reads the door's targets from `team.json`, not from the door's file, so a target that the file
