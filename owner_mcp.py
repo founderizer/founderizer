@@ -398,6 +398,13 @@ NOT_TOOLS = {
                          "yes of 16 November 2026, feedback-diagnostics-plan.md Phase 3)",
 }
 
+# The fields of an owner route that only the owner's own app sends, which no tool here sends, each with its reason:
+# the hub refuses such a field from a program. `selftest.py` takes them out of its check that no tool drops a field.
+APP_FIELDS = {
+    "/ui/knowledge": {"key_kept": "the owner's own Keep it, which the hub takes only from the owner's app and refuses "
+                                  "from a program (UI-API 1.335)"},
+}
+
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the
 # standard library alone, and the hub is on another machine. Each name is a constant of `hub.py` or `lifecycle.py`,
 # and the checks of both files hold these to it, so a value the hub gains reaches the owner's agent instead of

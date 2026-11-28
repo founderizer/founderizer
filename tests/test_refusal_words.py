@@ -84,6 +84,10 @@ OLD = {
     "drive_folder_google": "Google did not answer about this folder: {reason}. Try again.",
     # a grant of one of the product's own repositories (the area "Vault, keys and access", 20 November 2026)
     "repo_vendor": "The door refuses {repo} in every fleet, so no grant of it works: leave it out.",
+    # the knowledge key rule (owner API 1.335): a knowledge file's write that holds what looks like a key
+    "knowledge_key": ("This holds what looks like a key. Agents read knowledge files, so save the key with Add secret "
+                      "and leave it out of the file. If it is no key, keep it when the app asks; an AI session asks the"
+                      " owner to save the text from the app."),
     # the lane "Any MCP server: install and sign-in" (UI-API.md 1.187)
     "package_unknown": "{registry} has no package {name}",
     "package_unread": "{registry} did not give the record of {name} ({http_status})",

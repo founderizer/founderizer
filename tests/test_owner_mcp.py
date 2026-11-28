@@ -352,11 +352,24 @@ class Shape(WithServer):
                 missing = fields - sent[route]
             else:                                   # built by a run function of its own: the name must appear
                 missing = {f for f in fields if f'"{f}"' not in own}
+            missing -= set(owner_mcp.APP_FIELDS.get(route, {}))      # a field that only the owner's app sends
             checked += 1
             if missing:
                 gaps[route] = (name, sorted(missing))
         self.assertGreater(checked, 40, "too few routes compared: check the patterns")
         self.assertEqual(gaps, {}, f"fields of an owner route that no tool can send: {gaps}")
+
+    def test_an_app_field_is_one_that_the_hub_takes_and_no_tool_sends(self):
+        """APP_FIELDS takes a field out of the drift check above: a stale entry (a field that the route no longer
+        takes, or that a tool sends after all) would hide a real drop of a field that the owner's agent needs."""
+        own = re.sub(r"\nAPP_FIELDS = \{.*?\n\}", "", (HERE / "owner_mcp.py").read_text(), flags=re.S)
+        routes = self.hub_routes()
+        for route, fields in owner_mcp.APP_FIELDS.items():
+            self.assertIn(route, routes, route)
+            for field, reason in fields.items():
+                self.assertIn(field, routes[route][1], (route, field))
+                self.assertTrue(reason.strip(), (route, field))
+                self.assertNotIn(f'"{field}"', own, (route, field))      # no tool sends it
 
     def test_what_this_server_repeats_from_the_hub_is_what_the_hub_says(self):
         """`owner_mcp.py` runs on the owner's Mac with the standard library alone, so it cannot import the hub's

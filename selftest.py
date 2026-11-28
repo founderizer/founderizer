@@ -619,6 +619,7 @@ try:
         if route in owner_mcp.NOT_TOOLS:
             continue
         missing = (fields - sends[route]) if route in sends else {f for f in fields if f'"{f}"' not in OWNER_MCP}
+        missing -= set(owner_mcp.APP_FIELDS.get(route, {}))      # a field that only the owner's app sends
         if missing:
             dropped[route] = sorted(missing)
     check("every field an owner route takes can be sent by one of its tools",

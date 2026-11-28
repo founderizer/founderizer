@@ -57,6 +57,9 @@ WORDS = {
     # the hub's own checkout
     "revision_unreadable": "the hub cannot read its own revision",
     "knowledge_unread": "the knowledge files cannot be read now; try again in a moment",
+    "knowledge_key": "This holds what looks like a key. Agents read knowledge files, so save the key with Add secret "
+                     "and leave it out of the file. If it is no key, keep it when the app asks; an AI session asks "
+                     "the owner to save the text from the app.",
     "profile_unread": "{agent}'s profile cannot be read now; try again in a moment",
     "signature_unchecked": "the hub could not check the signature of this yes now; answer it again",
     # a server and its service

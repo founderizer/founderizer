@@ -56,6 +56,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import bisect
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2144,6 +2145,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                # owner API 1.328: the manager gives each resource that the fleet holds by default (resource_standing),
                # and GET /ui/vault's standing.due names the pool statements that the owner's app signs for it
                "pool_default",
+               "knowledge_key",     # owner API 1.335: POST /ui/knowledge refuses a key (knowledge_key) and takes key_kept
                "steer_files",       # the owner, 19 November 2026 ("Yes, build it" to the pictures of the file "+" on a
                                     # task's guidance box): POST /ui/tasks/<id>/steer takes `attachments` (owner API
                                     # 1.223), and each task of GET /ui/state says from_conversation (UI-API.md 1.231)
@@ -53769,6 +53771,12 @@ def team_owner_file(ctx, c):
                         f"base_sha256.")
     if not isinstance(text, str) or not text.strip():
         raise ToolError("text is the owner file's whole new text, under its own title and Source lines.")
+    # the text as the hub saves it (knowledge_replaced), so a control character cannot hide a key from the check
+    if set(key_parts(knowledge_saved_text(text))) - set(key_parts(before.decode("utf-8", "replace"))):
+        # every agent that reads the file reads it on its own machine (owner API 1.335): a key goes into the vault
+        raise ToolError("The new text holds what looks like a key, and every agent that reads this file would read it. "
+                        "Leave the key out: a key goes into the vault with request_secret, and the file names it by its "
+                        "variable. If it is no key, ask the owner to save the text from the app.")
     try:
         content = knowledge_replaced(path, before, text)
     except Refusal as e:
@@ -68438,6 +68446,459 @@ def owner_file_unread(path):
         raise Refusal(503, code="knowledge_unread")
 
 
+# ---------------------------------------------------------------- a key in an owner knowledge file (owner_knowledge)
+# Agents read the owner's knowledge files, so a key in one reaches each agent's machine. The hub holds every writer of
+# them (the apps' Add file, a drop, Add URL, Keep as knowledge, the owner's MCP save_knowledge, the manager's team plan)
+# to the apps' own rule, FleetCore's KeyInText (app/Sources/FleetCore/KeyInText.swift), as the Windows port
+# (app/windows/Founderizer.Core/KeyInText.cs) reads it: in UTF-16 units, with ICU's word boundary and Apple's whitespace.
+# test_knowledge.py holds it to each example of app/vectors/key-in-text.json, which the Swift code writes. It is a
+# guard, not a filter: the owner's "Keep it" in their app sends the SHA-256 of each part that they kept (key_kept).
+KEY_SHAPE_PATTERNS = (
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:[\s\S]{0,20000}?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)?",
+    r"\bsk-(?:ant-[a-z0-9]+-|proj-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_-]{20,}",
+    r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}", r"\bwhsec_[A-Za-z0-9]{20,}",
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}", r"\bgithub_pat_[A-Za-z0-9_]{40,}", r"\bglpat-[A-Za-z0-9_-]{20,}",
+    r"\bxox[abposr]-[A-Za-z0-9-]{10,}", r"\bxapp-[A-Za-z0-9-]{10,}",
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", r"\bAIza[0-9A-Za-z_-]{35}",
+    r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
+    r"\b(?:hf|gsk|r8|npm|xai|pplx|tvly|lin_api|shpat|shpss|dop_v1)_[A-Za-z0-9_-]{20,}",
+    r"\b(?:xai|pplx)-[A-Za-z0-9]{30,}",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+)
+# The literal start of each shape that begins with \b, which every find of it begins with (test_knowledge holds each
+# shape to it): key_shape_finds asks ICU's boundary there BEFORE it runs the rest of the shape, as ICU does, so a text
+# of many starts whose boundary fails ("ask-" * 40000) costs one pass and not one pass of its tail for each start (the
+# Door area's read of 25 November 2026: 5.8 s for 160 KB, minutes for 1 MiB). The start of every such shape is an ASCII
+# letter, so a start after an ASCII letter, digit or "_" has no boundary for ICU either: the look-behind leaves out only
+# starts that key_boundary refuses. Only the private key's header begins without one.
+KEY_SHAPE_HEADS = (None, "sk-", "(?:sk|rk)_", "whsec_", "gh[pousr]_", "github_pat_", "glpat-", "xox[abposr]-", "xapp-",
+                   "(?:AKIA|ASIA)", "AIza", r"SG\.", "(?:hf|gsk|r8|npm|xai|pplx|tvly|lin_api|shpat|shpss|dop_v1)_",
+                   "(?:xai|pplx)-", "eyJ")
+# The one shape whose try can fail after a long run, and whose run tells for each later start inside it: eyJ R\.eyJ R\.R
+# with R = [A-Za-z0-9_-]{8,}, which holds no ".". A try at s ends its first R where the run that begins at s ends (a
+# shorter R is followed by a letter of R, never by "."), and so does each later start inside that run, with a shorter R
+# and the same rest: when the try at s fails, each of them fails, and the next try starts after the run (" " + "eyJ-" *
+# 10000: 0.44 s for 40 KB before, one pass now).
+KEY_SHAPE_RUN = re.compile(r"[A-Za-z0-9_-]*")
+# The private key's shape (the first of KEY_SHAPE_PATTERNS, which test_knowledge holds equal to these parts): its
+# header, then the first END line that begins at most KEY_PRIVATE_MOST units after it, if one does. key_private_finds
+# finds every END line once and takes the first after each header (bisect), so a text of many headers with no END line
+# costs one pass, and not 20,000 units for each header (the coordinator's M6 of 25 November 2026: 22.9 s for 1 MiB).
+KEY_PRIVATE_HEAD = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+KEY_PRIVATE_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+KEY_PRIVATE_ENDS = re.compile(r"(?=-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)")
+KEY_PRIVATE_MOST = 20000
+KEY_SHAPES = tuple((re.compile(p[2 if p.startswith(r"\b") else 0:-2 if p.endswith(r"\b") else None]),
+                    p.startswith(r"\b"), p.endswith(r"\b"),
+                    re.compile(f"(?<![A-Za-z0-9_])(?={h})") if h else None, h == "eyJ")
+                   for p, h in zip(KEY_SHAPE_PATTERNS, KEY_SHAPE_HEADS, strict=True))
+KEY_RUN = re.compile(r"[A-Za-z0-9+/=_-]{32,4096}")
+KEY_KEPT_MOST = 30000       # SHA-256s of key_kept: a list of mixed-case IDs can have tens of thousands of parts
+KEY_ASTRAL = re.compile("[\U00010000-\U0010FFFF]")
+# Apple's whitespacesAndNewlines and U+200B, and half of a UTF-16 pair: where the word that holds a run begins
+KEY_BREAK = re.compile("[\t\n\x0b\x0c\r\x85\u200b \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ud800-\udfff]")
+KEY_WORD = frozenset(("Lu", "Ll", "Lt", "Lm", "Lo", "Nl", "Mn", "Mc", "Me", "Nd", "Pc"))
+
+
+def key_units(text):
+    """`text` as its UTF-16 units, one character each (a pair as its two halves), as KeyInText's ranges count."""
+    if not KEY_ASTRAL.search(text):
+        return text
+    data = text.encode("utf-16-le", "surrogatepass")
+    return "".join(chr(int.from_bytes(data[i:i + 2], "little")) for i in range(0, len(data), 2))
+
+
+def key_rune(units, at, end=None):
+    """The character that begins at unit `at`: a whole pair, else U+FFFD for half of one."""
+    end = len(units) if end is None else end
+    unit = units[at]
+    if "\ud800" <= unit <= "\udbff" and at + 1 < end and "\udc00" <= units[at + 1] <= "\udfff":
+        return chr(0x10000 + ((ord(unit) - 0xD800) << 10) + ord(units[at + 1]) - 0xDC00)
+    return "\ufffd" if "\ud800" <= unit <= "\udfff" else unit
+
+
+def key_boundary(units, at):
+    """ICU's `\b` (KeyInText.cs Boundary): none before a scalar that it looks past (KEY_BOUNDARY_SKIPS: the marks, the
+    format characters and the spacing marks that extend a grapheme); else a word character on one side and none on the
+    other, with those scalars before the place skipped."""
+    here = False
+    if at < len(units):
+        rune = key_rune(units, at)
+        if ord(rune) in KEY_BOUNDARY_SKIPS:
+            return False
+        here = key_word(rune)
+    before, end = False, at
+    while end > 0:
+        if end >= 2 and "\udc00" <= units[end - 1] <= "\udfff" and "\ud800" <= units[end - 2] <= "\udbff":
+            rune, end = key_rune(units, end - 2), end - 2
+        else:
+            rune, end = ("\ufffd" if "\ud800" <= units[end - 1] <= "\udfff" else units[end - 1]), end - 1
+        if ord(rune) in KEY_BOUNDARY_SKIPS:
+            continue
+        before = key_word(rune)
+        break
+    return here != before
+
+
+def key_word(rune):
+    """A word character as ICU reads one: KEY_WORD's categories, the two joiners, and the circled and squared letters,
+    which ICU counts as letters (U+24B6 to U+24E9, U+1F130 to U+1F149, U+1F150 to U+1F169 and U+1F170 to U+1F189; the
+    reads of the Door area and the coordinator's validator). A known limit: the categories are this Python's Unicode, so
+    a letter newer than it (and one of the 35 private-use characters that Apple's ICU counts as letters) is no word
+    character here and is one on the Mac; the hub then finds a key next to it that the Mac does not. The reverse does
+    not happen while the hub's Python knows no Unicode newer than the Mac that measured the tables (17), the case today
+    (UI-API.md 1.335; a measured table of ICU's \\w can follow)."""
+    code = ord(rune)
+    return code in (0x200C, 0x200D) or unicodedata.category(rune) in KEY_WORD or 0x24B6 <= code <= 0x24E9 or \
+        0x1F130 <= code <= 0x1F149 or 0x1F150 <= code <= 0x1F169 or 0x1F170 <= code <= 0x1F189
+
+
+def key_shape_finds(units, shape):
+    """Each match of one shape whose word boundaries hold where ICU sees them, as NSRegularExpression gives them: the
+    first match at or after the end of the one before, at the first start whose boundaries hold. A shape with a start
+    (KEY_SHAPE_HEADS) is tried only where its start and ICU's boundary are, in one pass (key_shape_finds_by_start, the
+    same finds as a search from each start)."""
+    regex, before, after, head, run = shape
+    if head is None:                                # the private key's, the one shape with no \\b
+        return key_private_finds(units)
+    return key_shape_finds_by_start(units, regex, after, head, run)
+
+
+def key_private_finds(units):
+    """The finds of the private key's shape, as a search from the end of each find gives them: the leftmost header,
+    with the first END line that begins at most KEY_PRIVATE_MOST units after it (the lazy part of the shape), else the
+    header alone."""
+    out, at, ends = [], 0, None
+    while True:
+        header = KEY_PRIVATE_HEAD.search(units, at)
+        if not header:
+            return out
+        if ends is None:
+            ends = [m.start() for m in KEY_PRIVATE_ENDS.finditer(units)]       # every start of an END line, once
+        end, i = header.end(), bisect.bisect_left(ends, header.end())
+        if i < len(ends) and ends[i] - header.end() <= KEY_PRIVATE_MOST:
+            end = KEY_PRIVATE_END.match(units, ends[i]).end()
+        out.append((header.start(), end))
+        at = end
+
+
+def key_shape_finds_by_start(units, regex, after, head, run):
+    """key_shape_finds for a shape that begins with \\b and its start `head`: each start in the order of the text,
+    from the end of the last find, whose boundary holds, tried in place (`match` at a place is the try that a search
+    makes there); with `run`, a failed try leaves out the starts inside its run (KEY_SHAPE_RUN)."""
+    out, at = [], 0
+    for c in head.finditer(units):
+        start = c.start()
+        if start < at or not key_boundary(units, start):
+            continue
+        m = regex.match(units, start)
+        if m and (not after or key_boundary(units, m.end())):
+            out.append((start, m.end()))
+            at = m.end() if m.end() > start else start + 1
+        elif not m and run:
+            at = KEY_SHAPE_RUN.match(units, start).end()
+    return out
+
+
+# The two joiner tables of the shared key rule (the Mac's KeyInText and the Windows app's port), as ranges of scalars
+# [first, last] MEASURED on the Mac that writes app/vectors/key-in-text.json ("tables"), so that no copy of the rule
+# depends on its own runtime's Unicode data (the Door area's and the coordinator's reads of 25 November 2026: this
+# Python, 3.12, has Unicode 15.0, older than Apple's). test_knowledge holds both equal to the vectors file.
+# KEY_ADDRESS_MARK_RANGES: the units of the BMP after which a word's "://", "?" or "#" does not count (key_stands), as
+# NSString's search on main reads them (Mn, Me, U+200C and the spacing marks that extend a letter).
+KEY_ADDRESS_MARK_RANGES = (
+    (0x0300, 0x036F), (0x0483, 0x0489), (0x0591, 0x05BD), (0x05BF, 0x05BF), (0x05C1, 0x05C2), (0x05C4, 0x05C5),
+    (0x05C7, 0x05C7), (0x0610, 0x061A), (0x064B, 0x065F), (0x0670, 0x0670), (0x06D6, 0x06DC), (0x06DF, 0x06E4),
+    (0x06E7, 0x06E8), (0x06EA, 0x06ED), (0x0711, 0x0711), (0x0730, 0x074A), (0x07A6, 0x07B0), (0x07EB, 0x07F3),
+    (0x07FD, 0x07FD), (0x0816, 0x0819), (0x081B, 0x0823), (0x0825, 0x0827), (0x0829, 0x082D), (0x0859, 0x085B),
+    (0x0897, 0x089F), (0x08CA, 0x08E1), (0x08E3, 0x0902), (0x093A, 0x093A), (0x093C, 0x093C), (0x0941, 0x0948),
+    (0x094D, 0x094D), (0x0951, 0x0957), (0x0962, 0x0963), (0x0981, 0x0981), (0x09BC, 0x09BC), (0x09BE, 0x09BE),
+    (0x09C1, 0x09C4), (0x09CD, 0x09CD), (0x09D7, 0x09D7), (0x09E2, 0x09E3), (0x09FE, 0x09FE), (0x0A01, 0x0A02),
+    (0x0A3C, 0x0A3C), (0x0A41, 0x0A42), (0x0A47, 0x0A48), (0x0A4B, 0x0A4D), (0x0A51, 0x0A51), (0x0A70, 0x0A71),
+    (0x0A75, 0x0A75), (0x0A81, 0x0A82), (0x0ABC, 0x0ABC), (0x0AC1, 0x0AC5), (0x0AC7, 0x0AC8), (0x0ACD, 0x0ACD),
+    (0x0AE2, 0x0AE3), (0x0AFA, 0x0AFF), (0x0B01, 0x0B01), (0x0B3C, 0x0B3C), (0x0B3E, 0x0B3F), (0x0B41, 0x0B44),
+    (0x0B4D, 0x0B4D), (0x0B55, 0x0B57), (0x0B62, 0x0B63), (0x0B82, 0x0B82), (0x0BBE, 0x0BBE), (0x0BC0, 0x0BC0),
+    (0x0BCD, 0x0BCD), (0x0BD7, 0x0BD7), (0x0C00, 0x0C00), (0x0C04, 0x0C04), (0x0C3C, 0x0C3C), (0x0C3E, 0x0C40),
+    (0x0C46, 0x0C48), (0x0C4A, 0x0C4D), (0x0C55, 0x0C56), (0x0C62, 0x0C63), (0x0C81, 0x0C81), (0x0CBC, 0x0CBC),
+    (0x0CBF, 0x0CC0), (0x0CC2, 0x0CC2), (0x0CC6, 0x0CC8), (0x0CCA, 0x0CCD), (0x0CD5, 0x0CD6), (0x0CE2, 0x0CE3),
+    (0x0D00, 0x0D01), (0x0D3B, 0x0D3C), (0x0D3E, 0x0D3E), (0x0D41, 0x0D44), (0x0D4D, 0x0D4D), (0x0D57, 0x0D57),
+    (0x0D62, 0x0D63), (0x0D81, 0x0D81), (0x0DCA, 0x0DCA), (0x0DCF, 0x0DCF), (0x0DD2, 0x0DD4), (0x0DD6, 0x0DD6),
+    (0x0DDF, 0x0DDF), (0x0E31, 0x0E31), (0x0E34, 0x0E3A), (0x0E47, 0x0E4E), (0x0EB1, 0x0EB1), (0x0EB4, 0x0EBC),
+    (0x0EC8, 0x0ECE), (0x0F18, 0x0F19), (0x0F35, 0x0F35), (0x0F37, 0x0F37), (0x0F39, 0x0F39), (0x0F71, 0x0F7E),
+    (0x0F80, 0x0F84), (0x0F86, 0x0F87), (0x0F8D, 0x0F97), (0x0F99, 0x0FBC), (0x0FC6, 0x0FC6), (0x102D, 0x1030),
+    (0x1032, 0x1037), (0x1039, 0x103A), (0x103D, 0x103E), (0x1058, 0x1059), (0x105E, 0x1060), (0x1071, 0x1074),
+    (0x1082, 0x1082), (0x1085, 0x1086), (0x108D, 0x108D), (0x109D, 0x109D), (0x135D, 0x135F), (0x1712, 0x1715),
+    (0x1732, 0x1734), (0x1752, 0x1753), (0x1772, 0x1773), (0x17B4, 0x17B5), (0x17B7, 0x17BD), (0x17C6, 0x17C6),
+    (0x17C9, 0x17D3), (0x17DD, 0x17DD), (0x180B, 0x180D), (0x180F, 0x180F), (0x1885, 0x1886), (0x18A9, 0x18A9),
+    (0x1920, 0x1922), (0x1927, 0x1928), (0x1932, 0x1932), (0x1939, 0x193B), (0x1A17, 0x1A18), (0x1A1B, 0x1A1B),
+    (0x1A56, 0x1A56), (0x1A58, 0x1A5E), (0x1A60, 0x1A60), (0x1A62, 0x1A62), (0x1A65, 0x1A6C), (0x1A73, 0x1A7C),
+    (0x1A7F, 0x1A7F), (0x1AB0, 0x1ADD), (0x1AE0, 0x1AEB), (0x1B00, 0x1B03), (0x1B34, 0x1B3D), (0x1B42, 0x1B44),
+    (0x1B6B, 0x1B73), (0x1B80, 0x1B81), (0x1BA2, 0x1BA5), (0x1BA8, 0x1BAD), (0x1BE6, 0x1BE6), (0x1BE8, 0x1BE9),
+    (0x1BED, 0x1BED), (0x1BEF, 0x1BF3), (0x1C2C, 0x1C33), (0x1C36, 0x1C37), (0x1CD0, 0x1CD2), (0x1CD4, 0x1CE0),
+    (0x1CE2, 0x1CE8), (0x1CED, 0x1CED), (0x1CF4, 0x1CF4), (0x1CF8, 0x1CF9), (0x1DC0, 0x1DFF), (0x200C, 0x200C),
+    (0x20D0, 0x20F0), (0x2CEF, 0x2CF1), (0x2D7F, 0x2D7F), (0x2DE0, 0x2DFF), (0x302A, 0x302F), (0x3099, 0x309A),
+    (0xA66F, 0xA672), (0xA674, 0xA67D), (0xA69E, 0xA69F), (0xA6F0, 0xA6F1), (0xA802, 0xA802), (0xA806, 0xA806),
+    (0xA80B, 0xA80B), (0xA825, 0xA826), (0xA82C, 0xA82C), (0xA8C4, 0xA8C5), (0xA8E0, 0xA8F1), (0xA8FF, 0xA8FF),
+    (0xA926, 0xA92D), (0xA947, 0xA951), (0xA953, 0xA953), (0xA980, 0xA982), (0xA9B3, 0xA9B3), (0xA9B6, 0xA9B9),
+    (0xA9BC, 0xA9BD), (0xA9C0, 0xA9C0), (0xA9E5, 0xA9E5), (0xAA29, 0xAA2E), (0xAA31, 0xAA32), (0xAA35, 0xAA36),
+    (0xAA43, 0xAA43), (0xAA4C, 0xAA4C), (0xAA7C, 0xAA7C), (0xAAB0, 0xAAB0), (0xAAB2, 0xAAB4), (0xAAB7, 0xAAB8),
+    (0xAABE, 0xAABF), (0xAAC1, 0xAAC1), (0xAAEC, 0xAAED), (0xAAF6, 0xAAF6), (0xABE5, 0xABE5), (0xABE8, 0xABE8),
+    (0xABED, 0xABED), (0xFB1E, 0xFB1E), (0xFE00, 0xFE0F), (0xFE20, 0xFE2F), (0xFF9E, 0xFF9F))
+
+# KEY_BOUNDARY_SKIP_RANGES: the scalars that ICU's \b looks past (key_boundary): Mn, Me, Cf, the spacing marks that
+# extend a grapheme (34 of the BMP, 29 astral) and Apple's private-use U+F870-F87F, U+F884-F899 and U+F89F.
+KEY_BOUNDARY_SKIP_RANGES = (
+    (0x00AD, 0x00AD), (0x0300, 0x036F), (0x0483, 0x0489), (0x0591, 0x05BD), (0x05BF, 0x05BF), (0x05C1, 0x05C2),
+    (0x05C4, 0x05C5), (0x05C7, 0x05C7), (0x0600, 0x0605), (0x0610, 0x061A), (0x061C, 0x061C), (0x064B, 0x065F),
+    (0x0670, 0x0670), (0x06D6, 0x06DD), (0x06DF, 0x06E4), (0x06E7, 0x06E8), (0x06EA, 0x06ED), (0x070F, 0x070F),
+    (0x0711, 0x0711), (0x0730, 0x074A), (0x07A6, 0x07B0), (0x07EB, 0x07F3), (0x07FD, 0x07FD), (0x0816, 0x0819),
+    (0x081B, 0x0823), (0x0825, 0x0827), (0x0829, 0x082D), (0x0859, 0x085B), (0x0890, 0x0891), (0x0897, 0x089F),
+    (0x08CA, 0x0902), (0x093A, 0x093A), (0x093C, 0x093C), (0x0941, 0x0948), (0x094D, 0x094D), (0x0951, 0x0957),
+    (0x0962, 0x0963), (0x0981, 0x0981), (0x09BC, 0x09BC), (0x09BE, 0x09BE), (0x09C1, 0x09C4), (0x09CD, 0x09CD),
+    (0x09D7, 0x09D7), (0x09E2, 0x09E3), (0x09FE, 0x09FE), (0x0A01, 0x0A02), (0x0A3C, 0x0A3C), (0x0A41, 0x0A42),
+    (0x0A47, 0x0A48), (0x0A4B, 0x0A4D), (0x0A51, 0x0A51), (0x0A70, 0x0A71), (0x0A75, 0x0A75), (0x0A81, 0x0A82),
+    (0x0ABC, 0x0ABC), (0x0AC1, 0x0AC5), (0x0AC7, 0x0AC8), (0x0ACD, 0x0ACD), (0x0AE2, 0x0AE3), (0x0AFA, 0x0AFF),
+    (0x0B01, 0x0B01), (0x0B3C, 0x0B3C), (0x0B3E, 0x0B3F), (0x0B41, 0x0B44), (0x0B4D, 0x0B4D), (0x0B55, 0x0B57),
+    (0x0B62, 0x0B63), (0x0B82, 0x0B82), (0x0BBE, 0x0BBE), (0x0BC0, 0x0BC0), (0x0BCD, 0x0BCD), (0x0BD7, 0x0BD7),
+    (0x0C00, 0x0C00), (0x0C04, 0x0C04), (0x0C3C, 0x0C3C), (0x0C3E, 0x0C40), (0x0C46, 0x0C48), (0x0C4A, 0x0C4D),
+    (0x0C55, 0x0C56), (0x0C62, 0x0C63), (0x0C81, 0x0C81), (0x0CBC, 0x0CBC), (0x0CBF, 0x0CC0), (0x0CC2, 0x0CC2),
+    (0x0CC6, 0x0CC8), (0x0CCA, 0x0CCD), (0x0CD5, 0x0CD6), (0x0CE2, 0x0CE3), (0x0D00, 0x0D01), (0x0D3B, 0x0D3C),
+    (0x0D3E, 0x0D3E), (0x0D41, 0x0D44), (0x0D4D, 0x0D4D), (0x0D57, 0x0D57), (0x0D62, 0x0D63), (0x0D81, 0x0D81),
+    (0x0DCA, 0x0DCA), (0x0DCF, 0x0DCF), (0x0DD2, 0x0DD4), (0x0DD6, 0x0DD6), (0x0DDF, 0x0DDF), (0x0E31, 0x0E31),
+    (0x0E34, 0x0E3A), (0x0E47, 0x0E4E), (0x0EB1, 0x0EB1), (0x0EB4, 0x0EBC), (0x0EC8, 0x0ECE), (0x0F18, 0x0F19),
+    (0x0F35, 0x0F35), (0x0F37, 0x0F37), (0x0F39, 0x0F39), (0x0F71, 0x0F7E), (0x0F80, 0x0F84), (0x0F86, 0x0F87),
+    (0x0F8D, 0x0F97), (0x0F99, 0x0FBC), (0x0FC6, 0x0FC6), (0x102D, 0x1030), (0x1032, 0x1037), (0x1039, 0x103A),
+    (0x103D, 0x103E), (0x1058, 0x1059), (0x105E, 0x1060), (0x1071, 0x1074), (0x1082, 0x1082), (0x1085, 0x1086),
+    (0x108D, 0x108D), (0x109D, 0x109D), (0x135D, 0x135F), (0x1712, 0x1715), (0x1732, 0x1734), (0x1752, 0x1753),
+    (0x1772, 0x1773), (0x17B4, 0x17B5), (0x17B7, 0x17BD), (0x17C6, 0x17C6), (0x17C9, 0x17D3), (0x17DD, 0x17DD),
+    (0x180B, 0x180F), (0x1885, 0x1886), (0x18A9, 0x18A9), (0x1920, 0x1922), (0x1927, 0x1928), (0x1932, 0x1932),
+    (0x1939, 0x193B), (0x1A17, 0x1A18), (0x1A1B, 0x1A1B), (0x1A56, 0x1A56), (0x1A58, 0x1A5E), (0x1A60, 0x1A60),
+    (0x1A62, 0x1A62), (0x1A65, 0x1A6C), (0x1A73, 0x1A7C), (0x1A7F, 0x1A7F), (0x1AB0, 0x1ADD), (0x1AE0, 0x1AEB),
+    (0x1B00, 0x1B03), (0x1B34, 0x1B3D), (0x1B42, 0x1B44), (0x1B6B, 0x1B73), (0x1B80, 0x1B81), (0x1BA2, 0x1BA5),
+    (0x1BA8, 0x1BAD), (0x1BE6, 0x1BE6), (0x1BE8, 0x1BE9), (0x1BED, 0x1BED), (0x1BEF, 0x1BF3), (0x1C2C, 0x1C33),
+    (0x1C36, 0x1C37), (0x1CD0, 0x1CD2), (0x1CD4, 0x1CE0), (0x1CE2, 0x1CE8), (0x1CED, 0x1CED), (0x1CF4, 0x1CF4),
+    (0x1CF8, 0x1CF9), (0x1DC0, 0x1DFF), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F),
+    (0x20D0, 0x20F0), (0x2CEF, 0x2CF1), (0x2D7F, 0x2D7F), (0x2DE0, 0x2DFF), (0x302A, 0x302F), (0x3099, 0x309A),
+    (0xA66F, 0xA672), (0xA674, 0xA67D), (0xA69E, 0xA69F), (0xA6F0, 0xA6F1), (0xA802, 0xA802), (0xA806, 0xA806),
+    (0xA80B, 0xA80B), (0xA825, 0xA826), (0xA82C, 0xA82C), (0xA8C4, 0xA8C5), (0xA8E0, 0xA8F1), (0xA8FF, 0xA8FF),
+    (0xA926, 0xA92D), (0xA947, 0xA951), (0xA953, 0xA953), (0xA980, 0xA982), (0xA9B3, 0xA9B3), (0xA9B6, 0xA9B9),
+    (0xA9BC, 0xA9BD), (0xA9C0, 0xA9C0), (0xA9E5, 0xA9E5), (0xAA29, 0xAA2E), (0xAA31, 0xAA32), (0xAA35, 0xAA36),
+    (0xAA43, 0xAA43), (0xAA4C, 0xAA4C), (0xAA7C, 0xAA7C), (0xAAB0, 0xAAB0), (0xAAB2, 0xAAB4), (0xAAB7, 0xAAB8),
+    (0xAABE, 0xAABF), (0xAAC1, 0xAAC1), (0xAAEC, 0xAAED), (0xAAF6, 0xAAF6), (0xABE5, 0xABE5), (0xABE8, 0xABE8),
+    (0xABED, 0xABED), (0xF870, 0xF87F), (0xF884, 0xF899), (0xF89F, 0xF89F), (0xFB1E, 0xFB1E), (0xFE00, 0xFE0F),
+    (0xFE20, 0xFE2F), (0xFEFF, 0xFEFF), (0xFF9E, 0xFF9F), (0xFFF9, 0xFFFB), (0x101FD, 0x101FD), (0x102E0, 0x102E0),
+    (0x10376, 0x1037A), (0x10A01, 0x10A03), (0x10A05, 0x10A06), (0x10A0C, 0x10A0F), (0x10A38, 0x10A3A),
+    (0x10A3F, 0x10A3F), (0x10AE5, 0x10AE6), (0x10D24, 0x10D27), (0x10D69, 0x10D6D), (0x10EAB, 0x10EAC),
+    (0x10EFA, 0x10EFF), (0x10F46, 0x10F50), (0x10F82, 0x10F85), (0x11001, 0x11001), (0x11038, 0x11046),
+    (0x11070, 0x11070), (0x11073, 0x11074), (0x1107F, 0x11081), (0x110B3, 0x110B6), (0x110B9, 0x110BA),
+    (0x110BD, 0x110BD), (0x110C2, 0x110C2), (0x110CD, 0x110CD), (0x11100, 0x11102), (0x11127, 0x1112B),
+    (0x1112D, 0x11134), (0x11173, 0x11173), (0x11180, 0x11181), (0x111B6, 0x111BE), (0x111C0, 0x111C0),
+    (0x111C9, 0x111CC), (0x111CF, 0x111CF), (0x1122F, 0x11231), (0x11234, 0x11237), (0x1123E, 0x1123E),
+    (0x11241, 0x11241), (0x112DF, 0x112DF), (0x112E3, 0x112EA), (0x11300, 0x11301), (0x1133B, 0x1133C),
+    (0x1133E, 0x1133E), (0x11340, 0x11340), (0x1134D, 0x1134D), (0x11357, 0x11357), (0x11366, 0x1136C),
+    (0x11370, 0x11374), (0x113B8, 0x113B8), (0x113BB, 0x113C0), (0x113C2, 0x113C2), (0x113C5, 0x113C5),
+    (0x113C7, 0x113C9), (0x113CE, 0x113D0), (0x113D2, 0x113D2), (0x113E1, 0x113E2), (0x11438, 0x1143F),
+    (0x11442, 0x11444), (0x11446, 0x11446), (0x1145E, 0x1145E), (0x114B0, 0x114B0), (0x114B3, 0x114B8),
+    (0x114BA, 0x114BA), (0x114BD, 0x114BD), (0x114BF, 0x114C0), (0x114C2, 0x114C3), (0x115AF, 0x115AF),
+    (0x115B2, 0x115B5), (0x115BC, 0x115BD), (0x115BF, 0x115C0), (0x115DC, 0x115DD), (0x11633, 0x1163A),
+    (0x1163D, 0x1163D), (0x1163F, 0x11640), (0x116AB, 0x116AB), (0x116AD, 0x116AD), (0x116B0, 0x116B7),
+    (0x1171D, 0x1171D), (0x1171F, 0x1171F), (0x11722, 0x11725), (0x11727, 0x1172B), (0x1182F, 0x11837),
+    (0x11839, 0x1183A), (0x11930, 0x11930), (0x1193B, 0x1193E), (0x11943, 0x11943), (0x119D4, 0x119D7),
+    (0x119DA, 0x119DB), (0x119E0, 0x119E0), (0x11A01, 0x11A0A), (0x11A33, 0x11A38), (0x11A3B, 0x11A3E),
+    (0x11A47, 0x11A47), (0x11A51, 0x11A56), (0x11A59, 0x11A5B), (0x11A8A, 0x11A96), (0x11A98, 0x11A99),
+    (0x11B60, 0x11B60), (0x11B62, 0x11B64), (0x11B66, 0x11B66), (0x11C30, 0x11C36), (0x11C38, 0x11C3D),
+    (0x11C3F, 0x11C3F), (0x11C92, 0x11CA7), (0x11CAA, 0x11CB0), (0x11CB2, 0x11CB3), (0x11CB5, 0x11CB6),
+    (0x11D31, 0x11D36), (0x11D3A, 0x11D3A), (0x11D3C, 0x11D3D), (0x11D3F, 0x11D45), (0x11D47, 0x11D47),
+    (0x11D90, 0x11D91), (0x11D95, 0x11D95), (0x11D97, 0x11D97), (0x11EF3, 0x11EF4), (0x11F00, 0x11F01),
+    (0x11F36, 0x11F3A), (0x11F40, 0x11F42), (0x11F5A, 0x11F5A), (0x13430, 0x13440), (0x13447, 0x13455),
+    (0x1611E, 0x16129), (0x1612D, 0x1612F), (0x16AF0, 0x16AF4), (0x16B30, 0x16B36), (0x16F4F, 0x16F4F),
+    (0x16F8F, 0x16F92), (0x16FE4, 0x16FE4), (0x16FF0, 0x16FF1), (0x1BC9D, 0x1BC9E), (0x1BCA0, 0x1BCA3),
+    (0x1CF00, 0x1CF2D), (0x1CF30, 0x1CF46), (0x1D165, 0x1D169), (0x1D16D, 0x1D182), (0x1D185, 0x1D18B),
+    (0x1D1AA, 0x1D1AD), (0x1D242, 0x1D244), (0x1DA00, 0x1DA36), (0x1DA3B, 0x1DA6C), (0x1DA75, 0x1DA75),
+    (0x1DA84, 0x1DA84), (0x1DA9B, 0x1DA9F), (0x1DAA1, 0x1DAAF), (0x1E000, 0x1E006), (0x1E008, 0x1E018),
+    (0x1E01B, 0x1E021), (0x1E023, 0x1E024), (0x1E026, 0x1E02A), (0x1E08F, 0x1E08F), (0x1E130, 0x1E136),
+    (0x1E2AE, 0x1E2AE), (0x1E2EC, 0x1E2EF), (0x1E4EC, 0x1E4EF), (0x1E5EE, 0x1E5EF), (0x1E6E3, 0x1E6E3),
+    (0x1E6E6, 0x1E6E6), (0x1E6EE, 0x1E6EF), (0x1E6F5, 0x1E6F5), (0x1E8D0, 0x1E8D6), (0x1E944, 0x1E94A),
+    (0xE0001, 0xE0001), (0xE0020, 0xE007F), (0xE0100, 0xE01EF))
+
+KEY_ADDRESS_MARKS = frozenset(c for a, b in KEY_ADDRESS_MARK_RANGES for c in range(a, b + 1))
+KEY_BOUNDARY_SKIPS = frozenset(c for a, b in KEY_BOUNDARY_SKIP_RANGES for c in range(a, b + 1))
+
+
+def key_stands(units, at, end):
+    """Whether a find that ends before unit `at` of a word that ends at `end` counts on the Mac: not when that unit is
+    one of KEY_ADDRESS_MARKS, which extend the word for NSString's search (KeyInText.cs Stands). A half of a pair is
+    not one of them, so a find before an astral mark counts, as it does on the Mac."""
+    if at >= end:
+        return True
+    return ord(units[at]) not in KEY_ADDRESS_MARKS
+
+
+def key_found(units, what, start, end):
+    """The first find of `what` in units[start:end] that counts (key_stands), or -1."""
+    at = units.find(what, start, end)
+    while at >= 0 and not key_stands(units, at + len(what), end):
+        at = units.find(what, at + 1, end)
+    return at
+
+
+def key_word_facts(units, word, end):
+    """What KeyInText reads of the word units[word:end], found once for all its runs (the Door area's read: a run's own
+    search from the word's start made one long word cost the square of its length): its first `://` that counts, the
+    first `?` or `#` that counts after it, and the places where a picture's base64 stands (key_pictures)."""
+    scheme = key_found(units, "://", word, end)
+    query = -1
+    if scheme >= 0:
+        # the next `?` and the next `#` are kept apart, so each mark that does not count is passed once (linear)
+        ask, mark = units.find("?", scheme + 3, end), units.find("#", scheme + 3, end)
+        while ask >= 0 or mark >= 0:
+            at = ask if mark < 0 or 0 <= ask < mark else mark
+            if key_stands(units, at + 1, end):
+                query = at
+                break
+            if at == ask:
+                ask = units.find("?", ask + 1, end)
+            else:
+                mark = units.find("#", mark + 1, end)
+    return {"scheme": scheme, "query": query, "pictures": key_pictures(units, word, end)}
+
+
+def key_in_address_path(facts, start):
+    """True when the run at `start` stands in the path of a web address of its word, after `://` and before its query
+    or fragment (KeyInText.inAddressPath)."""
+    scheme, query = facts["scheme"], facts["query"]
+    return 0 <= scheme and scheme + 3 <= start and not 0 <= query < start
+
+
+KEY_PICTURE_TYPE = re.compile(r"[A-Za-z0-9.+\-_;=%]*")     # a media type and its parameters (image/svg+xml;q=1)
+KEY_PICTURE_DATA = re.compile(r"[A-Za-z0-9+/]*")            # base64's letters, without its "="
+KEY_PICTURE_RUN = re.compile(r"[A-Za-z0-9+/]*=*")           # a run of base64: "=" only at its end
+
+
+def key_pictures(units, word, end):
+    """[(first, last)]: each place p of the word units[word:end] whose units before it, from the word's start, end in
+    the base64 of a picture's `data:` address, as half-open ranges in the order of the word (KeyInText.Words.read, the
+    shared rule of 25 November 2026): "data:image/", then ";base64,", with only the units of a media type and its
+    parameters between them (KEY_PICTURE_TYPE), then base64's letters. Any other unit, also the "=" that ends the
+    base64, ends the picture for good, until another "data:image/" whose last unit is at or after it. Found by searches,
+    so a long word costs one pass."""
+    out, gone = [], word        # gone: the unit at which the last picture ended
+    while gone < end:
+        image = units.find("data:image/", max(word, gone - 10), end)
+        if image < 0:
+            break
+        kind = image + 11
+        comma = KEY_PICTURE_TYPE.match(units, kind, end).end()
+        if comma < end and units[comma] == "," and comma - 7 >= kind and units.startswith(";base64", comma - 7):
+            data = KEY_PICTURE_DATA.match(units, comma + 1, end).end()
+            out.append((comma + 1, data + 1))
+            gone = data
+            while gone < end and units[gone] == "=":
+                gone += 1
+        else:
+            gone = comma
+    return out
+
+
+def key_in_data_uri(facts, start, units, end):
+    """True when the run units[start:end] stands in an image's base64, an embedded image of a Markdown file, which is no
+    key (the shared rule of 25 November 2026, with the Mac's KeyInText and the Windows app's port): the units before it
+    in its word end in a picture's base64 (key_pictures), and the run itself is base64, with "=" only at its end. So a
+    comma, a quote, a bracket or a colon before ";base64,", a run right after the "=" of a picture
+    (`...Ggo=token=...`), a later ";base64," of the word, a data: URI of another type and a fake prefix are read as any
+    text (the Windows readers' finds and the coordinator's validator)."""
+    pictures = facts["pictures"]
+    at = bisect.bisect_right(pictures, (start, len(units) + 1)) - 1
+    return at >= 0 and pictures[at][0] <= start < pictures[at][1] and \
+        KEY_PICTURE_RUN.fullmatch(units, start, end) is not None
+
+
+def key_assigned(units, start, end):
+    """(start, end) of the part of a run after its last `=` that is not base64's padding (KeyInText.assigned)."""
+    body = units[start:end].rstrip("=")
+    sign = body.rfind("=")
+    return (start, end) if sign < 0 else (start + sign + 1, end)
+
+
+def key_looks_random(run):
+    """True when a run reads as random (KeyInText.looksRandom): capitals, small letters and digits all three, not a
+    path, about as varied as random letters are, changing between them as often, and few runs of small letters."""
+    if len(run) < 32 or run.startswith("/") or "//" in run:
+        return False
+    kinds = [0 if "A" <= c <= "Z" else 1 if "a" <= c <= "z" else 2 if "0" <= c <= "9" else 3 for c in run]
+    if not (0 in kinds and 1 in kinds and 2 in kinds):
+        return False
+    counts = collections.Counter(run)
+    total = float(len(run))
+    entropy = -sum(n / total * math.log2(n / total) for n in counts.values())
+    changes = sum(1 for a, b in zip(kinds, kinds[1:]) if a != b) / (total - 1)
+    wordy = small = 0
+    for kind in kinds + [0]:
+        if kind == 1:
+            small += 1
+            continue
+        if small >= 4:
+            wordy += small
+        small = 0
+    return entropy >= 4.2 and changes >= 0.4 and wordy / total < 0.4
+
+
+def keys_in_text(text):
+    """Every part of `text` that looks like a key, as [(start, end)] in its UTF-16 units, in the order of the text
+    (KeyInText.all): each key with a shape of its own, and each run that reads as random outside of them. Each word's
+    start is found once (KEY_BREAK), so a long line costs one pass."""
+    units = key_units(text)
+    # The finds of the shapes by their start: none overlaps another, so their ends rise too, and a part [s, e) overlaps
+    # one exactly when the last find that starts before e ends after s (bisect: 1 MiB of short keys in one pass, not
+    # each find against the whole list, the coordinator's M5 of 25 November 2026: 18.7 s)
+    starts, ends = [], []
+
+    def overlaps(s, e):
+        at = bisect.bisect_left(starts, e)
+        return at > 0 and ends[at - 1] > s
+    for shape in KEY_SHAPES:
+        for s, e in key_shape_finds(units, shape):
+            if not overlaps(s, e):
+                at = bisect.bisect_left(starts, s)
+                starts.insert(at, s)
+                ends.insert(at, e)
+    found, breaks, words = list(zip(starts, ends)), None, {}
+    for m in KEY_RUN.finditer(units):
+        s, e = key_assigned(units, m.start(), m.end())
+        if e - s < 32 or overlaps(s, e) or not key_looks_random(units[s:e]):
+            continue
+        if breaks is None:
+            breaks = [b.start() for b in KEY_BREAK.finditer(units)]
+        at = bisect.bisect_left(breaks, s)                  # the first break at or after the run's start
+        word = breaks[at - 1] + 1 if at else 0
+        if word not in words:
+            words[word] = key_word_facts(units, word, breaks[at] if at < len(breaks) else len(units))
+        if not key_in_address_path(words[word], s) and not key_in_data_uri(words[word], s, units, e):
+            found.append((s, e))
+    return sorted(found)
+
+
+def key_parts(text):
+    """The text of each part of `text` that looks like a key (keys_in_text)."""
+    units = key_units(text)
+    return [units[s:e].encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+            for s, e in keys_in_text(text)]
+
+
+def knowledge_key_check(texts, kept=(), before=""):
+    """Refusal knowledge_key when one of `texts` holds what looks like a key (key_parts) that `before`, the file's text
+    before a change, does not hold already, and that the owner did not keep: `kept` holds the SHA-256 of each part that
+    their "Keep it" kept (key_kept)."""
+    for text in texts:
+        if isinstance(text, str) and len(text.encode()) > KNOWLEDGE_LIMITS["owner"][1]:
+            raise Refusal(413, f"the file is larger than {KNOWLEDGE_LIMITS['owner'][1] // MIB} MiB of Markdown")
+    held = set(key_parts(before)) if before else set()     # the parts that the file held, as the app compares them
+    for text in texts:
+        if isinstance(text, str) and any(part not in held and hashlib.sha256(part.encode()).hexdigest() not in kept
+                                         for part in key_parts(text)):
+            raise Refusal(409, code="knowledge_key")
+
+
 def knowledge_text(entry):
     """The text of one catalog file, from the commit of its catalog entry, or None."""
     repo = CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__)))
@@ -68455,11 +68916,18 @@ def knowledge_slug(words):
     return slug or "file-" + hashlib.sha256(words.encode()).hexdigest()[:8]
 
 
+def knowledge_saved_text(text):
+    """The text of an owner knowledge file as the hub saves it: one new line for each line end, and a space for each
+    other control character. The key check reads this form (knowledge_key_check), because the saved file is what the
+    apps and the agents read: a control character in the middle of a word ends that word there."""
+    return LINE_CONTROL.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def knowledge_content(title, source, how, text, heading=None):
     """The one form of an owner knowledge file: its title, the line "Source: <source> · <how> <date>" and the text.
     heading: the title and Source lines of a file that keeps its own (knowledge_replace). Refused when it is larger
     than an owner file can be, or when it holds a registered login."""
-    text = LINE_CONTROL.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
+    text = knowledge_saved_text(text).strip()
     if not text:
         raise Refusal(400, "the text is empty")
     heading = heading or f"# {title}\n\nSource: {source} · {how} {time.strftime('%Y-%m-%d', time.gmtime())}"
@@ -93733,11 +94201,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_knowledge_change(self):
         """The owner's knowledge files (owner feature owner_knowledge): add a file's text {title, text, source}, add a
-        page {url}, keep a file he attached {attachment, title?} (attachment_knowledge), give a file new text in
-        place {path, text}, or delete one file {path, delete: true}. One commit in knowledge/owner/ for each change.
+        page {url}, keep a file that the owner attached {attachment, title?} (attachment_knowledge), give a file new text
+        in place {path, text}, or delete one file {path, delete: true}. Each but a delete is refused (knowledge_key) when
+        it holds what looks like a key that the owner did not keep: key_kept, the SHA-256 of each part that their "Keep
+        it" kept (owner API 1.335). One commit in knowledge/owner/ for each change.
         The hub reads a page, and an attachment's own bytes, before it takes the lock; the body that a repeat
         compares keeps the text's digest only."""
         made = {}
+        # key_kept counts only from the owner's own app, on the main Mac ("app") or a linked one ("device", which acts
+        # as the main Mac does): an AI session or a program says nothing for the owner (request_hand)
+        session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+        hand = request_hand(self.headers.get("X-Fleet-Client", "").strip(), owner_device_at(self.client_address[0]),
+                            None, None, session)
 
         def owner_path(path):
             if not (isinstance(path, str) and re.fullmatch(r"knowledge/owner/[A-Za-z0-9._/-]+\.md", path)
@@ -93746,7 +94221,26 @@ class Handler(BaseHTTPRequestHandler):
             return path
 
         def read(data):
-            fields = set(data) - {"request_id", "db"}
+            fields = set(data) - {"request_id", "db", "key_kept"}
+            # The gate for older apps (the Door area's read): an app of 1.335 and later always sends key_kept, [] when
+            # nothing was kept, so an "app" request with no field is an older app, which keeps the behaviour of before
+            # until it updates (its knowledge box asks the owner, Founderizer 0.1.476); every other hand is checked.
+            # Only a linked Mac's app writes knowledge as "device" today (device_may lets no phone or PC reach this
+            # route): a device that may write knowledge later must send key_kept from its first version, or this gate
+            # reads it as an older app and checks nothing (the coordinator's and the Door area's condition)
+            checked = hand not in ("app", "device") or "key_kept" in data
+            kept = data.get("key_kept", [])
+            if not (isinstance(kept, list) and len(kept) <= KEY_KEPT_MOST and
+                    all(isinstance(x, str) and re.fullmatch(r"[0-9a-f]{64}", x) for x in kept)):
+                raise ValueError("key_kept is the SHA-256 of each part that the owner kept, as lower-case hex, or absent")
+            if kept and hand not in ("app", "device"):
+                raise ValueError("key_kept is the owner's own Keep it in the owner's app, which no other caller sends; "
+                                 "an AI session asks the owner to save the text from the app")
+            kept = set(kept)
+
+            def check(texts, before=""):
+                if checked:
+                    knowledge_key_check(texts, kept, before)
             if "delete" in data:
                 if fields != {"path", "delete"} or data["delete"] is not True:
                     raise ValueError("a delete sends only path and delete: true")
@@ -93755,12 +94249,16 @@ class Handler(BaseHTTPRequestHandler):
                 if fields != {"path", "text"} or not isinstance(data["text"], str):
                     raise ValueError("a change sends only path and the file's new text")
                 made["text"] = data["text"]
+                rev = kit_revision(fresh=True)
+                before = git_blob(rev, owner_path(data["path"])) if rev else None
+                check([knowledge_saved_text(data["text"])], (before or b"").decode("utf-8", "replace"))
                 return {"path": owner_path(data["path"]), "replace": True,
                         "sha256": hashlib.sha256(data["text"].encode()).hexdigest()}
             if "url" in data:
                 if fields != {"url"}:
                     raise ValueError(f"unknown field {sorted(fields - {'url'})[0]}")
                 url = knowledge_url(data["url"])
+                check([url])        # its Source line; the page itself is a stranger's text
                 title, text = page_markdown(*fetch_page(url))
                 made["content"] = knowledge_content(title or url, url, "fetched", text)
                 return {"url": url, "path": OWNER_KNOWLEDGE + knowledge_slug(url.split("://", 1)[1]) + ".md"}
@@ -93782,6 +94280,7 @@ class Handler(BaseHTTPRequestHandler):
                 if row["kept"]:
                     raise Refusal(409, f"A-{aid} is already kept as {row['knowledge']}")
                 path, made["content"], title = attachment_knowledge(row, data.get("title"))
+                check([made["content"].decode("utf-8", "replace")])
                 return {"attachment": aid, "path": path, "title": title,
                         "sha256": hashlib.sha256(made["content"]).hexdigest()}
             extra = sorted(fields - {"title", "text", "source"})
@@ -93791,6 +94290,7 @@ class Handler(BaseHTTPRequestHandler):
             source = knowledge_line(data.get("source"), "source", 200)
             if not isinstance(data.get("text"), str):
                 raise ValueError("text must be the file's text")
+            check([title, source, knowledge_saved_text(data["text"])])       # as the hub saves them
             made["content"] = knowledge_content(title, source, "added", data["text"])
             return {"path": OWNER_KNOWLEDGE + knowledge_slug(title) + ".md", "title": title, "source": source,
                     "sha256": hashlib.sha256(data["text"].encode()).hexdigest()}

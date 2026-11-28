@@ -1631,6 +1631,22 @@ class TeamChanges(Remove):
             self.assertEqual(isinstance(refused.exception, hub.TeamPassing), passing, refused.exception)
             if not passing:
                 self.assertEqual(str(refused.exception), "There is no owner file knowledge/owner/brand.md.")
+        # a key in the manager's new text: every agent that reads the file would read it (owner API 1.335)
+        before = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nBlue.\n".encode()
+        with patch.object(hub, "knowledge_entries", lambda: listed), patch.object(hub, "git_blob", lambda rev, path: before), \
+                self.assertRaises(hub.ToolError) as refused:
+            hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(),
+                                     text="# Brand\n\nThe key: sk-proj-" + "Q3vT9xLm2NpR7sKw4YbZ8cHj6FdA1eGu\n"))
+        self.assertIn("holds what looks like a key", str(refused.exception))
+        # and one that a control character hides in an address's path: the hub saves it as a space, so the saved
+        # file holds the run as a word of its own (the three-copy validator, 25 November 2026)
+        hidden = "# Brand\n\nhttps://example.com/files/" + chr(0x1F) + "Xk7Qp2Lm9Rt4Vb8Nc3Wz6Hd1Jf5Gs0Ya\n"
+        with patch.object(hub, "knowledge_entries", lambda: listed), \
+                patch.object(hub, "git_blob", lambda rev, path: before), self.assertRaises(hub.ToolError) as refused:
+            hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(), text=hidden))
+        self.assertIn("holds what looks like a key", str(refused.exception))
         # the catalog stops being readable after the plan's own read: the 503 of the room check in knowledge_replaced
         # passes by itself too, and closes no card (lanes/knowledge-list-on-a-failed-read.md)
         before = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nBlue.\n".encode()
