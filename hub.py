@@ -3647,18 +3647,19 @@ def send_ping():
     starts again (BADGE["off"]). Apple keeps no badge-only push for a phone that is off (expires 0), so it never takes
     the place of a Needs-you ping that Apple keeps for that phone.
 
-    Each answer goes through push.outcome's one table, as for the members' pings, for a development build's ping too
-    (our side sends it to Apple's sandbox): held (our side's 502, 503, 401, 402, 429, no connection, a 3xx, 403, 404,
-    405, 408, 421, 425, 426 or 431, a channel or a bearer that cannot go out; Apple's 5xx, its 403 of a production ping,
-    its 429 TooManyProviderTokenUpdates) queues the ping again first while inside PUSH_KEEP and holds every owner ping
-    for its time (a row past PUSH_KEEP fails and holds nothing); Apple's other 429, and its 403 of a development ping,
-    hold only that phone's pings (PHONE_HOLDS, in memory: after a restart that phone asks again); may have gone (status
-    0, our side's 500, 504 or other 5xx) makes it unknown and holds the next pings RETRY_DEFAULT; the ping's own fault
-    fails it, and the token goes when the table says so (push.py's own refusal of it, Apple's 410, its 400
-    BadDeviceToken or DeviceTokenNotForTopic). A 502 that is not our side's own (a proxy's, when our side stops at a
-    deploy) holds a ping one time, and the row keeps it (status 502) while it stays queued, through the other holds in
-    between and across a restart: one second send, which can ring twice; the second such 502 of the same row makes it
-    unknown. Apple names no 502 of its own, so a row's 502 is a proxy's.
+    Each answer goes through push.outcome's one table, as for the members' pings, for a development build's ping too:
+    held (our side's 502, 503, 401, 402, 429, no connection, a 3xx, 403, 404, 405, 408, 421, 425, 426 or 431, a channel
+    or a bearer that cannot go out; Apple's 5xx, its 403 of a production ping, its 429 TooManyProviderTokenUpdates)
+    queues the ping again first while inside PUSH_KEEP and holds every owner ping for its time (a row past PUSH_KEEP
+    fails and holds nothing); Apple's other 429 holds only that phone's pings (PHONE_HOLDS, in memory: after a restart
+    that phone asks again); may have gone (status 0, our side's 500, 504 or other 5xx) makes it unknown and holds the
+    next pings RETRY_DEFAULT; the ping's own fault fails it, also Apple's 403 of a development ping (our side's key is a
+    production key for the app alone, UI-API 1.76: such a ping never arrives), and the token goes when the table says so
+    (push.py's own refusal of it, Apple's 410, its 400 BadDeviceToken or DeviceTokenNotForTopic). A 502 that is not our
+    side's own (a proxy's, when our side stops at a deploy) holds a ping one time, and the row keeps it (status 502)
+    while it stays queued, through the other holds in between and across a restart: one second send, which can ring
+    twice; the second such 502 of the same row makes it unknown. Apple names no 502 of its own, so a row's 502 is a
+    proxy's.
 
     The end of the call goes to the row only while it is 'sending': a row that went meanwhile (join_items_gone_rows),
     or a new row whose id came back, takes none of it.
@@ -69690,6 +69691,23 @@ def kit_revision(fresh=False):
     return _revision_cache["value"]
 
 
+SIGNIN_ENDS_RANGE = 400 * 86400        # a sign-in date that a reading may give, either side of now (signin_ends_kept)
+
+
+def signin_ends_kept(value):
+    """{"signin_ends": seconds} of a runtime in a machine's reading, or {} for none: the date of its Claude sign-in
+    (lifecycle.signin_ends), a whole number within SIGNIN_ENDS_RANGE of now. Anything else is no date and refuses
+    nothing of the report: text, a bool, a number of milliseconds, a date years away. The hub keeps a number here and
+    nothing more: /ui/machines gives it, and the manager will hear of it once a client can act on it (the design's
+    piece 3)."""
+    if isinstance(value, float) and math.isfinite(value):
+        value = int(value)
+    # in whole numbers: a huge one less the float of now() is an OverflowError, which would lose the whole report
+    if isinstance(value, bool) or not isinstance(value, int) or abs(value - int(now())) > SIGNIN_ENDS_RANGE:
+        return {}
+    return {"signin_ends": value}
+
+
 def _optional(value, kind, limit=200):
     if value is None:
         return None
@@ -69962,7 +69980,8 @@ def validate_status(data):
         raise ValueError("runtimes must map codex and claude to {version, signed_in}")
     kept = {}
     for n, r in (runtimes or {}).items():
-        kept[n] = {"version": _optional(r.get("version"), str, 120), "signed_in": _optional(r.get("signed_in"), bool)}
+        kept[n] = {"version": _optional(r.get("version"), str, 120), "signed_in": _optional(r.get("signed_in"), bool),
+                   **signin_ends_kept(r.get("signin_ends"))}
         update = runtime_update(r.get("update"))      # a helper from before the runtime updates sends none
         if update:
             kept[n]["update"] = update
@@ -69997,7 +70016,7 @@ def validate_status(data):
                                               ("macos_update", macos_update_status(sec.get("macos_update"))))
                             if k in sec}},
             "runtime": {"name": _optional(rt.get("name"), str, 40), "version": _optional(rt.get("version"), str, 120),
-                        "signed_in": _optional(rt.get("signed_in"), bool)},
+                        "signed_in": _optional(rt.get("signed_in"), bool), **signin_ends_kept(rt.get("signin_ends"))},
             "update": {"state": state, "detail": _optional(up.get("detail"), str, 500)},
             "access": {"ssh": _optional(ways.get("ssh"), bool), "screen_sharing": _optional(ways.get("screen_sharing"), bool),
                        "user": user, **({"uid": uid} if uid is not None else {})},
@@ -83542,6 +83561,13 @@ def machine_said(agent, runtime, reads=None):
     wants another account of the same provider — must not be closed by a reading taken before its sign-out, which
     still says "signed in" about the account he is leaving. So `end_signed_in_waits` asks when the machine said it,
     and a reading older than the job's own last step decides nothing."""
+    entry, read_at = machine_entry(agent, runtime, reads)
+    return (entry or {}).get("signed_in"), read_at
+
+
+def machine_entry(agent, runtime, reads=None):
+    """(that runtime's entry of the machine's own reading, or None; read_at or None), as machine_said dates it: the
+    reader of `signed_in` (machine_said) and of the sign-in's date (signin_ends_said)."""
     row = q1("SELECT data, reported FROM machine_status WHERE agent=?", (agent,)) if reads is None \
         else reads.status.get(agent)                    # agent_reads(): every agent's, read once
     if not row or now() - row["reported"] > MACHINE_STALE:
@@ -83550,8 +83576,16 @@ def machine_said(agent, runtime, reads=None):
     read_at = row["reported"] - reading_age_of(data.get("reading_age"))
     for where in (data.get("runtimes") or {}, {(data.get("runtime") or {}).get("name"): data.get("runtime") or {}}):
         if runtime in where and isinstance(where[runtime], dict):
-            return where[runtime].get("signed_in"), read_at
+            return where[runtime], read_at
     return None, read_at
+
+
+def signin_ends_said(agent, runtime):
+    """(the date of that runtime's sign-in in the machine's own reading, or None; read_at or None): what a renewal of the
+    design's piece 2 must move later, and what the manager will hear of (piece 3)."""
+    entry, read_at = machine_entry(agent, runtime)
+    ends = (entry or {}).get("signin_ends")
+    return (ends if isinstance(ends, int) and not isinstance(ends, bool) else None), read_at
 
 
 def end_signed_in_waits(agent, t0=None):

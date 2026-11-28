@@ -4452,6 +4452,10 @@ def honest_raw(**change):
         members[0][1], members[0][4] = b"{}", 0
     if change.get("broken"):                    # a final block of type 3, which no deflate stream has
         members[0][1] = b"\x07\x00\x00\x00"
+    if change.get("crc"):                       # a CRC that is wrong in both heads alike
+        members[0][2] ^= 1
+    if change.get("stored_deflate"):            # stored by its method, but its bytes inflate to its size and CRC
+        members[0][4] = 0
     if "whole" in change:
         members[0][3] = change["whole"]
     return raw_zip([tuple(m) for m in members], local_extra=change.get("local_extra", b""))
@@ -4505,6 +4509,9 @@ PARITY_NOT_HUBS.update({
     "a local size that is not its directory's": local_field(honest_raw(), 22, b"\x09\0\0\0"),
     "a local method that is not its directory's": local_field(honest_raw(), 8, b"\0\0"),
     "a broken deflate stream": honest_raw(broken=True),
+    # two rules that no other case holds (the Door area's reader of HubCopyForm's parity test, 28 November 2026)
+    "a copy whose CRC is wrong in both heads": honest_raw(crc=True),
+    "a stored member whose bytes are a deflate stream of its stated size and CRC": honest_raw(stored_deflate=True),
     "one byte after a stream's end": junk_after(1),
     "forty bytes after a stream's end": junk_after(40),
     # Apple's decoder takes in what comes after an end in the same call: an end inside a large part, with more room

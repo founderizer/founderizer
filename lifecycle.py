@@ -3347,6 +3347,33 @@ def codex_keeps_sign_in(text):
     return any(word in text for word in CODEX_KEEPS_SIGN_IN) and "Not logged in" not in text
 
 
+# `claude auth status` gives the date of the stored claude.ai sign-in as `loginExpiresAt`, an ISO time with its zone
+# ("2026-11-24T18:22:49.758Z"). Claude Code 2.1.321 gives it, and the changelog inside that program names 2.1.318 for
+# it; 2.1.312 has none (read in both programs).
+LOGIN_ENDS = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})")
+
+
+def signin_ends(value):
+    """The date of a Claude sign-in as Claude Code's own status gives it (`loginExpiresAt`), in seconds since 1970,
+    or None: the date of the reading that the manager will hear of (the design's piece 3) and that a renewal must
+    move later (the design's piece 2). Only a time WITH its zone is read: the same text read as local time
+    would move the date by the machine's offset, and a number has no unit that Claude Code says (seconds and
+    milliseconds give dates 1,000 times apart). It is read from the status command's words, never from the stored
+    sign-in itself, whose file holds the tokens: the hub gets a date and nothing more (the design of 22 November
+    2026, ~/dev/founderizer-plans/claude-signin-renewal-2026-11-22.md, 2.2)."""
+    found = LOGIN_ENDS.fullmatch(value) if isinstance(value, str) else None
+    if not found:
+        return None
+    zone = found[7]
+    try:
+        offset = datetime.timedelta(0) if zone == "Z" else \
+            (1 if zone[0] == "+" else -1) * datetime.timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6]))
+        return int(datetime.datetime(*(int(found[i]) for i in range(1, 7)),
+                                     tzinfo=datetime.timezone(offset)).timestamp())
+    except ValueError:
+        return None
+
+
 # Where the helpers of one OS user leave the word of the newest account read of the screen runtime that gave an
 # answer (leave_screen_word), for the one reader that has no account read of its own: a Mac's server service,
 # whose reading says whether the ChatGPT app is signed in (Lifecycle.chatgpt). All agents of a Mac run as that
@@ -4771,7 +4798,8 @@ class Lifecycle:
         return self.which(name) if self.which else exe(name, self.home)
 
     def runtime(self, name=None, stored=False):
-        """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model.
+        """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model. A
+        Claude sign-in whose status gives its date also has `signin_ends` (seconds; signin_ends).
         stored: only what the machine keeps, without the account read's word on it (`ended`): the question of a
         sign-out, which removes what is kept, and of a sign-in job, which asks the account read itself.
 
@@ -4797,15 +4825,22 @@ class Lifecycle:
         elif name == "claude":
             code, out, _ = self.run([exe, "auth", "status"])
             try:
-                result["signed_in"] = bool(json.loads(out).get("loggedIn"))
+                said = json.loads(out)
             except ValueError:
-                pass
+                said = None
+            if isinstance(said, dict):
+                result["signed_in"] = bool(said.get("loggedIn"))
+                # the date of the stored sign-in, from the same words: only where they give one (signin_ends)
+                ends = signin_ends(said.get("loginExpiresAt")) if result["signed_in"] else None
+                if ends:
+                    result["signin_ends"] = ends
         # A status command reads what the machine keeps, and Codex's keeps saying "Logged in" after the provider
         # ended the sign-in: the refresh token was revoked, has expired, or the account signed in again somewhere
         # else. Each turn fails then, and the owner's Sign in was refused with "is signed in on this machine" (the
         # owner's Mac Studio, 13 November 2026, for a day). The account read asks the provider, so its word decides.
         if result["signed_in"] and not stored and self.ended and self.ended(name):
             result["signed_in"] = False
+            result.pop("signin_ends", None)     # an ended sign-in has no date ahead of it
         return result
 
     def collect(self, fast=False):
@@ -4816,7 +4851,8 @@ class Lifecycle:
         runtimes = {name: self.runtime(name) for name in SWITCH_RUNTIMES}
         self.remember_signed_in(runtimes)
         name = self.conf.get("runtime")
-        said = {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()}
+        said = {n: {"version": r["version"], "signed_in": r["signed_in"],
+                    **({"signin_ends": r["signin_ends"]} if r.get("signin_ends") else {})} for n, r in runtimes.items()}
         outcomes = self.runtime_updates().get("runtimes") if self.runtimes_busy else None
         for n, outcome in outcomes.items() if isinstance(outcomes, dict) else ():
             if n in said and isinstance(outcome, dict):     # its last update, by any helper of this user

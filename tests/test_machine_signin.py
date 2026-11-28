@@ -99,13 +99,15 @@ class Machines(OwnerAPI):
         self.assertEqual(code, 200, state)
         return next(m for m in state["machines"] if m["agent"] == agent)["login"]
 
-    def machine_says(self, agent="solo", claude=None, codex=None):
-        """That machine's helper checking in through its own route, so the hub reads the report as it really does."""
-        return self.request(f"/helper/status/{agent}", {
+    def machine_says(self, agent="solo", claude=None, codex=None, ends=None, **more):
+        """That machine's helper checking in through its own route, so the hub reads the report as it really does.
+        ends: the date of its Claude sign-in (`signin_ends`), as a helper of 2026.11.22 and later sends it."""
+        dated = {} if ends is None else {"signin_ends": ends}
+        return self.request(f"/helper/status/{agent}", dict({
             "os": {"name": "Debian GNU/Linux 12", "kernel": "6.1.0"}, "update": {"state": None, "detail": None},
-            "runtime": {"name": "claude", "version": "2.1.287", "signed_in": claude},
-            "runtimes": {"claude": {"version": "2.1.287", "signed_in": claude},
-                         "codex": {"version": "0.160.0", "signed_in": codex}}}, source="127.0.0.3")
+            "runtime": {"name": "claude", "version": "2.1.287", "signed_in": claude, **dated},
+            "runtimes": {"claude": {"version": "2.1.287", "signed_in": claude, **dated},
+                         "codex": {"version": "0.160.0", "signed_in": codex}}}, **more), source="127.0.0.3")
 
     def waiting_job(self, runtime="claude", agent="solo", kind="install"):
         """A server job of that agent parked at its sign-in step, as a server service leaves one."""
@@ -474,6 +476,30 @@ class Signin(Machines):
         self.assertEqual((self.view()["state"], self.view()["timed_out"]), ("failed", False))    # a link never came
         self.assertIn("Start the sign-in again", self.view()["detail"])
         self.assertEqual(self.start()[1]["changed"], True)       # and the owner can start a new one at once
+
+    def test_the_hub_keeps_the_date_of_a_claude_sign_in_as_a_number_and_nothing_else(self):
+        """The design of 22 November 2026 (piece 1): the hub tells the manager from this date, and the app reads it
+        from /ui/machines. Bug: a helper puts any text, a number of milliseconds or a date years away into the
+        field, and the hub stores it and shows it; or such a value refuses the whole report, with its sign-in word."""
+        soon = int(hub.now()) + 5 * 86400
+
+        def kept(value):
+            code, said = self.machine_says(claude=True, ends=value)
+            self.assertEqual(code, 200, said)
+            code, state = self.request("/ui/machines?db=test-generation")
+            row = next(m for m in state["machines"] if m["agent"] == "solo")
+            self.assertIs(row["runtimes"]["claude"]["signed_in"], True, value)
+            self.assertEqual(row["runtime"].get("signin_ends"), row["runtimes"]["claude"].get("signin_ends"))
+            return row["runtimes"]["claude"].get("signin_ends")
+        self.assertEqual(kept(soon), soon)
+        self.assertEqual(kept(soon + 0.5), soon)
+        self.assertEqual(hub.signin_ends_said("solo", "claude")[0], soon)
+        for wrong in ("2026-11-24T18:22:49Z", True, soon * 1000, int(hub.now()) + 401 * 86400,
+                      int(hub.now()) - 401 * 86400, {"token": "x"}, float("nan"), float("inf"), 10 ** 400):
+            self.assertIsNone(kept(wrong), wrong)
+        self.assertIsNone(hub.signin_ends_said("solo", "claude")[0])
+        stored = hub.q1("SELECT data FROM machine_status WHERE agent='solo'")["data"]
+        self.assertNotIn("token", stored)
 
     def test_the_machines_page_shows_the_last_sign_in(self):
         self.assertIsNone(self.view())

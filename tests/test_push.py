@@ -453,10 +453,10 @@ class Sender(PushCase):
         the owner's ping, queued and first, for RETRY_DEFAULT, and so do Apple's 429 and our side's own 502; a proxy's
         502 holds it one time (one second send, which can ring twice), and its second makes the row unknown; our
         side's 504 makes it unknown, never sent again, and the next ping waits. Apple's 403 of a development build's
-        ping (our side sends it to Apple's sandbox, where a fault of the key may stand alone) holds only that phone,
-        and its token stays. Bugs: an Apple outage, or an expired provider key of our side, fails each card's ping; a
-        proxy's 502 or 504 after the ping went to Apple sends it twice; a development build holds each card's ping of
-        every phone for a day; or its key fault takes the phone's token."""
+        ping fails it (our side's key is a production key for the app alone, so it never arrives) and holds nothing,
+        and the phone keeps its token. Bugs: an Apple outage, or an expired provider key of our side, fails each card's
+        ping; a proxy's 502 or 504 after the ping went to Apple sends it twice; a development build's ping is held
+        and sent again each minute for a day, and holds its phone or every phone."""
         self.give(self.enrolled())
         for answer, state in (((200, {"status": 500, "reason": "InternalServerError"}), "queued"),
                               ((200, {"status": 503, "reason": "ServiceUnavailable"}), "queued"),
@@ -478,8 +478,9 @@ class Sender(PushCase):
         hub.q("UPDATE owner_device_push SET environment='development'")
         self.raise_item(title="From a development build")
         self.side.answer = (200, {"status": 403, "reason": "BadCertificateEnvironment"})
-        self.assertEqual((self.sent()["state"], hub._ping_hold["until"]), ("queued", 0.0))
-        self.assertEqual(sorted(hub.PHONE_HOLDS), ["iphone"])
+        ping = self.sent()
+        self.assertEqual((ping["state"], ping["error"], hub._ping_hold["until"], hub.PHONE_HOLDS),
+                         ("failed", "Apple: 403 BadCertificateEnvironment", 0.0, {}))
         self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))
 
     def test_the_refusals_of_the_open_route_say_what_our_side_said(self):
@@ -734,8 +735,8 @@ class Sender(PushCase):
 
     def test_apples_429_holds_only_that_phone_and_a_development_ping_takes_the_same_table(self):
         """Apple's 429 (too many pings to that phone) holds only that phone's pings, its log line says when it goes
-        again, and the other phone's ping goes at once. A development build's ping (our side sends it to Apple's
-        sandbox) takes the same table: our side's 429 queues it again, and Apple's 410 drops its token. Bugs: one
+        again, and the other phone's ping goes at once. A development build's ping takes the same table: our side's
+        429 queues it again, and Apple's 410 drops its token. Bugs: one
         phone's 429 holds every phone of the owner; or a development ping is lost at our side's 429, or keeps a token
         that Apple called gone and goes to it again."""
         hub.TEAM["owner_devices"]["ipad"] = {"label": "iPad", "address": OTHER}     # a second phone of the owner
@@ -1171,9 +1172,10 @@ class MemberRoute(PushCase):
             (dict(status=503, reason="ServiceUnavailable"), (held, D, False, False)),
             (dict(status=403, reason="ExpiredProviderToken"), (held, D, False, False)),
             (dict(status=403, reason="ExpiredProviderToken", environment="production"), (held, D, False, False)),
-            (dict(status=403, reason="BadCertificateEnvironment", environment="development"), (phone, D, False, False)),
+            (dict(status=403, reason="BadCertificateEnvironment", environment="development"),
+             (refused, None, False, False)),
             (dict(status=403, reason="BadCertificateEnvironment", environment="development", member=True),
-             (phone, D, False, False)),
+             (refused, None, False, True)),
             (dict(status=410, reason="Unregistered", environment="development"), (refused, None, False, True)),
             (dict(status=429, reason="TooManyProviderTokenUpdates"), (held, D, False, False)),
             (dict(status=403, reason="InvalidProviderToken"), (held, D, False, False)),
@@ -1185,7 +1187,7 @@ class MemberRoute(PushCase):
             (dict(status=413, reason="PayloadTooLarge"), (refused, None, False, False)),
             (dict(status=403, reason="Forbidden"), (held, D, False, False)),
             (dict(status=403, reason="UnrelatedKeyIdInToken", environment="production"), (held, D, False, False)),
-            (dict(status=403, reason="Forbidden", environment="development"), (phone, D, False, False)),
+            (dict(status=403, reason="Forbidden", environment="development"), (refused, None, False, False)),
         ]
         for given, (kind, wait, licence, gone) in table:
             with self.subTest(given=str(given)):

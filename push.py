@@ -99,20 +99,19 @@ class PushError(Exception):
 #            channel or a bearer that cannot go out, a 3xx, 403, 404 or 405 of a channel that moved or a route that is
 #            not live, a 408, 421, 425, 426 or 431); Apple's 5xx; Apple's 403 of a production ping (its reasons are
 #            about our side's own key); Apple's 429 TooManyProviderTokenUpdates (our side's own).
-#   PHONE    Apple's other 429: too many pings to that phone; its pings wait RETRY_DEFAULT, this one first. And Apple's
-#            403 of a development ping: our side sends it to Apple's sandbox with the same key of the team (the
-#            website's src/lib/push.ts, HOSTS), so the reason is about that key too, but it may stand in the sandbox
-#            alone, and a build from Xcode never holds the pings of the other phones; the token stays.
+#   PHONE    Apple's other 429: too many pings to that phone; its pings wait RETRY_DEFAULT, this one first.
 #   MAYBE    the ping may have gone: it never goes again, and every ping waits RETRY_DEFAULT (the owner's row is
 #            unknown). Status 0, by any cause, on the member route a 502 that is not our side's own, and our side's
 #            500, 504 or any other 5xx: a proxy may answer after our side gave the ping to Apple.
 #   REFUSED  the ping's own fault: that ping goes (the owner's row failed). Our side's 400 and 413, and each other
 #            4xx; this file's own refusal of the token or the environment (`token_gone`); Apple's 410 and 400
-#            BadDeviceToken or DeviceTokenNotForTopic (`token_gone`); our side's 410 {"gone": true} on the member route
+#            BadDeviceToken or DeviceTokenNotForTopic (`token_gone`); Apple's 403 of a development ping (`token_gone` on
+#            the member route): our side's key is a production key for the app alone (UI-API 1.76), so such a ping
+#            never arrives, and a hold would send it again for a day; our side's 410 {"gone": true} on the member route
 #            (`token_gone`); Apple's other 4xx.
 #   SENT     Apple took it.
-# A development ping (a build from Xcode) takes the same table: our side sends it to Apple's sandbox. Its words are
-# Apple's reason alone for REFUSED, and "Apple: <status> <reason>" for each other answer of Apple's that is no 200.
+# A development ping (a build from Xcode) takes the same table. The words are Apple's reason alone for Apple's refusal,
+# and "Apple: <status> <reason>" for each other answer of Apple's that is no 200, and for its 403 of a development ping.
 
 HELD, PHONE, MAYBE, REFUSED, SENT = "held", "phone", "maybe", "refused", "sent"
 GONE_REASONS = ("BadDeviceToken", "DeviceTokenNotForTopic")     # Apple's 400 reasons of a token that is not the app's
@@ -155,8 +154,8 @@ def outcome(status=None, reason=None, error=None, environment=None, member=False
     apple = f"Apple: {status} {words}".strip()
     if status == 429:               # too many pings to that phone; or too many updates of our side's own key
         return Outcome(HELD if words == "TooManyProviderTokenUpdates" else PHONE, RETRY_DEFAULT, False, False, apple)
-    if status == 403 and environment == "development":     # the sandbox's answer for our side's key: that phone waits
-        return Outcome(PHONE, RETRY_DEFAULT, False, False, apple)
+    if status == 403 and environment == "development":     # our side's production key sends no development ping
+        return Outcome(REFUSED, None, False, member, apple)
     if status >= 500 or status == 403:      # Apple's 403 reasons are about our side's own key
         return Outcome(HELD, RETRY_DEFAULT, False, False, apple)
     return Outcome(REFUSED, None, False, status == 410 or (status == 400 and words in GONE_REASONS), words)
