@@ -131,6 +131,61 @@ class Devices(test_ui_api.OwnerAPI):
                 return r.code, json.load(r)
 
     # ---- team.json: what an owner device may be
+    def test_a_device_and_its_codes_come_only_from_the_owners_own_hand(self):
+        """Door's finding of 28 November 2026 (rows A2 and A3): an AI session that the owner tools steer, or a program
+        on the Mac, could save a stranger's node as an owner device, or take a device's code or a new phone's code and
+        give it to a stranger, whose requests then count as the owner's. The hub takes these only from the owner's own
+        hand (the app, an owner device, a chat). A bug here gives one of them to the owner MCP, the app's program, a
+        session's mark or a shell, refuses the owner's own app, or refuses a removal, which links nothing."""
+        hub.REFUSED_HANDS.clear()
+        self.addCleanup(hub.REFUSED_HANDS.clear)
+        others = {"the owner MCP": {"X-Fleet-Client": "founderizer-mcp/1/test"},
+                  "the app's program": {"X-Fleet-Client": "founderizer-cli/1/test"},
+                  "a session's mark": {"X-Fleet-Client": "founderizer-swift/1/test", "X-Fleet-Session": "codex/x"},
+                  "a shell": {"X-Fleet-Client": "curl/8.7.1"}}
+        base = lambda: hub.team_view(hub.kit_revision(fresh=True))[1]       # noqa: E731
+        calls = {"a device's code": ("/ui/owner/devices/iphone/code", dict),
+                 "a new phone's code": ("/ui/owner/devices/code", dict),
+                 "a new device": ("/ui/owner/devices", lambda: {"device": "ipad", "label": "iPad",
+                                                                "address": "100.64.0.9", "base_sha256": base()}),
+                 # the owner's phone moved to a stranger's address, with its label as it is
+                 "a changed device": ("/ui/owner/devices", lambda: {"device": "iphone", "label": "iPhone",
+                                                                    "address": "100.64.0.10", "base_sha256": base()})}
+        others["a job of the hub's own"] = {"X-Fleet-Client": "founderizer-release/1/test"}
+        for who, headers in others.items():
+            for what, (path, body) in calls.items():
+                with self.subTest(who=who, what=what):
+                    status, answer = self.call(path, dict({"request_id": str(uuid.uuid4()), "db": "test-generation"},
+                                                          **body()), headers=headers)
+                    self.assertEqual(status, 409, answer)
+                    # a new phone's code is a route that no tool sends (owner_mcp.NOT_TOOLS), which Door's rule 5
+                    # refuses for a tool or a program before this check, with its own words; a job reaches this check
+                    if what != "a new phone's code" or who.startswith("a job"):
+                        self.assertEqual(answer.get("error"), hub.OWNER_DEVICE_HAND)
+        self.assertEqual(hub.TEAM.get("owner_devices"), {"iphone": {"label": "iPhone", "address": PHONE}})
+        # each refused try is logged by the route's own name, once for each hand and route: a path that a caller
+        # writes (a fragment, an empty part) never reaches the log, and a loop of tries adds no line
+        self.call("/ui//owner/devices/iphone/code", {"request_id": str(uuid.uuid4()), "db": "test-generation"},
+                  headers=others["the owner MCP"])
+        lines = [r["what"] for r in hub.q("SELECT what FROM log WHERE what LIKE 'refused %'")]
+        self.assertIn("refused POST /ui/owner/devices/<device>/code: the hand tool is not the owner's own", lines)
+        self.assertEqual(len(lines), len(set(lines)))
+        self.assertFalse([line for line in lines if "iphone" in line or "//" in line])
+        self.assertIsNone(hub.q1("SELECT 1 FROM owner_device_codes"))
+        # the owner's own app passes the check (a device's save writes team.json through the kit, whose repository
+        # this class does not give an origin, so only the codes reach 200 here)
+        for what, (path, body) in calls.items():
+            with self.subTest(app=what):
+                status, answer = self.call(path, dict({"request_id": str(uuid.uuid4()), "db": "test-generation"},
+                                                      **body()))
+                self.assertNotEqual(answer.get("error"), hub.OWNER_DEVICE_HAND)
+                if what.endswith("code"):
+                    self.assertEqual(status, 200, answer)
+        status, answer = self.call("/ui/owner/devices", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                         "device": "iphone", "delete": True, "base_sha256": base()},
+                                   headers=others["the owner MCP"])
+        self.assertNotEqual(answer.get("error"), hub.OWNER_DEVICE_HAND, answer)     # a tool may take a device out
+
     def test_validate_team_takes_a_device_and_refuses_a_bad_one(self):
         team = {"addresses": {"owner": MAC, "hub": "127.0.0.2"}, "hub": {"machine": "hub"},
                 "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []}},

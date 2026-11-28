@@ -1679,16 +1679,29 @@ class TeamChanges(Remove):
             return {"rev": "r" * 40, "team": hub.TEAM, "files": {}, "access": [], "parts": [], "facts": [], "said": [],
                     "phrases": []}
         good = dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(), text="# Brand\n\nGreen and gold.\n")
+        keyed = "# Brand\n\nThe key: sk-proj-" + "Q3vT9xLm2NpR7sKw4YbZ8cHj6FdA1eGu\n"
+        held = ("# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nThe key: sk-proj-" +
+                "Q3vT9xLm2NpR7sKw4YbZ8cHj6FdA1eGu\n").encode()
+        blob = {"now": before}
         with patch.object(hub, "knowledge_entries", lambda: [dict(listed[0], bytes=len(before))]), \
-                patch.object(hub, "git_blob", lambda rev, path: before), \
+                patch.object(hub, "git_blob", lambda rev, path: blob["now"]), \
                 patch.object(hub, "knowledge_readers", lambda path, rev, strict=False: set()), \
                 patch.object(hub, "key_parts", lambda text: calls.append(text) or real(text)):
             hub.team_owner_file(ctx(), good)
             hub.team_owner_file(ctx(), good)
             self.assertEqual(len(calls), 2)                     # the text and the file before, once
+            for _ in range(2):              # a pair that failed is never kept: sent again, it is refused again
+                with self.assertRaises(hub.ToolError) as refused:
+                    hub.team_owner_file(ctx(), dict(good, text=keyed))
+                self.assertIn("holds what looks like a key", str(refused.exception))
+            # a text that passed on a base that held its key is checked again on a base that does not: the owner
+            # took the key out of the file, and the same text must not put it back
+            blob["now"] = held
+            hub.team_owner_file(ctx(), dict(good, base_sha256=hub.hashlib.sha256(held).hexdigest(),
+                                            text=keyed + "More.\n"))
+            blob["now"] = before
             with self.assertRaises(hub.ToolError) as refused:
-                hub.team_owner_file(ctx(), dict(good, text="# Brand\n\nThe key: sk-proj-" +
-                                                "Q3vT9xLm2NpR7sKw4YbZ8cHj6FdA1eGu\n"))
+                hub.team_owner_file(ctx(), dict(good, text=keyed + "More.\n"))
             self.assertIn("holds what looks like a key", str(refused.exception))
         # the catalog stops being readable after the plan's own read: the 503 of the room check in knowledge_replaced
         # passes by itself too, and closes no card (lanes/knowledge-list-on-a-failed-read.md)
@@ -1714,6 +1727,158 @@ class TeamChanges(Remove):
                                 dict(step, base_sha256=hub.hashlib.sha256(same).hexdigest()))
         self.assertNotIsInstance(refused.exception, hub.TeamPassing)
         self.assertEqual(str(refused.exception), "knowledge/owner/brand.md has this text already.")
+
+    def test_a_large_text_is_searched_for_logins_before_lock_and_never_under_it(self):
+        """The coordinator's pick (b) of 28 November 2026: a plan's texts and its owner files' content are searched for
+        registered logins before LOCK (call_tool's step for change_team, team_plan_ahead for the press and the steps),
+        and a check under LOCK never does more search than LOGIN_LOCK_WORK that the cache lacks: past it, it starts the
+        search outside LOCK and passes by itself (TeamPassing), and the next try reads the cache. Bugs: a 2 MiB plan
+        holds LOCK for minutes (107 s to 502 s with 155 logins); or a text that holds a login in a form after the
+        first (here a soft hyphen makes a second form) waits for ever and its refusal never comes (its readers' M1); or
+        no search before LOCK for a plan; or one new login over a large cached text makes it wait (S1)."""
+        import time as clock
+        # one new login over the four search forms of the largest plan fits the budget (the validator's round 6, S1)
+        self.assertGreaterEqual(hub.LOGIN_LOCK_WORK, 4 * hub.TEAM_PLAN_CHARS)
+        before = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nBlue.\n".encode()
+        listed = [{"path": "knowledge/owner/brand.md", "scope": "owner", "bytes": len(before)}]
+        step = {"path": "knowledge/owner/brand.md", "base_sha256": hub.hashlib.sha256(before).hexdigest()}
+
+        def ctx():
+            return {"rev": "r" * 40, "team": hub.TEAM, "files": {}, "access": [], "parts": [], "facts": [], "said": [],
+                    "phrases": []}
+
+        def content(text):
+            return hub.knowledge_replaced(step["path"], before, text, search=False).decode()
+
+        def searched(text):
+            for _ in range(200):
+                if hub.logins_searched(text):
+                    return
+                clock.sleep(0.05)
+            self.fail("the search outside LOCK did not end")
+
+        def login(ref, value):
+            hub.register_fingerprints(ref, [{"kind": "password", "len": len(value), "hash": hub.hashlib.sha256(
+                (hub.fingerprint_salt(hub.fingerprint_label(ref, "password")) + value).encode()).hexdigest()}])
+        value = "Zq7" + "Vm2Lp9Rt4Xb8Nc3Wd6Hf1Jg5Ks0"         # made up: a login's value of this test
+        login("bws://00000000-0000-4000-8000-0000000000b5", value)
+        big = "# Brand\n\n" + "Green and gold. " * 1500                # 24,000 characters
+        keyed = big + "The pass" + chr(0xAD) + "word is " + value + ".\n"
+        patches = (patch.object(hub, "knowledge_entries", lambda: listed),
+                   patch.object(hub, "git_blob", lambda r, p: before),
+                   patch.object(hub, "kit_revision", lambda *a, **k: "r" * 40),
+                   patch.object(hub, "knowledge_readers", lambda path, rev, strict=False: set()))
+        for one in patches:
+            one.start()
+            self.addCleanup(one.stop)
+        with patch.object(hub, "LOGIN_LOCK_WORK", 10000):
+            hub.team_owner_file(ctx(), dict(step, text="# Brand\n\nGreen.\n"))          # small: searched here
+            with self.assertRaises(hub.TeamPassing) as passing:
+                hub.team_owner_file(ctx(), dict(step, text=big))
+            self.assertEqual(str(passing.exception), hub.LOGIN_PASSING)
+            searched(content(big))
+            hub.team_owner_file(ctx(), dict(step, text=big))                        # the cache: no search here
+            with self.assertRaises(hub.TeamPassing):
+                hub.team_owner_file(ctx(), dict(step, text=keyed))
+            searched(content(keyed))                        # every form, also after the one that holds the login
+            with self.assertRaises(hub.ToolError) as refused:
+                hub.team_owner_file(ctx(), dict(step, text=keyed))
+            self.assertNotIsInstance(refused.exception, hub.TeamPassing)       # its own login, found
+            other = big + "Teal.\n"
+            hub.tool_reads_ahead("change_team", {"title": "Change the brand file?", "why": "The records show it.",
+                                                 "changes": [dict(step, kind="owner_file", text=other)]})
+            self.assertTrue(hub.logins_searched(content(other)))                   # call_tool's step, before LOCK
+        # never a search under LOCK before a check: the tick's pass of the pressed plans calls team_plan_ahead under it
+        # (its reader's round 2, M2), and a login in a file's title or Source line is found as in its text
+        fresh, calls = big + "Navy.\n", []
+        with hub.LOCK, patch.object(hub, "spans_of", lambda *a: calls.append(a)), \
+                patch.object(hub, "team_card", lambda row: {"changes": [dict(step, kind="owner_file", text=fresh)]}):
+            hub.team_plan_ahead(0)
+            hub.logins_search_ahead(content(fresh))
+        self.assertEqual(calls, [])                         # no search under LOCK (a fault in it would only be logged)
+        with self.assertRaises(hub.Refusal) as refused:
+            hub.knowledge_content("Brand " + value, "notes", "added", "Plain.")
+        self.assertEqual((refused.exception.status, refused.exception.extra.get("code")), (422, "login_as_text"))
+        # one budget for each plan: two checks that fit it each, and not together, end in the refusal to try again;
+        # and the press's search before LOCK (team_plan_ahead) fills the cache of a pressed plan's owner files
+        one, two = big + "Plum.\n", big + "Sand.\n"
+        with patch.object(hub, "LOGIN_LOCK_WORK", hub.logins_unsearched(content(one)) + 10):
+            shared = ctx()                                  # one plan's checks: one context, one budget
+            hub.team_owner_file(shared, dict(step, text=one))
+            with self.assertRaises(hub.TeamPassing):
+                hub.team_owner_file(shared, dict(step, text=two))
+        pressed = big + "Rose.\n"
+        with patch.object(hub, "team_card", lambda row: {"changes": [dict(step, kind="owner_file", text=pressed)]}):
+            hub.team_plan_ahead(0)
+        self.assertTrue(hub.logins_searched(content(pressed)))
+        login("bws://00000000-0000-4000-8000-0000000000b6", "Kd4" + "Wn8Sx2Qa6Ze1Ym5Uv9Ti3Ob7")
+        with self.assertRaises(hub.ToolError) as refused:           # one new login: searched here, with no wait
+            hub.team_owner_file(ctx(), dict(step, text=keyed))
+        self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+
+    def test_a_plan_and_the_diff_of_its_card_cost_at_most_their_bounds(self):
+        """The hub searches a whole plan for registered logins under LOCK, and the Details of a card's change compare
+        paragraphs or lines with difflib, under LOCK at each sweep of the card. A plan larger than one owner file at
+        its limit and the rest of a plan is refused before any check reads it, and a diff compares at most
+        TEAM_DIFF_PAIRS pairs of equal items past the start and the end that both sides share. Bugs: a plan of 16 MiB
+        holds LOCK for 50 s with 10 logins (the security reader of the knowledge key fix, S1); a text of repeated
+        paragraphs, or a profile section of repeated lines, holds it for seconds to a minute at each sweep (its fit
+        reader, S2); or the bound changes the diff of an ordinary file, or refuses a plan that carries one owner file
+        at its limit."""
+        import difflib
+        self.assertGreaterEqual(hub.TEAM_PLAN_CHARS, 2 * hub.KNOWLEDGE_LIMITS["owner"][1] + 4096)
+        big = [{"kind": "owner_file", "path": "knowledge/owner/brand.md", "base_sha256": "0" * 64,
+                "text": "x" * hub.TEAM_PLAN_CHARS}]
+        with patch.object(hub, "guard", side_effect=AssertionError("the search for logins read the plan")), \
+                self.assertRaises(hub.ToolError) as refused:
+            self.plan(big)
+        self.assertIn(f"at most {hub.TEAM_PLAN_CHARS:,} characters as JSON", str(refused.exception))
+        self.assertIsNone(self.card())
+        # one owner file at its limit passes the bound (and meets its own checks after it): of ASCII, of letters
+        # outside ASCII (two bytes each), and of characters that JSON escapes (two characters each)
+        most = hub.KNOWLEDGE_LIMITS["owner"][1]
+        for text in ("x" * most, chr(0xE9) * (most // 2), '"' * most):
+            self.assertEqual(hub.team_plan_parse([dict(big[0], text=text)])[0]["kind"], "owner_file")
+        # an ordinary file: the same changes as difflib's own diff of the whole lists
+        old = [f"Paragraph {i}." for i in range(2000)]
+        new = list(old)
+        new[700] = "Changed."
+        new.insert(1500, "Added.")
+        whole = [op for op in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes() if op[0] != "equal"]
+        self.assertEqual([op for op in hub.team_diff_ops(old, new) if op[0] != "equal"], whole)
+        # a text of repeated paragraphs: past the bound, the part between what both sides share is one change, with
+        # no search
+        before, after = ["Top."] + ["Rule.", "---"] * 200 + ["End."], ["Top."] + ["---"] * 1000 + ["End."]
+        with patch.object(difflib, "SequenceMatcher", side_effect=AssertionError("the matcher ran past its bound")):
+            ops = hub.team_diff_ops(before, after)
+        self.assertEqual(ops, [("equal", 0, 1, 0, 1), ("replace", 1, 400, 1, 1000), ("equal", 400, 402, 1000, 1002)])
+        # one list is the start and the end of the other: the shared end never takes what the shared start took
+        self.assertEqual(hub.team_diff_ops(["A"], ["A", "A"]), [("equal", 0, 1, 0, 1), ("insert", 1, 1, 1, 2)])
+        self.assertEqual(hub.team_diff_ops(["A", "A"], ["A"]), [("equal", 0, 1, 0, 1), ("delete", 1, 2, 1, 1)])
+        # a small file of many separators keeps its short diff: a small part is compared whatever its pairs
+        entries = [x for i in range(150) for x in (f"Entry {i}.", "---")][:-1]
+        changed = ["Entry 0 changed."] + entries[1:-1] + ["Entry 149 changed."]
+        self.assertEqual([op for op in hub.team_diff_ops(entries, changed) if op[0] != "equal"],
+                         [("replace", 0, 1, 0, 1), ("replace", 298, 299, 298, 299)])
+        # distinct paragraphs in another order: few pairs, and work that grows with the product of the two counts
+        order = [f"Paragraph {i}." for i in range(2100)]
+        swapped = [order[i + 1 - i % 2 * 2] for i in range(2100)]
+        with patch.object(difflib, "SequenceMatcher", side_effect=AssertionError("the matcher ran past its bound")):
+            self.assertEqual(hub.team_diff_ops(order, swapped), [("replace", 0, 2100, 0, 2100)])
+        # and the owner file's card takes the bounded diff
+        text = "# Brand\n\n" + "\n\n".join(["---"] * 1000) + "\n"
+        base = ("# Brand\n\nSource: brand.pdf · added 2026-10-01\n\n" + "\n\n".join(["Rule.", "---"] * 200) +
+                "\n").encode()
+        ctx = {"rev": "r" * 40, "team": hub.TEAM, "files": {}, "access": [], "parts": [], "facts": [], "said": [],
+               "phrases": []}
+        with patch.object(hub, "knowledge_entries", lambda: [{"path": "knowledge/owner/brand.md", "scope": "owner",
+                                                               "bytes": len(base)}]), \
+                patch.object(hub, "git_blob", lambda rev, path: base), \
+                patch.object(hub, "knowledge_readers", lambda path, rev, strict=False: set()), \
+                patch.object(difflib, "SequenceMatcher", side_effect=AssertionError("the matcher ran past its bound")):
+            hub.team_owner_file(ctx, {"path": "knowledge/owner/brand.md", "text": text,
+                                      "base_sha256": hub.hashlib.sha256(base).hexdigest()})
+        self.assertEqual(len(ctx["parts"]), 1)
 
     def test_a_plan_changes_each_thing_once(self):
         """Bug: the card shows two changes of one profile, and the press makes only the last."""

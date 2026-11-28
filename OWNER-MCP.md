@@ -1683,7 +1683,7 @@ People who write to agents, and chat apps.
 | --- | --- | --- |
 | `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). `role_access` true gives a person their role's set again (Founderizer for Teams; a fleet with no Teams answers `teams_off`). |
 | `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. `access` is the role's set of access (Founderizer for Teams), in the shape of `scopes`, which the hub writes into each person of the role who is as the role gave it; `null` takes the set away. A fleet with no Teams answers `teams_off`. |
-| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account, or make a person's Telegram invite; remove one of the owner's handles. |
+| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Make a person's Telegram invite; remove one of the owner's handles. The code that links the owner's own chat account comes only from the Founderizer app on the owner's computer: the tool gets 409 `owner_code_from_tool` for it (UI-API.md 1.400). |
 | `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
 | `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
 | `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
@@ -1711,7 +1711,7 @@ A new fleet, this Mac and the owner's phones.
 | `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). `manager_name` is the owner's own name for the manager, which the tool gives to `hub.sh` (the same section). |
 | `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
 | `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
-| `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
+| `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | Takes one of the owner's phones out. A new phone, a change and a code are the owner's own, in Add device on their computer: the hub refuses this server (since 28 November 2026), and always refuses `device_code`. |
 | `setup_state` / `setup_show` / `setup_diagnosis` | the link to the running app | The program's own reads: where the setup stands in the app on this Mac; the app to the front on one of its pages; why the hub does not answer. |
 | `prepare_problem_report` | the link to the running app | The program's own: the agent's text into the app's problem report form. It sends nothing: only the owner sends it. |
 

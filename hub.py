@@ -2498,6 +2498,37 @@ def owner_force(hand):
     return hand in OWNER_FORCE_HANDS
 
 
+# What links a device or an app to the owner is made only by the owner's own hand (Door's finding of 28 November 2026,
+# rows A2 and A3; its rules 1 and 5): an AI session that the owner tools steer, or a program, never adds or changes an
+# owner device, never gets a device's code or a new phone's code, and never makes a connected app's code. A phone gets
+# 403 on these routes (device_may), so the words name the owner's computer, a Mac or a PC.
+OWNER_DEVICE_HAND = ("An owner device is added, changed or given a code only with Add device in Founderizer on the "
+                     "owner's computer, never by an AI session or a program.")
+CONNECT_CODE_HAND = ("A connected app's code is made only in Founderizer on the owner's computer, never by an AI "
+                     "session or a program.")
+
+
+REFUSED_HANDS = set()           # the (hand, route) pairs that owners_own_hand logged since the start
+
+
+def owners_own_hand(handler, words, route):
+    """Refuses (409, `words`) a request whose hand (`request_hand`) is not the owner's own (`owner_force`: the app, an
+    owner device, a chat of the owner's). The one check of each route that links a device or an app to the owner, so
+    that a statement that only a press in the app signs can join it here later (the finding's rule 1). The hand is the
+    client's own label: this stops an owner tool that says what it is, not a shell on the computer that reads the owner
+    key and sends the app's label, nor a computer-use session that presses Add device and reads its QR (the finding's
+    limits, written there). A refused try is a security event, so it is logged, by the route's own name (`route`), never
+    by the request's path, which a caller writes; once for each hand and route until the hub starts again, so a loop
+    of tries cannot fill the log (as REFUSED_HOSTS does)."""
+    session = (handler.headers.get("X-Fleet-Session") or "").strip() or None
+    hand = request_hand(handler.headers.get("X-Fleet-Client", "").strip(), handler.ui_device, None, None, session)
+    if not owner_force(hand):
+        if (hand, route) not in REFUSED_HANDS:
+            REFUSED_HANDS.add((hand, route))
+            log("owner", f"refused {route}: the hand {hand or 'none'} is not the owner's own")
+        raise Refusal(409, words)
+
+
 def request_via(hand):
     """The mark of a request's header for its hand: ai-session for a tool, program for any other label that is no app
     of the owner's and for the release job ("job"), None for the owner's own hand (whose device or app the caller marks
@@ -5890,11 +5921,11 @@ def older_triggers():
     # AUTOINCREMENT), and a steer of the old event is then in its block's answer again, with the new event's read time.
     made["task_block_event_insert"] = f"AFTER INSERT ON events WHEN EXISTS (SELECT 1 FROM steers s WHERE s.event_id = " \
                                       f"NEW.id) BEGIN {steers_count('s.event_id = NEW.id')} END"
-    # The registered logins. A new login masks older text, and a login that leaves shows it again, in any block:
-    # every block counts, and each reader reads every block again. So three kinds of write that change no mask of
-    # older text do not count: a row beside one of the same salt, hash and length (the owner's save of a value that
-    # is there already adds its new row and then removes the old one, register_fingerprints); the key of the practice
-    # page, which each open of GET /site/key makes new (practice_key); and a token that a provider gave the hub at
+    # The registered logins. A new login masks older text, and a login that leaves shows it again, in any block: every
+    # block counts, and each reader reads every block again. So three kinds of write that change no mask of older text
+    # do not count: a row beside one of the same salt, hash and length (the owner's save of a value that is there
+    # already adds its new row and then removes the old one, register_fingerprints); the key of the practice page, which
+    # GET /site/key makes new at most once in its window (practice_key); and a token that a provider gave the hub at
     # that moment (mcp_fingerprints, and a Google account's), which no older text can hold. When such a key or token
     # leaves, an answer that a reader kept still masks it, and that is no harm. The labels are the hub's own: a login
     # that POST /secrets registers under one of them (the route takes the label from the owner's computer; only
@@ -9542,8 +9573,8 @@ class SpanCache:
         """(the rows of logins that a text searched for `searched` was not searched for, as (digest, row) pairs, and
         what it counts as searched for after them), once for each pair of sets. After a search that is `logins`, and
         not `searched` with them: a login that the list dropped leaves the set, so a set holds one list of logins and
-        no more, however often a login changes (GET /site/key makes a new one at each read). A login that comes back
-        is searched for again."""
+        no more, however often a login changes (GET /site/key makes a new one at most once in ten minutes). A login
+        that comes back is searched for again."""
         pair = (searched, logins)
         got = self.joins.get(pair)
         if got is None:
@@ -9794,6 +9825,90 @@ def hit_forms(text):
         if bare is not plain:
             forms.append(bare)
     return forms
+
+
+# The search for logins before LOCK (the coordinator's pick (b) of 28 November 2026, after the knowledge key fix): a
+# team plan and an owner file's text can be 2 MiB, and the search costs about 0.3 s for each MiB and each login under
+# LOCK (one crafted run of 2 MiB with 155 logins: 107 s; with a backslash and a zero-width space: 443 s). The search
+# runs before LOCK and fills its cache for each login (SpanCache), and the check under LOCK reads that cache: it is
+# whole, because a pass counts only for the same text and the same logins, and a login saved in between is searched
+# again. A search that the cache lacks is never done under LOCK past LOGIN_LOCK_WORK: the check then refuses with words
+# to try again (TeamPassing, or LOGIN_PASSING to the manager), writes nothing, and starts that search outside LOCK
+# (logins_warm_later). One search for all the logins in place of one for each is not cheap: each login's hash has a
+# salt of its own (fingerprint_salt), so each window is hashed once for each login.
+# The most search work that a check under LOCK does for logins that the cache lacks, in characters of a form times
+# logins: one new login over the four forms of the largest plan (TEAM_PLAN_CHARS each, about 2.4 s to 3 s), as the
+# coordinator's condition asks (a login saved in between is searched again under LOCK); past it, the check refuses with
+# words to try again. Decided by the missing logins' work and not by the text's length, so one new login does not make
+# every large text wait (the security reader of piece (b), S1). Four times TEAM_PLAN_CHARS (2 MiB + 64 KiB), written
+# here as its number, which test_team_changes holds to it (the validator's round 6, S1: 8 MiB was less than one login
+# over four forms of the largest plan).
+LOGIN_LOCK_WORK = 4 * (2 * 1024 * 1024 + 64 * 1024)
+LOGIN_PASSING = "The hub is still searching this text for registered logins. Try again in a minute."
+LOGIN_PASSING_OWNER = "the hub is still checking the new text for logins"
+LOGINS_WARMING = set()                  # the digests of the texts whose search runs in a thread now
+LOGINS_WARMING_LOCK = threading.Lock()
+
+
+def logins_unsearched(*texts):
+    """The search work that secret_hit of these texts would do now, in characters of a form times the logins that the
+    search's cache does not hold for that form (SpanCache.missing): 0 when it costs no search, and 0 with no
+    registered login."""
+    key = secret_key()
+    return sum(len(form) * len(_secret_spans.missing(form, key)) for text in texts
+               for form in hit_forms(str(text or ""))) if key else 0
+
+
+def logins_searched(*texts):
+    """True when secret_hit of these texts costs no search now (logins_unsearched)."""
+    return not logins_unsearched(*texts)
+
+
+def logins_search_ahead(*texts):
+    """Fill the search's cache with every form of these texts, outside LOCK, for every login: the answers are dropped,
+    and the check under LOCK reads them from the cache. Each form is searched, also after one that holds a login:
+    secret_hit stops at the first, and the forms after it would stay unsearched, so a text with a login would wait
+    for ever (the security reader of piece (b), M1). A fault stops nothing: the check under LOCK searches then. It
+    searches nothing when this thread holds LOCK: the tick's pass of the pressed plans calls team_plan_ahead under it
+    (team_plans_retry), and there the check's own bound decides (logins_or_passing; its reader's round 2, M2)."""
+    key = secret_key()
+    if not key or LOCK._is_owned():
+        return
+    try:
+        for text in texts:
+            for form in hit_forms(str(text or "")):
+                spans_of(form, key)
+    except Exception:
+        print_fault()
+
+
+def logins_warm_later(*texts):
+    """Start the search of these texts in a thread of its own, once for the same texts at a time."""
+    digest = hashlib.sha256("\0".join(str(t or "") for t in texts).encode("utf-8", "surrogatepass")).hexdigest()
+    with LOGINS_WARMING_LOCK:
+        if digest in LOGINS_WARMING:
+            return
+        LOGINS_WARMING.add(digest)
+
+    def run():
+        try:
+            logins_search_ahead(*texts)
+        finally:
+            with LOGINS_WARMING_LOCK:
+                LOGINS_WARMING.discard(digest)
+    threading.Thread(target=run, name="logins-ahead", daemon=True).start()
+
+
+def logins_or_passing(*texts, spent=None):
+    """Under LOCK, before a check that searches these texts: a TeamPassing when the search that the cache lacks is
+    more than LOGIN_LOCK_WORK, after it started that search outside LOCK; else nothing, and the check searches what is
+    small, cached, or a few new logins. spent: a dict that one plan's checks share, so their sum counts."""
+    work = logins_unsearched(*texts)
+    if spent is not None:               # one budget for all the checks of one plan (its fit reader's S2)
+        spent["login_work"] = work = spent.get("login_work", 0) + work
+    if work > LOGIN_LOCK_WORK:
+        logins_warm_later(*texts)
+        raise TeamPassing(LOGIN_PASSING, LOGIN_PASSING_OWNER)
 
 
 # A file's bytes that are not UTF-8 hold logins too. The delivery of a task's files searched only a file that decoded
@@ -53499,6 +53614,14 @@ TEAM_PLAN_FIELDS = {"add": {"server", "names", "title", "runtime", "role", "repo
                     "settings": {"agent", "title", "expertise"}, "lines": {"lines"},
                     "owner_file": {"path", "base_sha256", "text"}}
 TEAM_PLAN_CHANGES = 12          # changes in one plan: one card is one decision of the owner's
+# The most characters of a plan's changes as JSON with no ASCII escapes (ensure_ascii=False), the same text that
+# t_change_team's guard searches for registered logins under LOCK, about 0.3 s for each million characters and each
+# login: nothing bounded it before the owner file's own size check, and 16 MiB held LOCK for about 50 s with 10 logins
+# (the security reader of the knowledge key fix, S1 of 28 November 2026). One owner file at its limit (KNOWLEDGE_LIMITS,
+# 1 MiB) is at most 1,048,576 characters, twice that as JSON when every one of them is escaped (a quote, a backslash,
+# a line end), and the rest of a plan is small. Counted in characters, a file of letters outside ASCII is no longer
+# than a file of ASCII (its readers' round 2: the escaped form was three times as long for the search).
+TEAM_PLAN_CHARS = 2 * 1024 * 1024 + 64 * 1024
 TEAM_PLAN_NAMES = 3             # names that the card of a new agent offers, one yes option each
 TEAM_PLAN_DETAILS_CHARS = 12000     # the hub's Details of a team card: one whole profile is about 5,000 characters
 TEAM_PLAN_WORDS_CHARS = 1500    # the manager's own words, under the hub's Details
@@ -53587,6 +53710,10 @@ def team_plan_parse(given):
     if not isinstance(given, list) or not 1 <= len(given) <= TEAM_PLAN_CHANGES:
         raise ToolError(f"changes is a list of 1 to {TEAM_PLAN_CHANGES} changes, each with its kind: "
                         f"{', '.join(TEAM_PLAN_KINDS)}.")
+    # the size first, before any check reads the plan: the search for logins reads it whole under LOCK
+    if len(json.dumps(given, ensure_ascii=False)) > TEAM_PLAN_CHARS:
+        raise ToolError(f"The changes of one plan are at most {TEAM_PLAN_CHARS:,} characters as JSON: one owner file "
+                        f"at its largest, and the rest of the plan. Make a larger change in more than one plan.")
     out = []
     for c in given:
         kind = c.get("kind") if isinstance(c, dict) else None
@@ -53826,9 +53953,13 @@ def team_plan_ahead(nid):
     """Before the lock of an owner's press of a team card (phone_submit) and of a pass of team_plans_pressed:
     github_repo_ahead for each repository of the plan's access, so that its second check (team_repo_refusal) reads a
     list of the last minute where only the list decides (the coordinator's validator, P2: else each press after a quiet
-    minute waits again, and nothing lists the repositories). Never under LOCK."""
+    minute waits again, and nothing lists the repositories); and the search for logins of each owner file's content
+    (piece (b)). The press and a pass after it call it before LOCK; the tick's pass (team_plans_retry) calls it under
+    LOCK, where both steps skip their waits and their search."""
     plan = team_card(read_row("SELECT team_plan FROM needs WHERE id=?", (nid,)))
     github_repos_ahead(call_repos("change_team", {"changes": (plan or {}).get("changes") or []}))
+    if not LOCK._is_owned():        # the tick's pass under LOCK: the check's bound decides there (piece (b))
+        logins_search_ahead(*owner_file_contents_ahead((plan or {}).get("changes")))
 
 
 def team_tool_keyed(name, team=None):
@@ -54398,12 +54529,55 @@ def team_settings(ctx, c):
 
 
 # The pairs (SHA-256 of an owner file's bytes before, SHA-256 of the new text as the hub saves it) whose key check
-# passed in a change of a team plan (team_owner_file). The card's sweep, the press and each pass of the steps check
-# the same change again, under LOCK, and the check is a function of the pair alone (the coordinator's validator, S1 of
-# 28 November 2026: up to 0.85 s for each change, each minute while a card is open). A pair that failed is not kept.
-# The oldest pair goes first.
+# passed in a change of a team plan (team_owner_file). The card's sweep (under LOCK), the press and each pass of the
+# steps (under kit_lock) check the same change again, and the check is a function of the pair alone (the coordinator's
+# validator, S1 of 28 November 2026: up to 0.85 s for each change, each minute while a card is open). A pair is kept
+# only after its check passed, and a pair that failed is not kept. The oldest pair goes first.
 TEAM_KEY_PASSED = collections.OrderedDict()
 TEAM_KEY_PASSED_MOST = 64
+
+# The most pairs of equal items that the diff of a team card's change compares (team_diff_ops). difflib's matcher
+# costs about that count of pairs, and more, and the card's sweep runs it under LOCK each minute: 20,000 pairs take at
+# most about 0.1 s on a Mac. Measured on 28 November 2026: 100,000 pairs of one repeated paragraph took 0.2 s to
+# 0.4 s, a 1 MiB text of them about a minute, and 16,000 lines of two alternating words, half of a profile's 32 KiB,
+# 1.9 s; distinct paragraphs, as files have them, give few pairs (2,000 of them: 0.001 s). A part of at most
+# TEAM_DIFF_SMALL cells (its items before times its items after) is compared whatever its pairs: the worst shape of
+# that size took 0.14 s, and a small file of many separators keeps its short diff (its security reader's round 2: 150
+# entries with "---" between them, the first and the last changed, showed 896 paragraphs in place of 4).
+TEAM_DIFF_PAIRS = 20000
+TEAM_DIFF_SMALL = 100000
+# And the most cells of the part that the matcher compares (its items before times its items after): distinct items in
+# another order give few pairs and still work that grows with that product (its fit reader's round 2: 20,000 distinct
+# paragraphs swapped two by two took 13.5 s). 4,000,000 cells of that shape took 0.12 s on a Mac.
+TEAM_DIFF_CELLS = 4000000
+
+
+def team_diff_ops(old, new):
+    """difflib's opcodes of two lists (the paragraphs or the lines of a team card's change), at a bounded cost. The
+    items that both lists share at their start and at their end are equal with no search, and the matcher compares only
+    the rest, while the pairs of equal items in it (an item of the one list and an equal item of the other) are at most
+    TEAM_DIFF_PAIRS and its cells (its items before times its items after) at most TEAM_DIFF_CELLS, or its cells at most
+    TEAM_DIFF_SMALL. Past that, the rest is one change, whole before and whole after (the fit reader of the knowledge
+    key fix, S2 of 28 November 2026: a text of repeated paragraphs held LOCK for a minute)."""
+    import difflib
+    head = 0
+    while head < len(old) and head < len(new) and old[head] == new[head]:
+        head += 1
+    tail = 0
+    while tail < len(old) - head and tail < len(new) - head and old[-1 - tail] == new[-1 - tail]:
+        tail += 1
+    a, b = old[head:len(old) - tail], new[head:len(new) - tail]
+    ops = [("equal", 0, head, 0, head)] if head else []
+    counts = collections.Counter(b)
+    cells = len(a) * len(b)
+    if cells <= TEAM_DIFF_SMALL or cells <= TEAM_DIFF_CELLS and sum(counts[x] for x in a) <= TEAM_DIFF_PAIRS:
+        ops += [(op, i1 + head, i2 + head, j1 + head, j2 + head)
+                for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()]
+    else:
+        ops.append(("replace", head, head + len(a), head, head + len(b)))
+    if tail:
+        ops.append(("equal", len(old) - tail, len(old), len(new) - tail, len(new)))
+    return ops
 
 
 def team_owner_file(ctx, c):
@@ -54455,7 +54629,12 @@ def team_owner_file(ctx, c):
         while len(TEAM_KEY_PASSED) > TEAM_KEY_PASSED_MOST:
             TEAM_KEY_PASSED.popitem(last=False)
     try:
-        content = knowledge_replaced(path, before, text)
+        # the content with no search, then its search as one string, which team_plan_search_ahead and team_plan_ahead
+        # made before LOCK: never a large one here (piece (b)), and one budget for the whole plan (ctx)
+        content = knowledge_replaced(path, before, text, search=False)
+        logins_or_passing(content.decode(), spent=ctx)
+        if secret_hit(content.decode()):
+            raise Refusal(422, code="login_as_text")
     except Refusal as e:
         if getattr(e, "extra", {}).get("code") == "knowledge_unread":
             raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER) from None
@@ -54467,11 +54646,10 @@ def team_owner_file(ctx, c):
         raise team_unread() from None
     ctx["access"].append(f"The owner file {path} steers every agent that reads it: "
                          f"{', '.join(team_said_role(team, r) for r in readers) or 'none'}.")
-    import difflib
     old = [p for p in before.decode("utf-8", "replace").split("\n\n", 2)[2].strip().split("\n\n") if p.strip()]
     new = [p for p in content.decode("utf-8", "replace").split("\n\n", 2)[2].strip().split("\n\n") if p.strip()]
     out = []
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+    for op, i1, i2, j1, j2 in team_diff_ops(old, new):          # bounded: it runs under LOCK at the sweep
         if op != "equal":
             out.append("Before:\n\n" + (team_quote("\n\n".join(old[i1:i2])) if i2 > i1 else "> (none)") +
                        "\n\nAfter:\n\n" + (team_quote("\n\n".join(new[j1:j2])) if j2 > j1 else "> (removed)"))
@@ -55220,6 +55398,35 @@ def team_plan_busy():
                          if stuck.get("tries") else ""))
 
 
+def owner_file_contents_ahead(changes):
+    """The content of each owner-file change of a plan as team_owner_file builds it (knowledge_replaced, with no
+    search), for the search before LOCK; a change that cannot be built now is left out, and its check under LOCK
+    refuses it in its own words."""
+    out, rev = [], kit_revision()
+    for c in changes if isinstance(changes, list) else ():
+        if isinstance(c, dict) and c.get("kind") == "owner_file" and isinstance(c.get("text"), str) and rev:
+            try:
+                before = git_blob(rev, c.get("path"))
+                if before is not None:
+                    out.append(knowledge_replaced(c["path"], before, c["text"], search=False).decode())
+            except Exception:       # noqa: BLE001 -- a refusal comes under LOCK, in the check's own words
+                pass
+    return out
+
+
+def team_plan_search_ahead(a):
+    """call_tool, before the LOCK of change_team: the search for logins of the texts that its guard and its owner
+    files' content search under LOCK (logins_search_ahead), so that those checks read the cache. A plan that its parse
+    refuses is searched for nothing: the parse refuses it again under LOCK."""
+    try:
+        changes = team_plan_parse(a.get("changes"))
+    except Exception:       # noqa: BLE001 -- the call under LOCK gives the refusal
+        return
+    title, why, words = (str(a.get(k) or "").strip() for k in ("title", "why", "words"))
+    logins_search_ahead(title, why, words, json.dumps(changes, ensure_ascii=False),
+                        *owner_file_contents_ahead(changes))
+
+
 def t_change_team(agent, a):
     """change_team (the fleet manager): one plan of team changes, which only the owner's press of its card makes
     (owner API 1.214). Its checks run now, so that a plan that cannot work never reaches the owner; the card is the
@@ -55244,7 +55451,12 @@ def t_change_team(agent, a):
     if card_route(title, why, "", words, []):
         raise ToolError(CARD_ROUTE_REFUSAL)
     changes = team_plan_parse(a.get("changes"))
-    guard(agent, title, why, words, json.dumps(changes))
+    plan = json.dumps(changes, ensure_ascii=False)        # the form that TEAM_PLAN_CHARS bounds
+    try:                    # searched before LOCK (team_plan_search_ahead); a large text not in the cache is not here
+        logins_or_passing(title, why, words, plan)
+    except TeamPassing as e:
+        raise ToolError(str(e)) from None
+    guard(agent, title, why, words, plan)
     # F15: a plan that may be an order takes the owner's own newest message M-<n> as ask also when no work is filed
     # under it (the owner said "take that line out", and a card is the owner's way to decide it)
     order = all(c["kind"] == "profile" and c.get("agent") != agent for c in changes)
@@ -55395,7 +55607,8 @@ def team_plan_end(nid, state, reason=None):
 
 def team_plans_pressed():
     """Each pressed team plan whose steps are not all done: after the owner's answer, outside its transaction and its
-    LOCK, once a minute from tick (team_plans_retry), and at the hub's start for one that a stop cut. A plan's commit
+    LOCK; once a minute from tick (team_plans_retry), under the tick's LOCK; and at the hub's start for one that a stop
+    cut. A plan's commit
     is a write of the hub's own files, so a pass runs in their turn (kit_lock): from outside LOCK it waits for an
     owner's write that runs its git now. A pass that fails counts in the plan's mark, which keeps its last fault, and
     the manager hears it at the first failed pass and again at the TEAM_PLAN_TRIES-th. A plan that git says has no
@@ -63006,7 +63219,9 @@ def tool_reads_ahead(name, args):
     """call_tool, before the LOCK of a tool: the configuration ref's files that its function reads under LOCK
     (kit_reads_ahead). see_capacity reads every profile, and so does create_task, for the start text of the task's
     owner, which names what each agent that it can write to looks after (team_start_text)."""
-    if name == "see_capacity":
+    if name == "change_team":
+        team_plan_search_ahead(args)
+    elif name == "see_capacity":
         kit_reads_ahead(profile_paths())
     elif name == "create_task" and isinstance(args.get("owner"), str) and args["owner"] in agents():
         kit_reads_ahead(profile_paths(), starts=args["owner"])
@@ -68542,16 +68757,33 @@ PRACTICE_HOLD = 50              # the most seconds that the practice send keeps 
 SITE_KEY = "pilot-site-key"     # the label of the one record of the key that the page /site/key showed last
 
 
+# The seconds for which the page /site/key shows one key. Each new key is a new registered login, and the hub then
+# searches its texts again for it, the large ones too, some of them under LOCK; the route has no caller check
+# (it is the practice site's page), so a program that opened it each minute changed the set of logins each minute (the
+# security reader of the search before LOCK, 28 November 2026). The key of the window is in the hub's memory only.
+PRACTICE_KEY_EVERY = 600
+PRACTICE_KEY_SHOWN = {"key": None, "at": 0.0}
+
+
 def practice_key():
-    """A new key for the page /site/key: 32 URL-safe characters. The hub keeps only the fingerprint of the key that
-    the page showed last, as one record with a salt of its own. That salt is never the salt of a login, so the
-    fingerprint that a vault registers for a saved copy of the key stays a row of its own. The key itself is only in
-    the page."""
-    key, salt = secrets.token_urlsafe(24), secrets.token_hex(16)
-    with LOCK:
+    """The key for the page /site/key: 32 URL-safe characters, new at most once in PRACTICE_KEY_EVERY seconds. The hub
+    keeps only the fingerprint of the key that the page shows, as one record with a salt of its own. That salt is never
+    the salt of a login, so the fingerprint that a vault registers for a saved copy of the key stays a row of its own.
+    The key itself is in the page, and in the hub's memory for its window (PRACTICE_KEY_SHOWN); a window whose record is
+    gone (a restore, a removal) ends with it. Within a window every opener of the page sees the same key (the route has
+    no caller check), where before each open got its own: it is the practice site's own key and a registered login, so
+    the hub's checks refuse a text that carries it as before."""
+    with LOCK:                      # the time inside LOCK: an open that waited for it starts no second key
+        t0 = now()
+        shown = PRACTICE_KEY_SHOWN
+        if shown["key"] and 0 <= t0 - shown["at"] < PRACTICE_KEY_EVERY and \
+                q1("SELECT 1 FROM secrets WHERE label=?", (SITE_KEY,)):
+            return shown["key"]
+        key, salt = secrets.token_urlsafe(24), secrets.token_hex(16)
         q("DELETE FROM secrets WHERE label=?", (SITE_KEY,))
         ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')",
             (SITE_KEY, salt, hashlib.sha256((salt + key).encode()).hexdigest(), len(key)))
+        shown.update(key=key, at=t0)
     return key
 
 
@@ -69618,7 +69850,7 @@ def knowledge_saved_text(text):
     return LINE_CONTROL.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def knowledge_content(title, source, how, text, heading=None):
+def knowledge_content(title, source, how, text, heading=None, search=True):
     """The one form of an owner knowledge file: its title, the line "Source: <source> · <how> <date>" and the text.
     heading: the title and Source lines of a file that keeps its own (knowledge_replace). Refused when it is larger
     than an owner file can be, or when it holds a registered login."""
@@ -69629,7 +69861,9 @@ def knowledge_content(title, source, how, text, heading=None):
     content = f"{heading}\n\n{text}\n".encode()
     if len(content) > KNOWLEDGE_LIMITS["owner"][1]:
         raise Refusal(413, f"the file is larger than {KNOWLEDGE_LIMITS['owner'][1] // MIB} MiB of Markdown")
-    if secret_hit(content.decode()):
+    # search=False: the caller searches the content itself, before LOCK and then under it (team_owner_file), as the
+    # same whole string that GET /ui/knowledge searches, so that each read finds it in the search's cache
+    if search and secret_hit(content.decode()):
         raise Refusal(422, code="login_as_text")
     return content
 
@@ -69920,7 +70154,7 @@ def knowledge_delete(path):
     return {"path": path, "deleted": True, "commit": commit}
 
 
-def knowledge_replaced(path, before, text):
+def knowledge_replaced(path, before, text, search=True):
     """The new bytes of an owner knowledge file with this text, under its own title and its Source line ("changed" and
     today's date), with no write: knowledge_replace commits them, and a team plan of the manager's checks them first
     (owner API 1.214). Refused when the file has no title and Source lines to keep, when the text is the one it has,
@@ -69930,7 +70164,8 @@ def knowledge_replaced(path, before, text):
         raise Refusal(409, f"{path} has no title and Source lines to keep. Delete it, then add it again.")
     dated = re.fullmatch(r"Source: (.*) · [a-z]+ \d{4}-\d{2}-\d{2}", parts[1])
     source = dated.group(1) if dated else parts[1][len("Source: "):]
-    content = knowledge_content(None, source, "changed", text, heading=parts[0] + "\n\nSource: " + source + " · changed "
+    content = knowledge_content(None, source, "changed", text, search=search,
+                                heading=parts[0] + "\n\nSource: " + source + " · changed "
                                 + time.strftime("%Y-%m-%d", time.gmtime()))
     if content.split(b"\n\n", 2)[2] == before.split(b"\n\n", 2)[2]:
         raise Refusal(409, f"{path} has this text already.")
@@ -91797,6 +92032,7 @@ class Handler(BaseHTTPRequestHandler):
             self.only(data, ("level",))
             if data.get("level") not in oauth_server.LEVELS:
                 raise ValueError("level must be read or act")
+            owners_own_hand(self, CONNECT_CODE_HAND, "POST /ui/connect/code")     # before the feature turns on
             return {"level": data["level"]}
         return self.ui_command("connect/code", read, lambda body: capp_new_code(body["level"]), keep=hide_device_code)
 
@@ -91834,7 +92070,8 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("delete") not in (None, True):
                 raise ValueError("delete must be true or absent")
             if data.get("delete"):
-                return {"base_sha256": base, "device": device, "delete": True}
+                return {"base_sha256": base, "device": device, "delete": True}     # a removal links nothing
+            owners_own_hand(self, OWNER_DEVICE_HAND, "POST /ui/owner/devices")
             label, address = data.get("label"), data.get("address")
             if not isinstance(label, str) or not 1 <= len(label.strip()) <= 40 or "\n" in label:
                 raise ValueError("label must be 1 to 40 characters on one line")
@@ -91848,6 +92085,7 @@ class Handler(BaseHTTPRequestHandler):
         does not hold yet. The hub keeps no code, so a repeat gives code null."""
         def read(data):
             self.only(data, ())
+            owners_own_hand(self, OWNER_DEVICE_HAND, "POST /ui/owner/devices/code")
             return {}
         return self.ui_command("owner/devices/code", read, lambda body: new_phone_code(), keep=hide_device_code)
 
@@ -91857,6 +92095,7 @@ class Handler(BaseHTTPRequestHandler):
             self.only(data, ())
             if not ENTRY_ID.fullmatch(device):
                 raise ValueError("device must be a name of 2 to 31 characters: a-z, 0-9 and -")
+            owners_own_hand(self, OWNER_DEVICE_HAND, "POST /ui/owner/devices/<device>/code")
             return {"device": device}
         return self.ui_command(f"owner/devices/{device}/code", read, lambda body: new_device_code(device),
                                keep=hide_device_code)
@@ -95644,6 +95883,15 @@ class Handler(BaseHTTPRequestHandler):
                 rev = kit_revision(fresh=True)
                 before = git_blob(rev, owner_path(data["path"])) if rev else None
                 check([knowledge_saved_text(data["text"])], (before or b"").decode("utf-8", "replace"))
+                # the search for logins of knowledge_content, before LOCK (the coordinator's validator, R3-S1: a file
+                # with an embedded picture held LOCK 33 s with 155 logins); the check under LOCK reads the cache
+                try:
+                    content = knowledge_replaced(owner_path(data["path"]), before, data["text"], search=False) \
+                        if before is not None else None
+                except Refusal:         # the same refusal comes under LOCK, in its turn
+                    content = None
+                if content is not None:
+                    logins_search_ahead(content.decode())
                 return {"path": owner_path(data["path"]), "replace": True,
                         "sha256": hashlib.sha256(data["text"].encode()).hexdigest()}
             if "url" in data:
@@ -96510,7 +96758,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_people_code(self):
         """POST /ui/people/codes: a one-time owner code, or a person's invite on Telegram (CHAT-APPS.md 19.4). The hub
-        keeps no code; a repeat gives code null."""
+        keeps no code; a repeat gives code null.
+
+        Whoever sends an owner code first becomes an owner handle, with the owner's own chat. So only the owner's own
+        hand makes one (owner_force): of the hands that reach this route, that is the Founderizer app on the owner's
+        computer (Mac or PC), as no enrolled device (device_may) and no chat message reaches it. An AI session (a
+        session's header, or the owner tools' person_code), a program and no hand get 409 owner_code_from_tool, with a
+        REFUSED row of the hub's in the log (counted, as refuse_counted counts), and no code is made or kept (the Door's finding of 27 November 2026: a session that a page's
+        words steer could give the owner's chat to a stranger). An invite of a person stays as it is, for each hand.
+
+        The hole that stays open: the hand is the client's own label (SECURITY.md), so this stops an AI session that
+        goes through the owner tools and an honest program. A program that sends the app's label with no session
+        header gets the code, and so does a session with computer use that reads it on the app's screen."""
+        session = (self.headers.get("X-Fleet-Session") or "").strip() or None      # ui_command checks its form
+        hand = request_hand(self.headers.get("X-Fleet-Client", "").strip(), owner_device_at(self.client_address[0]),
+                            None, None, session)
+
         def read(data):
             if data.get("purpose") == "invite":
                 return telegram_invite_read(self, data)
@@ -96519,6 +96782,21 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("purpose must be owner or invite")
             if data.get("app") not in CHAT_APP_NAMES:
                 raise ValueError("app must be discord, telegram or whatsapp")
+            if not owner_force(hand):
+                # a REFUSED row of the hub's, which the board's count of refusals takes, counted as refuse_counted
+                # counts: the first try of an address, then each tenth up to the hundredth, then each hundredth, so
+                # that a tool that tries again and again does not fill the log
+                where = self.client_address[0]
+                with REFUSED_LOCK:
+                    count = OWNER_REFUSALS[("owner_code_from_tool", where)] = \
+                        OWNER_REFUSALS.get(("owner_code_from_tool", where), 0) + 1
+                if count == 1:
+                    log("hub", f"REFUSED an owner link code for {data['app']} from {where}, a hand that is not the "
+                               f"owner's ({request_via(hand) or hand or 'none'}): owner_code_from_tool")
+                elif count % 100 == 0 or (count < 100 and count % 10 == 0):
+                    log("hub", f"REFUSED {count} owner link codes from {where} since this hub started: "
+                               f"owner_code_from_tool")
+                raise Refusal(409, code="owner_code_from_tool")
             return {"purpose": "owner", "app": data["app"]}
 
         def act(body):

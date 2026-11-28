@@ -777,7 +777,31 @@ class ChatApps(OwnerAPI):
 
     # ---- link codes and handles
     def test_link_codes_bind_the_owner_once_and_refuse_wrong_expired_and_repeated_codes(self):
-        code, data = self.post("/ui/people/codes", purpose="owner", app="whatsapp")
+        """The owner's code links their own chat account once; wrong, expired and repeated codes are refused; and only
+        the owner's own hand makes one (UI-API.md 1.400). Bug: an AI session that a page's words steer (the owner
+        tools' person_code) or any program makes an owner code, and the stranger who sends it gets the owner's chat."""
+        # an AI session (also one that sends the app's own label beside its session), an owner tool and a program;
+        # and a session that tries again and again leaves a counted row, not one for each try
+        tries = (("founderizer-mcp/1/test", "claude-code/0d8aa41c"), ("founderizer-cli/1/test", None),
+                 ("founderizer-swift/1/test", "claude-code/0d8aa41c"), ("curl/8.7.1", None)) + \
+            (("founderizer-mcp/1/test", "claude-code/0d8aa41c"),) * 6
+        counts = patch.dict(hub.OWNER_REFUSALS, clear=True)
+        counts.start()
+        self.addCleanup(counts.stop)
+        for client, session in tries:
+            headers = {"Content-Type": "application/json", "X-Fleet-Client": client,
+                       **({"X-Fleet-Session": session} if session else {})}
+            code, data = self.request("/ui/people/codes", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                               purpose="owner", app="whatsapp"), headers)
+            self.assertEqual((code, data.get("code")), (409, "owner_code_from_tool"), (client, session, data))
+            self.assertEqual(data["error"], hub.refusal_words.WORDS["owner_code_from_tool"])
+        self.assertEqual(self.count("link_codes"), 0)                  # no code, and no command kept
+        self.assertEqual(hub.q("SELECT route FROM ui_controls WHERE route='people/codes'"), [])
+        self.assertEqual([(r["agent"], r["what"].split(",")[0].split(" since")[0]) for r in hub.q(
+            "SELECT agent, what FROM log WHERE what LIKE 'REFUSED%owner link code%' ORDER BY id")],
+            [("hub", "REFUSED an owner link code for whatsapp from 127.0.0.1"),
+             ("hub", "REFUSED 10 owner link codes from 127.0.0.1")])
+        code, data = self.post("/ui/people/codes", purpose="owner", app="whatsapp")     # the app's own hand
         self.assertEqual(code, 200, data)
         self.assertRegex(data["code"], r"^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
         self.assertAlmostEqual(data["expires"], hub.now() + 600, delta=5)

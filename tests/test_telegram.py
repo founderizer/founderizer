@@ -805,7 +805,12 @@ class RealHub(test_ui_api.OwnerAPI):
         code, data = self.owner_post("/ui/people", name="Ana Ruiz", role="customer", agents=["sales"])
         self.assertEqual(code, 200, data)
         pid = data["person"]["id"]
-        code, invite = self.owner_post("/ui/people/codes", purpose="invite", app="telegram", person=pid, agent="sales")
+        # a person's invite is no owner code: an AI session makes it through the owner tools too (UI-API.md 1.400)
+        tool = {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-mcp/1/test",
+                "X-Fleet-Session": "claude-code/0d8aa41c"}
+        code, invite = self.request("/ui/people/codes", dict(request_id=str(uuid.uuid4()), db="test-generation",
+                                                             purpose="invite", app="telegram", person=pid,
+                                                             agent="sales"), tool, source=OWNER_IP)
         self.assertEqual(code, 200, invite)
         self.assertEqual(invite["targets"][0]["url"], f"https://t.me/{BOT_NAME}?start={invite['code']}")
         # the owner who opens the link himself is not bound to Ana

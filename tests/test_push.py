@@ -5,6 +5,7 @@ No real device, key, network or AI call."""
 import base64
 import hashlib
 import json
+import os
 import threading
 import unittest
 import uuid
@@ -12,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import hub
+import leftovers
 import push
 from test_mobile import MAC, OTHER, PHONE, Devices
 
@@ -19,6 +21,20 @@ TOKEN = "ab" * 32                                   # a device token as Apple gi
 KEY = bytes(range(32))                              # the phone's own seal key
 SEAL = base64.b64encode(KEY).decode()
 ENTITLEMENT = "eyJmbGVldCI6IjBmMWUyZDNjNGI1YTY5NzgifQ.c2lnbmVk"
+# B9 10.7: a member's phone gives its push token sealed, v1.<key id>.<448 of b64u>. The hub never opens it, so a
+# value of that form is all that the route needs here; the phone's own values are in
+# app/vectors/member-token-vectors.json
+SEALED = "v1.test0key." + base64.urlsafe_b64encode(bytes(range(256)) + bytes(80)).decode()
+
+
+def member_tokens():
+    """The phone's values of app/vectors/member-token-vectors.json, or None in a published clone, which has no app
+    folder (the file is found through leftovers.ROOT, never through this file's own place)."""
+    path = os.path.join(leftovers.ROOT, "app", "vectors", "member-token-vectors.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="ascii") as f:
+        return json.load(f)
 
 
 def load_tests(loader, _tests, _pattern):
@@ -1118,7 +1134,7 @@ class MemberRoute(PushCase):
     PAYLOAD = {"aps": {"alert": {"loc-key": "shared-reply"}, "mutable-content": 1}, "sealed": "AAAA"}
 
     def member(self, **extra):
-        return push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD, "production", **extra)
+        return push.send_member(hub.CFG["release_channel"], ENTITLEMENT, SEALED, self.PAYLOAD, **extra)
 
     def refusal(self, call):
         with self.assertRaises(push.PushError) as refused:
@@ -1174,8 +1190,6 @@ class MemberRoute(PushCase):
             (dict(status=403, reason="ExpiredProviderToken", environment="production"), (held, D, False, False)),
             (dict(status=403, reason="BadCertificateEnvironment", environment="development"),
              (refused, None, False, False)),
-            (dict(status=403, reason="BadCertificateEnvironment", environment="development", member=True),
-             (refused, None, False, True)),
             (dict(status=410, reason="Unregistered", environment="development"), (refused, None, False, True)),
             (dict(status=429, reason="TooManyProviderTokenUpdates"), (held, D, False, False)),
             (dict(status=403, reason="InvalidProviderToken"), (held, D, False, False)),
@@ -1231,22 +1245,22 @@ class MemberRoute(PushCase):
         for cut in (True, False):
             side.cut, side.status = cut, 200
             with self.subTest(cut=cut):
-                for send in (lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+                for send in (lambda: push.send_member(channel, ENTITLEMENT, SEALED, self.PAYLOAD),
                              lambda: push.send(channel, None, TOKEN, {"aps": {}}, "production")):
                     status, reason = send()
                     self.assertEqual((status, reason), (0, "127.0.0.1 gave no answer in time"))
         # a 429 whose body is cut: still our side's refusal, with the time of its head
         side.cut, side.status = True, 429
-        for send in (lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+        for send in (lambda: push.send_member(channel, ENTITLEMENT, SEALED, self.PAYLOAD),
                      lambda: push.send(channel, None, TOKEN, {"aps": {}}, "production")):
             e = self.refusal(send)
             self.assertEqual((e.status, e.retry_after), (429, 45))
         # a body of JSON too deep to read: a 200 is an answer that is not Apple's, a 429 our side's refusal
         side.cut, side.status = "deep", 200
-        self.assertEqual(push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"),
+        self.assertEqual(push.send_member(channel, ENTITLEMENT, SEALED, self.PAYLOAD),
                          (0, "127.0.0.1 answered with something other than Apple's answer"))
         side.status = 429
-        e = self.refusal(lambda: push.send_member(channel, ENTITLEMENT, TOKEN, self.PAYLOAD, "production"))
+        e = self.refusal(lambda: push.send_member(channel, ENTITLEMENT, SEALED, self.PAYLOAD))
         self.assertEqual((e.status, e.full), (429, "fleet"))
 
     def test_a_channel_or_a_bearer_that_cannot_go_into_a_request_is_a_refusal_of_the_setting(self):
@@ -1263,7 +1277,7 @@ class MemberRoute(PushCase):
         cases.append((good, ENTITLEMENT + "\r\nX-Other: 1", "bearer"))
         for channel, bearer, setting in cases:
             with self.subTest(channel=channel, bearer=bearer[-12:]):
-                for send in (lambda: push.send_member(channel, bearer, TOKEN, self.PAYLOAD, "production"),
+                for send in (lambda: push.send_member(channel, bearer, SEALED, self.PAYLOAD),
                              lambda: push.send(channel, bearer, TOKEN, {"aps": {}}, "production")):
                     e = self.refusal(send)
                     self.assertEqual((e.setting, e.local), (setting, False))
@@ -1276,8 +1290,8 @@ class MemberRoute(PushCase):
         for body, gone in (({"gone": True}, True), ({"gone": "yes"}, False), ({"error": "x"}, False)):
             with self.subTest(body=body):
                 self.side.answer = (410, body)
-                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD,
-                                                          "production"))
+                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT,
+                                                          SEALED, self.PAYLOAD))
                 self.assertEqual((e.status, e.gone), (410, gone))
         self.side.answer = (410, {"gone": True})            # the owner's route has no such answer
         self.assertFalse(self.refusal(lambda: push.send(hub.CFG["release_channel"], None, TOKEN, {"aps": {}},
@@ -1291,8 +1305,8 @@ class MemberRoute(PushCase):
                            ({"error": "bad_gateway"}, "bad_gateway"), ({"nothing": 1}, None)):
             with self.subTest(word=word):
                 self.side.answer = (502, body)
-                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, TOKEN, self.PAYLOAD,
-                                                          "production"))
+                e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT,
+                                                          SEALED, self.PAYLOAD))
                 self.assertEqual((e.status, e.word), (502, word))
                 self.assertEqual(str(e), "127.0.0.1 could not reach Apple's push service" if word == "unreachable"
                                  else "127.0.0.1 answered 502")     # a proxy's 502 does not claim it
@@ -1300,15 +1314,18 @@ class MemberRoute(PushCase):
     def test_push_gives_the_name_of_the_full_count_of_a_429_and_a_member_ping_goes_by_its_own_route(self):
         """Bugs: the hub reads no count from a 429, so a full count of one phone holds back the member pings of every
         phone of the fleet, or a full count of the fleet holds back none; a member ping goes to /api/push, which
-        refuses the member form, or with no licence; a 503 of the member route (its switch, a closed shop) gives no
+        refuses the member form, or with no licence; a member ping carries Apple's token or its environment in the
+        clear (b9-phone-members.md 10.7), or a value of another form goes out; a 503 of the member route (its switch, a
+        closed shop) gives no
         time, so its ping is lost or sent again at once; a refusal of push.py's own checks reads as one of our side,
         so the sender holds every ping for it in place of dropping the one that can never go; or no licence, or no
         network, reads as such a refusal, and each ping that meets it is dropped."""
         self.assertEqual(self.member(collapse="c" * 32, expires=123), (200, ""))
         got = self.side.got[-1]
         self.assertEqual((got["path"], got["headers"]["authorization"]), ("/api/push/member", "Bearer " + ENTITLEMENT))
-        self.assertEqual(got["body"], {"token": TOKEN, "environment": "production", "payload": self.PAYLOAD,
-                                       "collapse": "c" * 32, "expires": 123})
+        self.assertEqual(got["body"], {"push": SEALED, "payload": self.PAYLOAD, "collapse": "c" * 32, "expires": 123})
+        self.assertNotIn('"token"', got["raw"])         # no token and no environment in the clear (b9 10.7)
+        self.assertNotIn('"environment"', got["raw"])
         for full, named in (("phone", "phone"), ("members", "members"), ("fleet", "fleet"), ("galaxy", "fleet"),
                             (None, "fleet")):
             with self.subTest(full=full):
@@ -1325,14 +1342,15 @@ class MemberRoute(PushCase):
         self.assertIsNone(self.refusal(self.member).retry_after)
         self.assertFalse(self.refusal(self.member).local)                  # our side refused it: it went out
         before = len(self.side.got)
-        e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], None, TOKEN, self.PAYLOAD, "production"))
+        e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], None, SEALED, self.PAYLOAD))
         self.assertEqual((len(self.side.got), e.status, e.local), (before, None, False))     # no licence: it waits
-        for token, environment in (("XY" * 32, "production"), (TOKEN, "sandbox")):     # push.py's own checks
-            e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, token, self.PAYLOAD,
-                                                      environment))
+        tokens = member_tokens()
+        for value in [TOKEN, None, "v1.test0key." + "A" * 447, *(tokens["not_push"].values() if tokens else ())]:
+            e = self.refusal(lambda: push.send_member(hub.CFG["release_channel"], ENTITLEMENT, value, self.PAYLOAD))
             self.assertEqual((e.local, len(self.side.got)), (True, before))
-        e = self.refusal(lambda: push.send_member("http://127.0.0.1:1", ENTITLEMENT, TOKEN, self.PAYLOAD,
-                                                  "production"))
+        for one in (tokens["valid"] + tokens["refused"]) if tokens else ():     # each value of the phone's form goes
+            self.assertTrue(push.member_push(one["push"]), one["name"])
+        e = self.refusal(lambda: push.send_member("http://127.0.0.1:1", ENTITLEMENT, SEALED, self.PAYLOAD))
         self.assertIn("cannot be reached", str(e))
         self.assertIs(e.local, False)           # an outage of the network: each ping waits, none is dropped
 

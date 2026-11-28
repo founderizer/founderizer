@@ -389,8 +389,8 @@ NOT_TOOLS = {
     "/ui/owner/devices/{}/recovery/held": "the phone's own word that it holds its copy, which the route takes from the "
                                           "phone only",
     "/ui/owner/enroll": "the phone's own call, before it has a key",
-    "/ui/owner/devices/code": "a code for a new phone, which its camera reads from the Mac app's screen; the owner's "
-                              "agent adds a phone with owner_device and device_code",
+    "/ui/owner/devices/code": "a code for a new phone, which its camera reads from the screen of the owner's own "
+                              "Founderizer; the hub gives it to no AI session (Door's finding of 28 November 2026)",
     "/ui/connect/code": "a one-time code for a connected app, which the hub makes at the owner's Mac, where they read "
                         "it; connected apps are not in this release",
     "/ui/connect/{}/revoke": "the end of a connected app's connection; connected apps are not in this release",
@@ -6113,11 +6113,12 @@ def tools():
               **rid}, ("person", "app"),
              plain("/ui/people/{person}/handles", ("app", "handle", "name", "delete"), "this person's handle")),
         tool("People",
-             "person_code", "A one-time code that links the owner's own chat account on Discord, WhatsApp or "
-                            "Telegram (purpose owner), or a person's Telegram invite (purpose invite, app telegram, "
-                            "with person and agent): a link to that agent's bot for 7 days and one use, which binds "
-                            "the Telegram account that presses Start to that person. A new invite of a person "
-                            "replaces their open one. The hub keeps no code: a repeat gives code null.",
+             "person_code", "A person's Telegram invite (purpose invite, app telegram, with person and agent): a "
+                            "link to that agent's bot for 7 days and one use, which binds the Telegram account that "
+                            "presses Start to that person. A new invite of a person replaces their open one. The code "
+                            "that links the owner's own chat account (purpose owner) comes only from the Founderizer "
+                            "app on the owner's computer: this tool gets 409 owner_code_from_tool for it. The hub "
+                            "keeps no code: a repeat gives code null.",
              {"app": S["text"], "purpose": S["text"], "person": S["int"], "agent": S["text"], **rid}, ("app",),
              plain("/ui/people/codes", ("app", "purpose", "person", "agent"), "a link code")),
         tool("People",
@@ -6235,16 +6236,16 @@ def tools():
              {"address": S["text"], "claim_code": S["text"], "claim_port": S["int"], "port": S["int"]},
              ("address", "claim_code"), claim_hub),
         tool("Setup",
-             "owner_device", "One of the owner's own phones: its name, its label and its address on the private "
-                             "network, or delete true to take it out. Its key is taken by the phone itself with a "
-                             "code from device_code.",
+             "owner_device", "One of the owner's own phones: delete true takes it out. A new phone, or a change of "
+                             "one, is the owner's own step: the hub refuses it from an AI session, so ask the owner to "
+                             "use Add device in Founderizer on their computer.",
              {"device": S["text"], "label": S["text"], "address": S["text"], "delete": S["bool"],
               "base_sha256": S["record_base"], **rid},
              ("device",),
              with_base("/ui/owner/devices", ("device", "label", "address", "delete"), "this owner device")),
         tool("Setup",
-             "device_code", "One enrollment code for one of the owner's phones. The hub keeps no code: a repeat "
-                            "gives code null.",
+             "device_code", "The hub always refuses this tool: a phone's enrollment code goes only to the owner's "
+                            "own Founderizer. Ask the owner to use Add device in Founderizer on their computer.",
              {"device": S["text"], **rid}, ("device",),
              plain("/ui/owner/devices/{device}/code", (), "an enrollment code")),
     ]

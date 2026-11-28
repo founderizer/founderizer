@@ -196,6 +196,10 @@ WORDS = {
     # an invite asked by an AI session or a program (teams-design-4, section 6; decision D68 e): its line never reaches
     # a transcript
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
+    # an owner link code asked by an AI session or a program (UI-API.md 1.400): whoever sends that code becomes the
+    # owner in that chat app
+    "owner_code_from_tool": "The code that links the owner's own chat account is made in Founderizer on the owner's "
+                            "computer, never by an AI session or a program.",
     # a copy of the fleet (GET /ui/backup): the hub's disk has no room for its passing files now, or its records need
     # the fields of Zip64, which the Mac app does not read yet (the analysis of F14, 22 November 2026). The sizes are
     # written as the Mac app writes a size ("1.2 GB")

@@ -184,6 +184,26 @@ class OwnerRoutes(Base):
         self.assertEqual(page["gate"], {"version": None, "ok": False})
         self.assertEqual(self.request("/ui/connect?db=old")[0], 409)
 
+    def test_a_code_comes_only_from_the_owners_own_hand(self):
+        """A connected app's code signs an outside app in to the fleet, so the hub makes it only for the owner's own
+        hand, also while the feature is off for customers (the supervisor's order of 28 November 2026, after Door's
+        finding of outside accounts bound to the fleet). A bug here gives the code to the owner MCP, a session's mark
+        or a shell, which a steered session hands to a stranger's app."""
+        # the route is one that no tool sends (owner_mcp.NOT_TOOLS), which Door's rule 5 refuses for a tool or a
+        # program before this check, with its own words; a job of the hub's own reaches this check
+        for headers in ({"X-Fleet-Client": "founderizer-mcp/1/test"}, {"X-Fleet-Client": "founderizer-cli/1/test"},
+                        {"X-Fleet-Client": "founderizer-swift/1/test", "X-Fleet-Session": "claude-code/x"},
+                        {"X-Fleet-Client": "curl/8.7.1"}, {"X-Fleet-Client": "founderizer-release/1/test"}):
+            with self.subTest(headers):
+                code, answer = self.request("/ui/connect/code", {"request_id": str(uuid.uuid4()),
+                                                                 "db": "test-generation", "level": "read"},
+                                            headers=dict({"Content-Type": "application/json"}, **headers))
+                self.assertEqual(code, 409, answer)
+                if headers["X-Fleet-Client"].startswith("founderizer-release/"):
+                    self.assertEqual(answer.get("error"), hub.CONNECT_CODE_HAND)
+        self.assertIsNone(hub.q1("SELECT 1 FROM capp_codes"))
+        self.assertEqual(self.command("/ui/connect/code", level="read")[0], 200)     # the owner's own app
+
     def test_a_code_is_shown_once_and_a_new_one_replaces_it(self):
         code, made = self.command("/ui/connect/code", level="read")
         self.assertEqual(code, 200, made)

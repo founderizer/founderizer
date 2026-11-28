@@ -37,6 +37,11 @@ RETRY_DEFAULT = 60      # seconds before a ping that our side held back (429) go
 RETRY_MOST = 1200       # the longest wait for one, whatever our side said: two of its windows of 10 minutes
 LICENCE_HOLD = 900      # seconds that a refusal of the licence holds pings, unless a new licence token ends it first
 MEMBER_ROUTE = "/api/push/member"       # B9: the route of a member ping (the website's docs/CONTRACTS.md)
+# B9 (b9-phone-members.md 10.7): a member's phone seals its kind, the fleet's id and its push token for our side alone
+# (HPKE, app/vectors/member-token-vectors.json), so a company's hub never holds or sends a token in the clear: "v1.",
+# a key id of 8, ".", and 448 characters of base64url with no padding (enc and the sealed bytes, 336 bytes).
+MEMBER_PUSH = re.compile(r"v1\.[a-z0-9]{8}\.[A-Za-z0-9_-]{448}")
+MEMBER_PUSH_BYTES = 336
 FULL_COUNTS = ("fleet", "phone", "members")     # the counts that a 429 of that route names in `full`
 
 
@@ -58,8 +63,8 @@ class PushError(Exception):
     `retry_after` too, on both routes (the switch is off, the shop is closed, a fault of our side): the same ping may
     go again after it, and a long 503 does not bring each fleet's call back each minute.
 
-    `local` is True when this file's own checks refused the ping's own token or environment before anything went out:
-    the same ping has them again each time.
+    `local` is True when this file's own checks refused the ping's own token, environment or sealed value (a member
+    ping's `push`, member_push) before anything went out: the same ping has them again each time.
 
     `setting` names a setting of the fleet that this file refused before anything went out: "channel" (an address
     that no request can go to) or "bearer" (a licence that cannot go into a header). It is no fault of the ping, and a
@@ -105,13 +110,14 @@ class PushError(Exception):
 #            500, 504 or any other 5xx: a proxy may answer after our side gave the ping to Apple.
 #   REFUSED  the ping's own fault: that ping goes (the owner's row failed). Our side's 400 and 413, and each other
 #            4xx; this file's own refusal of the token or the environment (`token_gone`); Apple's 410 and 400
-#            BadDeviceToken or DeviceTokenNotForTopic (`token_gone`); Apple's 403 of a development ping (`token_gone` on
-#            the member route): our side's key is a production key for the app alone (UI-API 1.76), so such a ping
-#            never arrives, and a hold would send it again for a day; our side's 410 {"gone": true} on the member route
-#            (`token_gone`); Apple's other 4xx.
+#            BadDeviceToken or DeviceTokenNotForTopic (`token_gone`); on the owner's route, Apple's 403 of a development
+#            ping: our side's key is a production key for the app alone (UI-API 1.76), so such a ping never arrives, and
+#            a hold would send it again for a day; our side's 410 {"gone": true} on the member route (`token_gone`: a
+#            development build's value gets it too, as the member route sends no environment); Apple's other 4xx.
 #   SENT     Apple took it.
-# A development ping (a build from Xcode) takes the same table. The words are Apple's reason alone for Apple's refusal,
-# and "Apple: <status> <reason>" for each other answer of Apple's that is no 200, and for its 403 of a development ping.
+# A development ping of the owner's (a build from Xcode) takes the same table. The words are Apple's reason alone for
+# Apple's refusal, and "Apple: <status> <reason>" for each other answer of Apple's that is no 200, and for its 403 of a
+# development ping.
 
 HELD, PHONE, MAYBE, REFUSED, SENT = "held", "phone", "maybe", "refused", "sent"
 GONE_REASONS = ("BadDeviceToken", "DeviceTokenNotForTopic")     # Apple's 400 reasons of a token that is not the app's
@@ -154,11 +160,24 @@ def outcome(status=None, reason=None, error=None, environment=None, member=False
     apple = f"Apple: {status} {words}".strip()
     if status == 429:               # too many pings to that phone; or too many updates of our side's own key
         return Outcome(HELD if words == "TooManyProviderTokenUpdates" else PHONE, RETRY_DEFAULT, False, False, apple)
-    if status == 403 and environment == "development":     # our side's production key sends no development ping
-        return Outcome(REFUSED, None, False, member, apple)
+    if status == 403 and environment == "development" and not member:     # our side's production key sends none
+        return Outcome(REFUSED, None, False, False, apple)
     if status >= 500 or status == 403:      # Apple's 403 reasons are about our side's own key
         return Outcome(HELD, RETRY_DEFAULT, False, False, apple)
     return Outcome(REFUSED, None, False, status == 410 or (status == 400 and words in GONE_REASONS), words)
+
+
+def member_push(value):
+    """True for a phone's sealed push token of the exact form (MEMBER_PUSH) whose base64url decodes strictly to
+    MEMBER_PUSH_BYTES: one spelling for each value. The hub never opens it."""
+    if not isinstance(value, str) or not MEMBER_PUSH.fullmatch(value):
+        return False
+    body = value.rsplit(".", 1)[1]
+    try:
+        raw = base64.urlsafe_b64decode(body)
+    except ValueError:
+        return False
+    return len(raw) == MEMBER_PUSH_BYTES and base64.urlsafe_b64encode(raw).decode("ascii") == body
 
 
 def _retry_after(headers):
@@ -281,25 +300,30 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
     came, so that the ping may or may not have arrived. PushError when nothing left: our side refused the ping or
     could not be reached. `entitlement` goes as the bearer when this fleet holds one, as before; with none, the ping
     goes with no Authorization header. A 429, and a 503 with a Retry-After, give their time (PushError.retry_after)."""
-    return _post(channel, "/api/push", entitlement, device_token, payload, environment, collapse, expires, timeout)
-
-
-def send_member(channel, licence, device_token, payload, environment, collapse=None, expires=None, timeout=None):
-    """One member ping (B9) through our side's member route, with the fleet's licence as the bearer: as send, and a 429
-    names its full count (PushError.full). With no licence nothing goes:
-    the route takes no ping without one."""
-    if not licence:
-        raise PushError("a member ping goes only with the fleet's licence")
-    return _post(channel, MEMBER_ROUTE, licence, device_token, payload, environment, collapse, expires, timeout,
-                 member=True)
-
-
-def _post(channel, path, bearer, device_token, payload, environment, collapse, expires, timeout, member=False):
     if not isinstance(device_token, str) or not DEVICE_TOKEN.fullmatch(device_token):
         raise PushError("that is not a device token", local=True)
     if environment not in ENVIRONMENTS:
         raise PushError("the environment is production or development", local=True)
-    body = {"token": device_token, "environment": environment, "payload": payload}
+    return _post(channel, "/api/push", entitlement, {"token": device_token, "environment": environment}, payload,
+                 collapse, expires, timeout)
+
+
+def send_member(channel, licence, sealed, payload, collapse=None, expires=None, timeout=None):
+    """One member ping (B9) through our side's member route, with the fleet's licence as the bearer: as send, and a 429
+    names its full count (PushError.full). It carries the phone's sealed push token (`push`, member_push) and no token
+    or environment in the clear: our side opens it, and refuses a token in the clear with 400. With no licence nothing
+    goes: the route takes no ping without one."""
+    if not licence:
+        raise PushError("a member ping goes only with the fleet's licence")
+    if not member_push(sealed):
+        raise PushError("that is not a sealed push token of a member's phone", local=True)
+    return _post(channel, MEMBER_ROUTE, licence, {"push": sealed}, payload, collapse, expires, timeout, member=True)
+
+
+def _post(channel, path, bearer, to, payload, collapse, expires, timeout, member=False):
+    """`to` is what names the phone in the body: {"token", "environment"} on the owner's route, {"push"} on the
+    member route."""
+    body = dict(to, payload=payload)
     if collapse:
         body["collapse"] = collapse
     if expires is not None:

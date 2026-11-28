@@ -795,6 +795,10 @@ class CallApi(CreateLogin):
     def test_the_key_page_shows_a_new_key_each_time_and_a_saved_copy_of_the_last_one_is_shown(self):
         here = "http://%s:%d" % hub.hub_address()                   # the origin of this hub: its address in team.json
         self.allow()
+        self.addCleanup(hub.PRACTICE_KEY_SHOWN.update, key=None, at=0.0)
+        window = patch.object(hub, "PRACTICE_KEY_EVERY", 0)         # each page a new key; the window: at the end
+        window.start()
+        self.addCleanup(window.stop)
         fingerprint = lambda salt, text: hashlib.sha256((salt + text).encode()).hexdigest()
         ref = lambda n: f"bws://{n}1111111-2222-4333-8444-55555555555b"
         keys, salts = [], []                                        # of each page: its key, and the salt of its record
@@ -890,6 +894,27 @@ class CallApi(CreateLogin):
         self.assertEqual(self.request("/outbox", {"key": "K-8", "text": f"my key is {last}"})[0], 200)
         row = hub.q1("SELECT id FROM outbox WHERE key='K-8'")["id"]
         self.assertEqual(hub.leak_scan(), [f"outbox row {row}"])
+
+        # The window: within PRACTICE_KEY_EVERY each open shows the same key and keeps the same one record, so a program
+        # that opens the page each minute does not make a new registered login each minute; after it, a new key and
+        # salt (the security reader of the search before LOCK, 28 November 2026). Bug: each open makes a new login, and
+        # the hub searches its large texts again for each one.
+        window.stop()
+        hub.PRACTICE_KEY_SHOWN.update(key=None, at=0.0)
+        first = hub.practice_key()
+        self.assertEqual(hub.practice_key(), first)
+        with patch.object(hub, "now", lambda: time.time() + 60):
+            self.assertEqual(hub.practice_key(), first)                     # a minute later: the same window
+        hub.q("DELETE FROM secrets WHERE label=?", (hub.SITE_KEY,))
+        renewed = hub.practice_key()                                        # its record gone: the window ends
+        self.assertNotEqual(renewed, first)
+        record = hub.q1("SELECT salt FROM secrets WHERE label=?", (hub.SITE_KEY,))["salt"]
+        self.assertEqual([r["salt"] for r in hub.q("SELECT salt FROM secrets WHERE label=?", (hub.SITE_KEY,))], [record])
+        with patch.object(hub, "now", lambda: time.time() + hub.PRACTICE_KEY_EVERY + 1):
+            later = hub.practice_key()
+        self.assertNotEqual(later, renewed)
+        self.assertNotEqual(hub.q1("SELECT salt FROM secrets WHERE label=?", (hub.SITE_KEY,))["salt"], record)
+        window.start()
 
 
 if __name__ == "__main__":

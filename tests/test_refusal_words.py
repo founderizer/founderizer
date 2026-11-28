@@ -160,6 +160,8 @@ OLD = {
     "link_most": "This fleet has {most} Founderizer rows with an invite or a device, the most that it can have. "
                  "Remove one first.",
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
+    "owner_code_from_tool": "The code that links the owner's own chat account is made in Founderizer on the owner's "
+                            "computer, never by an AI session or a program.",
     # a copy of the fleet that the hub's disk has no room for, or whose records need Zip64 (F14 piece 1)
     "copy_no_room": "The hub's server has {free} free. A copy needs {need} there while the hub makes it.",
     "copy_over_format": "This fleet's records are larger than 2 GB. Founderizer cannot put them into one copy yet.",
@@ -297,6 +299,7 @@ SITES = {
     'ui_owner_enroll': {'not_owner_device': 1},
     'ui_people': {'hub_changed': 1},
     'ui_person': {'no_such_person': 1},
+    'ui_people_code': {'owner_code_from_tool': 1},      # an owner link code from a hand that is not the owner's
     'ui_person_handles': {'no_such_person': 1, 'person_handles_most': 1},
     'ui_profile_save': {'no_such_agent': 1},
     'ui_profiles': {'hub_changed': 1, 'profile_unread': 1, 'revision_unreadable': 1},
@@ -562,7 +565,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 225)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 226)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one
