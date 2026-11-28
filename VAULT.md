@@ -1467,7 +1467,8 @@ host.
     a write that a row records. Known limits: a row that a stop of the hub left out (the same Give press, or the same
     grant_access request, again writes it), a database older than its `team.json`, and a revert or an undo of
     `team.json` to an older state: each such hold whose newest row is of another level, or that no row names, reads as
-    the owner's own and is a commit target. Holds at write or deploy that the
+    the owner's own and is a commit target. A Mac app from before owner API 1.364 reads no targets and makes every hold
+    of an Operator a commit target, until it takes the release. Holds at write or deploy that the
     default gave from hub 2026.11.812 to this release stay as they are (none on the owner's fleet). On 26 November
     2026 the default had given no repository at write or deploy since it came (hub 2026.11.812), so nothing was taken
     back. The hub reads the door's targets from `team.json`, not from the door's file, so a target that the file

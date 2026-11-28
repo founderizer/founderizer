@@ -110,6 +110,9 @@ class Remove(Servers):
                     "skills/vps/deploy/SKILL.md": "---\nname: deploy\n---\n"}, team)
         for agent in ("scout", "vps"):
             self.own_rows(agent)
+        with hub.transaction():         # D143: the owner's yes for a customer action of each
+            for agent in ("scout", "vps"):
+                hub.action_yes_set(agent, "order_status", "a" * 64, "owner")
         hub.kv_set("talk_guard:scout:vps", "1")         # the talk guard's mark of a pair, and of another pair
         hub.kv_set("talk_guard:ann:vps", "1")
         hub.history_catch_up()          # the history search has copies of their lessons, items and reports
@@ -147,6 +150,9 @@ class Remove(Servers):
         self.assertIn("profiles/vps.md", files)
         self.assertNotIn("scout", hub.agents())
         self.assertEqual(set(self.count("scout").values()), {0})
+        # the owner's yes for an action of scout goes with it, and vps keeps its own: a new scout with the same
+        # action is not active by the old yes (D143)
+        self.assertEqual([r["agent"] for r in hub.q("SELECT agent FROM action_yes")], ["vps"])
         self.assertEqual(self.count("vps")["agent_notes"], 1)
         self.assertEqual(self.count("vps")["memories"], 1)
         self.assertEqual(self.count("vps")["standing"], 1)
@@ -176,6 +182,7 @@ class Remove(Servers):
         self.job("box", receipt["job"], "done", "user")
         self.assertIsNone(hub.q1("SELECT 1 FROM agents WHERE name='scout'"))
         self.assertEqual(self.add_agent("box", "scout", "codex")[0], 200)
+        self.assertIsNone(hub.action_yes_hash("scout", "order_status"))
 
     def deleted_inside(self, name, path, before=False):
         """The answer to scout's call of `path` when the owner's delete lands inside the hub's function `name`, which

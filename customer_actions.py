@@ -14,9 +14,14 @@ network:
   count), and the matcher does one pass over the value for each element, so its work is the number of elements times
   the value's length, also for a hostile value under the hub's LOCK.
 - action_hash: the one hash of an action and its login's recorded site and form, which the owner's yes binds.
-pattern_words gives the plain words of a pattern for the owner's card."""
+pattern_words gives the plain words of a pattern for the owner's card.
+
+And the pure parts of one run (design v5, 3.2), which the hub calls under its LOCK: e164 and whatsapp_e164 (the one
+rule of a phone number), action_request (the request of one call), check_answer (the check and the cut of the
+service's answer) and run_hashes (the salted hashes of the folded runs of a customer's own words)."""
 
 import hashlib
+import hmac
 import json
 import math
 import unicodedata
@@ -570,10 +575,15 @@ def _parts(name, action, login):
     headers = action.get("headers", {})
     if not isinstance(headers, dict) or len(headers) > HEADERS_MOST:
         return f"The headers of action {name} are an object of at most {HEADERS_MOST}."
+    seen = set()
     for k, v in headers.items():
         low = k.lower() if isinstance(k, str) else ""
         if not (low and HEADER_NAME.fullmatch(k) and (low == "accept" or low.endswith("-version"))):
             return f"Action {name} sets only Accept and a header whose name ends in -Version: the hub sends the rest."
+        if low in seen:         # Accept and accept are one header, which the vault would send two times
+            return (f"Action {name} sets the header {k} two times: a header's name is the same in small and capital "
+                    "letters.")
+        seen.add(low)
         if not (isinstance(v, str) and HEADER_VALUE.fullmatch(v)):
             return f"Each header of action {name} is fixed visible text of at most 200 characters, with no {{ or }}."
     fills, binds = action.get("fills", {}), action.get("binds", {})
@@ -853,3 +863,215 @@ def pattern_words(pattern):
         else:
             parts.append(f"{count} {_class_words(chars, True)}")
     return ", then ".join(parts)
+
+
+# ---- One run (design v5, 3.2): the request of one call, and the check and the cut of the service's answer. The hub
+# calls these under its LOCK, so each one reads what it gets once: never a value against a pattern of Python's `re`.
+
+PHASES = ("read", "write", "create")
+E164 = re.compile(r"\+[1-9][0-9]{6,14}")
+WHATSAPP_JID = re.compile(r"([1-9][0-9]{6,14})@s\.whatsapp\.net")
+PHONE_DROPS = frozenset("-.()")             # with every whitespace character: what the E.164 rule removes
+REQUEST_PATH_MOST, REQUEST_BODY_MOST = 2000, 65536      # call_api's bounds of a path and of a body
+RUN = 12                                    # characters of a run that a value shares with a customer's own words
+RUN_DROPS = frozenset("_-.")                # with every whitespace character: what a folded run ignores
+_MISSING = object()
+
+
+class ActionError(ValueError):
+    """A call that a request cannot carry: its words say why, in one sentence that the session may read."""
+
+
+def e164(value):
+    """The E.164 form ("+" and digits) of a phone number of a service's answer, or None (design v5, 3.2.7). The value
+    is a JSON string, not empty. Remove all whitespace, dashes, dots and parentheses; then only ASCII digits may
+    follow a leading + or 00, and the result matches \\+[1-9][0-9]{6,14}. Bare digits and a JSON number never match:
+    a service that writes a number with no + or 00 does not say which country it is in."""
+    if not isinstance(value, str) or not value or len(value) > VALUE_MOST:
+        return None
+    text = "".join(c for c in value if not (c.isspace() or c in PHONE_DROPS))
+    if text.startswith("+"):
+        digits = text[1:]
+    elif text.startswith("00"):
+        digits = text[2:]
+    else:
+        return None
+    if not (digits.isascii() and digits.isdigit()):
+        return None
+    return "+" + digits if E164.fullmatch("+" + digits) else None
+
+
+def whatsapp_e164(handle):
+    """The E.164 form of a WhatsApp handle or alias, made only from a full match of [1-9][0-9]{6,14}@s.whatsapp.net;
+    None for a hidden id (@lid), a group or any other text."""
+    if not isinstance(handle, str):
+        return None
+    match = WHATSAPP_JID.fullmatch(handle)
+    return "+" + match.group(1) if match else None
+
+
+def _segment(value, name):
+    """A value of a path part or of a query, encoded: ASCII text, never empty, `.` or `..`."""
+    if not isinstance(value, str) or not value or not value.isascii() or value in (".", ".."):
+        raise ActionError(f"The value of {name} cannot go in the request: it is ASCII text, never empty, . or ...")
+    return urllib.parse.quote(value, safe="")
+
+
+def _filled(body, value):
+    """A new copy of a body template with each whole "{name}" replaced by its value, in one pass: a value that holds
+    a {name} of its own is never read again."""
+    if isinstance(body, dict):
+        return {k: _filled(v, value) for k, v in body.items()}
+    if isinstance(body, list):
+        return [_filled(v, value) for v in body]
+    whole = TEMPLATE.fullmatch(body) if isinstance(body, str) else None
+    if whole:
+        got = value(whole.group(1))
+        if not isinstance(got, str):
+            raise ActionError(f"The value of {whole.group(1)} is text: a fill goes into the body as a JSON string.")
+        return got
+    return body
+
+
+def action_request(parts, phase, values, bound):
+    """(method, path, body text or None, extra headers) of one call of a parsed action (action_parts' dict). phase:
+    read, write or create; values: {fill: value} of the call; bound: {bind name: value} that the hub bound. Only the
+    names of parts["sent"] go to the service. Each value of a path part or of a query is ASCII, never `.` or `..`, and
+    encoded with quote(value, safe=""); a trailing / of the action stays. The body is the action's template, filled
+    in one pass, each fill as a JSON string; the one extra header, Content-Type: application/json, comes only with a
+    body. ActionError when the call cannot be carried."""
+    if phase not in PHASES:
+        raise ActionError("A phase is read, write or create.")
+    r = parts["read"] if phase == "read" else parts["write"]
+    if r is None or (phase == "create") != (parts["read"] is None and parts["write"] is not None):
+        raise ActionError(f"This action has no {phase}.")
+    # A fill's value comes only from the call's values, and a bind's only from the hub's bound: an address of the
+    # body is only the hub's own bind, also when a caller puts a bind's name among the values
+    fills = set(parts["patterns"]) | set(parts["texts"])
+    given = {k: v for k, v in (values or {}).items() if k in fills and k in parts["sent"]}
+    given.update((k, v) for k, v in (bound or {}).items() if k in parts["binds"] and k in parts["sent"])
+
+    def value(name):
+        if name not in given:
+            raise ActionError(f"The call gives no value of {name}.")
+        return given[name]
+
+    def part(text):
+        whole = TEMPLATE.fullmatch(text)
+        return _segment(value(whole.group(1)), whole.group(1)) if whole else text
+
+    path = "/" + "/".join(part(s) for s in r["segments"]) + ("/" if r["slash"] else "")
+    if r["query"]:
+        path += "?" + "&".join(f"{k}={part(v)}" for k, v in r["query"])
+    body = None
+    if r["body"] is not None:
+        body = json.dumps(_filled(r["body"], value), ensure_ascii=True, separators=(",", ":"))
+    if len(path) > REQUEST_PATH_MOST or body is not None and len(body) > REQUEST_BODY_MOST:
+        raise ActionError("The values of this call make the request too long.")
+    return r["method"], path, body, ({"Content-Type": "application/json"} if body is not None else {})
+
+
+def _field(doc, parts):
+    """The value at a field of a parsed answer, or _MISSING. A part of digits indexes a list, and any other part is a
+    key of an object; nothing else reads a part, so no number goes into an object and no name into a list."""
+    for p in parts:
+        if p.isdigit():
+            if not isinstance(doc, list) or int(p) >= len(doc):
+                return _MISSING
+            doc = doc[int(p)]
+        elif isinstance(doc, dict) and p in doc:
+            doc = doc[p]
+        else:
+            return _MISSING
+    return doc
+
+
+def _text(value):
+    """A value of the answer as text: a JSON string, or a JSON integer (never true or false) as its decimal text;
+    else None."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _folded_equal(service, customer):
+    """True when the service's value and the customer's fill are the same text with case and whitespace folded. An
+    empty text never matches."""
+    a = "".join(service.casefold().split()) if isinstance(service, str) else ""
+    b = "".join(customer.casefold().split()) if isinstance(customer, str) else ""
+    return bool(a) and a == b
+
+
+def _returns(parts, doc):
+    """{returns key: text} of each returns value of the answer that passes its own pattern, its length first."""
+    out = {}
+    for key, (fparts, elements) in parts["returns"].items():
+        got = _text(_field(doc, fparts))
+        if got is not None and len(got) <= VALUE_MOST and pattern_match(elements, got):
+            out[key] = got
+    return out
+
+
+def _once(pairs):
+    """An object of a JSON text whose keys each come once; a key that comes two times is a ValueError, because two
+    readers of the text can then read two other values (the first key or the last one)."""
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError("a key comes two times in one object")
+        out[k] = v
+    return out
+
+
+def check_answer(parts, phase, text, bound_kind, bound, also_value):
+    """(passed, returns) of the body of the service's answer to one call (design v5, 3.2.7 and 3.2.8). One json.loads
+    of the whole text (a RecursionError, a ValueError or a key that comes two times in one object is a failure), and
+    it is one JSON object. A read: the owner
+    field is the customer's own (for whatsapp_phone a JSON string whose e164 equals the bound value; for telegram_id
+    and chat_id the same text exactly, never compared with a phone), and with also, the also field equals the
+    customer's fill, case and whitespace folded (empty never matches). A create: the owner check against the bound
+    handle. A write: no owner check, only the returns cut, so it passes here (the hub reads the status). returns: only
+    the values that pass their patterns, each a JSON string or a JSON integer; the read of a write gives none, because
+    its pass only opens the write. The status, a body that the vault cut or held back, and the shared-run drop are
+    the caller's."""
+    try:
+        doc = json.loads(text, object_pairs_hook=_once) if isinstance(text, str) else None
+    except (ValueError, RecursionError):
+        doc = None
+    if phase == "write":
+        return True, _returns(parts, doc) if isinstance(doc, dict) else {}
+    if phase not in ("read", "create") or not isinstance(doc, dict):
+        return False, {}
+    if bound_kind != parts["kind"] or not isinstance(bound, str) or not bound:
+        return False, {}
+    owner = _field(doc, parts["owner"])
+    if (e164(owner) if bound_kind == "whatsapp_phone" else _text(owner)) != bound:
+        return False, {}
+    if phase == "read" and parts["also"] and not _folded_equal(_text(_field(doc, parts["also"][0])), also_value):
+        return False, {}
+    if phase == "read" and parts["write"] is not None:
+        return True, {}
+    return True, _returns(parts, doc)
+
+
+def folded(text):
+    """A text as a run reads it: case folded, with every whitespace character, _, - and . removed."""
+    return "".join(c for c in text.casefold() if not (c.isspace() or c in RUN_DROPS)) if isinstance(text, str) else ""
+
+
+def run_hashes(text, salt):
+    """The salted hashes of every run of RUN characters of the folded text (each window of 12 characters): the hub
+    keeps only these of a customer's own words, never the words, and a returns value that shares one with them is
+    dropped (design v5, 3.2.7). salt: the hub's own secret, text or bytes. A text of fewer than RUN characters after
+    the fold has none."""
+    f = folded(text)
+    key = salt.encode() if isinstance(salt, str) else bytes(salt)
+    return {hmac.new(key, f[i:i + RUN].encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()[:32]
+            for i in range(len(f) - RUN + 1)}
+
+
+def shares_run(value, salt, known):
+    """True when the value shares a run of RUN characters, folded, with a text whose run_hashes are in `known`."""
+    return not run_hashes(value, salt).isdisjoint(known)

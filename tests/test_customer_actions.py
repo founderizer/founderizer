@@ -3,6 +3,7 @@ keeps a support agent's fixed request to the customer's own record, the hub's ow
 meets under the hub's LOCK, and the hash that the owner's yes binds. Each test names the bug that it catches."""
 
 import copy
+import json
 import random
 import re
 import unittest
@@ -151,6 +152,15 @@ class Form(unittest.TestCase):
             self.refused(changed(ORDER_STATUS, headers=headers), "header")
         self.assertIsNone(ca.action_form("act", changed(ORDER_STATUS, headers={"Stripe-Version": "2024-06-20"}),
                                          LOGIN))
+
+    def test_a_header_name_comes_once_whatever_its_case(self):
+        """Accept and accept are one header: a form that takes both lets the vault send two values of one header,
+        and a service reads either one. Bug: the form compares header names with their case."""
+        for headers in ({"Accept": "application/json", "accept": "text/html"},
+                        {"Stripe-Version": "2024-06-20", "stripe-version": "2023-01-01"}):
+            self.refused(changed(ORDER_STATUS, headers=headers), "two times")
+        self.assertIsNone(ca.action_form("act", changed(ORDER_STATUS, headers={"Accept": "application/json",
+                                                                               "Stripe-Version": "2024-06-20"}), LOGIN))
 
     def test_method_override_in_a_query_is_refused(self):
         """`_method=DELETE` turns a checked GET into a delete on many frameworks."""
@@ -400,8 +410,8 @@ class Patterns(unittest.TestCase):
 
 class Hash(unittest.TestCase):
     def test_every_field_and_the_logins_site_change_the_hash(self):
-        """The owner's yes binds one hash: a field or a site that the hash leaves out could change after the yes and
-        keep the action active."""
+        """The owner's yes binds one hash: a field, or the login's site, kind, form or title, that the hash leaves out
+        could change after the yes and keep the action active."""
         base = ca.action_hash("cancel_order", CANCEL_ORDER, LOGIN)
         self.assertEqual(base, ca.action_hash("cancel_order", copy.deepcopy(CANCEL_ORDER), dict(LOGIN)))
         seen = {base}
@@ -414,9 +424,178 @@ class Hash(unittest.TestCase):
         seen.add(ca.action_hash("cancel_order", CANCEL_ORDER, dict(LOGIN, form="header:x-api-key")))
         seen.add(ca.action_hash("cancel_other", CANCEL_ORDER, LOGIN))
         seen.add(ca.action_hash("cancel_order", CANCEL_ORDER, dict(LOGIN, title="Other key")))
-        self.assertEqual(len(seen), len(CANCEL_ORDER) + 6)
+        seen.add(ca.action_hash("cancel_order", CANCEL_ORDER, dict(LOGIN, kind="login")))
+        self.assertEqual(len(seen), len(CANCEL_ORDER) + 7)
         self.assertEqual(ca.action_hash("o", changed(OPEN_TICKET, per_day=None), LOGIN),
                          ca.action_hash("o", changed(OPEN_TICKET, per_day=3), LOGIN))
+
+
+PHONE = "+34600123456"
+GOOD = {"customer": {"phone": "+34 600-123.456"}, "shipping": {"postcode": " ab 12 "}, "status": "shipped",
+        "eta": "2026-11-30"}
+
+
+def body(**changes):
+    """The service's answer to the order_status read, as JSON text, with fields replaced."""
+    return json.dumps(dict(copy.deepcopy(GOOD), **changes))
+
+
+class Run(unittest.TestCase):
+    """One run of an action (design v5, 3.2): the request, the check and the cut of the answer, and the runs of a
+    customer's own words."""
+    def parts(self, name, action):
+        problem, parts = ca.action_parts(name, action, LOGIN)
+        self.assertIsNone(problem)
+        return parts
+
+    def test_one_rule_reads_a_phone_number(self):
+        """A rule that takes bare digits, a JSON number or digits of another script lets a service's number with no
+        country, or of another customer, pass the owner check; a handle that is no full phone JID binds a hidden id or
+        a group as the customer's number."""
+        for value in ("+34 600 123 456", "0034-600.123.456", "(+34) 600123456", "+34\t600 123456", PHONE):
+            self.assertEqual(ca.e164(value), PHONE, value)
+        for value in ("34600123456", 34600123456, "", None, "+0034600123456", "+34 600 abc", "+34/600123456",
+                      "+３４600123456", "+123456", "+1234567890123456", "00", "+", "++34600123456",
+                      "0 0 34600123456x", "+34600123456" + " " * 600):
+            self.assertIsNone(ca.e164(value), value)
+        self.assertEqual(ca.whatsapp_e164("34600123456@s.whatsapp.net"), PHONE)
+        for handle in ("34600123456@lid", "034600123456@s.whatsapp.net", "34600123456@s.whatsapp.net\n",
+                       "120363012345678901@g.us", "+34600123456@s.whatsapp.net", "34600123456@s.whatsappXnet", None):
+            self.assertIsNone(ca.whatsapp_e164(handle), handle)
+
+    def test_the_request_carries_only_its_names_encoded_and_a_body_filled_once(self):
+        """A path value with / or .. that the request does not encode reaches another path of the service; a fill that
+        only also reads (it may be an email) goes to the service; a value that holds a {name} is filled again; and a
+        run that fills the parsed body itself carries one customer's words into the next one's request."""
+        status = self.parts("order_status", ORDER_STATUS)
+        self.assertEqual(ca.action_request(status, "read", {"order": "123", "postcode": "AB12"}, {}),
+                         ("GET", "/api/orders/123", None, {}))
+        self.assertEqual(ca.action_request(status, "read", {"order": "a/b c?#%", "postcode": "AB12"}, {})[1],
+                         "/api/orders/a%2Fb%20c%3F%23%25")
+        for bad in (".", "..", "", "café", 7):
+            with self.assertRaises(ca.ActionError, msg=bad):
+                ca.action_request(status, "read", {"order": bad, "postcode": "AB12"}, {})
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(status, "read", {"postcode": "AB12"}, {})        # no value of a name that it sends
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(status, "write", {"order": "1"}, {})             # it has no write
+        query = self.parts("q", changed(ORDER_STATUS, read={"method": "GET", "path": "/api/orders/?number={order}"}))
+        self.assertEqual(ca.action_request(query, "read", {"order": "1 2", "postcode": "AB12"}, {})[1],
+                         "/api/orders/?number=1%202")
+        cancel = self.parts("cancel_order", CANCEL_ORDER)
+        values = {"order": "123", "postcode": "AB12", "reason": "Please cancel {order}, \"now\"."}
+        self.assertEqual(ca.action_request(cancel, "write", values, {}),
+                         ("POST", "/api/orders/123/cancel", '{"reason":"Please cancel {order}, \\"now\\"."}',
+                          {"Content-Type": "application/json"}))
+        self.assertEqual(cancel["write"]["body"], {"reason": "{reason}"})
+        self.assertEqual(ca.action_request(cancel, "read", values, {}), ("GET", "/api/orders/123", None, {}))
+        ticket = self.parts("open_ticket", OPEN_TICKET)
+        method, path, sent, headers = ca.action_request(ticket, "create", {"text": "Hola, café"}, {"phone": PHONE})
+        self.assertEqual((method, path, json.loads(sent), headers),
+                         ("POST", "/api/tickets", {"requester_phone": PHONE, "message": "Hola, café",
+                                                   "channel": "whatsapp"}, {"Content-Type": "application/json"}))
+        self.assertTrue(sent.isascii())
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(ticket, "read", {"text": "x"}, {"phone": PHONE})   # a create is no read
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(ticket, "create", {"text": 7}, {"phone": PHONE})   # a fill goes as a JSON string
+
+    def test_a_fill_comes_only_from_the_values_and_a_bind_only_from_the_hub(self):
+        """An address of the body is only the hub's own bind (design v5, 7). Bug: action_request takes a bind's
+        value from the call's values (a ticket for another number), or a fill's value from the binds."""
+        ticket = self.parts("open_ticket", OPEN_TICKET)
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(ticket, "create", {"text": "Hello.", "phone": "+15550000000"}, {})
+        sent = json.loads(ca.action_request(ticket, "create", {"text": "Hello.", "phone": "+15550000000"},
+                                            {"phone": PHONE})[2])
+        self.assertEqual(sent["requester_phone"], PHONE)
+        status = self.parts("order_status", ORDER_STATUS)
+        with self.assertRaises(ca.ActionError):
+            ca.action_request(status, "read", {"postcode": "AB12"}, {"order": "123"})
+
+    def test_a_read_passes_only_for_the_customers_own_record(self):
+        """The owner check is the one fact that ties a record to the customer: another number, a number with no
+        country, a JSON number, an also field that differs or is empty, a body that is not one JSON object, a key that
+        comes two times (json.loads keeps the last one, another parser the first), or a digit part read as a key would
+        each let another customer's record through."""
+        parts = self.parts("order_status", ORDER_STATUS)
+
+        def check(text, bound=PHONE, also="AB12", kind="whatsapp_phone"):
+            return ca.check_answer(parts, "read", text, kind, bound, also)
+        self.assertEqual(check(body()), (True, {"status": "shipped", "eta": "2026-11-30"}))
+        for text, also in ((body(customer={"phone": "+34 699 999 999"}), "AB12"),
+                           (body(customer={"phone": "34600123456"}), "AB12"),
+                           (body(customer={"phone": 34600123456}), "AB12"), (body(customer=[PHONE]), "AB12"),
+                           (body(), "AB13"), (body(shipping={"postcode": ""}), ""), (body(shipping={}), "AB12"),
+                           ("[" + body() + "]", "AB12"), ("{", "AB12"), ("[" * 100000, "AB12"), (None, "AB12"),
+                           (body() + body(), "AB12")):
+            self.assertEqual(check(text, also=also), (False, {}), (text[:80] if text else text, also))
+        self.assertEqual(check(body(), bound="+34699999999"), (False, {}))
+        # two keys of one name: a reader of the first one sees another customer than a reader of the last one
+        twice = '{"customer": {"phone": "+34699999999"}, ' + body()[1:]
+        self.assertEqual(json.loads(twice)["customer"]["phone"], GOOD["customer"]["phone"])
+        self.assertEqual(check(twice), (False, {}))
+        self.assertEqual(check(body(shipping={"postcode": "AB12", "postcode ": "x"})), (True, {"status": "shipped",
+                                                                                            "eta": "2026-11-30"}))
+        self.assertEqual(check(body(), kind="telegram_id"), (False, {}))        # the kind is the action's own
+        # a value that fails its pattern, a value too long, and true or false stay out; an integer is its digits
+        self.assertEqual(check(body(status="Shipped, call Luis", eta=2026113000)), (True, {"eta": "2026113000"}))
+        self.assertEqual(check(body(status="a" * 501, eta=True)), (True, {}))
+        listed = self.parts("listed", changed(ORDER_STATUS, owner={"field": "contacts.0.phone", "kind": "whatsapp_phone"},
+                                              returns={"contacts.0.state": "^[a-z]{1,9}$"}, also=None,
+                                              fills={"order": "^[0-9]{1,6}$"}))
+        good = {"contacts": [{"phone": PHONE, "state": "open"}]}
+        self.assertEqual(ca.check_answer(listed, "read", json.dumps(good), "whatsapp_phone", PHONE, None),
+                         (True, {"contacts.0.state": "open"}))
+        keyed = {"contacts": {"0": {"phone": PHONE, "state": "open"}}}      # a digit part never reads a key
+        self.assertEqual(ca.check_answer(listed, "read", json.dumps(keyed), "whatsapp_phone", PHONE, None),
+                         (False, {}))
+
+    def test_telegram_and_chat_ids_are_compared_as_text_and_never_as_a_phone(self):
+        """A Telegram id or a chat id read as a phone number lets a service's phone field that holds the same digits
+        pass for another customer."""
+        tg = self.parts("tg", changed(ORDER_STATUS, owner={"field": "customer.tg", "kind": "telegram_id"}))
+        for value, passed in (("123456789", True), (123456789, True), ("+123456789", False), (" 123456789", False),
+                              (True, False)):
+            got = ca.check_answer(tg, "read", body(customer={"tg": value}), "telegram_id", "123456789", "AB12")[0]
+            self.assertEqual(got, passed, value)
+        chat = self.parts("chat", changed(ORDER_STATUS, owner={"field": "customer.chat", "kind": "chat_id"}))
+        self.assertTrue(ca.check_answer(chat, "read", body(customer={"chat": "discord:42"}), "chat_id", "discord:42",
+                                        "AB12")[0])
+        self.assertFalse(ca.check_answer(chat, "read", body(customer={"chat": "42"}), "chat_id", "discord:42",
+                                         "AB12")[0])
+
+    def test_a_write_gets_only_the_cut_and_the_read_of_a_write_keeps_nothing(self):
+        """A write's answer is not about the owner (only the returns cut, design 3.2.8), and the read of a write
+        only opens the write: a read of a write that kept its returns would carry a value to the customer's way back
+        that no read action gave. A create's answer is checked against the bound handle."""
+        cancel = self.parts("cancel_order", CANCEL_ORDER)
+        self.assertEqual(ca.check_answer(cancel, "write", '{"state": "cancelled", "customer": {}}', "whatsapp_phone",
+                                         None, None), (True, {"state": "cancelled"}))
+        self.assertEqual(ca.check_answer(cancel, "write", "", "whatsapp_phone", None, None), (True, {}))
+        self.assertEqual(ca.check_answer(cancel, "read", body(state="cancelled"), "whatsapp_phone", PHONE, "AB12"),
+                         (True, {}))
+        ticket = self.parts("open_ticket", OPEN_TICKET)
+        answer = json.dumps({"requester_phone": "0034600123456", "id": 77, "state": "open"})
+        self.assertEqual(ca.check_answer(ticket, "create", answer, "whatsapp_phone", PHONE, None),
+                         (True, {"id": "77", "state": "open"}))
+        self.assertEqual(ca.check_answer(ticket, "create", answer, "whatsapp_phone", "+34699999999", None), (False, {}))
+
+    def test_a_value_that_shares_twelve_characters_with_a_customers_words_is_found(self):
+        """A service that echoes the customer's own words (a ticket's subject) would bring free text back through a
+        returns value; a fold that misses case, spaces, _, - or . lets the same words through in another form, and a
+        hash with no salt of the hub's own can be read back from the stored hashes."""
+        words = "Please mark it as Urgent Waiting-Customer, thanks."
+        salt = "a" * 64
+        known = ca.run_hashes(words, salt)
+        self.assertTrue(known and all(len(h) == 32 for h in known))
+        self.assertFalse(any("urgent" in h for h in known))
+        for value, shared in (("urgent_waiting", True), ("URGENT.WAITING", True), ("urgentwaitin", True),
+                              ("urgentwaiti", False), ("waiting_room", False), ("shipped", False)):
+            self.assertEqual(ca.shares_run(value, salt, known), shared, value)
+        self.assertFalse(ca.shares_run("urgent_waiting", "b" * 64, known))      # another hub's salt
+        self.assertEqual(ca.run_hashes("short words", salt), set())
+        self.assertEqual(ca.folded(" A_b-C.d\tE "), "abcde")
 
 
 if __name__ == "__main__":
