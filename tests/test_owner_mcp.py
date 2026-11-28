@@ -11,6 +11,9 @@ must not do.
 import base64
 import contextlib
 import io
+import warnings
+import zipfile
+import zlib
 import json
 import os
 import pathlib
@@ -58,7 +61,7 @@ def load_tests(loader, _tests, _pattern):
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
                                                     SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect,
-                                                    FolderGrant, Cloud, CompanyLogoFile)
+                                                    FolderGrant, Cloud, CompanyLogoFile, CopyWithAccessKey)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -4290,7 +4293,217 @@ PARITY_TEAM = {"sha256": "team-sha-1", "lines": [
 PARITY_PROFILES = {"profiles": [{"agent": "worker-1", "sha256": "profile-sha-1", "sections": []},
                                 {"agent": "ops lead", "sha256": "profile-sha-2", "sections": []}]}
 PARITY_FILE = b"hello attachment\n"
-PARITY_COPY = b"PK\x03\x04 a stand-in copy of a fleet\n"
+def hub_zip(names, zip64=False, comment=b"", extra=b"", link=None):
+    """A copy of these members as a hub writes one (hub.py backup_bundle: deflate, the date of 1980, no ZIP64, no
+    comment, no extra field), with no time of now in it, so a fixture made twice is the same. The other words make it
+    differ: zip64 (ZIP64's end records, which zipfile writes for so few members only under a limit of 1), a comment of
+    the end record, an extra field of each member, link: the member of that name a symbolic link (its mode)."""
+    out = io.BytesIO()
+    with patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 1 if zip64 else zipfile.ZIP_FILECOUNT_LIMIT), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore")             # zipfile warns of a name that comes twice
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, allowZip64=zip64) as z:
+            for name in names:
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type, info.extra = zipfile.ZIP_DEFLATED, extra
+                if name == link:
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                z.writestr(info, b"/etc/hosts" if name == link else b"example bytes of " + name.encode())
+            z.comment = comment
+    return out.getvalue()
+
+
+def changed(body, old, new):
+    """The bytes of a copy with each `old` made `new` (the same length): a name in its member and its directory."""
+    assert len(old) == len(new) and old in body
+    return body.replace(old, new)
+
+
+def flagged(body):
+    """The copy with its first member marked as encrypted, in its local head and in its directory alike."""
+    for sign, place in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        at = body.index(sign) + place
+        body = body[:at] + bytes([body[at] | 1]) + body[at + 1:]
+    return body
+
+
+_CORE = ["fleet.json", "RESTORE.md", "fleet.sqlite3"]   # the members of each copy that a hub writes
+PARITY_COPY = hub_zip(_CORE)
+_HUB = hub_zip(_CORE + ["config/team.json", "config/knowledge/a/notes.md", "config/skills/ab/cd/SKILL.md",
+                        "vault/central.json"])
+# Copies that take_backup refuses, with the words of each, and copies that it keeps (both programs: the parity cases).
+# A key's name in any case and in any folder (lifecycle.COPY_KEY_NAMES), also behind "." or ".." or from the root, says
+# COPY_WITH_KEY; a name that is not plain says COPY_NOT_HUBS; any other name is kept (the validation of 26 November).
+PARITY_KEYED = {"a member of the access key": hub_zip(_CORE + ["owner-access.key"]),
+                "the access key in a folder in capitals": hub_zip(_CORE + ["copy/OWNER-ACCESS.KEY"]),
+                "the access key by a backslash path": hub_zip(_CORE + ["copy\\Owner-Access.Key"]),
+                "the access key in mixed case": hub_zip(_CORE + ["Owner-Access.Key"]),
+                "the access key after a dot part": hub_zip(_CORE + ["./owner-access.key"]),
+                "the access key after a parent's part": hub_zip(_CORE + ["a/../owner-access.key"]),
+                "the access key from the root and a drive": hub_zip(_CORE + ["/C:/owner-access.key"]),
+                "the access key in a folder of notes": hub_zip(_CORE + ["notes/owner-access.key"]),
+                "a skill's file named owner-access.key": hub_zip(_CORE + ["config/skills/ab/cd/owner-access.key"]),
+                "the public half in a folder in capitals": hub_zip(_CORE + ["a/OWNER-ACCESS.PUB"]),
+                # Windows drops a name's last dots when it writes the file (the Door area's read of 390dae8ee)
+                "the access key with a dot after it": hub_zip(_CORE + ["owner-access.key."]),
+                "the public half with dots after it": hub_zip(_CORE + ["a/Owner-Access.Pub..."])}
+PARITY_NOT_HUBS = {"a name with a drive's colon": hub_zip(_CORE + ["C:owner-access.key"]),
+                   "a parent's part after the key's name": hub_zip(_CORE + ["owner-access.key/../x"]),
+                   "a name from the root": hub_zip(_CORE + ["/notes.txt"]),
+                   "an empty part": hub_zip(_CORE + ["a//notes.txt"]),
+                   "a dot part": hub_zip(_CORE + ["./notes.txt"]),
+                   "a space in a name": hub_zip(_CORE + ["my notes.txt"]),
+                   # above visible ASCII: a Kelvin sign that a Mac's file system folds to "k" (the Vault area's read of
+                   # 462bd384d), and DEL
+                   "the key's name with a Kelvin sign": hub_zip(_CORE + ["owner-access.\u212aey"]),
+                   "a DEL in a name": hub_zip(_CORE + ["notes\x7f.txt"]),
+                   "a backslash in a name": hub_zip(_CORE + ["a\\notes.txt"]),
+                   "a parent's part in a config path": hub_zip(_CORE + ["config/knowledge/../x.md"]),
+                   "a member twice": hub_zip(_CORE + ["fleet.json"]),
+                   "a NUL in a name": changed(hub_zip(_CORE + ["vault/central.json"]), b"vault/central.json",
+                                              b"vault/central.jso\x00"),
+                   "ZIP64's end records": hub_zip(_CORE, zip64=True),
+                   "bytes before the zip": b"a hub's own bytes\n" + _HUB,
+                   "bytes between its directory and its end": _HUB[:-22] + b"\0\0\0\0" + _HUB[-22:],
+                   "a comment that looks like an end": hub_zip(_CORE, comment=b"PK\x05\x06"),
+                   "an extra field in both heads": hub_zip(_CORE, extra=b"up\x05\x00\x01abcd"),
+                   "a member marked as encrypted": flagged(_HUB),
+                   "no records": hub_zip(["fleet.json", "RESTORE.md"]),
+                   "no member at all": hub_zip([]),
+                   "no zip": b"PK\x03\x04 a stand-in that is no zip\n"}
+_START = struct.unpack("<I", _HUB[-6:-2])[0]          # where the directory begins
+
+
+def raw_zip(members, local_extra=b""):
+    """A zip made byte by byte, as zipfile would write it but for what each member says: (name, packed bytes, CRC-32,
+    size, method, flags). So a member can say more packed bytes than its stream has. local_extra: an extra field in
+    the first member's local head alone."""
+    body, table = b"", b""
+    for name, packed, check, whole, method, flags in members:
+        name, extra = name.encode(), local_extra if not body else b""
+        head = struct.pack("<HHHHHIIIHH", 20, flags, method, 0, 0x21, check, len(packed), whole, len(name), 0)
+        table += b"PK\x01\x02" + struct.pack("<H", 20) + head + struct.pack("<HHHII", 0, 0, 0, 0, len(body)) + name
+        body += b"PK\x03\x04" + head[:-2] + struct.pack("<H", len(extra)) + name + extra + packed
+    return body + table + b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, len(members), len(members), len(table),
+                                                       len(body), 0)
+
+
+def deflated(data):
+    pack = zlib.compressobj(6, zlib.DEFLATED, -15)
+    return pack.compress(data) + pack.flush()
+
+
+def hidden_member():
+    """The bytes of a whole local member of the access key, as a reader of local members reads one."""
+    key = b"-----BEGIN OPENSSH PRIVATE KEY-----\nexample\n-----END OPENSSH PRIVATE KEY-----\n"
+    return (b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, 0, 0, 0, 0x21, zlib.crc32(key), len(key), len(key), 16, 0)
+            + b"owner-access.key" + key)
+
+
+def hidden_after_deflate():
+    """A member whose packed size runs on after its deflate stream ends, with a whole member of the access key in that
+    room: a reader that reads a stream to its end and then the next member (Finder's ditto) writes owner-access.key."""
+    key = b"-----BEGIN OPENSSH PRIVATE KEY-----\nexample\n-----END OPENSSH PRIVATE KEY-----\n"
+    inner = (b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, 0, 0, 0, 0x21, zlib.crc32(key), len(key), len(key), 16, 0)
+             + b"owner-access.key" + key)
+    records = b"example records of a fleet"
+    return raw_zip([(n, deflated(d), zlib.crc32(d), len(d), 8, 0) for n, d in (("fleet.json", b"{}"),
+                                                                              ("RESTORE.md", b"notes"))]
+                   + [("fleet.sqlite3", deflated(records) + inner, zlib.crc32(records), len(records), 8, 0)])
+
+
+def junk_after(count, records=b"example records of a fleet", after=None):
+    """The copy made byte by byte with `count` bytes after the end of its records' stream, inside its packed size, or the
+    bytes `after` there."""
+    return raw_zip([(n, deflated(d), zlib.crc32(d), len(d), 8, 0) for n, d in (("fleet.json", b"{}"),
+                                                                              ("RESTORE.md", b"notes"))]
+                   + [("fleet.sqlite3", deflated(records) + (after if after is not None else b"J" * count),
+                       zlib.crc32(records), len(records), 8, 0)])
+
+
+def honest_raw(**change):
+    """The same copy with nothing after its streams: raw_zip itself writes a copy that the check keeps. change: one
+    field of the first member made other (method, flags, a stored body), or local_extra."""
+    members = [[n, deflated(d), zlib.crc32(d), len(d), 8, 0] for n, d in (("fleet.json", b"{}"), ("RESTORE.md", b"notes"),
+                                                                         ("fleet.sqlite3", b"example records of a fleet"))]
+    if "flags" in change:
+        members[0][5] = change["flags"]
+    if change.get("stored"):
+        members[0][1], members[0][4] = b"{}", 0
+    if change.get("broken"):                    # a final block of type 3, which no deflate stream has
+        members[0][1] = b"\x07\x00\x00\x00"
+    if "whole" in change:
+        members[0][3] = change["whole"]
+    return raw_zip([tuple(m) for m in members], local_extra=change.get("local_extra", b""))
+
+
+def local_field(body, place, value):
+    """The copy with one field of its first member's local head made `value` (its directory as it was)."""
+    at = body.index(b"PK\x03\x04") + place
+    return body[:at] + value + body[at + len(value):]
+
+
+def rebuilt(body, extra=b"", gap=b""):
+    """The copy with `extra` as an extra field of its first member in the directory alone, or with `gap` between its
+    first two members, the offsets of the directory and of its end made to fit, so each other rule still holds."""
+    count, length, start = struct.unpack("<HII", body[-12:-2])
+    directory, entries, at = body[start:start + length], [], 0
+    for _ in range(count):
+        name_size, extra_size, note = struct.unpack("<HHH", directory[at + 28:at + 34])
+        size = 46 + name_size + extra_size + note
+        entries.append(bytearray(directory[at:at + size]))
+        at += size
+    first_end = struct.unpack("<I", entries[1][42:46])[0]
+    if extra:
+        name_size = struct.unpack("<H", entries[0][28:30])[0]
+        entries[0][30:32] = struct.pack("<H", len(extra))
+        entries[0][46 + name_size:46 + name_size] = extra
+    for entry in entries[1:]:
+        entry[42:46] = struct.pack("<I", struct.unpack("<I", entry[42:46])[0] + len(gap))
+    members = body[:first_end] + gap + body[first_end:start]
+    table = b"".join(entries)
+    end = bytearray(body[-22:])
+    end[12:20] = struct.pack("<II", len(table), start + len(gap))
+    return members + table + bytes(end)
+
+
+PARITY_NOT_HUBS.update({
+    # a reader of the local members, not of the directory, would find these
+    "bytes hidden before its directory": _HUB[:_START] + b"JUNKJUNK" + _HUB[_START:-6] + struct.pack("<I", _START + 8)
+                                         + _HUB[-2:],
+    "a local name that is not its directory's": _HUB.replace(b"fleet.json", b"fleet.jsoX", 1),
+    "bytes hidden between two members": rebuilt(_HUB, gap=b"JUNKJUNK"),
+    "an extra field in its directory alone": rebuilt(_HUB, extra=b"up\x05\x00\x01abcd"),
+    "a member hidden after the end of a deflate stream": hidden_after_deflate(),
+    "a member that is a link": hub_zip(_CORE + ["config/skills/ab/cd/owner-access.key"],
+                                       link="config/skills/ab/cd/owner-access.key"),
+    # each rule of a member, alone
+    "a data descriptor in both heads": honest_raw(flags=8),
+    "a stored member": honest_raw(stored=True),
+    "an extra field in the local head alone": honest_raw(local_extra=b"up\x05\x00\x01abcd"),
+    "a local CRC that is not its directory's": local_field(honest_raw(), 14, b"\0\0\0\0"),
+    "a local size that is not its directory's": local_field(honest_raw(), 22, b"\x09\0\0\0"),
+    "a local method that is not its directory's": local_field(honest_raw(), 8, b"\0\0"),
+    "a broken deflate stream": honest_raw(broken=True),
+    "one byte after a stream's end": junk_after(1),
+    "forty bytes after a stream's end": junk_after(40),
+    # Apple's decoder takes in what comes after an end in the same call: an end inside a large part, with more room
+    # after it than the last bytes that go in one at a time, and a stream of much output, pin how it is read
+    "a stream's end with 200,000 bytes after it": junk_after(200_000),
+    "a stream of 4 MiB of output with bytes after its end": junk_after(30, records=b"\0" * (4 << 20)),
+    "16 MiB of zeros with bytes after their end": junk_after(30, records=b"records" + b"\0" * (16 << 20)),
+    # Door's reader of 43ab1e08a: a zero run in the window where the decoder still held output at its last call, with
+    # 300 bytes after its end that begin with a whole member of the access key (ditto wrote it there)
+    "4,290,000 zeros and a member of the access key after their end": junk_after(0, records=b"\0" * 4_290_000,
+                                                                                after=hidden_member().ljust(300, b"\0")),
+    "a member that states 4 GiB": honest_raw(whole=0xFFFFFFFF)})
+PARITY_KEPT_RAW = honest_raw()
+PARITY_KEPT = {"each member that a hub writes": _HUB, "the copy made byte by byte": PARITY_KEPT_RAW,
+               # records whose free pages at their end are zeros: a long run that the decoder holds back (Vault's reader)
+               "records that end in 16 MiB of zeros": junk_after(0, records=b"records" + b"\0" * (16 << 20)),
+               "8 MiB of zeros and nothing after them": junk_after(0, records=b"\0" * (8 << 20)),
+               # the hub releases before the app: a member that only a later hub writes is kept
+               "a member that a later hub adds": hub_zip(_CORE + ["later/member.json", "notes.txt"])}
 PARITY_RID = "6F1C2A3B-0000-4000-8000-00000000000A"
 PARITY_SECRET = "bws://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"       # an API key of the catalog
 PARITY_LOGIN = "bws://bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"        # a login of the catalog
@@ -4945,6 +5158,13 @@ def parity_cases():
     case("take_backup: a place that cannot be written", "take_backup", {"path": "<tmp>/note.txt/c.zip"},
          files={"note.txt": "a file"})
     case("take_backup: no path", "take_backup", {})
+    # A copy that is not in a hub's own form, above all one with a member of the fleet's access key, is kept by neither
+    # program, and nothing is confirmed.
+    for words, body in list(PARITY_KEYED.items()) + list(PARITY_NOT_HUBS.items()) + list(PARITY_KEPT.items()):
+        case(f"take_backup: a copy with {words}", "take_backup", {"path": "<tmp>/c.zip"},
+             lambda s, r, body=body: (200, {"Content-Type": "application/zip",
+                                            "X-Fleet-Backup-SHA256": hashlib.sha256(body).hexdigest()}, body)
+             if r["path"] == "/ui/backup" else None)
     # The hub's name of a file counts only as one file name in the folder that the agent named (F1).
     names = {"a parent's part": "../../.zshrc", "a whole path": "/Library/LaunchAgents/a.plist",
              "a dot": ".", "two dots": "..", "nothing": "", "a folder in it": "dl2/a.txt",
@@ -5500,6 +5720,83 @@ def parity_fixture():
 
 def parity_text():
     return json.dumps(parity_fixture(), indent=1, sort_keys=True) + "\n"
+
+
+class CopyWithAccessKey(unittest.TestCase):
+    """take_backup keeps only a copy in the one form that a hub writes, of its members (the Door area's finding of 25
+    November 2026; the Vault area's read of 15477930f): the owner's way back after a lost Mac reads the member of the
+    fleet's access key from a copy, and a reader that differs from the restore's, unzip's or the app's could read a
+    member that a looser check did not see. A bug here keeps such a copy and tells the hub that it is kept, or refuses
+    a hub's real copy."""
+
+    def fault(self, body):
+        folder = pathlib.Path(tempfile.mkdtemp(prefix="copy-shape-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        (folder / "c.zip").write_bytes(body)
+        return owner_mcp.copy_fault(str(folder / "c.zip"))
+
+    def test_the_forms_that_count(self):
+        for words, body in PARITY_KEYED.items():
+            with self.subTest(words):
+                self.assertEqual(self.fault(body), owner_mcp.COPY_WITH_KEY)
+        for words, body in PARITY_NOT_HUBS.items():
+            with self.subTest(words):
+                self.assertEqual(self.fault(body), owner_mcp.COPY_NOT_HUBS)
+        for words, body in list(PARITY_KEPT.items()) + [("the parity copy", PARITY_COPY)]:
+            with self.subTest(words):
+                self.assertIsNone(self.fault(body))
+
+    def test_its_names_and_limits_are_the_hubs(self):
+        """The names and limits of a copy are the hub's own (a hub's real copy passes in the test of take_backup
+        above): the three members of each copy, the key's two names that no file of the fleet takes, and the bounds;
+        and the app's program holds the same text."""
+        import lifecycle
+        self.assertEqual(set(owner_mcp.COPY_NEEDED), {hub.BACKUP_MANIFEST, "RESTORE.md", hub.BACKUP_DB})
+        self.assertEqual(owner_mcp.COPY_KEY_NAMES, lifecycle.COPY_KEY_NAMES)
+        self.assertEqual((owner_mcp.COPY_ENTRIES_MAX, owner_mcp.COPY_DIRECTORY_MAX),
+                         (hub.BACKUP_ENTRIES_MAX, hub.BACKUP_DIRECTORY_MAX))
+        # every name that the hub's copy writes now is a plain one, which a check of its names keeps
+        for name in (hub.BACKUP_MANIFEST, "RESTORE.md", hub.BACKUP_DB, hub.CENTRAL_MEMBER, hub.BACKUP_CONFIG + "team.json"):
+            self.assertTrue(owner_mcp.copy_member(name.encode()), name)
+        source = HERE / "app/Sources/FleetOwnerAPI/OwnerWrites.swift"
+        if not source.exists():
+            self.skipTest("the apps' folder app/ is not in this tree (the published repository has none)")
+        swift = source.read_text()
+        self.assertIn("static let keyNames = [" + ", ".join(f'"{n}"' for n in owner_mcp.COPY_KEY_NAMES) + "]", swift)
+        self.assertIn("static let needed = [" + ", ".join(f'"{n}"' for n in owner_mcp.COPY_NEEDED) + "]", swift)
+        self.assertIn(f"static let entriesMost = {owner_mcp.COPY_ENTRIES_MAX:_}", swift)
+        self.assertIn(f"static let directoryMost = 4 * 1024 * 1024", swift)
+        self.assertIn("static let unpackMost = 2048 * 1024 * 1024 + 2 * 1024 * 1024", swift)
+        # Apple's decoder takes in bytes after a stream's end that come in the same call: 64 bytes one at a time find
+        # each such end (the Vault area's reader of 1e27407be); 1, 2 or 8 do not
+        self.assertIn("static let tailBytes = 64\n", swift)
+
+    def test_a_copy_that_states_more_than_a_restore_unpacks_is_never_inflated(self):
+        """A hub could state 4 GiB of each member in a small copy: the sum of the stated sizes is held to what a
+        restore unpacks before one byte is inflated, so such a copy costs no time. A bug here inflates it first."""
+        def never(*_args):
+            raise AssertionError("a member was inflated")
+        with patch.object(owner_mcp, "inflates_whole", never):
+            self.assertEqual(self.fault(PARITY_NOT_HUBS["a member that states 4 GiB"]), owner_mcp.COPY_NOT_HUBS)
+        self.assertEqual(owner_mcp.COPY_UNPACK_MAX, hub.RESTORE_UNPACK + 2 * hub.BACKUP_MANIFEST_MAX)
+
+    def test_such_a_copy_is_neither_kept_nor_confirmed(self):
+        folder = pathlib.Path(tempfile.mkdtemp(prefix="keyed-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        body, said = PARITY_KEYED["the access key in a folder in capitals"], []
+
+        class Answer:
+            headers = {"X-Fleet-Backup-SHA256": hashlib.sha256(body).hexdigest()}
+
+        def get(path, what, into=None):
+            into.write(body)
+            return Answer()
+        with patch.object(owner_mcp, "get", get), \
+                patch.object(owner_mcp, "command", lambda *a, **k: said.append(a) or {"ok": True}), \
+                self.assertRaises(owner_mcp.Refused) as refused:
+            owner_mcp.take_backup({"path": str(folder)})
+        self.assertEqual(str(refused.exception), owner_mcp.COPY_WITH_KEY)
+        self.assertEqual((said, list(folder.iterdir())), ([], []))
 
 
 class Parity(unittest.TestCase):

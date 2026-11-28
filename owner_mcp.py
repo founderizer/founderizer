@@ -118,6 +118,26 @@ COPY_WAIT = 600
 COPY_TOTAL = 1500
 COPY_SLOW = (f"The copy did not arrive in {COPY_TOTAL // 60} minutes, the most that one tool call waits, so nothing was "
              f"kept. Save copy in Settings \u203a Backup of the Founderizer app has no such limit of time.")
+# take_backup keeps only a copy in the one form that a hub writes (hub.py backup_bundle: zipfile with allowZip64 off,
+# nothing before or after it, no comment, no extra field), with plain names, and refuses every other file: a reader
+# that differs from the restore's, unzip's or the app's (ZipArchive) could then read a member that this check did not
+# see (the Door area's finding of 25 November 2026, and the Vault area's read of 15477930f). Above all a member of the
+# fleet's access key's names (OwnerAccess.member), which no hub writes and which the owner's way back after a lost Mac
+# reads (HUB-INSTALL.md, "A hub that moves to a new server"). A member of any other plain name is kept: the hub
+# releases before the app, so a later hub can add one (the validation of 26 November 2026; audit finding 1, 41eadef52).
+# The app's program checks the same (CopyShape).
+ACCESS_MEMBER = "owner-access.key"
+COPY_KEY_NAMES = (ACCESS_MEMBER, "owner-access.pub")      # lifecycle.COPY_KEY_NAMES: in any case and in any folder
+COPY_NEEDED = ("fleet.json", "RESTORE.md", "fleet.sqlite3")         # hub.py BACKUP_MANIFEST, RESTORE.md, BACKUP_DB
+COPY_ENTRIES_MAX = 20_000                       # hub.py BACKUP_ENTRIES_MAX
+COPY_DIRECTORY_MAX = 4 * 1024 * 1024            # hub.py BACKUP_DIRECTORY_MAX
+COPY_UNPACK_MAX = 2048 * 1024 * 1024 + 2 * 1024 * 1024    # hub.py RESTORE_UNPACK, and BACKUP_MANIFEST_MAX twice
+COPY_WITH_KEY = ("The hub's copy holds a member named owner-access.key or owner-access.pub, which no hub writes: only the "
+                 "Founderizer app puts the fleet's access key into a copy, its own. So nothing was kept, and the hub was "
+                 "not told that the copy is kept.")
+COPY_NOT_HUBS = ("The hub's copy is not a copy in the form that a hub writes (one zip with fleet.json, RESTORE.md and "
+                 "fleet.sqlite3, each member once and under a plain name), so nothing was kept, and the hub was not "
+                 "told that the copy is kept.")
 # The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own types
 # (hub.py ATTACH_TYPES and, since owner API 1.251, ATTACH_OFFICE, Word, Excel and PowerPoint; it takes no other) and the
 # other endings of the same types. Every other file is
@@ -2226,6 +2246,9 @@ def take_backup(args):
         said = answer.headers.get("X-Fleet-Backup-SHA256")
         if said and said != digest:
             raise Refused("the copy did not arrive whole: the hub's SHA-256 is not the one of the bytes received.")
+        fault = copy_fault(coming)
+        if fault:
+            raise Refused(fault)
         if folder is not None:
             place = into_folder(folder, hub_file_name(answer, f"founderizer-{int(time.time())}.zip"))
         kept_as(coming, place, folder)          # before the confirmation: a write refused confirms nothing
@@ -2237,6 +2260,110 @@ def take_backup(args):
     receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": into.size, "keyed": False, "maker": "command"},
                       "the confirmation of the copy", args.get("request_id"))
     return dict(receipt, path=str(place), bytes=into.size, sha256=digest, keyed=False, note=COPY_NO_KEY)
+
+
+def copy_fault(path):
+    """None for a file in the one form of a hub's copy (the comment above ACCESS_MEMBER), else the words of the
+    refusal: COPY_WITH_KEY for a member whose last path part is one of COPY_KEY_NAMES in any case of ASCII, in any
+    folder, also with dots after it; COPY_NOT_HUBS for each other difference, a member with a mode (such as a link) or
+    a name that is not plain (`copy_member`) among them. It reads the end record at the file's very end, the central
+    directory that it names, and the head of each local member, which must stand where the directory says, one after
+    the other from the file's first byte to the directory, with the directory's name, flags, method, sizes and check:
+    so a reader that reads the local members, not the directory, finds the same members and no other."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            if size < 22:
+                return COPY_NOT_HUBS
+            f.seek(size - 22)
+            end = f.read(22)
+            if size >= 42:
+                f.seek(size - 42)
+                if f.read(4) == b"PK\x06\x07":      # ZIP64's locator: no hub writes ZIP64
+                    return COPY_NOT_HUBS
+            if end[:4] != b"PK\x05\x06":
+                return COPY_NOT_HUBS
+            disk, first, here, count, length, start, comment = struct.unpack("<HHHHIIH", end[4:])
+            if (disk, first, comment) != (0, 0, 0) or here != count or count > COPY_ENTRIES_MAX \
+                    or length > COPY_DIRECTORY_MAX or start + length != size - 22:
+                return COPY_NOT_HUBS
+            f.seek(start)
+            directory = f.read(length)
+            names, streams, at, local = [], [], 0, 0
+            for _ in range(count):
+                if directory[at:at + 4] != b"PK\x01\x02" or at + 46 > length:
+                    return COPY_NOT_HUBS
+                flags, method = struct.unpack("<HH", directory[at + 8:at + 12])
+                check, packed, whole = struct.unpack("<III", directory[at + 16:at + 28])
+                size_name, extra, note, disk_start = struct.unpack("<HHHH", directory[at + 28:at + 36])
+                # its mode: zipfile writes rw------- and no kind of file (0o600 << 16); a link or a folder is no hub's
+                mode, offset = struct.unpack("<II", directory[at + 38:at + 46])
+                odd = (mode >> 16) & 0o170000 not in (0, 0o100000) or mode & 0xFFFF
+                name = directory[at + 46:at + 46 + size_name]
+                if flags & 9 or extra or note or disk_start or odd or offset != local or at + 46 + size_name > length:
+                    return COPY_NOT_HUBS
+                f.seek(offset)                  # the local head: the same member, where the directory says
+                head = f.read(30 + size_name)
+                if len(head) != 30 + size_name or head[:4] != b"PK\x03\x04" or method != 8 or \
+                        struct.unpack("<HH", head[6:10]) != (flags, method) or \
+                        struct.unpack("<IIIHH", head[14:30]) != (check, packed, whole, size_name, 0) or head[30:] != name:
+                    return COPY_NOT_HUBS
+                names.append(name)
+                streams.append((offset + 30 + size_name, packed, whole, check))
+                at, local = at + 46 + size_name, offset + 30 + size_name + packed
+            if at != length or local != start or sum(whole for _at, _packed, whole, _check in streams) > COPY_UNPACK_MAX:
+                return COPY_NOT_HUBS            # what a restore unpacks, which bounds the inflating below too
+            keys = {name.encode() for name in COPY_KEY_NAMES}
+            # in any folder: no file of the fleet takes either name (lifecycle); and with dots after it, which Windows
+            # drops when it writes a file (the Door area's read of 390dae8ee)
+            if any(re.split(rb"[/\\]", raw)[-1].rstrip(b".").lower() in keys for raw in names):
+                return COPY_WITH_KEY
+            if not all(map(copy_member, names)) or len(set(names)) != len(names) or \
+                    not {name.encode() for name in COPY_NEEDED} <= set(names):
+                return COPY_NOT_HUBS            # plain names, each member once, and the three of each copy there
+            for place, packed, whole, check in streams:
+                f.seek(place)
+                if not inflates_whole(f, packed, whole, check):
+                    return COPY_NOT_HUBS
+    except OSError:
+        return COPY_NOT_HUBS
+    return None
+
+
+def inflates_whole(f, packed, whole, check):
+    """Whether the `packed` bytes at f's place are one deflate stream that ends with its last byte and gives `whole`
+    bytes of this CRC-32: no byte after its end, where a reader that reads a stream to its end and then looks for the
+    next member would find a member that the directory does not name (Door's readers of e80cd4387). In parts, as
+    the SHA-256 is read: a copy of any size takes no more memory than one part and its output."""
+    import zlib
+    inflate, left, made, crc, pending = zlib.decompressobj(-15), packed, 0, 0, b""
+    while True:
+        if not pending and left:
+            pending = f.read(min(1 << 20, left))
+            if not pending:
+                return False
+            left -= len(pending)
+        try:
+            out = inflate.decompress(pending, 1 << 20)  # also what zlib still holds, once all input is in
+        except zlib.error:
+            return False                # a broken stream (a block of type 3, a bad code)
+        pending = inflate.unconsumed_tail
+        made, crc = made + len(out), zlib.crc32(out, crc)
+        if made > whole:
+            return False
+        if inflate.eof:
+            return not inflate.unused_data and not pending and not left and made == whole and crc == check
+        if not out and not pending and not left:
+            return False                # all of it read, nothing more out, and no end: a cut or broken stream
+
+
+def copy_member(raw):
+    """Whether a member's name is a plain one: visible ASCII bytes with no backslash and no colon, not from the root,
+    and no part between its slashes that is empty, "." or "..". Any such name is kept, also one that only a later hub
+    writes."""
+    if not raw or any(byte <= 0x20 or byte >= 0x7f or byte in (0x5c, 0x3a) for byte in raw):
+        return False
+    return all(part not in (b"", b".", b"..") for part in raw.split(b"/"))
 
 
 def kept_as(coming, place, folder=None):

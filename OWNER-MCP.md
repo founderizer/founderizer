@@ -1130,7 +1130,20 @@ the fleet (`owner-access.key`), which only a copy that the Founderizer app keeps
 (`OwnerAccess.withKey`), so after a lost Mac only such a copy is the way back into the servers. So both
 programs confirm their copy with `keyed: false, maker: "command"` and say so in the result (`keyed`,
 `note`): the hub keeps it as the newest copy of an owner command, and its copy warnings stay until the
-app keeps a copy with the key (UI-API.md 1.346). An answer that is not a success is words, never a file: both
+app keeps a copy with the key (UI-API.md 1.346). A copy from the hub that holds a member of the key's
+name itself would put a key of the hub's own where the way back reads the fleet's. Both programs keep
+only a copy in the one form that a hub writes (a zip with its end record at its very end, no comment,
+no ZIP64, no extra field, no link and no folder, nothing before it or between its parts, each local
+member where its directory says and as it says, deflated and inflating to its size and CRC with no
+byte after its stream, one after the other up to the directory, each member once, fleet.json,
+RESTORE.md and fleet.sqlite3 among them, each name of visible ASCII with no backslash or colon, not
+from the root, and with no part that is empty, "." or ".."), read after its SHA-256 (`copy_fault`,
+`CopyShape`), and refuse each other file with COPY_WITH_KEY or COPY_NOT_HUBS, keeping nothing and
+confirming nothing: so no reader that differs from the restore's, unzip's, Finder's or the app's can
+read a member that the check did not see. A member of any other name is kept, because the hub
+releases before the app and a later hub can add one. A member whose last part is owner-access.key or
+owner-access.pub, in any case and in any folder (`lifecycle.COPY_KEY_NAMES`, which no file of the
+fleet takes), says COPY_WITH_KEY. An answer that is not a success is words, never a file: both
 programs read at most 8 MiB of it, under the same total time. The whole
 snapshot (`GET /ui/state`), which a process reads before its first call for the hub's generation,
 has a limit of its own in both programs, 64 MiB (`STATE_MAX`, `Transfer.state`): it is an
