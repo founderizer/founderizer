@@ -63,6 +63,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -106,6 +107,8 @@ MADE_FILE = STATE + "/made.json"            # names of what writes through the d
 REMOVED_FILE = STATE + "/removed.json"      # objects that GitOps commits through the door removed, for a prune (X3)
 REMOVED_DAYS = 30                           # a removal older than this is no longer the door's own for a prune
 REPOS_FILE = STATE + "/repos.json"          # the repositories that the door made, and a repo-new that is pending (N3)
+REPO_APPS_FILE = STATE + "/repo-apps.json"  # the GitHub Apps of one repository each (M2): ids and facts, no key
+REPO_APPS_DIR = STATE + "/repo-apps"         # their keys, one file each, mode 400, this user only
 ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
 KEYS_FILE = STATE + "/keys.json"            # what each saved Cloudflare key is, and the work keys that the door made
 KEY_SAID_AGAIN = 600                        # seconds before the same failure of a work key gets a second record line
@@ -275,6 +278,107 @@ def same_ref(a, b):
     lower case, so a comparison of the exact text would let one value pass under two names: a hub that is broken into
     could write a provider's key as an app's setting by its reference in capitals (a read of 22 November 2026)."""
     return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
+
+
+# The GitHub App of one repository (the order of `main` on GitHub, M2, row 6: the developer agents' App of the
+# product's source): GitHub makes it from the owner's press on its manifest page, and the door makes its key from the
+# one-time code, so that the key passes neither the owner's Mac nor the hub. It holds exactly these permissions, as
+# Release and the order's two readers settled them on 27 November 2026 (checks and actions at read, so that an agent
+# reads why the gate or CI refused its pull request); nothing else (never checks or actions at write, workflows,
+# administration or secrets), and no event.
+REPO_APP_PERMISSIONS = {"metadata": "read", "contents": "write", "pull_requests": "write", "checks": "read",
+                        "actions": "read"}
+MANIFEST_CODE = re.compile(r"[A-Za-z0-9]{1,100}")     # GitHub's one-time code of the manifest flow
+APP_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,99}")
+
+
+def repo_app_fault(made, repo):
+    """Why GitHub's answer to a code's conversion is no App of one repository for `repo`, in words, or None: an App
+    with its id, slug and key, owned by the repository's owner, with exactly REPO_APP_PERMISSIONS, and no event."""
+    if not isinstance(made, dict) or isinstance(made.get("id"), bool) or not isinstance(made.get("id"), int) or \
+            made["id"] <= 0:
+        return "GitHub's answer names no App"
+    if not isinstance(made.get("pem"), str) or "PRIVATE KEY" not in made["pem"]:
+        return "GitHub's answer holds no key"
+    if not isinstance(made.get("slug"), str) or not APP_SLUG.fullmatch(made["slug"]):
+        return "GitHub's answer names the App in another form"
+    owner = made.get("owner") if isinstance(made.get("owner"), dict) else {}
+    if not isinstance(owner.get("login"), str) or owner["login"].lower() != repo.split("/")[0]:
+        return f"the App is not of {repo.split('/')[0]}, the repository's owner"
+    if made.get("permissions") != REPO_APP_PERMISSIONS:
+        return ("the App holds other permissions than contents and pull requests at write and checks, actions and "
+                "metadata at read")
+    if made.get("events") not in ([], None):
+        return "the App takes events, and an App of one repository takes none"
+    return None
+
+
+def repo_app_page(made):
+    """The page of an App on GitHub, where its owner deletes it."""
+    owner = made.get("owner") if isinstance(made.get("owner"), dict) else {}
+    slug = made.get("slug") if isinstance(made.get("slug"), str) and APP_SLUG.fullmatch(made["slug"]) else None
+    if not slug:
+        return "the account's Apps page on GitHub"
+    if owner.get("type") == "Organization" and isinstance(owner.get("login"), str):
+        return f"https://github.com/organizations/{owner['login']}/settings/apps/{slug}"
+    return f"https://github.com/settings/apps/{slug}"
+
+
+def repo_apps():
+    """The door's Apps of one repository each, {repository in lower case: {app_id, slug, owner, permissions, made,
+    key_sha256}}: {} with no file, None when the file is there and does not read as such a record (fail closed: the
+    door then makes no token for a repository that may have an App of its own)."""
+    if not os.path.lexists(P(REPO_APPS_FILE)):
+        return {}
+    got = read_json(REPO_APPS_FILE, None)
+    if not isinstance(got, dict) or not all(isinstance(k, str) and door_targets.REPO.fullmatch(k) and k == k.lower()
+                                            and isinstance(v, dict) and isinstance(v.get("app_id"), int)
+                                            and not isinstance(v.get("app_id"), bool) for k, v in got.items()):
+        return None
+    return got
+
+
+def repo_app_path(app_id):
+    """The file of one App of a repository's key, checked: a regular file of this user's, mode 400, in a folder of
+    mode 700 of this user's. The key is never read into the door's memory: openssl signs from this file."""
+    folder = P(REPO_APPS_DIR)
+    path = os.path.join(folder, f"{int(app_id)}.pem")
+    try:
+        held = os.lstat(folder)
+        info = os.lstat(path)
+    except OSError:
+        raise Refused(f"the door holds no key of the App {app_id}") from None
+    if not stat.S_ISDIR(held.st_mode) or stat.S_IMODE(held.st_mode) != 0o700 or held.st_uid != os.getuid() or \
+            not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o400 or info.st_uid != os.getuid():
+        raise Refused(f"the door's file of the App {app_id}'s key is not its own, with mode 400")
+    return path
+
+
+def repo_app_jwt(app_id):
+    """A JWT of one App of a repository, signed by openssl from the key's own file (repo_app_path), with no copy of
+    the key in a temporary file."""
+    path = repo_app_path(app_id)
+
+    def sign(text, _pem):
+        signed = subprocess.run(["openssl", "dgst", "-sha256", "-sign", path], input=text.encode(),
+                                capture_output=True, timeout=20)
+        if signed.returncode != 0 or not signed.stdout:
+            raise door_providers.Stop(f"openssl could not sign with the App {app_id}'s key")
+        return signed.stdout
+    return door_providers.app_jwt(app_id, "", sign)
+
+
+def repo_app_installation_fault(inst, listed, repo):
+    """Why an installation of a repository's own App is not that one repository's alone, or None: it must hold
+    selected repositories, and exactly `repo` (the order's rows 6 and 8: the agents' App is on the source only, and no
+    other repository of the gate is in an App). listed: its repositories in lower case (Door.selected)."""
+    if inst.get("repository_selection") != "selected" or listed != {repo}:
+        return (f"the App of {repo} is installed on more than {repo}: on its installation's page the owner chooses "
+                f"\"Only select repositories\" and that one repository")
+    return None
+
+
+door_providers.OWN_APP_REPOS = lambda: (lambda own: None if own is None else set(own))(repo_apps())
 
 
 def value_file(ref):
@@ -2035,7 +2139,10 @@ class Door:
         pool = (access.get("pools") or {}).get(me.get("business")) or {}
         levels = list(GITHUB_ACCESS)
         groups, refused, vendors = {}, [], []
-        operator, kept = bool(me.get("servers") or me.get("business")), []
+        operator, kept, narrow = bool(me.get("servers") or me.get("business")), [], []
+        own = repo_apps()
+        if own is None:     # a repository may have an App of its own that the door cannot read now: no token at all
+            raise Refused(f"the door cannot read its record of the Apps of one repository ({REPO_APPS_FILE})")
         for repo, level in sorted((repos or {}).items()):
             if door_targets.vendor(repo):
                 vendors.append(repo)
@@ -2049,24 +2156,38 @@ class Door:
             if self.repo_record("made", repo) and (level == "deploy" or (level == "write" and operator)):
                 kept.append(repo)
                 continue
-            groups.setdefault((repo.split("/")[0], level), []).append(repo)
+            # M2: a repository with an App of its own gets its tokens from that App only, never from the door's own
+            # App of its owner, and at read or write only, which is all that such an App holds
+            app = own.get(repo.lower())
+            if app and level not in ("read", "write"):
+                narrow.append(repo)
+                continue
+            groups.setdefault((repo.split("/")[0], level, app["app_id"] if app else None), []).append(repo)
         tokens, errors = [], [{"repos": [r], "error": "neither the door's access file nor the business's pool gives "
                                                       "this agent that level"} for r in refused]
+        errors += [{"repos": [r], "error": "this repository has a GitHub App of its own, which gives read or write and "
+                                          "nothing more"} for r in narrow]
         errors += [{"repos": [r], "error": VENDOR_TOKEN_WORDS} for r in vendors]
         errors += [{"repos": [r], "error": "the door made this repository: it makes no deploy token on it, and no write "
                                           "token for an Operator, whose workflow files there go through the door"}
                    for r in kept]
         # the highest level first, as the hub's own path sends them: the session's GH_TOKEN is the first token
-        # (fleet.py integration_env), so gh and the GitHub tool get the token that does the most
-        for (owner, level), names in sorted(groups.items(), key=lambda g: (-levels.index(g[0][1]), g[0][0])):
-            conf = github_app(access, owner) or sole_app(access) or {}
+        # (fleet.py integration_env), so gh and the GitHub tool get the token that does the most; at one level, a
+        # repository's own App before the door's own App of that owner (M2: the developer agents' source)
+        for (owner, level, app_id), names in sorted(groups.items(), key=lambda g: (-levels.index(g[0][1]),
+                                                                                  0 if g[0][2] else 1, g[0][0])):
+            conf = {"app_id": app_id} if app_id else github_app(access, owner) or sole_app(access) or {}
             try:
                 ctx = {"credentials": dict(conf, owner=owner), "http": self.http, "secret": self.secret}
-                jwt = door_providers.app_jwt(conf["app_id"], self.secret(conf.get("secret")))
+                jwt = repo_app_jwt(app_id) if app_id else \
+                    door_providers.app_jwt(conf["app_id"], self.secret(conf.get("secret")))
                 inst = self.installation(jwt, names)
                 # new-projects plan N1: a repository that the installation no longer lists (deleted on GitHub, or no
                 # longer selected) is dropped before the token, so that it does not stop the tokens of the others
                 listed = self.selected(jwt, inst)
+                fault = repo_app_installation_fault(inst, listed, names[0].lower()) if app_id else None
+                if fault:
+                    raise Refused(fault)
                 if listed is not None:
                     gone = [n for n in names if n.lower() not in listed]
                     if gone:
@@ -2091,6 +2212,154 @@ class Door:
         self.record.add(caller="hub", target="github", action="token", kind="token",
                         outcome="done" if tokens else "failed", why=f"{agent}: {len(tokens)} tokens")
         return tokens, errors
+
+    REPO_APP_LOCK = threading.Lock()    # one conversion at a time: a second ask gets 503 and does not wait
+
+    def repo_app_code(self, data):
+        """POST /github/app-code (the order of `main` on GitHub, M2, row 6): GitHub's one-time code of a manifest flow,
+        converted here into the App of one repository, whose key the door keeps and never gives out. The code is the
+        credential of that call (POST /app-manifests/<code>/conversions, with no token), so the door converts it at
+        once and keeps nothing of it. Its answer holds the App's id, slug, owner, permissions, the page that installs
+        it and the SHA-256 of its key's public half, which GitHub's App page shows: no secret. An App of another owner
+        or with other permissions (repo_app_fault) is refused after GitHub made it: its key is dropped, and the owner
+        deletes it on its page. One App for each repository: a second code for a repository that has one is refused
+        before GitHub is asked. None for one of the product's own repositories that no App may reach (VENDOR_REPOS)."""
+        extra = sorted(set(data) - {"code", "repo"})
+        if extra:
+            raise Refused(f"unknown field {extra[0]}")
+        code, repo = data.get("code"), data.get("repo")
+        if not isinstance(code, str) or not MANIFEST_CODE.fullmatch(code):
+            raise Refused("code is GitHub's one-time code of the manifest flow")
+        if not isinstance(repo, str) or not door_targets.REPO.fullmatch(repo):
+            raise Refused("repo is the repository's owner/name")
+        repo = repo.lower()
+        made_at_press = ("GitHub may have made this code's App at the owner's press: the owner deletes it on the "
+                         "account's Apps page on GitHub")
+        if door_targets.vendor(repo):
+            raise Refused(f"{repo} is one of the product's own repositories that no App of the door reaches. "
+                          f"{made_at_press}")
+        held = repo_apps()
+        if held is None:
+            raise Refused(f"the door cannot read its record of the Apps of one repository ({REPO_APPS_FILE}). "
+                          f"{made_at_press}")
+        old = held.get(repo)
+        if old:
+            # a redo after the check of the owner's press failed (M2): the door takes a second App for the repository
+            # only when GitHub no longer knows the first one or no longer takes its key, which only its owner can
+            # change on GitHub
+            try:
+                repo_app_path(old["app_id"])
+            except Refused:
+                raise Refused(f"the door holds the App {old['app_id']} for {repo} but no key file of its own for it, "
+                              f"so it cannot ask GitHub about it: a code sent again changes nothing until root on the "
+                              f"door's server removes {repo} from {REPO_APPS_FILE} or gives the key's file mode 400. "
+                              f"{made_at_press}") from None
+            gone = self.repo_app_gone(old["app_id"])
+            if gone is None:
+                raise Refused(f"the door cannot tell now whether GitHub still has the App {old['app_id']} of {repo}: "
+                              f"send the code again in a moment. {made_at_press}")
+            if not gone:
+                raise Refused(f"the door holds the App {old['app_id']} for {repo} already: it takes no second one "
+                              f"while GitHub has the first. {made_at_press}; to replace the first, the owner deletes "
+                              f"it on GitHub, then makes the App again")
+        # the key's folder first, so that a folder that is not the door's own leaves no App on GitHub without a key
+        folder = P(REPO_APPS_DIR)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+            raise Refused(f"{REPO_APPS_DIR} is not the door's own folder with mode 700: root makes it so first")
+        spent = hashlib.sha256(code.encode()).hexdigest()[:16]
+        status, made = self.http("POST", f"{GitHub.API}/app-manifests/{code}/conversions",
+                                 {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}, b"")
+        del code
+        if status != 201:
+            # every attempt leaves a line: a code that GitHub refuses just after the owner's press may have been
+            # converted by another party first (the listener and the hub carry it), and the record shows it
+            self.record.add(caller="hub", target="github", action="repo-app", kind="rule", outcome="failed",
+                            why=f"{repo}: GitHub answered {status} to the code {spent}...")
+            raise door_providers.Stop(f"GitHub made no App of this code ({status}): a code works once, within an hour "
+                                      f"of the owner's press. If no conversion of it was meant before, another party "
+                                      f"may hold that App's key: the owner deletes, on the account's Apps page, each "
+                                      f"App that the door does not hold")
+        fault = repo_app_fault(made, repo)
+        if fault:
+            if isinstance(made, dict):
+                made.pop("pem", None)
+            self.record.add(caller="hub", target="github", action="repo-app", kind="rule", outcome="refused",
+                            why=f"{repo}: {fault}")
+            raise Refused(f"{fault}, so the door kept no key of it. GitHub made it anyway: the owner deletes it at "
+                          f"{repo_app_page(made)}")
+        pem, app_id = made.pop("pem"), made["id"]
+        made.pop("client_secret", None)
+        made.pop("webhook_secret", None)
+        path = os.path.join(folder, f"{app_id}.pem")
+        try:
+            return self.repo_app_keep(repo, made, pem, app_id, path, held)
+        except Exception as e:
+            self.record.add(caller="hub", target="github", action="repo-app", kind="rule", outcome="failed",
+                            why=f"{repo}: App {app_id} made, its key not kept ({e.__class__.__name__})")
+            raise
+
+    def repo_app_gone(self, app_id):
+        """True when GitHub no longer knows this App of a repository (its owner deleted it: GET /app with its own JWT
+        answers 404, or 401 while the door's own App's JWT gets 200), False when GitHub has it, None when the door
+        cannot tell (no key file, no answer, a 401 that its own App cannot rule out as the clock's)."""
+        try:
+            jwt = repo_app_jwt(app_id)
+        except (Refused, door_providers.Stop):
+            return None
+        head = {"Accept": "application/vnd.github+json"}
+        status, _ = self.http("GET", f"{GitHub.API}/app", dict(head, Authorization="Bearer " + jwt), None)
+        if status in (200, 404):
+            return status == 404
+        if status != 401:
+            return None
+        # GitHub answers 401 also for a JWT that its clock refuses: a 401 counts as gone only while a JWT of the door's
+        # own App, made by the same clock, gets 200 in the same call (the readers' round of 27 November 2026)
+        own = next((c for k, c in sorted((self.access().get("credentials") or {}).items())
+                    if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and
+                    c.get("secret")), None)
+        if own is None:
+            return None
+        try:
+            control = door_providers.app_jwt(own["app_id"], self.secret(own["secret"]))
+        except (Refused, door_providers.Stop):
+            return None
+        status, _ = self.http("GET", f"{GitHub.API}/app", dict(head, Authorization="Bearer " + control), None)
+        return True if status == 200 else None
+
+    def repo_app_keep(self, repo, made, pem, app_id, path, held):
+        """The key's file and the record of one App of a repository that GitHub made (repo_app_code)."""
+        try:
+            out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        except OSError as e:
+            raise Refused(f"the door could not make the file of the App {app_id}'s key ({e.__class__.__name__}): "
+                          f"the owner deletes the App at {repo_app_page(made)}") from None
+        try:
+            data = pem.encode("ascii")
+            while data:
+                data = data[os.write(out, data):]
+            os.fsync(out)
+        finally:
+            os.close(out)
+        del pem
+        public = subprocess.run(["openssl", "pkey", "-in", path, "-pubout", "-outform", "DER"], capture_output=True,
+                                timeout=20)
+        key_sha256 = base64.b64encode(hashlib.sha256(public.stdout).digest()).decode() \
+            if public.returncode == 0 and public.stdout else None
+        owner = made["owner"]
+        facts = {"app_id": app_id, "slug": made["slug"], "owner": owner["login"].lower(),
+                 "permissions": dict(sorted(made["permissions"].items())), "made": int(now()),
+                 "key_sha256": key_sha256}
+        write_json(REPO_APPS_FILE, dict(held, **{repo: facts}), sync=True)
+        old = held.get(repo)
+        if old and old.get("app_id") != app_id:     # an App that GitHub no longer knows, or whose key it refuses
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(os.path.dirname(path), f"{int(old['app_id'])}.pem"))
+        self.record.add(caller="hub", target="github", action="repo-app", kind="rule", outcome="done",
+                        why=f"{repo}: App {app_id} ({made['slug']})" +
+                            (f", in place of the App {old['app_id']}, whose key GitHub no longer takes" if old else ""))
+        return dict(facts, repo=repo, install=f"https://github.com/apps/{made['slug']}/installations/new")
 
     def installation(self, jwt, names):
         """The installation of the door's App that holds these repositories, from the first of them that GitHub
@@ -2174,7 +2443,13 @@ class Door:
                 entry = accounts.setdefault(login.lower(), {"name": login, "repos": set()})
                 entry["repos"] |= {r for r in listed if door_targets.REPO.fullmatch(r) and
                                    r.split("/")[0] == login.lower()}
-        return {"accounts": {a: {"name": e["name"], "repos": sorted(e["repos"])} for a, e in sorted(accounts.items())}}
+                # M2: whether an installation of the door's own App holds all the account's repositories, the one
+                # fact that tells the order's two branches apart; its key is on the door only
+                entry["whole"] = entry.get("whole", False) or one.get("repository_selection") == "all"
+        for repo in self.repo_apps_reached():       # M2: the one repository of each App of its own
+            accounts.setdefault(repo.split("/")[0], {"name": repo.split("/")[0], "repos": set()})["repos"].add(repo)
+        return {"accounts": {a: {"name": e["name"], "repos": sorted(e["repos"]), "whole": e.get("whole", False)}
+                             for a, e in sorted(accounts.items())}}
 
     REACH_LOCK = threading.Lock()   # one read by repository id at a time: a second ask gets 503 and does not wait
 
@@ -2472,8 +2747,29 @@ class Door:
                     every.add(login.lower())    # more than the door reads: the hub marks none of this account's
                 else:
                     repos.update(listed)
+        own = self.repo_apps_reached()       # M2: the hub keeps such a repository the owner's to give (resource_kept)
+        repos.update(own)
         return {"pages": pages, "all": sorted(every), "repos": sorted(repos), "install": install,
-                "owners": sorted(owners)}
+                "owners": sorted(owners), "own": own}
+
+    def repo_apps_reached(self):
+        """The repositories whose own App's installation holds them now, and only them (M2): each App counts for its
+        one repository only, never for its account's others, and gives no installation page and no owner, which stay
+        the door's own App's. An App that the door cannot read, or whose installation holds more than its repository
+        (repo_app_installation_fault), reaches nothing (the hub then marks its repository unreached: the safe side)."""
+        reached = []
+        for repo, app in sorted((repo_apps() or {}).items()):
+            try:
+                jwt = repo_app_jwt(app["app_id"])
+                inst = self.installation(jwt, [repo])
+                if inst.get("suspended_at"):
+                    continue
+                listed = self.selected(jwt, inst)
+            except (Refused, door_providers.Stop, KeyError, TypeError, ValueError):
+                continue
+            if repo_app_installation_fault(inst, listed, repo) is None:     # its one repository, and no other
+                reached.append(repo)
+        return reached
 
 
 
@@ -2496,6 +2792,7 @@ class GitHub:
         self.commit_sha = self.commit_branch = None     # the commit that this object made last
 
     def token(self):
+        door_providers.own_app_refusal(self.repo)     # M2: before the cache, which holds a token of the owner's App
         got = self.TOKENS.get(self.owner.lower())
         if got and got[1] > now() + 300:
             return got[0]
@@ -3146,20 +3443,23 @@ def sole_app(access):
 
 
 def token_permissions(level, held):
-    """The permissions of an agent's token at this level, from an installation that holds `held` (its own
-    permissions, as GitHub gives them with the installation): GITHUB_ACCESS of the level, and two that an App can
-    lack. For read and write also actions: read where the installation holds Actions, so that the agent can read the
-    runs of GitHub Actions and show that CI passed (10 November 2026: a write token got 404 on a repository's runs).
-    And issues where the installation holds Issues: read at read, so that the agent reads the issues of its
+    """The permissions of an agent's token at this level, from an installation that holds `held` (its own permissions,
+    as GitHub gives them with the installation): GITHUB_ACCESS of the level, and three that an App can lack. For read
+    and write also checks: read where the installation holds Checks (M2: the agents' App of the product's source, so
+    that an agent reads the gate's check), and actions: read where the installation holds Actions, so that the agent can
+    read the runs of GitHub Actions and show that CI passed (10 November 2026: a write token got 404 on a repository's
+    runs). And issues where the installation holds Issues: read at read, so that the agent reads the issues of its
     repositories, and write at write and deploy, so that it also opens them and comments on them (12 November 2026: a
     write token got 403 on a comment to the developer that the team's policy lets it talk to in GitHub issues), but
-    never more than the installation holds. GitHub refuses the whole token (422) when it asks for a permission that
-    the installation does not hold, and an older App can lack both, so where the installation names neither the
-    token is exactly GITHUB_ACCESS of the level."""
+    never more than the installation holds. GitHub refuses the whole token (422) when it asks for a permission that the
+    installation does not hold, and an older App can lack both, so where the installation names neither the token is
+    exactly GITHUB_ACCESS of the level."""
     asked = dict(GITHUB_ACCESS[level])
     held = held if isinstance(held, dict) else {}
     if level in ("read", "write") and held.get("actions") in ("read", "write"):
         asked["actions"] = "read"
+    if level in ("read", "write") and held.get("checks") in ("read", "write"):
+        asked["checks"] = "read"        # M2: an agent reads why the gate or CI refused its pull request
     if held.get("issues") in ("read", "write"):
         asked["issues"] = "write" if level != "read" and held["issues"] == "write" else "read"
     return asked
@@ -3495,6 +3795,20 @@ class Handler(BaseHTTPRequestHandler):
             except door_providers.Stop as e:
                 return self.answer(502, {"error": str(e)})
             return self.answer(status, answer)
+        if self.path == "/github/app-code":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "a repository's App is the hub's to hand over, with its token "
+                                                  "secret"})
+            if not self.door.REPO_APP_LOCK.acquire(blocking=False):
+                return self.answer(503, {"error": "a conversion runs already: send this when it ends"})
+            try:
+                return self.answer(200, self.door.repo_app_code(data))
+            except Refused as e:
+                return self.answer(400, {"error": str(e)})
+            except door_providers.Stop as e:
+                return self.answer(502, {"error": str(e)})
+            finally:
+                self.door.REPO_APP_LOCK.release()
         if self.path == "/github/repo-reach":
             if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
                 return self.answer(403, {"error": "whether the Apps reach a repository is the hub's to ask, with its "

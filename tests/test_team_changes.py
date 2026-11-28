@@ -1684,13 +1684,23 @@ class TeamChanges(Remove):
         self.assertIsNone(self.card())
 
     def test_a_plan_that_the_card_cannot_show_whole_is_refused(self):
-        """Bug: the owner says yes to a change that the card cut."""
+        """Bug: the owner says yes to a change that the card cut. Or a reason over 140 characters (P7 section 5)
+        reaches the card, or its refusal sends the manager to details, which change_team does not take."""
         long = "Every sentence of this text is a rule that the agent follows when it answers. " * 90
         with self.assertRaises(hub.ToolError) as refused:
             self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
                         "sections": [{"key": "responsible_for", "title": "Responsible for", "text": long},
                                      {"key": "character", "title": "Character", "text": long}]}])
         self.assertIn("cannot show this plan whole", str(refused.exception))
+        self.assertIsNone(self.card())
+        with self.assertRaises(hub.ToolError) as refused:
+            self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                        "sections": [{"key": "character", "title": "Character", "text": "Careful."}]}],
+                      why="w " * 70 + "w")
+        self.assertIn("why is at most 140 characters", str(refused.exception))
+        self.assertIn("Put the evidence in words, which the card shows under the hub's Details. This one has 141.",
+                      str(refused.exception))
+        self.assertNotIn("in details", str(refused.exception))
         self.assertIsNone(self.card())
 
     def test_a_manager_that_could_forge_the_press_writes_no_plan(self):

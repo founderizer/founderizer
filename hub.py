@@ -3837,6 +3837,26 @@ NEED_OPTION_CHARS = 120         # a short sentence on one row, not a paragraph
 # quotes and the facts go behind Details. The hub refuses longer words, and codes, which people do not read.
 NEED_TITLE_CHARS = 70
 NEED_WHY_CHARS = 240
+# P7 section 5, "The advice on a card" (the owner, 22 November 2026, of the cards on his phone: "there is too much text
+# and it's a phone!", then "Reason at most 140, option at most 50", his yes F9-1): the words that an agent writes on a
+# card. Its why (raise_needs_you, request_secret, change_team), at most three or four lines on a phone; and its own
+# options and its recommended words, at most two lines, where 43% of the options of before wrapped. The same number as
+# PUSH_BUTTON by chance, not by design: that one is what a notification's button carries, and a longer option of the
+# hub's opens the app, so neither follows the other. The options that the hub writes itself (Give, the door's three
+# answers, a key swap's two, a team plan's yes) keep NEED_OPTION_CHARS: they name a role, a server or a plan, and a
+# change of NEED_OPTION_CHARS closes open Give cards (need_give_words). NEED_WHY_CHARS keeps its value, and no check
+# reads it since owner API 1.380: each why that the hub checks is an agent's.
+ADVICE_WHY_CHARS = 140
+ADVICE_OPTION_CHARS = 50
+# Where the refusal of a long why sends the rest: a field that the card takes, so that no two refusals send the agent
+# back and forth (P7 piece 2's readers: the door's card, a sign-in's and a key swap's refuse details, and change_team
+# has words). The door's card shows its whole script, so its why names the changes by kind and number.
+NEED_WHY_REST = "Put the reasoning, the quotes and the facts in details, which the owner's card shows behind Details."
+NEED_WHY_REST_NONE = "Say it in fewer words: this card takes no details."
+NEED_WHY_REST_SCRIPT = ("Say it in fewer words, and name the changes by kind and number (three packages, the site's "
+                        "configuration, a restart): the card shows the whole script under Script, and takes no "
+                        "details.")
+NEED_WHY_REST_TEAM = "Put the evidence in words, which the card shows under the hub's Details."
 NEED_DETAILS_CHARS = 4000
 NEED_TALK_CHARS = 2000          # one message under a card (owner feature need_clarify): the owner's or the agent's reply
 NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-9])")
@@ -3849,16 +3869,16 @@ NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-
 NEED_FENCED = re.compile(r"^[ \t]*```[^\n]*\n.*?^[^\S\n]*```[^\n]*$", re.M | re.S)
 
 
-def need_words(title, why, todo="", options=(), details=""):
+def need_words(title, why, todo="", options=(), details="", rest=NEED_WHY_REST):
     """What is wrong with the words of a Needs-you item that the owner reads, or None: a title and a why that a
-    glance takes in, and no code anywhere (T-61, R-3, Q-59): he reads names and plain words."""
+    glance takes in, and no code anywhere (T-61, R-3, Q-59): he reads names and plain words. rest: where the refusal
+    of a long why sends the rest, a field that this card takes (NEED_WHY_REST and its kin)."""
     if len(title) > NEED_TITLE_CHARS:
         return (f"The title is at most {NEED_TITLE_CHARS} characters: name what the owner decides, in a few words. "
                 f"This one has {len(title)}.")
-    if len(why) > NEED_WHY_CHARS:
-        return (f"why is at most {NEED_WHY_CHARS} characters, one or two plain sentences: what the owner decides and "
-                f"why it matters now. Put the reasoning, the quotes and the facts in details, which the owner's card "
-                f"shows behind Details. This one has {len(why)}.")
+    if len(why) > ADVICE_WHY_CHARS:     # each why that reaches here is an agent's (P7 section 5)
+        return (f"why is at most {ADVICE_WHY_CHARS} characters, one or two plain sentences: what the owner decides and "
+                f"why it matters now. {rest} This one has {len(why)}.")
     if len(details) > NEED_DETAILS_CHARS:
         return f"details is at most {NEED_DETAILS_CHARS} characters. This one has {len(details)}."
     if len(todo) > NEED_DETAILS_CHARS:          # the steps, which the hub reads under its lock as it reads details
@@ -4077,6 +4097,13 @@ def door_script_details(script):
     app's own parser of that text must give back exactly this script, which the owner's Mac checks before it signs
     (DoorCall.shown in the app)."""
     return "```\n" + script + ("" if script.endswith("\n") else "\n") + "```"
+
+
+def door_card_answers(host):
+    """The three answers of the door's card of a run on `host`, in their order, as the owner approved them (the
+    door-modes proposal, step 4), or () when `host` is no text: the hub's own words, which keep NEED_OPTION_CHARS
+    however long the server's name is, also when the manager gives them word for word (check_need_options)."""
+    return ["Run it once", f"Full access on {host}", "No"] if isinstance(host, str) else ()
 
 
 def door_script_card(title, host, call, script, words=()):
@@ -4664,18 +4691,20 @@ def need_recommended(given, options, give=False):
         if found is None:
             raise ToolError("recommended is one of options, word for word: " + "; ".join(options) + ".")
         return found
-    if len(words) > NEED_OPTION_CHARS:
-        raise ToolError(f"The card draws recommended as one row, so it is at most {NEED_OPTION_CHARS} characters: say "
-                        f"the answer in fewer words, and the reasons in why or details.")
+    if len(words) > ADVICE_OPTION_CHARS:        # the agent's own words, as its option's (P7 section 5)
+        raise ToolError(f"The card draws recommended as one row, so it is at most {ADVICE_OPTION_CHARS} characters: "
+                        f"say the answer in fewer words, and the reasons in why or details.")
     if any(c in words for c in "\r\n") or any(ord(c) < 32 or ord(c) == 127 for c in words):
         raise ToolError("recommended is one line of plain words, with no line break or control character.")
     return words
 
 
-def check_need_options(given, least=2):
+def check_need_options(given, least=2, own=()):
     """The options of raise_needs_you, as the hub stores them, or a ToolError. The hub keeps the words it was given:
     they are data that the app draws as a label, never markup. least: 1 for an item with pictures (owner API 1.285),
-    where one design to approve is one option, and the no is the owner's own words."""
+    where one design to approve is one option, and the no is the owner's own words. own: the options that the hub
+    writes itself (Give, the door's three answers, a key swap's two, a team plan's), which keep NEED_OPTION_CHARS;
+    every other option is an agent's, at most ADVICE_OPTION_CHARS (P7 section 5)."""
     if given is None:
         return None
     if not isinstance(given, list) or not all(isinstance(x, str) for x in given):
@@ -4692,11 +4721,13 @@ def check_need_options(given, least=2):
     for x in out:
         if not x:
             raise ToolError("An option cannot be empty.")
-        if len(x) > NEED_OPTION_CHARS:
+        most = NEED_OPTION_CHARS if x in own else ADVICE_OPTION_CHARS
+        if len(x) > most:
             shown = cut_whole(x, 60)
-            raise ToolError(f"The app draws each option as one row, so an option is at most {NEED_OPTION_CHARS} "
-                            f"characters: shorten " + (f'"{shown}"' if shown else f"the option of {len(x)} characters")
-                            + " or leave the options out and ask in why.")
+            raise ToolError(f"The app draws each option as one row, so an option is at most {most} characters: "
+                            f"shorten " + (f'"{shown}"' if shown else f"the option of {len(x)} characters")
+                            + " to what it does and what it costs, in a few words, and put the rest in details and "
+                              "your pick in recommended.")
         if any(c in x for c in "\r\n") or any(ord(c) < 32 or ord(c) == 127 for c in x):
             raise ToolError("An option is one line of plain text.")
     if len({x.lower() for x in out}) != len(out):
@@ -22732,7 +22763,12 @@ def t_raise_needs_you(agent, a):
     # this one takes the place of
     details = str(a.get("details") or "").strip()
     if give is None:
-        options = check_need_options(a.get("options"), least=1 if pictures else 2)
+        # an item with a door_host takes only the door's three answers, word for word, and the door's check below
+        # says so: its options get no agent's limit first, which no shorter words of a server's name could meet
+        given = a.get("options")
+        door_own = [x.strip() for x in given if isinstance(x, str)] \
+            if a.get("door_host") is not None and isinstance(given, list) else ()
+        options = check_need_options(given, least=1 if pictures else 2, own=door_own)
     else:
         # Give is the hub's first option, the manager's own options (its No) follow it, and the hub writes the step:
         # the press is the step. The owner reads what it gives on the card: its title or its why names the one
@@ -22745,7 +22781,8 @@ def t_raise_needs_you(agent, a):
         if any(isinstance(o, str) and o.strip().casefold().startswith("give") for o in given or ()):
             raise ToolError("With needs_agent, your options are only the no: the hub writes Give itself, and an option "
                             "of yours that gives would give nothing.")
-        options = check_need_options([need_give_words(give)] + (list(given) if given else ["No"]))
+        gives = need_give_words(give)       # the hub's own words, which name a role: NEED_OPTION_CHARS
+        options = check_need_options([gives] + (list(given) if given else ["No"]), own=(gives,))
         repos, role = give["repos"], shown_role(give["agent"])
         if give["resources"]:       # F6 piece 2: one mailbox, one Drive or one MCP server, which the card names
             kind, what = resource_parts(give["resources"][0])
@@ -22797,8 +22834,11 @@ def t_raise_needs_you(agent, a):
     # and the title of the item about a server's key swap, which names the server however long its name is
     swap_title = isinstance(a.get("key_swap_server"), str) and \
         title == KEY_SWAP_CARD_TITLE.format(server=a["key_swap_server"])
+    # where a long why's rest goes: a door's card, a sign-in's and a key swap's take no details (NEED_WHY_REST)
+    rest = NEED_WHY_REST_SCRIPT if a.get("door_script") is not None or a.get("door_host") is not None else \
+        NEED_WHY_REST_NONE if sign_in or a.get("key_swap_server") is not None else NEED_WHY_REST
     wrong = need_words("" if door_title or swap_title or sign_in else title, why, todo,
-                       json.loads(options) if options else (), details)
+                       json.loads(options) if options else (), details, rest=rest)
     if wrong:
         raise ToolError(wrong)
     replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
@@ -22822,11 +22862,11 @@ def t_raise_needs_you(agent, a):
             raise ToolError(f"The title of the door's card is \"{DOOR_CARD_TITLE.format(host=door_host)}\", word "
                             f"for word, as the owner approved it: their Mac signs Run it once and Full access only "
                             f"for the server that the card names.")
-        fixed = ["Run it once", f"Full access on {door_host}", "No"]
+        fixed = door_card_answers(door_host)
         if (options is not None and json.loads(options) != fixed) or a.get("multi"):
             raise ToolError(f"An item with a door_host has the three answers of the door's card, in this order: "
                             f"{', '.join(fixed)}. Leave options and multi out.")
-        options = check_need_options(fixed)
+        options = check_need_options(fixed, own=fixed)
     if door_call is not None:       # what the door's own record says that this hash is of, before the card's words
         if a.get("multi"):          # the signed yes is one press of the first answer, which ticks combine with none
             raise ToolError("An item with a door_call takes one answer: leave multi out.")
@@ -22900,7 +22940,8 @@ def t_raise_needs_you(agent, a):
         if q1("SELECT 1 FROM needs WHERE key_swap_server=? AND answer IS NULL", (key_swap_server,)):
             raise ToolError(f"An item about the key swap of {key_swap_server} is open already: the hub closes it by "
                             f"itself.")
-        options, details = check_need_options(list(KEY_SWAP_CARD_ANSWERS)), key_swap_card_details(key_swap_server)
+        options, details = check_need_options(list(KEY_SWAP_CARD_ANSWERS), own=KEY_SWAP_CARD_ANSWERS), \
+            key_swap_card_details(key_swap_server)
     # owner feature need_run, until 17 November 2026: a command for the owner to run is fleet work through their Mac,
     # so no new item takes one (card_route). An item raised before keeps its Run.
     if a.get("run_command") is not None or a.get("run_on") is not None:
@@ -41162,6 +41203,7 @@ def attachment_safe_names():
     (owner API 1.361). From 20 November 2026 until then a chat app's file of a type that the hub does not check kept
     its sender's ending (invoice.html, x.terminal, x.webloc), and the owner's apps save, drag and open a file under its
     name. A row of the owner's place stays as it is, and a second start changes no row."""
+    in_transaction("attachment_safe_names")
     for r in DB.execute("SELECT id, name, mime FROM attachments WHERE device IS NULL OR device=?",
                         (NO_OWNER_PLACE,)).fetchall():
         safe = attachment_safe_name(r["name"], r["mime"])
@@ -52019,6 +52061,17 @@ def money_secrets():
 PRODUCT_SOURCE_NAME = "founderizer-source"
 
 
+def repo_apps_kept():
+    """The repositories that the hub's own record names as having a GitHub App of their own on the door (REPO_APPS_KV,
+    written by POST /ui/door/repo-app). read_row only: resource_kept runs inside transactions and under LOCK."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (REPO_APPS_KV,))
+    try:
+        held = json.loads(row["v"]) if row and row["v"] else []
+    except ValueError:
+        return ()
+    return {str(r).lower() for r in held} if isinstance(held, list) else ()
+
+
 def product_source(what):
     """True for the product's own private source (PRODUCT_SOURCE_NAME) under any account."""
     return str(what or "").lower().rsplit("/", 1)[-1] == PRODUCT_SOURCE_NAME
@@ -52070,6 +52123,13 @@ def resource_kept(rid, team=None):
         if kind == "secret" and what.lower() in money_secrets() and what.lower() in vault_unpooled():
             return "money"
         return None
+    # before the door's first reading (and after one that failed) only the hub's own record of the route keeps such a
+    # repository; the product's source is kept by its name in any case (product_source)
+    if kind == "repo" and (what.lower() in ((GITHUB_REACH.get("reach") or {}).get("own") or ()) or     # no read starts
+                           what.lower() in repo_apps_kept()):
+        # M2: a repository with a GitHub App of its own on the door (the developer agents' source): only the owner's
+        # own level gives it, never the default, so that no other worker reads it by the pool (the order's M5)
+        return "owner"
     if kind == "repo" and product_source(what):
         return "source"
     if kind == "tool":
@@ -54560,7 +54620,8 @@ def t_change_team(agent, a):
     if len(words) > TEAM_PLAN_WORDS_CHARS:
         raise ToolError(f"words is at most {TEAM_PLAN_WORDS_CHARS} characters: the evidence, and what you did to "
                         f"keep what must stay.")
-    bad = need_words(title, why, "", (), words) or need_is_notice(title, why) or need_asks_secret(title, why)
+    bad = need_words(title, why, "", (), words, rest=NEED_WHY_REST_TEAM) or need_is_notice(title, why) or \
+        need_asks_secret(title, why)
     if bad:
         raise ToolError(bad)
     if card_route(title, why, "", words, []):
@@ -54594,7 +54655,7 @@ def t_change_team(agent, a):
         details = effect["details"] + (f"\n\n**{shown_role(agent)}'s words**\n\n{team_quote(words)}" if words else "")
         if len(details) > TEAM_PLAN_DETAILS_CHARS:
             raise ToolError("The card cannot show this plan with your words: shorten words, or split the plan.")
-        options = check_need_options(effect["options"])
+        options = check_need_options(effect["options"], own=effect["options"])     # the hub's own yes and No
         kept = json.dumps({"changes": changes, "digest": effect["digest"], "names": effect["names"]}, sort_keys=True,
                           ensure_ascii=False)
         old = read_row("SELECT * FROM needs WHERE team_plan IS NOT NULL AND answer IS NULL ORDER BY id DESC LIMIT 1")
@@ -60268,7 +60329,8 @@ TOOLS = [
      "(rules/manager.md, \"Needs you\", says when and how). When you ask the owner to choose, give the "
      "choices in options: they press one, and its words come back as the answer. Never ask for a key, a password or "
      "a token here: request_secret is how the value reaches the vault without passing you. Its title, why and "
-     "options are plain words with no codes (T-61, R-3). Read before you raise: an item about a server, a version or "
+     "options are plain words with no codes (T-61, R-3) and no tool or variable name. Read before you raise: an "
+     "item about a server, a version or "
      "a deploy rests on a reading that is newer than the last change to it, made by you, by an agent that can read "
      "it, or by the next run of its watch, and why says how old that reading is. Raise it only when that reading still "
      "shows the problem. When an item of yours is not needed any more, withdraw_need closes it. Never write combined options "
@@ -60279,8 +60341,10 @@ TOOLS = [
      "** around the words of a button, and a numbered list, and write a page's address as it is, with no mark.",
      S({"title": {"type": "string",
                   "description": f"What the owner decides, in at most {NEED_TITLE_CHARS} characters."},
-        "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
-                                                "what the owner decides and why it matters now."},
+        "why": {"type": "string", "description": f"At most {ADVICE_WHY_CHARS} characters of plain words: what the "
+                                                "owner decides and why now; for a choice, the answer that you "
+                                                "recommend and why, with its numbers, and one thing that you did not "
+                                                "check, only when it can change the answer."},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: the "
                     f"reasoning, an agent's words and the facts that the why and the options do not say, at most "
                     f"{NEED_DETAILS_CHARS} characters, in plain words. Say each fact once on the card. With "
@@ -60289,8 +60353,8 @@ TOOLS = [
                   "the ones they ticked, and the words of those options, joined, are the answer."},
         "recommended": {"type": "string", "description": "The answer that you recommend, which the card marks. With "
                         "options: one of them, word for word (also Give, Run it once or Switch it on). With none: the "
-                        "answer in a few words, which the owner sends with one press. Put the reasons in why or "
-                        "details. Give one on every item, except a step with no choice."},
+                        f"answer in at most {ADVICE_OPTION_CHARS} characters, which the owner sends with one press. "
+                        "Put the reasons in why or details. Give one on every item, except a step with no choice."},
         "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
                      "example N-12, when its options or its words changed: that item leaves Needs you. Give "
                      "question_id and recommended again."},
@@ -60330,8 +60394,9 @@ TOOLS = [
                         f"policy file or a profile, a standing rule that they gave, or their own message. An agent's "
                         f"reading of them does not count."},
         "options": {"type": "array", "items": {"type": "string"},
-                    "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
-                                   f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
+                    "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each at most "
+                                   f"{ADVICE_OPTION_CHARS} characters, because the app draws one row for each: what "
+                                   f"happens and what it costs. "
                                    f"Leave it out for a question that is not a choice; the owner can always write "
                                    f"their own answer instead."},
         # owner API 1.285; tools_for takes the field away while an app of the owner's does not draw pictures
@@ -60505,7 +60570,7 @@ TOOLS = [
         "failed": {"type": "string", "description": SECRET_FAILED},
         "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
-                                                 f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
+                                                 f"{ADVICE_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
                     f"make the key, as numbered steps: its page as its full address with https://, what to click there "
@@ -60550,7 +60615,7 @@ TOOLS = [
         "failed": {"type": "string", "description": SECRET_FAILED_OWN},
         "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
-                                                 f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
+                                                 f"{ADVICE_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
                     f"make the key, as numbered steps: its page as its full address with https://, what to click there "
@@ -61007,7 +61072,8 @@ TOOLS = [
      S({"request_id": REQUEST_ID,
         "title": {"type": "string", "description": "The decision that the owner makes, in at most 70 characters of "
                   "plain words, for example \"Add a second Support agent on worker-2?\""},
-        "why": {"type": "string", "description": "What the records show, in at most 240 characters of plain words"},
+        "why": {"type": "string", "description": f"What the records show, in at most {ADVICE_WHY_CHARS} characters "
+                                                 "of plain words"},
         "words": {"type": "string", "description": "Your own words under the hub's Details, at most 1500 "
                   "characters: the evidence, and what you did to keep what must stay"},
         "changes": {"type": "array", "description": "The changes, in the order that the hub makes them: a change "
@@ -77683,7 +77749,10 @@ def door_reach_read(conf=None):
                       GITHUB_FULL_NAME.fullmatch(r.lower())},
             "install": install if isinstance(install, str) and GITHUB_INSTALL_PAGE.fullmatch(install) else None,
             "owners": {o.lower() for o in answer.get("owners") or [] if isinstance(o, str) and GITHUB_LOGIN.fullmatch(o)},
-            "many": {a.lower() for a in answer.get("many") or [] if isinstance(a, str) and GITHUB_LOGIN.fullmatch(a)}}
+            "many": {a.lower() for a in answer.get("many") or [] if isinstance(a, str) and GITHUB_LOGIN.fullmatch(a)},
+            # M2: the repositories that a GitHub App of their own reaches on the door, which stay the owner's to give
+            "own": {r.lower() for r in answer.get("own") or [] if isinstance(r, str) and
+                    GITHUB_FULL_NAME.fullmatch(r.lower())}}
 
 
 # Every repository that the fleet's GitHub Apps reach, for the app's list that gives an agent its repositories (owner
@@ -77703,11 +77772,12 @@ def github_repos_read():
     import door_targets
     found, problems = {}, []
 
-    def keep(login, name, repos):
+    def keep(login, name, repos, whole=False):
         mine = {r for r in repos if REPO_NAME.fullmatch(r) and r.split("/")[0] == login.lower()}
         own = {r for r in mine if not door_targets.vendor(r)}
         entry = found.setdefault(login.lower(), {"name": name, "repos": set(), "product": True})
         entry["repos"] |= own
+        entry["whole"] = entry.get("whole", False) or whole is True
         if own or not mine:
             entry.pop("product", None)
     app = github_app()
@@ -77748,7 +77818,7 @@ def github_repos_read():
         except GitHubError as e:
             problems.append(str(e))
             continue
-        keep(login, login, repos)
+        keep(login, login, repos, one.get("repository_selection") == "all")
     conf = door_conf()
     if conf is not None:
         status, answer = door_call(conf, "GET", "/github/repos", conf["token"])
@@ -77757,12 +77827,13 @@ def github_repos_read():
                 if isinstance(login, str) and GITHUB_LOGIN.fullmatch(login) and isinstance(entry, dict):
                     name = entry.get("name")
                     keep(login, name if isinstance(name, str) and name.lower() == login.lower() else login,
-                         {r.lower() for r in entry.get("repos") or [] if isinstance(r, str)})
+                         {r.lower() for r in entry.get("repos") or [] if isinstance(r, str)}, entry.get("whole"))
         else:
             problems.append("the door's code does not list repositories yet" if status == 404 else
                             "the door gave no list of repositories" + (f": {answer['error']}" if isinstance(answer, dict)
                                                                       and isinstance(answer.get("error"), str) else ""))
-    return {a: dict({"name": e["name"], "repos": sorted(e["repos"])}, **({"product": True} if e.get("product") else {}))
+    return {a: dict({"name": e["name"], "repos": sorted(e["repos"]), "whole": e.get("whole", False)},
+                    **({"product": True} if e.get("product") else {}))
             for a, e in sorted(found.items())}, problems
 
 
@@ -77806,7 +77877,11 @@ def github_app_asks(reach):
     told = []
     for owner, repos in sorted(held.items()):
         key = f"github_app_asked:{owner}"
-        if owner in reach["pages"] or owner in reach["all"] or owner in reach.get("owners", set()) or owner in made:
+        # M2: an account whose held repositories each have a GitHub App of their own needs no App of the door there
+        # (the order's row 6: in the gate's organization only its two Apps are installed)
+        own = set(reach.get("own") or ()) | set(repo_apps_kept())
+        if owner in reach["pages"] or owner in reach["all"] or owner in reach.get("owners", set()) or owner in made or \
+                all(r.lower() in own for r in repos):
             kv_set(key, None)
             continue
         if kv_get(key):
@@ -79767,6 +79842,40 @@ def save_door_secrets(body, check):
     log("owner", f"the door mints every GitHub token (owners: {', '.join(check['owners']) or 'none'})"
                  + ("; the hub no longer holds the GitHub App key" if removed else ""))
     return {"linked": True, "owners": check["owners"], "app_removed": removed}
+
+
+REPO_APP_PENDING = {}   # {request_id: (code, time)} of POST /ui/door/repo-app: in memory only, never in a record
+REPO_APPS_KV = "repo_apps"  # kv: the repositories that the door made an App of their own for through this hub
+
+
+def door_repo_app_send(body):
+    """Outside LOCK, for POST /ui/door/repo-app: GitHub's one-time code of this request to the door
+    (POST /github/app-code), which converts it there. (status, answer). The code leaves the hub's memory here,
+    whatever the door answers: GitHub takes it once."""
+    code = (REPO_APP_PENDING.pop(body["request_id"], None) or (None,))[0]
+    if code is None or hashlib.sha256(code.encode()).hexdigest() != body["code_sha256"]:
+        return None, {"error": "the hub started again while it took this command, so it holds no code: the owner "
+                               "makes the App again on GitHub's page"}
+    conf = door_conf()
+    if conf is None:
+        return None, {"error": "this hub is not linked to its door"}
+    return door_call(conf, "POST", "/github/app-code", conf["token"], {"code": code, "repo": body["repo"]})
+
+
+def save_door_repo_app(body, sent):
+    """POST /ui/door/repo-app (owner feature door_setup; the order of `main` on GitHub, M2, row 6): the door's answer
+    to the code (door_repo_app_send), with no secret: the App's id, slug, owner, permissions, the page that installs it,
+    and the SHA-256 of its key's public half. A refusal of the door's is the command's refusal, with its words."""
+    status, answer = sent
+    if status != 200 or not isinstance(answer, dict) or isinstance(answer.get("app_id"), bool) or \
+            not isinstance(answer.get("app_id"), int):
+        said = answer.get("error") if isinstance(answer, dict) else None
+        raise Refusal(502 if status is None or status >= 500 else 409, str(said or f"the door answered {status}"))
+    log("owner", f"the door holds the GitHub App {answer['app_id']} of {body['repo']}")
+    # the hub's own record of such a repository, which keeps it the owner's to give (resource_kept) also while the
+    # door's reading of its reach fails or a hub starts again (the door's `own` is the other source)
+    kv_set(REPO_APPS_KV, json.dumps(sorted(set(repo_apps_kept()) | {body["repo"]})))
+    return {k: answer.get(k) for k in ("repo", "app_id", "slug", "owner", "permissions", "install", "key_sha256")}
 
 
 def save_door_entry(body):
@@ -87885,7 +87994,7 @@ MANAGER_OPS = {
         "/ui/owner/devices/{}/push", "/ui/owner/devices/{}/recovery", "/ui/owner/devices/{}/recovery/held",
         "/ui/owner/enroll", "/ui/owner/key", "/ui/owner/computer",
         "/ui/connect/code", "/ui/connect/settings", "/ui/connect/{}/revoke", "/ui/error-reports", "/ui/github-app",
-        "/ui/door", "/ui/door/secrets", "/ui/door/github-app", "/ui/door/host", "/ui/door/mode",
+        "/ui/door", "/ui/door/secrets", "/ui/door/github-app", "/ui/door/repo-app", "/ui/door/host", "/ui/door/mode",
     ),
 }
 
@@ -93602,6 +93711,27 @@ class Handler(BaseHTTPRequestHandler):
                     "record_sha256": hashlib.sha256(record.encode()).hexdigest()}
         return self.ui_command("door/secrets", read, save_door_secrets, outside=door_mint_check)
 
+    def ui_door_repo_app(self):
+        """POST /ui/door/repo-app (owner feature door_setup; the order of `main` on GitHub, M2, row 6): GitHub's
+        one-time code of a manifest flow for the App of one repository, which the door converts and keeps. The code
+        passes the hub's memory only: the command's record names its SHA-256 (REPO_APP_PENDING, as DOOR_PENDING does for
+        the door's secrets)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "code", "repo"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            code, repo = data.get("code"), data.get("repo")
+            if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9]{1,100}", code):
+                raise ValueError("code is GitHub's one-time code of the manifest flow")
+            if not isinstance(repo, str) or not GITHUB_FULL_NAME.fullmatch(repo.lower()):
+                raise ValueError("repo is the repository's owner/name")
+            for old in [k for k, (_, at) in REPO_APP_PENDING.items() if at < now() - 3600]:
+                REPO_APP_PENDING.pop(old, None)     # GitHub's code is dead an hour after the press
+            REPO_APP_PENDING[data["request_id"]] = (code, now())
+            return {"request_id": data["request_id"], "repo": repo.lower(),
+                    "code_sha256": hashlib.sha256(code.encode()).hexdigest()}
+        return self.ui_command("door/repo-app", read, save_door_repo_app, outside=door_repo_app_send)
+
     def ui_door_host(self):
         """POST /ui/door/host (owner feature door_setup, new-projects plan N8 (b)): the app's word about one business
         server: installed, passed or failed, with its words."""
@@ -93833,8 +93963,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, refusal_words.answer("hub_changed"))
         found, problem = github_repo_list()
         return self.json(200, {"db": generation, "problem": problem,
-                               "accounts": [{"account": e["name"], "repos": e["repos"]} for e in found.values()
-                                            if not e.get("product")]},
+                               "accounts": [{"account": e["name"], "repos": e["repos"], "whole": e.get("whole") is True}
+                                            for e in found.values() if not e.get("product")]},
                          {"Cache-Control": "no-store"})
 
     def ui_resources(self, query):
@@ -96872,6 +97002,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_door_secrets()
         if parts == ["ui", "door", "github-app"]:    # DevOps plan 13, item 4: an App made by the manifest flow
             return self.ui_door_github_app()
+        if parts == ["ui", "door", "repo-app"]:      # M2: GitHub's one-time code of a repository's own App, to the door
+            return self.ui_door_repo_app()
         if parts == ["ui", "door", "host"]:          # new-projects plan N8 (b): the door's parts on one server
             return self.ui_door_host()
         if parts == ["ui", "door", "mode"]:          # owner feature door_mode_set: his signed mode of one server

@@ -338,7 +338,14 @@ class Sender(PushCase):
         self.raise_item(options=[fits, "Wait"])
         self.sent()
         self.assertEqual(self.opened(self.side.got[0]["body"]["payload"])["options"], [fits, "Wait"])
-        self.raise_item(title="Another", options=[fits + "!", "Wait"])      # one character more opens the app
+        # one character more opens the app. Since owner API 1.380 an agent's option is at most that long too
+        # (ADVICE_OPTION_CHARS), and only the hub's own options (a Give, the door's, a team plan's yes) or an item
+        # raised before are longer: such an item is put in place as an item raised before is, and pinged as
+        # raise_needs_you pings.
+        nid = hub.ins("INSERT INTO needs(id,title,why,todo,raised,by,options) VALUES(?,?,?,?,?,?,?)",
+                      (hub.unused_id("needs"), "Another", "The card is the owner's", "Press one", hub.now(), "manager",
+                       json.dumps([fits + "!", "Wait"])))
+        hub.ping_need(nid)
         self.sent()
         self.assertNotIn("options", self.opened(self.side.got[1]["body"]["payload"]))
 

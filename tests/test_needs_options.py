@@ -105,12 +105,20 @@ class Options(NeedsCase):
         self.assertIn("empty", self.refusal(["Tide", "   "]))
 
     def test_an_option_that_does_not_fit_a_row_is_refused_not_cut(self):
-        self.assertIn("120", self.refusal(["Tide", "x" * 121]))
-        self.raise_item(options=["Tide", "x" * 120])
-        self.assertEqual(len(json.loads(self.row()["options"])[1]), 120)
+        """P7 section 5, "The advice on a card" (the owner, 22 November 2026: "Reason at most 140, option at most
+        50"; 120 before). Bugs: an agent's option of more than two lines on the owner's phone reaches the card, or
+        loses its end; or the refusal does not name the limit, or not where the cut words go, so the agent guesses
+        again. The options that the hub writes keep 120: test_resources (Give), test_server_access (the door's card)
+        and test_team_changes (a team plan's yes)."""
+        said = self.refusal(["Tide", "x" * 51])
+        self.assertIn("an option is at most 50 characters", said)
+        self.assertIn("what it does and what it costs, in a few words, and put the rest in details and your pick in "
+                      "recommended", said)
+        self.raise_item(options=["Tide", "x" * 50])
+        self.assertEqual(len(json.loads(self.row()["options"])[1]), 50)
 
     def test_an_option_can_be_a_short_sentence(self):
-        sentence = "Move the analytics export to vps and tell Studio to stop its own run first."
+        sentence = "Move the export to vps and stop Studio's run first"
         self.raise_item(options=[sentence, "Wait for mini to answer"])
         self.assertEqual(self.item()["options"][0], sentence)
 
@@ -149,12 +157,16 @@ class Options(NeedsCase):
                          ["Green", "No refund, a store credit", None])
         for bad, refusal in ((dict(options=["Blue", "Green"], recommended="Red"), "one of options, word for word"),
                              (dict(recommended="two\nlines"), "one line"),
-                             (dict(recommended="x" * 121), "at most 120 characters"),
+                             (dict(recommended="x" * 51), "it is at most 50 characters"),
                              (dict(recommended=["Blue"]), "the answer that you recommend")):
             with self.subTest(refusal=refusal), self.assertRaises(hub.ToolError) as refused:
                 self.raise_item(title="Which one now?", **bad)
             self.assertIn(refusal, str(refused.exception))
         self.assertIn("need_recommended", self.request()[1]["ui_features"])
+        # free words take an agent's option's limit, 50 characters since owner API 1.380: at the limit they pass whole
+        limit = nid(self.raise_item(title="What do we offer?", recommended="No refund; a store credit for the full "
+                                                                          "price today"))
+        self.assertEqual(len(self.item(limit)["recommended"]), 50)
         # an option matches in any case and keeps its own words; free words get an option's checks
         case = nid(self.raise_item(title="Which size?", options=["Small", "Large"], recommended="large"))
         self.assertEqual(self.item(case)["recommended"], "Large")
@@ -397,16 +409,22 @@ class Talk(NeedsCase):
     November 2026 he may also ask under a card with Needs clarification (need_clarify), which keeps it open."""
 
     def test_a_card_is_short_and_its_long_part_goes_behind_details(self):
+        """P7 section 5 (the owner, 22 November 2026: "Reason at most 140, option at most 50"; 240 before). Bugs: a
+        reason longer than three or four lines on the owner's phone reaches the card; or the refusal does not name
+        the limit and the count, so the agent guesses again; or a reason at the limit is refused or cut."""
         with self.assertRaisesRegex(hub.ToolError, "The title is at most 70 characters"):
             self.raise_item(title="x" * 71)
-        with self.assertRaisesRegex(hub.ToolError, "why is at most 240 characters.*Put the reasoning"):
-            self.raise_item(why="y " * 121)
+        with self.assertRaisesRegex(hub.ToolError, "why is at most 140 characters.*Put the reasoning.*This one has "
+                                                   "141"):
+            self.raise_item(why="y " * 70 + "y")
         with self.assertRaisesRegex(hub.ToolError, "what_to_do is at most 4000 characters"):     # read under a lock
             self.raise_item(what_to_do="Press one. " * 400)
         self.raise_item(why="Two short sentences. He decides now.", details="The reasoning, and the facts, at length.")
         item = self.item()
         self.assertEqual((item["why"], item["details"], item["multi"], item["talk"]),
                          ("Two short sentences. He decides now.", "The reasoning, and the facts, at length.", False, []))
+        said = self.raise_item(title="A reason at the limit", why="y " * 69 + "yy")
+        self.assertEqual(len(self.item(int(said.split("N-")[1].split(".")[0]))["why"]), 140)
 
     def test_a_code_is_refused_anywhere_he_reads_it(self):
         for field, value in (("title", "Close T-61"), ("why", "R-3 needs it"), ("details", "as Q-59 says"),

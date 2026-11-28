@@ -1675,10 +1675,30 @@ def named_permissions(want, held):
     return out
 
 
+# The repositories that have a GitHub App of their own (door.py repo_apps, M2), set by door.py; None when its record
+# does not read. The door's own App never acts on one of them, by any of its tokens (github_token, one_call, and
+# GitHub.token in door.py): its installation may still hold such a repository (with "all", or before the owner took
+# it out), and its secrets and workflows rights would reach around the repository's narrow App.
+OWN_APP_REPOS = lambda: {}      # noqa: E731
+
+
+def own_app_refusal(*repos):
+    """Stop when one of these repositories (owner/name) has an App of its own, or when the door cannot tell."""
+    own = OWN_APP_REPOS()
+    if own is None:
+        raise Stop("the door cannot read its record of the Apps of one repository, so its own App acts on no "
+                   "repository")
+    for repo in repos:
+        if isinstance(repo, str) and repo.lower() in own:
+            raise Stop(f"{repo} has a GitHub App of its own: the door's own App does not act on it")
+
+
 def github_token(conf, ctx, repo, permissions=None):
     """An installation token of the door's App for this owner, from the App's key, signed by openssl, with its
     permissions by name (plan N2). The App's installation is the one of the call's repository, which GitHub gives for a
-    personal account and an organization alike (plan N1), as for the hub's tokens (door.py, github_tokens)."""
+    personal account and an organization alike (plan N1), as for the hub's tokens (door.py, github_tokens). Never for a
+    repository with an App of its own (own_app_refusal)."""
+    own_app_refusal(repo)
     jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
     status, answer = ctx["http"]("GET", f"{BASES['github']}/repos/{repo}/installation",
                                  {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}, None)
@@ -1749,7 +1769,9 @@ def app_jwt(app_id, key_pem, sign=None):
 
 def one_call(conf, ctx, via, permissions, repositories=None):
     """(installation, token) of a token for one call (plan N2), with exactly these permissions, which the door never
-    keeps; GitHub's two pages when the installation does not hold them. The installation is that of `via`."""
+    keeps; GitHub's two pages when the installation does not hold them. The installation is that of `via`. Never for
+    a repository with an App of its own (own_app_refusal), by `via` or by one of `repositories`."""
+    own_app_refusal(via, *(f"{via.split('/')[0]}/{name}" for name in repositories or []))
     jwt = app_jwt(conf["app_id"], ctx["secret"](conf["secret"]), ctx.get("sign"))
     head = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"}
     status, inst = ctx["http"]("GET", f"{BASES['github']}/repos/{via}/installation", head, None)

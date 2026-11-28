@@ -201,7 +201,8 @@ class Cuts(BlockedAccess):
         self.no_part(hub.mask_secrets(str(caught.exception)), login)
         with self.assertRaises(hub.ToolError) as caught:
             hub.check_need_options(["Yes", "x" * 130])
-        self.assertIn("characters: shorten the option of 130 characters or leave", str(caught.exception))
+        self.assertIn("characters: shorten the option of 130 characters to what it does and what it costs",
+                      str(caught.exception))
 
     def test_a_refused_message_to_no_agent_shows_no_part_of_a_login(self):
         login = "LqTo-7f3e9a01b2"

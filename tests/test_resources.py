@@ -386,6 +386,15 @@ class Resources(OwnerAPI):
         self.assertEqual(hub.resource_kept("repo:acme/web"), "fleet")
         hub.q(f"DELETE FROM resource_grants WHERE id IN ({rows[0]},{rows[1]})")
         hub.TEAM["agents"]["shopper"].pop("servers")
+        # M2: a repository that a GitHub App of its own reaches on the door is the owner's to give, never the
+        # default's, so that no worker reads it by the pool (the order's M5). Bug: the reach names the product's
+        # source, and the manager gives any worker read of it with no card
+        self.assertIsNone(hub.resource_kept("repo:acme/web"))
+        with patch.dict(hub.GITHUB_REACH, {"reach": {"own": {"acme/web"}}}):
+            self.assertEqual(hub.resource_kept("repo:acme/web"), "owner")
+        hub.kv_set(hub.REPO_APPS_KV, json.dumps(["acme/web"]))    # with no reading: the hub's own record of the route
+        self.assertEqual(hub.resource_kept("repo:acme/web"), "owner")
+        hub.kv_set(hub.REPO_APPS_KV, None)
         self.assertTrue(hub.owner_gave("dev", "jobs"))                  # a hold from before the records
         self.granted("dev", "tool:jobs", "use")
         self.assertFalse(hub.owner_gave("dev", "jobs"))                 # the manager's, by the default alone
@@ -1004,8 +1013,12 @@ class Resources(OwnerAPI):
         """The owner's press of Give is the grant: one real commit of team.json before his answer, and the manager
         reads what it gave. No gives nothing, a replay gives nothing twice, and a level that the agent holds already,
         higher than the card's, stays. Since pool_default a Give card is for what stays the owner's: what he keeps, a
-        level above his own, also of a thing that another agent holds; and the manager's own give is no card."""
+        level above his own, also of a thing that another agent holds; and the manager's own give is no card. And the
+        manager's own no beside Give is an agent's option, at most 50 characters (P7 section 5), while Give keeps the
+        hub's 120 (the mailbox cards of this class name it in 59): bug, the hub's limit reaches the manager's words."""
         self.reaches("acme/web", "acme/api", "acme/docs")
+        self.assertIn("an option is at most 50 characters",
+                      self.give_card(options=["No, keep it read-only until the shop review ends there"]))
         nid = self.give_card()
         self.assertIsInstance(nid, int, nid)
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))

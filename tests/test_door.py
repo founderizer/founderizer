@@ -2608,6 +2608,179 @@ class HubRights(Served):
         asked = json.loads(next(d for m, u, d in self.github if u.endswith("/access_tokens")))
         self.assertEqual(asked, {"repositories": ["shop"], "permissions": door.GITHUB_ACCESS["write"]})
 
+    def test_a_repository_s_own_app_comes_from_github_s_code_and_alone_gives_its_tokens(self):
+        """The order of `main` on GitHub, M2, row 6: the door makes a repository's own App from GitHub's one-time code,
+        so that its key passes neither the Mac nor the hub, and only an App of the repository's owner with exactly the
+        agents' five permissions; that App alone gives the repository's tokens, at read or write, from an installation
+        on that one repository only, and the door's own App never acts on it. Bugs: the key reaches the hub's answer;
+        an App with administration or of another owner is kept; a second code replaces the first App; a failed
+        conversion leaves no trace; the door's own App still makes the repository's token; a deploy token comes from
+        the narrow App; an installation on all repositories gives tokens; a record that does not read lets tokens
+        through."""
+        made = {"id": 990, "slug": "source-agents", "owner": {"login": "One-Org", "type": "Organization"},
+                "permissions": dict(door.REPO_APP_PERMISSIONS), "events": [], "client_secret": "cs-x",
+                "webhook_secret": None,
+                "pem": "-----BEGIN RSA PRIVATE KEY-----\nTEST\n-----END RSA PRIVATE KEY-----\n"}
+        answers, signed, scope = [], [], {"selection": "selected", "repos": ["One-Org/Shop"]}
+        convert = [201]
+        base = self.door.http
+
+        def http(method, url, headers, data, **more):
+            if "/app-manifests/" in url:
+                answers.append((url, headers))
+                return (convert[0], json.loads(json.dumps(made))) if convert[0] == 201 else (convert[0], {})
+            if url.endswith("/repos/one-org/shop/installation"):
+                return 200, {"id": 88, "repository_selection": scope["selection"], "account": {"login": "One-Org"},
+                             "permissions": dict(door.REPO_APP_PERMISSIONS)}
+            if "/installation/repositories?" in url:
+                return 200, {"repositories": [{"full_name": n} for n in scope["repos"]]}
+            return base(method, url, headers, data, **more)
+        self.door.http = http
+        self.addCleanup(door.Door.SELECTED.clear)
+        patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: signed.append(
+            (str(app_id), pem)) or "jwt")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        code = "a1B2c3D4e5"
+        status, got = self.post("/github/app-code", {"code": code, "repo": "one-org/shop"}, "not-the-secret")
+        self.assertEqual((status, answers), (403, []))
+        # a folder of the key that is not the door's own: refused before GitHub is asked, so no App is spent
+        os.makedirs(self.root + door.REPO_APPS_DIR, mode=0o755)
+        os.chmod(self.root + door.REPO_APPS_DIR, 0o755)
+        status, got = self.post("/github/app-code", {"code": code, "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, answers), (400, []), got)
+        os.chmod(self.root + door.REPO_APPS_DIR, 0o700)
+        # a code that GitHub refuses (spent, or converted by another party first) leaves a line, with no code in it
+        convert[0] = 404
+        status, got = self.post("/github/app-code", {"code": code, "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual(status, 502, got)
+        with open(self.root + door.RECORD_FILE) as f:
+            last = json.loads(f.read().splitlines()[-1])
+        self.assertEqual((last["action"], last["outcome"]), ("repo-app", "failed"))
+        self.assertNotIn(code, json.dumps(last))
+        convert[0] = 201
+        status, got = self.post("/github/app-code", {"code": code, "repo": "One-Org/Shop"}, self.secrets["token"])
+        self.assertEqual(status, 200, got)
+        self.assertEqual((got["app_id"], got["repo"], got["owner"], got["slug"]), (990, "one-org/shop", "one-org",
+                                                                                   "source-agents"))
+        self.assertEqual(got["install"], "https://github.com/apps/source-agents/installations/new")
+        self.assertNotIn("PRIVATE KEY", json.dumps(got))
+        self.assertNotIn("cs-x", json.dumps(got))
+        self.assertEqual(answers[-1][0], f"https://api.github.com/app-manifests/{code}/conversions")
+        self.assertNotIn("Authorization", answers[-1][1])
+        key = os.path.join(self.root + door.REPO_APPS_DIR, "990.pem")
+        self.assertEqual(oct(os.stat(key).st_mode & 0o777), oct(0o400))
+        self.assertEqual(set(door.read_json(door.REPO_APPS_FILE, {})), {"one-org/shop"})
+        self.assertNotIn("PRIVATE", open(self.root + door.REPO_APPS_FILE).read())
+        # one App for each repository: a second code is refused before it is converted while GitHub has the first,
+        # and taken in its place once its owner deleted the first on GitHub (M2's redo after a failed check)
+        app_known = [200]
+        inner = self.door.http
+
+        def http_app(method, url, headers, data, **more):
+            if url == "https://api.github.com/app":       # the door's own App's JWT (its control) answers control[0]
+                return (control[0] if signed and signed[-1][0] == "12345" else app_known[0]), {}
+            return inner(method, url, headers, data, **more)
+        control = [200]
+        self.door.http = http_app
+        status, got = self.post("/github/app-code", {"code": "z9", "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, len(answers)), (400, 2), got)
+        self.assertIn("takes no second one while GitHub has the first", got["error"])
+        app_known[0] = 503
+        status, got = self.post("/github/app-code", {"code": "z9", "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, len(answers)), (400, 2), got)
+        self.assertIn("cannot tell now", got["error"])
+        app_known[0], control[0] = 401, 401       # a 401 that the door's own App shares is the clock's: no redo
+        status, got = self.post("/github/app-code", {"code": "z9", "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, len(answers)), (400, 2), got)
+        self.assertIn("cannot tell now", got["error"])
+        control[0] = 200
+        made.update(id=992, slug="source-agents-2")
+        status, got = self.post("/github/app-code", {"code": "z9", "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, got["app_id"]), (200, 992), got)
+        self.assertFalse(os.path.exists(key))
+        key = os.path.join(self.root + door.REPO_APPS_DIR, "992.pem")
+        self.assertEqual(door.read_json(door.REPO_APPS_FILE, {})["one-org/shop"]["app_id"], 992)
+        with open(self.root + door.RECORD_FILE) as f:
+            self.assertIn("in place of the App 990", f.read().splitlines()[-1])
+        # a first App whose key file the door does not hold: no code sent again helps, and its words say so
+        os.rename(key, key + ".away")
+        before = len(answers)
+        status, got = self.post("/github/app-code", {"code": "z9", "repo": "one-org/shop"}, self.secrets["token"])
+        self.assertEqual((status, len(answers)), (400, before), got)
+        self.assertIn("changes nothing until root on the door's server removes one-org/shop", got["error"])
+        os.rename(key + ".away", key)
+        self.door.http = http
+        made.update(id=990, slug="source-agents")
+        # another owner's App, or other permissions, or an event: refused after GitHub made it, with no key kept
+        for change in ({"owner": {"login": "other", "type": "User"}},
+                       {"permissions": dict(door.REPO_APP_PERMISSIONS, administration="write")},
+                       {"permissions": dict(door.REPO_APP_PERMISSIONS, contents="read")},
+                       {"permissions": dict(door.REPO_APP_PERMISSIONS, workflows="write")},
+                       {"permissions": dict(door.REPO_APP_PERMISSIONS, checks="write")},
+                       {"permissions": {k: v for k, v in door.REPO_APP_PERMISSIONS.items() if k != "checks"}},
+                       {"events": ["push"]}):
+            made.update(id=991, slug="wrong-one", owner={"login": "one-org", "type": "Organization"},
+                        permissions=dict(door.REPO_APP_PERMISSIONS), events=[])
+            made.update(change)
+            status, got = self.post("/github/app-code", {"code": "c0de", "repo": "one-org/tools"},
+                                    self.secrets["token"])
+            self.assertEqual(status, 400, (change, got))
+            self.assertIn("deletes it at https://github.com/", got["error"])
+            self.assertFalse(os.path.exists(os.path.join(self.root + door.REPO_APPS_DIR, "991.pem")))
+        self.assertEqual(set(door.read_json(door.REPO_APPS_FILE, {})), {"one-org/shop"})
+        status, got = self.post("/github/app-code", {"code": "x", "repo": door_targets.VENDOR_REPOS[0]},
+                                self.secrets["token"])
+        self.assertEqual(status, 400, got)
+        self.assertIn("one of the product's own repositories", got["error"])
+        # the repository's tokens come from its own App only, at read or write; the door's own App makes the others
+        status, got = self.post("/github/token", {"agent": "ops-one", "repos": {
+            "one-org/shop": "write", "one-org/ops": "read"}}, self.secrets["token"])
+        self.assertEqual(status, 200, got)
+        self.assertEqual([(t["access"], t["repos"]) for t in got["tokens"]],
+                         [("write", ["one-org/shop"]), ("read", ["one-org/ops"])])
+        self.assertIn(("12345", "value-of-" + ref(6)[-4:]), signed)
+        self.assertEqual({p for a, p in signed if a == "992"}, {""})      # signed from its file, never from memory
+        self.assertEqual(self.door.repo_apps_reached(), ["one-org/shop"])
+        # an installation of that App on more than its one repository gives no token and reaches nothing
+        for selection, repos in (("all", ["One-Org/Shop"]), ("selected", ["One-Org/Shop", "One-Org/Ops"])):
+            door.Door.SELECTED.clear()
+            scope.update(selection=selection, repos=repos)
+            status, got = self.post("/github/token", {"agent": "ops-one", "repos": {"one-org/shop": "write"}},
+                                    self.secrets["token"])
+            self.assertEqual(got["tokens"], [], (selection, got))
+            self.assertIn("installed on more than one-org/shop", got["errors"][0]["error"])
+            self.assertEqual(self.door.repo_apps_reached(), [])
+        door.Door.SELECTED.clear()
+        scope.update(selection="selected", repos=["One-Org/Shop"])
+        # the door's own App acts on no such repository, by any of its tokens
+        with self.assertRaisesRegex(door_providers.Stop, "App of its own"):
+            door.GitHub(self.door, self.door.access(), "one-org/shop").token()
+        with self.assertRaisesRegex(door_providers.Stop, "App of its own"):
+            door_providers.one_call({"app_id": "12345", "secret": "x"}, {"secret": lambda r: "k", "http": http},
+                                    "one-org/ops", {"metadata": "read"}, repositories=["shop"])
+        door.write_json(door.REPO_APPS_FILE, dict(door.read_json(door.REPO_APPS_FILE, {}),
+                                                   **{"one-org/tools": {"app_id": 992}}))
+        status, got = self.post("/github/token", {"agent": "ops-one", "repos": {"one-org/tools": "deploy"}},
+                                self.secrets["token"])
+        self.assertEqual(got["tokens"], [])
+        self.assertIn("App of its own", got["errors"][0]["error"])
+        # a key file with another mode gives no token
+        os.chmod(key, 0o600)
+        status, got = self.post("/github/token", {"agent": "ops-one", "repos": {"one-org/shop": "write"}},
+                                self.secrets["token"])
+        self.assertEqual(got["tokens"], [])
+        self.assertIn("mode 400", got["errors"][0]["error"])
+        os.chmod(key, 0o400)
+        # a record that does not read: no token at all, and the door's own App acts on nothing
+        with open(self.root + door.REPO_APPS_FILE, "w") as f:
+            f.write("{not json")
+        status, got = self.post("/github/token", {"agent": "ops-one", "repos": {"one-org/ops": "read"}},
+                                self.secrets["token"])
+        self.assertEqual(status, 403, got)
+        with self.assertRaisesRegex(door_providers.Stop, "cannot read its record"):
+            door.GitHub(self.door, self.door.access(), "one-org/ops").token()
+
     def test_a_token_inside_the_business_pool_at_no_more_than_its_level(self):
         """The manager hands out what the pool holds, and the hub names the grant: the door makes a token for it inside
         the asking agent's business pool, at no more than the pool's level, and for no other business's agent."""
@@ -2661,6 +2834,13 @@ class HubRights(Served):
                          {"ops": door.GITHUB_ACCESS["read"], "shop": door.GITHUB_ACCESS["write"]})
         self.assertNotIn("actions", door.GITHUB_ACCESS["read"])
         self.assertNotIn("actions", door.GITHUB_ACCESS["write"])
+        # M2: an installation that holds Checks (the agents' App of the product's source) gives read and write tokens
+        # checks: read too, so that an agent reads why the gate refused its pull request; deploy stays as it was
+        held.clear()
+        held.update(door.REPO_APP_PERMISSIONS)
+        self.assertEqual(asked(three), {"ops": dict(door.GITHUB_ACCESS["read"], actions="read", checks="read"),
+                                        "shop": dict(door.GITHUB_ACCESS["write"], actions="read", checks="read"),
+                                        "tools": door.GITHUB_ACCESS["deploy"]})
 
     def test_a_token_reads_the_issues_and_from_write_comments_on_them_only_where_the_installation_holds_issues(self):
         """12 November 2026: a write token got 403 on a comment in an issue, so an agent could not talk to the
@@ -2747,7 +2927,7 @@ class HubRights(Served):
                                          "held": "https://github.com/settings/installations/79"},
                                "all": ["solo"], "repos": ["one-org/ops", "one-org/shop"],
                                "install": "https://github.com/apps/fleet-app/installations/new",
-                               "owners": ["one-org"]})
+                               "owners": ["one-org"], "own": []})
         self.assertIn(("GET", "https://api.github.com/installation/repositories?per_page=100&page=1",
                        "Bearer ghs_" + "x" * 36), self.github)
         # A page that GitHub does not give is an error of the whole reading, never a short list: else the hub marks
@@ -2784,7 +2964,8 @@ class HubRights(Served):
             return stubbed(method, url, headers, data)
         self.door.http = http
         status, got = self.get("/github/repos", self.secrets["token"])
-        self.assertEqual((status, got), (200, {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop"]}}}))
+        self.assertEqual((status, got), (200, {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop"],
+                                                                        "whole": True}}}))
         self.assertEqual(self.get("/github/repos", self.secrets["record"])[0], 403)
         self.assertEqual(self.get("/github/repos", self.secrets["token"], source=ONE)[0], 403)
 

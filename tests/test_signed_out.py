@@ -590,7 +590,8 @@ class SignedOut(test_agent_auth.Routes):
         a web address whose user part reads as an email address, a key after a prefix with an underscore, or a code in
         full-width letters, with a non-breaking hyphen or a zero-width space; a limit of that check that its comment
         does not write (a known hole is fixed or written); the hub's word after a refusal for want of a reading, which
-        never came (the area's reader of piece 1, finding 3); a reply under the card with an address or a code."""
+        never came (the area's reader of piece 1, finding 3); a reply under the card with an address or a code; a why
+        over 140 characters whose refusal sends the manager to details, which this card refuses (P7 piece 2)."""
         who = hub.shown_role("alpha")           # the label of the owner's apps (a role before F16, the name after)
         self.assertIn(f"the hub has no current reading of {who}'s sign-in to Claude Code and Codex on box",
                       self.sign_in_card())
@@ -634,6 +635,10 @@ class SignedOut(test_agent_auth.Routes):
                 # none of its words: the hub's log and the call's record mask a key only whole
                 for word in re.findall(r"\S*[\d/:@]\S*", why):
                     self.assertNotIn(word.strip(".`"), said)
+        said = self.sign_in_card(why="Its tasks wait. " + "w " * 62 + "w")                    # 141 characters
+        self.assertIn("why is at most 140 characters", said)
+        self.assertIn("Say it in fewer words: this card takes no details. This one has 141.", said)
+        self.assertNotIn("in details", said)
         # the limits of that check, which the comment above NEED_SIGN_IN_CODE writes: each is true, and each is written
         with open(hub.__file__, encoding="utf-8") as f:
             source = f.read()

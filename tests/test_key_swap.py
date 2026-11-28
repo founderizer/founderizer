@@ -2823,6 +2823,10 @@ class Wish(Fact):
         self.says("box", False)
         for more, words in (({"title": "Switch on the key swap?"}, "word for word"),
                             ({"options": ["Yes", "No"]}, "leave options"), ({"details": "More."}, "leave options"),
+                            # a long why (P7 section 5): never "in details", which this card refuses
+                            ({"why": "w " * 70 + "w"}, "at most 140 characters, one or two plain sentences: what the "
+                                                       "owner decides and why it matters now. Say it in fewer words: "
+                                                       "this card takes no details. This one has 141."),
                             ({"key_swap_server": "nowhere", "title": "Switch on the key swap on nowhere?"},
                              "a server of this fleet"),
                             ({"key_swap_server": "lone", "title": "Switch on the key swap on lone?"},

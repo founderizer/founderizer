@@ -327,6 +327,9 @@ NOT_TOOLS = {
     "/ui/door/github-app": "the ID of a GitHub App that the app made with GitHub's manifest flow, whose key the door "
                            "holds",
     "/ui/door/host": "the app's own word about the door's parts on one server, which its round writes by itself",
+    "/ui/door/repo-app": "GitHub's one-time code of the manifest flow of a repository's own App, which a "
+                         "session's listener takes on this Mac's loopback address and posts with the owner key on "
+                         "standard input: the door converts it, so the key passes neither the Mac nor the hub",
     "/ui/chat-apps/{}/token": "a Discord or Telegram bot token; the app's program has save_bot_token, which takes "
                               "the token from a file or a pipe on this Mac, or has the app read the clipboard, and "
                               "never as a field",

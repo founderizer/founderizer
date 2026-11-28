@@ -872,7 +872,7 @@ class DoorTokens(Access):
             self.assertEqual(reach, {"pages": {"acme": org, "solo": "https://github.com/settings/installations/6"},
                                      "all": {"solo"}, "repos": {"acme/web", "acme/ops"},
                                      "install": "https://github.com/apps/fleet-app/installations/new",
-                                     "owners": set(), "many": {"solo"}})
+                                     "owners": set(), "many": {"solo"}, "own": set()})
             self.assertEqual(StubDoor.calls[-1][:3], ("GET", "/github/reach", "Bearer token-secret"))
             hub.github_reach_refresh()
             self.assertEqual(hub.github_unreached(["acme/web", "acme/site", "solo/any", "new/y"]),
@@ -900,9 +900,43 @@ class DoorTokens(Access):
         self.assertEqual(len(told()), 1)
         hub.github_app_asks(dict(reach, all={"other"}))           # reached in between
         self.assertEqual(hub.github_app_asks(reach), ["other"])
+        # M2: an account whose held repositories each have a GitHub App of their own needs no App of the door there
+        # (in the gate's organization only its two Apps are installed). Bug: the hub asks for the door's own App,
+        # which holds administration, workflows and secrets
+        hub.github_app_asks(dict(reach, all={"other"}))
+        self.assertEqual(hub.github_app_asks(dict(reach, own={"other/site"})), [])
         secrets = self.root / "door.json"
         secrets.unlink()                                          # not linked: the hub's own App decides
         self.assertEqual(hub.github_app_asks(dict(reach, all=set())), [])
+
+    def test_a_repository_s_own_app_code_goes_to_the_door_and_stays_in_no_record(self):
+        """The order of `main` on GitHub, M2, row 6: GitHub's one-time code of a repository's own App goes to the door
+        once, which converts it there, and the hub's record of the command names its SHA-256 only. Bugs: the code is
+        kept in ui_controls, which a backup copy carries; the door's key or a refusal of the door's reaches the answer
+        as done."""
+        code = "a1B2c3D4e5F6"
+        StubDoor.answers["/github/app-code"] = (200, {
+            "repo": "acme/source", "app_id": 990, "slug": "source-agents", "owner": "acme",
+            "permissions": {"metadata": "read"}, "install": "https://github.com/apps/source-agents/installations/new",
+            "key_sha256": "x", "pem": "never"})
+        status, answer = self.owner("/ui/door/repo-app", code=code, repo="Acme/Source")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual((answer["app_id"], answer["repo"], answer["slug"]), (990, "acme/source", "source-agents"))
+        self.assertNotIn("pem", answer)
+        sent = [(path, auth, body) for _, path, auth, body in StubDoor.calls if path == "/github/app-code"]
+        self.assertEqual(sent, [("/github/app-code", "Bearer token-secret", {"code": code, "repo": "acme/source"})])
+        stored = [r["body"] for r in hub.q("SELECT body FROM ui_controls WHERE route='door/repo-app'")]
+        self.assertTrue(stored and all(code not in b for b in stored))
+        self.assertEqual(hub.REPO_APP_PENDING, {})
+        self.assertEqual(hub.repo_apps_kept(), {"acme/source"})    # the hub's own record keeps it the owner's
+        # a refusal of the door's is the command's, with its words; a code of another form never leaves the hub
+        StubDoor.answers["/github/app-code"] = (400, {"error": "the App is not of acme, the repository's owner"})
+        status, answer = self.owner("/ui/door/repo-app", code="b2", repo="acme/source")
+        self.assertEqual(status, 409, answer)
+        self.assertIn("not of acme", answer["error"])
+        StubDoor.calls = []
+        self.assertEqual(self.owner("/ui/door/repo-app", code="a b", repo="acme/source")[0], 400)
+        self.assertEqual(StubDoor.calls, [])
 
     def test_a_github_app_item_and_the_id_of_the_app_that_the_app_made(self):
         options = ["Make the App on GitHub", "Not now"]
@@ -2371,6 +2405,31 @@ class DoorCalls(Access):
         line(again, "journalctl --vacuum-time=7d\n", t - 150)
         self.assertEqual([r["id"] for r in hub.door_full_waiting("web-1", t)], sorted([waiting, twin, again]))
 
+    def test_the_door_s_card_of_a_server_with_a_long_name_keeps_its_answers(self):
+        """P7 section 5: an agent's option is at most 50 characters, and the answers that the hub writes keep 120.
+        Bug: Full access on <server>, which the hub writes, takes the agent's limit, so the door's card of a server
+        with a long name is refused, also when the manager gives the three answers word for word, and the refused run
+        waits with no card that the owner can sign. Or the three answers in another case get the agent's limit first,
+        and the manager shortens a server's name."""
+        host = "ip-10-0-12-34.eu-west-1.compute.internal"
+        self.assertEqual(self.grant(agent="vps", server=host, level="fix")[0], 200)
+        answers = ["Run it once", f"Full access on {host}", "No"]
+        self.assertGreater(len(answers[1]), hub.ADVICE_OPTION_CHARS)
+        for n, given in enumerate(({}, {"options": answers})):
+            with self.subTest(given=given):
+                said = hub.t_raise_needs_you("manager", run_card(
+                    host=host, script=f"mv /srv/app/uploads /srv/app/uploads-{n}\n", **given))
+                nid = int(said.split("N-")[1].split(".")[0])
+                self.assertEqual(hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))["options"], answers)
+                hub.q("UPDATE needs SET answer='No', answered=1 WHERE id=?", (nid,))     # one card on one server
+        # the three answers in other words get the door's own refusal, never the agent's limit of 50, which no
+        # shorter words of the server's name could meet
+        with self.assertRaises(hub.ToolError) as other:
+            hub.t_raise_needs_you("manager", run_card(host=host, script="mv /srv/app/uploads /srv/app/uploads-2\n",
+                                                      options=["Run it once", f"Full access on {host.upper()}", "No"]))
+        self.assertIn("the three answers of the door's card, in this order", str(other.exception))
+        self.assertNotIn("at most 50", str(other.exception))
+
     def test_the_words_of_a_signed_answer_do_not_close_the_door_s_card(self):
         """Words are no signature. An answer in words closes an item as a press does, so the words of Run it once or
         of Full access on <server>, sent as text, would close the door's card and give the door nothing. They get the
@@ -2844,7 +2903,8 @@ class DoorCalls(Access):
         """Review point 5.6 of 11 November 2026: the owner signed a hash, and the card's script was the manager's
         words. raise_needs_you door_script is the script itself: the hub checks that it is the script of door_call,
         the card shows it and nothing else under Script, and the owner's Mac computes the hash again from what it
-        shows. The hub's hash is the door's (test_door.CALL_HASHES)."""
+        shows. The hub's hash is the door's (test_door.CALL_HASHES). And a why over 140 characters (P7 section 5) is
+        refused with words that never send the manager to details, which this card refuses in turn."""
         import test_door
         for line in test_door.CALL_HASHES:
             target, action, args, content, sha = json.loads(line)
@@ -2889,6 +2949,12 @@ class DoorCalls(Access):
                          ({"door_script": 5}, "as text"), ({"door_script": "  \n"}, "as text")):
             with self.subTest(bad=bad), self.assertRaisesRegex(hub.ToolError, why):
                 hub.t_raise_needs_you("manager", dict(base, **bad))
+        with self.assertRaises(hub.ToolError) as long_why:
+            hub.t_raise_needs_you("manager", dict(base, door_script=script, why="w " * 70 + "w"))
+        for words in ("why is at most 140 characters", "name the changes by kind and number",
+                      "the card shows the whole script under Script", "This one has 141."):
+            self.assertIn(words, str(long_why.exception))
+        self.assertNotIn("in details", str(long_why.exception))
         # a script is printable ASCII and line feeds: each of these drew one thing on the card and ran another
         # in the review of 12 November 2026, or can
         for text, why in (("id\r\n", "U\\+000D"), ("echo a\u202eb\n", "U\\+202E"), ("echo a\u200bb\n", "U\\+200B"),

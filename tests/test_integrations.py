@@ -318,7 +318,8 @@ class HubSide(OwnerAPI):
         with patch.object(hub, "github_repos_read", return_value=(found, [])) as read:
             code, data = self.request("/ui/github/repos?db=test-generation")
             self.assertEqual((code, data["accounts"], data["problem"]),
-                             (200, [{"account": "Acme", "repos": ["acme/lib", "acme/web"]}], None), data)
+                             (200, [{"account": "Acme", "repos": ["acme/lib", "acme/web"], "whole": False}], None),
+                             data)
             self.assertEqual(self.request("/ui/github/repos?db=test-generation")[1]["accounts"], data["accounts"])
             self.assertEqual(read.call_count, 1)                                # a minute's reading, read once
         hub.GITHUB_REPOS.update(at=0.0, list=None)
@@ -337,15 +338,18 @@ class HubSide(OwnerAPI):
         a name there does not exist (the owner's card N-327)."""
         import door_targets
         door = {"address": "100.64.0.9", "port": 8766, "token": "t" * 43}
-        answer = {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop", "Other/stray", "bad name",
-                                                                         "One-Org/Core"]},
+        answer = {"accounts": {"one-org": {"name": "One-Org", "whole": True,
+                                           "repos": ["one-org/shop", "Other/stray", "bad name", "One-Org/Core"]},
                                "two-org": {"name": "Two-Org", "repos": ["two-org/core"]},
                                "x y": {"name": "x", "repos": ["x/y"]}}}
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \
                 patch.object(hub, "door_call", return_value=(200, answer)) as call, \
                 patch.object(door_targets, "VENDOR_REPOS", ("one-org/core", "two-org/core")):
-            self.assertEqual(hub.github_repos_read(), ({"one-org": {"name": "One-Org", "repos": ["one-org/shop"]},
-                                                        "two-org": {"name": "Two-Org", "repos": [], "product": True}},
+            # whole: the door's word that its own App's installation holds the whole account (M2's branch)
+            self.assertEqual(hub.github_repos_read(), ({"one-org": {"name": "One-Org", "repos": ["one-org/shop"],
+                                                                    "whole": True},
+                                                        "two-org": {"name": "Two-Org", "repos": [], "whole": False,
+                                                                    "product": True}},
                                                        []))
         self.assertEqual(call.call_args.args[1:4], ("GET", "/github/repos", "t" * 43))
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \
@@ -370,7 +374,8 @@ class HubSide(OwnerAPI):
         with patch.object(hub, "github_app", return_value=(APP_ID, "key")), \
                 patch.object(hub, "github_jwt", return_value="jwt"), \
                 patch.object(hub, "door_conf", return_value=None), patch.object(hub, "github_call", call):
-            self.assertEqual(hub.github_repos_read(), ({"two-org": {"name": "Two-Org", "repos": ["two-org/shop"]}},
+            self.assertEqual(hub.github_repos_read(), ({"two-org": {"name": "Two-Org", "repos": ["two-org/shop"],
+                                                                    "whole": False}},
                                                        ["an IP allow list refuses the App"]))
             pages[0] = 0
             self.assertEqual(hub.github_repos_read(), ({}, ["an IP allow list refuses the App",
