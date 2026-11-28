@@ -2344,11 +2344,15 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # of the bot"): agents[].spelling of GET /ui/state and GET /ui/mobile, kept in
                                     # team.json, and the `spelling` of the routes that add and rename an agent
                                     # (UI-API.md 1.339)
-               "server_made"]       # F17 design A, Setup's piece SP1 (the owner's rule of 22 November 2026, "my mac is
+               "server_made",       # F17 design A, Setup's piece SP1 (the owner's rule of 22 November 2026, "my mac is
                                     # just a client"): the signed records of the servers that clients made (GET and
                                     # POST /ui/servers/made, POST /ui/servers/made/swept) and the mark of an install's
                                     # end (POST /ui/servers/<server>/install-ended, servers[].install_ended of GET
                                     # /ui/servers); nothing on the owner's screen (UI-API.md 1.362)
+               "state_changes"]     # the owner, 26 November 2026 ("can yuo do them all?" to the resource findings):
+                                    # GET /ui/state?changes=1&base=<window> gives only what changed since the window
+                                    # that the reader holds, and the whole window when the hub no longer holds it
+                                    # (state_answer, UI-API.md 1.370)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -87617,6 +87621,168 @@ def save_connect(on):
     return {"on": on, "revoked": revoked, "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+# ---------------------------------------------------------------- the changes of the state (feature state_changes)
+#
+# The Mac app reads GET /ui/state at each change that the hub announces (at most one in 2 seconds) and 3 seconds after
+# its last read. On the first fleet on 26 November 2026 that was about 1,632 reads an hour, each a window of 1.74 MB
+# (566 KB with gzip): about 0.9 GB an hour, while one read changed a few rows. Eleven reads of the same window 3 seconds
+# apart on that fleet: no two were the same, also without their time and token (so a tag of the answer would save
+# nothing), and the changed rows of each pair were 8.0 KB with gzip (the median) against 582 KB for the window, 98%
+# less. So a reader that asks with `changes=1` gets `window`, the id of its answer, and the hub keeps what that answer
+# said (STATE_KEPT). Its next read with `base=<that id>` gets only what changed since (state_changes). A base that the
+# hub does not hold (it was never given, it left the ring, it is of another generation, the registered logins changed
+# since, or the hub started again since) gets the whole window again, with a new id. A reader that does not ask reads
+# what it always read, byte for byte (test_state_read.SameBytes).
+#
+# What the hub keeps of an answer is the JSON text of each of its values, and of each row of a list of rows
+# (state_rows). A change is a change of that text, so a value that keeps its number and changes its type (1 and true,
+# 1 and 1.0) is a change, as the app's decoder reads it; Python's == would call them the same. Both answers are made
+# from those texts (state_text), the same text as json.dumps writes, and no json.dumps of a whole change set or window
+# holds Python's interpreter lock (json_text). What it saves is the gzip and the bytes on the network: at each read
+# with changes=1 the hub still makes the text of each value and row, and a whole answer with a window (a first read, a
+# miss) costs about 1.4 times a read without changes=1 (18.1 ms against 12.6 ms, the second reader's probe, 26
+# November).
+#
+# The texts were masked by scrub with the registered logins of their read. A read whose logins differ from the ones
+# that the kept answers were masked with empties the ring first (state_kept), and an answer is kept only while the ring
+# is of its own logins (state_keep), also when a read of other logins came between its two steps: no answer made with
+# other logins is a base, and no text kept from before the change outlives the first read after it. Such texts are not
+# sent again: the base that held them was answered before the login came.
+#
+# Memory: the texts of one answer are about 1.37 times its JSON (the second reader's measure), about 2.5 MB at the first
+# fleet's size on 26 November 2026, so about 10 MB for the four. Only a read of the Mac's shape, tasks=window and
+# rest=window on a hub that serves both windows, keeps a base: a read with changes=1 of any other shape would keep
+# whole histories (over 8 MiB each, about 45 MB for four), so it gets the whole state with no window. Four is enough:
+# only the Mac apps read GET /ui/state with changes=1 (a phone and the PC app read GET /ui/mobile, and the owner's tools
+# ask for no changes), each Mac reads again 2 to 3 seconds after its last read, and a Mac's base is its own last window.
+# So with up to four Macs that read in turn, the base of each one is still in the ring at its next read. A miss costs
+# one whole window, which the reader takes as it takes its first one.
+STATE_KEPT = collections.OrderedDict()  # window id -> (db, marks): an answer's generation and its marks (state_marks)
+STATE_KEPT_LOGINS = [None]              # the registered logins (secret_key) that the kept answers were masked with
+STATE_KEPT_MOST = 4                     # the answers kept
+STATE_KEPT_LOCK = threading.Lock()      # held only while STATE_KEPT is read or changed, and never with LOCK
+STATE_HEAD = ("schema_version", "db", "time", "token")     # what a changes answer carries itself, and no mark has
+STATE_ROW_KEYS = ("id", "request_id", "name", "path")      # the first that names each row of a list once is its key
+
+
+class StateText(str):
+    """An answer's JSON text, made already from the kept texts (state_answer): Handler.json sends it as it is."""
+
+
+def state_rows(value):
+    """(key, the ids in their order) of a list of rows: a list of objects that each have the field `key`, the first of
+    STATE_ROW_KEYS that every row has as a string, or every row as a whole number (not true or false), with no id
+    twice. The tasks have `id`, the messages `request_id`, the agents `name`. None for every other value: a change
+    sends it whole."""
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        return None
+    for key in STATE_ROW_KEYS:
+        ids = [row.get(key) for row in value]
+        kinds = {type(i) for i in ids}
+        if (kinds <= {int} or kinds <= {str}) and len(set(ids)) == len(ids):
+            return key, ids
+    return None
+
+
+def state_marks(answer):
+    """What the hub keeps of each value of an answer, its head (STATE_HEAD) aside: ("rows", key, ids, {id: text}) for a
+    list of rows (state_rows), else ("value", text). json.dumps writes each text as the whole answer writes it
+    (json_text), and one at a time, so other threads run between them."""
+    marks = {}
+    for name, value in answer.items():
+        if name in STATE_HEAD:
+            continue
+        rows = state_rows(value)
+        marks[name] = ("value", json.dumps(value)) if rows is None else \
+            ("rows", rows[0], rows[1], {i: json.dumps(row) for i, row in zip(rows[1], value)})
+    return marks
+
+
+def state_mark_text(mark):
+    """The JSON text of a value from its mark: its own text, or its rows' texts in their order."""
+    return mark[1] if mark[0] == "value" else "[" + ", ".join(mark[3][i] for i in mark[2]) + "]"
+
+
+def state_changes(kept, marks):
+    """What changed from a kept answer (its marks) to an answer (its marks, state_marks), as texts:
+    {"set": {name: text}, "rows": {name: (key, order, [row texts])}, "remove": [names]}.
+    - A value that is new, that changed, or that is no list of rows on both sides with the same key goes whole in set.
+    - A list of rows that changed gives its key, the ids of all its rows in their new order, and the rows that are new
+      or changed: a row that left is one whose id is no longer in the order.
+    - A name that the answer no longer has is in remove.
+    The base with these changes, and the head of the answer, is the whole answer: its values, and the order of the rows
+    of each list. The order of the values is no part of it: a value that comes back comes last."""
+    changes = {"set": {}, "rows": {}, "remove": sorted(name for name in kept if name not in marks)}
+    for name, mark in marks.items():
+        was = kept.get(name)
+        if was == mark:
+            continue
+        if mark[0] == "rows" and was is not None and was[:2] == mark[:2]:
+            texts, now = was[3], mark[3]
+            changes["rows"][name] = (mark[1], mark[2], [now[i] for i in mark[2] if texts.get(i) != now[i]])
+        else:
+            changes["set"][name] = state_mark_text(mark)
+    return changes
+
+
+def state_text(head, changes=None, marks=None, answer=None):
+    """The JSON text of an answer, as json.dumps writes it: the values of `answer` from their marks, then `head` (each
+    value by json.dumps), then "changes" from state_changes."""
+    parts = [] if answer is None else \
+        [json.dumps(name) + ": " + (state_mark_text(marks[name]) if name in marks else json.dumps(value))
+         for name, value in answer.items()]
+    parts += [json.dumps(name) + ": " + json.dumps(value) for name, value in head.items()]
+    if changes is not None:
+        sets = ", ".join(json.dumps(name) + ": " + text for name, text in changes["set"].items())
+        rows = ", ".join(json.dumps(name) + ": {\"key\": " + json.dumps(key) + ", \"order\": " + json.dumps(order) +
+                         ", \"set\": [" + ", ".join(texts) + "]}"
+                         for name, (key, order, texts) in changes["rows"].items())
+        parts.append("\"changes\": {\"set\": {" + sets + "}, \"rows\": {" + rows + "}, \"remove\": " +
+                     json.dumps(changes["remove"]) + "}")
+    return StateText("{" + ", ".join(parts) + "}")
+
+
+def state_keep(db, marks, logins):
+    """Keeps the marks of an answer masked with `logins` under a new window id, and forgets the oldest beyond
+    STATE_KEPT_MOST. Gives the id. A read of other logins can come between this read's state_kept and this keep, and
+    empty the ring for its own logins: then this answer is kept not at all, and a later read from its window is a
+    miss, which costs one whole window."""
+    window = secrets.token_hex(8)
+    with STATE_KEPT_LOCK:
+        if STATE_KEPT_LOGINS[0] == logins:
+            STATE_KEPT[window] = (db, marks)
+            while len(STATE_KEPT) > STATE_KEPT_MOST:
+                STATE_KEPT.popitem(last=False)
+    return window
+
+
+def state_kept(base, db, logins):
+    """The marks kept under the window id `base` for the generation `db`, or None: an id that the hub does not hold
+    (never given, gone from the ring, or given before this process started) or one of another generation. When the
+    registered logins are not the ones that the kept answers were masked with, it empties the ring first."""
+    with STATE_KEPT_LOCK:
+        if STATE_KEPT_LOGINS[0] != logins:
+            STATE_KEPT.clear()
+            STATE_KEPT_LOGINS[0] = logins
+        kept = STATE_KEPT.get(base) if isinstance(base, str) and base else None
+    return kept[1] if kept is not None and kept[0] == db else None
+
+
+def state_answer(answer, base, logins):
+    """The answer of GET /ui/state?changes=1 (owner feature state_changes), from the answer after scrub with the
+    registered logins `logins` (secret_key): a text that a login registered since the base masks is a change, and a
+    base masked with other logins is none. With a base that the hub holds for this generation:
+    {schema_version, db, time, token, window, base, changes} (state_changes). Else the whole answer with `window`
+    last, so that every value of before keeps its place. Both as their text (state_text). The caller holds no LOCK."""
+    marks = state_marks(answer)
+    kept = state_kept(base, answer.get("db"), logins)      # before the keep, which can push the base out of the ring
+    window = state_keep(answer.get("db"), marks, logins)
+    if kept is None:
+        return state_text({"window": window}, marks=marks, answer=answer)
+    return state_text(dict({name: answer[name] for name in STATE_HEAD if name in answer}, window=window, base=base),
+                      changes=state_changes(kept, marks))
+
+
 # ---------------------------------------------------------------- the phone's functions
 #
 # The bodies of the phone's routes (owner feature mobile), after the route's own checks (ui_allowed, the body's type
@@ -90111,7 +90277,9 @@ class Handler(BaseHTTPRequestHandler):
           must not change because the apps' reads did.
         An InParts answer (the state) is written in parts (json_text), the same text, so that other threads run while
         it is made."""
-        body = (json_text(obj) if isinstance(obj, InParts) else json.dumps(obj)).encode()
+        # a StateText is the text of an answer of the state with changes=1, made already (state_answer)
+        body = (obj if isinstance(obj, StateText) else json_text(obj) if isinstance(obj, InParts) else json.dumps(obj))
+        body = body.encode()
         if code == 200 and self.command != "HEAD" and len(body) > GZIP_MIN and self.path.startswith("/ui/") \
                 and not LOCK._is_owned() and accepts_gzip(self.headers.get_all("Accept-Encoding")):
             packed = gzip_body(body)
@@ -91140,9 +91308,18 @@ class Handler(BaseHTTPRequestHandler):
         result["door_grant_waits"] = door_grant_waits()
         # owner feature ask_follow_ups: his list, after every key of before; its answers cut after the mask
         result["owner_asks"] = owner_asks
-        result = scrub(result)
-        owner_asks_cut(result["owner_asks"])
-        return self.json(200, InParts(result))
+        # Owner API 1.370 (feature state_changes): the changes since the reader's window, or the whole window with the
+        # id of this one, after scrub and with no LOCK held (state_answer). Only for a read of the Mac's shape, both
+        # windows, which keeps no history; and a HEAD, which gets no body, keeps no window.
+        if self.route()[1].get("changes") != "1" or self.command == "HEAD" or not (window and rest):
+            answer = scrub(result)
+            owner_asks_cut(answer["owner_asks"])
+            return self.json(200, InParts(answer))
+        logins = secret_key()           # what scrub masks now, for the answer and for its base (state_kept)
+        with logins_held(logins):
+            answer = scrub(result)
+        owner_asks_cut(answer["owner_asks"])
+        return self.json(200, state_answer(answer, self.route()[1].get("base"), logins))
 
     def ui_machines(self, query):
         """Machine status, Fleet revision and update state for every agent (owner API 1.2)."""
@@ -99567,8 +99744,9 @@ TEAMS_CALLS = {         # feature -> the names of the functions that Core calls 
     "person_links": ("start", "place", "handle", "handle_view", "person_rows", "link_rows", "join_check", "join_rows",
                      "join_view", "ui_links", "count", "work_note", "link_agents"),
     # D87, D88 and D90, the company's name and logo (teams_company.py): company_view for GET /ui/company and for the
-    # part person_links (`list` and `logo`), company_body and company_write for POST /ui/company
-    "company": ("company_view", "company_body", "company_write"),
+    # part person_links (`list` and `logo`), company_body and company_write for POST /ui/company; D149 and D150,
+    # company_large: the large logo's value and PNG, for a member's `logo` of size 128 and for the join's wire
+    "company": ("company_view", "company_body", "company_write", "company_large"),
 }
 # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
 TEAMS_TABLES = ("role_sets", "person_links", "person_link_asks")

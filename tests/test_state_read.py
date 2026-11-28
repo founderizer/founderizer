@@ -463,6 +463,13 @@ class SameBytes(StateCase):
     def test_the_state_is_the_same_bytes_as_with_each_part_read_alone(self):
         self.fill()
         body = self.state_bytes()
+        # Owner API 1.370: reads that ask for changes, whole and from a base, change nothing of a read that does not
+        # ask, which an app of before and the owner's tools make: the same bytes, with no `window`
+        mac = "/ui/state?tasks=window&rest=window&changes=1"
+        status, kept = self.request(mac)
+        self.assertEqual((status, list(kept)[-1]), (200, "window"))
+        self.assertEqual(self.request(f"{mac}&base={kept['window']}")[1]["base"], kept["window"])
+        self.assertNotIn("window", json.loads(body))
         self.assertEqual(self.state_bytes(), body)              # the clock stands still: a second read is the same
         alone = self.run_with(each_part_alone(), self.state_bytes)
         self.assertEqual(alone, body)
