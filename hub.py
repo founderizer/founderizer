@@ -694,10 +694,10 @@ CREATE INDEX IF NOT EXISTS action_yes_of ON action_yes(agent, action, id);
 -- D143 (design v5, 3.2.7): the salted hashes of each run of 12 characters of a customer's own words that a customer
 -- action sent (its text fills), by person, and never the words: a returns value of a service that shares one of them
 -- is dropped (action_answered). at: the last call that sent that run. A person's removal deletes their rows
--- (person_remove), and action_runs_sweep deletes a row ACTION_RUNS_DAYS after its last call.
+-- (person_remove), and action_runs_sweep deletes a row ACTION_RUNS_DAYS after its last call. A table of before `at`
+-- takes it in migrate, and so does the index action_run_at on it, which comes after that column.
 CREATE TABLE IF NOT EXISTS action_runs(person INTEGER NOT NULL, hash TEXT NOT NULL, at REAL NOT NULL,
   PRIMARY KEY(person, hash));
-CREATE INDEX IF NOT EXISTS action_run_at ON action_runs(at);
 -- The release channel (PRODUCT.md 4.2 and 4.3 name both tables). `entitlement` holds one row: this fleet's
 -- subscription as the website issued it, carried and never enforced. `releases` holds one row for each release
 -- this fleet learned about, with the update run that came of it. Founderizer for Teams reads the row (teams_on), with
@@ -10376,8 +10376,8 @@ def migrate():
                  # (NULL until request_done; 1 a pass, or a write or create told as sent; 0 a failed check, a 404, or a
                  # write or create that the service did not confirm; 2 a read that the service could not answer, 429
                  # or 5xx; 3 a read whose action changed while it ran; 4 a read that the service answered 401, a
-                 # fault of the key), and the kept returns values as JSON (cleared
-                 # at a removal)
+                 # fault of the key, of a customer who had a passed read of the action: for one who never had one,
+                 # a 401 is 0), and the kept returns values as JSON (cleared at a removal)
                  "action": "TEXT", "action_hash": "TEXT", "action_phase": "TEXT", "action_person": "INTEGER",
                  "action_values": "TEXT", "action_key": "TEXT", "action_try": "INTEGER", "action_read": "INTEGER",
                  "action_pass": "INTEGER", "action_returns": "TEXT"},
@@ -10616,6 +10616,9 @@ def migrate():
         # reattempted or reviewed by the agents!"): who checks an unknown outcome (outcome_step), the line that told
         # that agent, and the hub's one question to it (outcome_check_sweep)
         "outcomes": {"checker": "TEXT NOT NULL DEFAULT ''", "told": "INTEGER", "asked": "INTEGER"},
+        # D143: the time of the last call that sent a run hash (action_runs_sweep), on a table of before it; such a
+        # row reads as old, and the sweep takes it at its next pass
+        "action_runs": {"at": "REAL NOT NULL DEFAULT 0"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -10823,6 +10826,8 @@ def migrate():
         "NOT NULL",
         # ... and the fleet-wide counts of an action by day (fleet_day, the fleet's total of failed checks)
         "CREATE INDEX IF NOT EXISTS job_action_day ON jobs(agent, action, created) WHERE action IS NOT NULL",
+        # ... and the run hashes whose last call is old (action_runs_sweep): here, after the column `at` above
+        "CREATE INDEX IF NOT EXISTS action_run_at ON action_runs(at)",
         "CREATE INDEX IF NOT EXISTS chat_out_person ON chat_out(person) WHERE person IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS chat_in_person ON chat_in(person) WHERE person IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS trigger_open_run ON trigger_runs(trigger_id) "
@@ -20353,7 +20358,8 @@ ACTION_GONE = "This action is not given now."
 ACTION_CHECKED = "Checked; call again with the same values to send it."      # a passed read of a write
 ACTION_LATER = "The service could not answer now. Try again in a minute."    # a read answered 429 or 5xx
 ACTION_CHANGED = "This action changed since this call. Call it again."
-# a read answered 401: the key's fault, never the customer's, and no word that the record is missing
+# a read answered 401 of a customer who had a passed read of the action: the key's fault, never the customer's, and
+# no word that the record is missing (for a customer who never had one, a 401 is a failed check: action_answered)
 ACTION_KEY_REFUSED = "The service refused the key, so it cannot answer now. Do not say that the record is missing."
 ACTION_SECRET = "The hub does not send this value: it holds a key or a password."
 ACTION_WRITE_WAIT = 600         # seconds: a passed read opens its one write for this long (design v5, 3.2.8), and a
@@ -20363,8 +20369,9 @@ ACTION_BUSY_WAIT = 60           # seconds: a read that the service could not ans
 # The counts of a run are Chat and files' (t_use_action, design v5, 3.2.2), read from the jobs rows inside the block of
 # action_job: per_day counts each read or create row of the customer's runs of the action (a write never counts:
 # its read does) that is not provably unsent (finished with
-# ok 0), so a pass, a failed check (a 403 and a 404 too), a 2 (429 or 5xx), a 3 (the action changed meanwhile), a 4 (a
-# 401: the service refused the key), one in flight and an unknown one all count, and no new try at once is free; a
+# ok 0), so a pass, a failed check (a 403 and a 404 too, and a 401 of a customer who never had a pass of the action),
+# a 2 (429 or 5xx), a 3 (the action changed meanwhile), a 4 (a 401 of a customer who had a pass: the service refused
+# the key), one in flight and an unknown one all count, and no new try at once is free; a
 # 2, a 3 and a 4 are no failed check. The fleet keeps a total of its own
 # of 2-rows: at most ACTION_BUSY_HOUR of them in the last hour for one action of an agent, past which the counts refuse
 # a new read only of a customer who never had a pass of that action, as the fleet's failure total does, so a few
@@ -20373,8 +20380,9 @@ ACTION_BUSY_WAIT = 60           # seconds: a read that the service could not ans
 ACTION_BUSY_HOUR = 50
 ACTION_SALT_KEY = "action_run_key"      # kv: the hub's own secret that salts the run hashes of customers' words
 ACTION_RUNS_DAYS = 90           # days that a run hash stays after the last call that sent it (action_runs_sweep)
-ACTION_RUNS_EVERY = 3600        # seconds between two passes of that sweep
-ACTION_RUNS_BATCH = 5000        # rows that one pass deletes at most, so that the sweep holds LOCK for a short time
+ACTION_RUNS_EVERY = 3600        # seconds between two passes of that sweep that find less than a full batch
+ACTION_RUNS_BATCH = 1000        # rows that one pass deletes at most, so that the sweep holds LOCK for about 15 ms;
+#                                 after a full pass the next pass comes at the next tick
 ACTION_RUNS_SWEPT = {"at": 0.0}     # the time of its last pass, in this process
 ACTION_ANSWERED = "The service answered."       # jobs.result of an answered action job: no status, no body
 ACTION_KIND_WORDS = {"whatsapp_phone": "WhatsApp number", "telegram_id": "Telegram account", "chat_id": "chat account"}
@@ -20435,6 +20443,44 @@ def action_yes_hash(agent, name):
     return row["hash"] if row else None
 
 
+def action_yes_forget(names):
+    """Inside a transaction: delete each row of the owner's yes (action_yes) of these names, before a path adds an
+    agent of one of them (add_server_agent, the add of a team plan, reload_team), and before its commit. The owner's
+    yes is for the agent that they gave it to. A hand edit of team.json that removed an earlier agent of the name, and
+    that a hub start took in, deleted nothing (forget_removed_agents runs only in apply_team), so a new agent of the
+    name with the same action, field for field, would be active with no yes of the owner's. A start forgets the rows
+    of each name that its team lacks (settle_action_yes), for two hand edits that two starts took in. Each name is
+    one that no agent of the running team has, so no yes of an agent that runs goes. Returns the count of rows
+    deleted."""
+    in_transaction("action_yes_forget")
+    return sum(DB.execute("DELETE FROM action_yes WHERE agent=?", (name,)).rowcount for name in names)
+
+
+def settle_action_yes():
+    """At the start, after the hub took in team.json and the cut steps of a plan that the owner pressed: the owner's
+    yes (action_yes) of each name that no agent of the loaded team has goes (the security reader of D143 piece 3,
+    S2). A hand edit of team.json that removes an agent and a later one that adds an agent of the same name with the
+    same action, each taken in by a start and never by reload_team, would otherwise give the earlier agent's yes to
+    the new one. It fails closed: a team.json that lacks an agent by mistake costs a new Give press. A file whose
+    agents are no map of at least one name (no fleet runs with none: the manager is one) forgets nothing, so a broken
+    file takes no yes of the fleet's; a file that only breaks another rule (team_problem) still has its agents, and is
+    read, or the name that it removed would keep its yes for the next start that adds it back (the D143 validator,
+    round 3, S1). A fault is the start's to print, and stops no start."""
+    try:
+        team = agents()
+        if not isinstance(team, dict) or not team:
+            return
+        with transaction():
+            names = sorted({r["agent"] for r in DB.execute("SELECT DISTINCT agent FROM action_yes").fetchall()}
+                           - set(team))
+            gone = action_yes_forget(names)
+            if gone:
+                log_row("hub", f"forgot {gone} yes(es) of the owner's for customer actions of agents that team.json "
+                               f"no longer has: {', '.join(names)}")
+    except Exception:
+        print_fault()
+
+
 def action_salt():
     """The hub's own secret that salts the run hashes of customers' words (kv action_run_key). The hub makes it at its
     first need, inside the caller's transaction when one is open. Called with LOCK held."""
@@ -20452,14 +20498,19 @@ def action_salt():
 
 def action_runs_sweep(t0):
     """Under LOCK, at the tick: the run hashes of customers' words (action_runs) whose last call is ACTION_RUNS_DAYS
-    old, at most ACTION_RUNS_BATCH rows a pass and one pass each ACTION_RUNS_EVERY seconds. A person who writes no more
+    old, at most ACTION_RUNS_BATCH rows a pass. After a full pass the next pass comes at the next tick, so a fleet whose
+    customers send many words catches up; after a pass with fewer rows, the next one comes ACTION_RUNS_EVERY seconds
+    later. The time of a pass is set first, so a fault waits ACTION_RUNS_EVERY seconds. A person who writes no more
     keeps no hash of their words for good, also before their removal. Quiet: no app shows these rows."""
     if 0 <= t0 - ACTION_RUNS_SWEPT["at"] < ACTION_RUNS_EVERY:
         return 0
     ACTION_RUNS_SWEPT["at"] = t0
     with area("quiet"), transaction():
-        return DB.execute("DELETE FROM action_runs WHERE rowid IN (SELECT rowid FROM action_runs WHERE at < ? LIMIT ?)",
-                          (t0 - ACTION_RUNS_DAYS * 86400, ACTION_RUNS_BATCH)).rowcount
+        swept = DB.execute("DELETE FROM action_runs WHERE rowid IN (SELECT rowid FROM action_runs WHERE at < ? LIMIT ?)",
+                           (t0 - ACTION_RUNS_DAYS * 86400, ACTION_RUNS_BATCH)).rowcount
+    if swept >= ACTION_RUNS_BATCH:
+        ACTION_RUNS_SWEPT["at"] = t0 - ACTION_RUNS_EVERY        # more can wait: the next tick takes the next batch
+    return swept
 
 
 def action_live(agent, name, t=None):
@@ -20703,6 +20754,20 @@ def action_run_shared(person, value, salt):
     return False
 
 
+def action_had_pass(agent, row):
+    """True when the customer of this action job (action_person) had a passed read (action_pass 1) of the same action
+    of the agent, under the same hash, and of the same record, the same request path and body: proof that this key,
+    at this site, could read that record. A pass of another record proves nothing of this one: a stranger can make
+    one record with a create and read it back, and a 401 of any other record would then tell them in other words
+    which records exist, with no failed check (the security reader of D143 piece 3, S1). A pass under an older hash
+    proves nothing either: the owner may have moved the login to another site with the same paths (the D143
+    validator, round 3). read_row only (index job_action_person)."""
+    return row["action_person"] is not None and read_row(
+        "SELECT 1 FROM jobs WHERE action_person=? AND action=? AND agent=? AND action_phase='read' AND action_pass=1 "
+        "AND action_hash=? AND path=? AND body IS ? LIMIT 1",
+        (row["action_person"], row["action"], agent, row["action_hash"], row["path"], row["body"])) is not None
+
+
 def action_answered(agent, row, f, status, answer, gone):
     """request_done's store for a customer action's job that the service answered (design v5, 3.2.7, 3.2.8 and 3.4),
     before anything of the body is kept: ok 1 for any answer of the service, status and response NULL, action_pass,
@@ -20712,11 +20777,13 @@ def action_answered(agent, row, f, status, answer, gone):
     as sent with a 2xx status, and its answer gets only the returns cut; a write or a create with any other status
     is not confirmed (0). A read answered 429 or 5xx is no failed check: action_pass 2, and the same call may go
     again after ACTION_BUSY_WAIT seconds (action_goes_again). A read whose action changed while it ran is no failed
-    check either: action_pass 3, and the same call may go again at once. Of the returns values that pass their
-    patterns, each one that shares a run with this customer's text fills (action_runs) and each one that the mask
-    changes is dropped. The check reads the action as the job's hash says: an action that changed while the request
-    ran keeps nothing of the body. gone: the task's person was removed, and nothing of the body is kept. Called with
-    LOCK held."""
+    check either: action_pass 3, and the same call may go again at once. A read answered 401 of a customer who had a
+    passed read of this action, under its hash, and of the same record (action_had_pass) is the key's fault:
+    action_pass 4; of any other, it is a failed check (0), in a missing record's words. Of the returns values that
+    pass their patterns, each one that shares a run with this customer's text fills (action_runs) and each one that
+    the mask changes is dropped. The check reads the action as the job's hash says: an action that changed while the
+    request ran keeps nothing of the body. gone: the task's person was removed, and nothing of the body is kept.
+    Called with LOCK held."""
     name, phase = row["action"], row["action_phase"]
     action = agent_actions(agent).get(name)
     ref = action.get("login") if isinstance(action, dict) else None
@@ -20753,10 +20820,16 @@ def action_answered(agent, row, f, status, answer, gone):
             cause = None if ok else "the body is no JSON object, or its owner or also field is not this customer's"
         later = phase == "read" and usable and (status == 429 or 500 <= status <= 599)
         changed = phase == "read" and not gone and not usable          # the owner's edit, not the customer's fault
-        # A 401 is the key's fault. A 403 stays a failed check, as a 404 does: a service answers 403 when the key
-        # works and the record is not this caller's to see, so a customer who tries other people's records reaches
-        # the stop
+        # A 401 is the key's fault for a customer who had a passed read of this action and of this same record: no
+        # failed check, and the session reads that the service refused the key. For any other, a 401 is a failed
+        # check, in the words of a missing record: a service can answer 401 for a record that the key may not see, and
+        # other words would tell a stranger which records exist, while no failed check would let them try per_day
+        # records a day and not 2 (the coordinator's decision for D143). A 403 stays a failed check, as a 404 does: a service
+        # answers 403 when the key works and the record is not this caller's to see, so a customer who tries other
+        # people's records reaches the stop
         key_refused = phase == "read" and usable and status == 401
+        if key_refused and not action_had_pass(agent, row):
+            key_refused, cause = False, "this customer never had a passed read of this record"
         passed = 3 if changed else 4 if key_refused else 2 if later else 0 if cause else 1
     kept, dropped = {}, 0
     if got:
@@ -53811,6 +53884,15 @@ def team_settings(ctx, c):
                               f"change the title and expertise of {role}", f"change the settings of {agent_name(n, team['agents'])}"))
 
 
+# The pairs (SHA-256 of an owner file's bytes before, SHA-256 of the new text as the hub saves it) whose key check
+# passed in a change of a team plan (team_owner_file). The card's sweep, the press and each pass of the steps check
+# the same change again, under LOCK, and the check is a function of the pair alone (the coordinator's validator, S1 of
+# 28 November 2026: up to 0.85 s for each change, each minute while a card is open). A pair that failed is not kept.
+# The oldest pair goes first.
+TEAM_KEY_PASSED = collections.OrderedDict()
+TEAM_KEY_PASSED_MOST = 64
+
+
 def team_owner_file(ctx, c):
     """A change of one of the owner's own knowledge files (knowledge/owner/), as knowledge_replace writes it: its new
     text under its own title and Source lines, from the version whose SHA-256 the manager read. Every agent that reads
@@ -53836,12 +53918,29 @@ def team_owner_file(ctx, c):
                         f"base_sha256.")
     if not isinstance(text, str) or not text.strip():
         raise ToolError("text is the owner file's whole new text, under its own title and Source lines.")
+    # The size first, in the form that the hub saves (knowledge_content measures it so), before the key check: that
+    # check reads the whole text, here under LOCK, and nothing else bounds a plan's text before this line (the
+    # coordinator's validator, M1 of 28 November 2026: 16 MiB held LOCK for 35 s). A text of more than twice the
+    # limit in code points is refused before any pass over it: its saved form is within the limit only when most of it
+    # is line ends or whitespace at its two ends, which no owner file needs.
+    most = KNOWLEDGE_LIMITS["owner"][1]
+    saved = knowledge_saved_text(text) if len(text) <= 2 * most else None
+    if saved is None or len(saved.strip().encode("utf-8", "surrogatepass")) > most:
+        raise ToolError(f"The new text is larger than {most // MIB} MiB of Markdown, the most that an owner file "
+                        f"holds.")
     # the text as the hub saves it (knowledge_replaced), so a control character cannot hide a key from the check
-    if set(key_parts(knowledge_saved_text(text))) - set(key_parts(before.decode("utf-8", "replace"))):
+    pair = (hashlib.sha256(before).hexdigest(), hashlib.sha256(saved.encode("utf-8", "surrogatepass")).hexdigest())
+    if pair in TEAM_KEY_PASSED:
+        TEAM_KEY_PASSED.move_to_end(pair)
+    elif set(key_parts(saved)) - set(key_parts(before.decode("utf-8", "replace"))):
         # every agent that reads the file reads it on its own machine (owner API 1.335): a key goes into the vault
         raise ToolError("The new text holds what looks like a key, and every agent that reads this file would read it. "
                         "Leave the key out: a key goes into the vault with request_secret, and the file names it by its "
                         "variable. If it is no key, ask the owner to save the text from the app.")
+    else:
+        TEAM_KEY_PASSED[pair] = True
+        while len(TEAM_KEY_PASSED) > TEAM_KEY_PASSED_MOST:
+            TEAM_KEY_PASSED.popitem(last=False)
     try:
         content = knowledge_replaced(path, before, text)
     except Refusal as e:
@@ -54936,6 +55035,9 @@ def team_plan_steps(nid, mark):
             emit(need["by"], "say", f"[hub] The owner pressed yes on N-{nid} ({need['title']}), but the hub did not "
                  f"make the plan: {e} Nothing changed. Tell the owner in one line.")
             return None
+        if (effect["after"] or {}).get("added"):        # D143: no yes of an earlier agent of the name, before the commit
+            with transaction():
+                action_yes_forget([effect["after"]["added"]["agent"]])
         mark.update(step="committing", after=effect["after"], job=effect["job"], said=effect["said"])
         kv_set(key, json.dumps(mark, sort_keys=True))
         data = (json.dumps(effect["team"], indent=2) + "\n").encode()
@@ -68921,19 +69023,22 @@ def keys_in_text(text):
     units = key_units(text)
     # The finds of the shapes by their start: none overlaps another, so their ends rise too, and a part [s, e) overlaps
     # one exactly when the last find that starts before e ends after s (bisect: 1 MiB of short keys in one pass, not
-    # each find against the whole list, the coordinator's M5 of 25 November 2026: 18.7 s)
-    starts, ends = [], []
+    # each find against the whole list, the coordinator's M5 of 25 November 2026: 18.7 s). The finds of one shape
+    # never overlap each other (key_shape_finds goes on from the end of each), so each shape's new finds are checked
+    # against the shapes before it only and merged in one sort of two sorted runs, never by an insert each: the inserts
+    # moved the list's tail for each find, 35 s for 16 MiB of mixed shapes (the coordinator's validator, M1 of 28
+    # November 2026).
+    pairs, starts = [], []
 
     def overlaps(s, e):
         at = bisect.bisect_left(starts, e)
-        return at > 0 and ends[at - 1] > s
+        return at > 0 and pairs[at - 1][1] > s
     for shape in KEY_SHAPES:
-        for s, e in key_shape_finds(units, shape):
-            if not overlaps(s, e):
-                at = bisect.bisect_left(starts, s)
-                starts.insert(at, s)
-                ends.insert(at, e)
-    found, breaks, words = list(zip(starts, ends)), None, {}
+        new = [(s, e) for s, e in key_shape_finds(units, shape) if not overlaps(s, e)]
+        if new:
+            pairs = sorted(pairs + new)
+            starts = [s for s, _ in pairs]
+    found, breaks, words = list(pairs), None, {}
     for m in KEY_RUN.finditer(units):
         s, e = key_assigned(units, m.start(), m.end())
         if e - s < 32 or overlaps(s, e) or not key_looks_random(units[s:e]):
@@ -71671,6 +71776,9 @@ def reload_team(revision):
                                                "('completed','failed','rejected','canceled') LIMIT 1", (n,))]
     if busy:
         raise Refusal(409, "agents with open tasks cannot be removed or changed: " + ", ".join(busy))
+    if added:                       # D143: no yes of an earlier agent of an added name, before the checkout moves
+        with transaction():
+            action_yes_forget(added)
     if head != full:
         problem = move_kit(full)
         if problem:
@@ -74781,6 +74889,8 @@ def add_server_agent(server, body):
         except KitUnread:
             raise Refusal(503, code="profile_unread", names={"agent": agent_name(agent, team["agents"])}) from None
         profile = None if held else (SERVER_PROFILE % {"name": body.get("spelling") or agent}).encode()
+        with transaction():         # D143: no yes of an earlier agent of the name, before the commit
+            action_yes_forget([agent])
         commit = commit_kit_file("team.json", data, f"Owner added agent {agent} on server {server}",
                                  more={f"profiles/{agent}.md": profile} if profile else None)
         apply_team(team)
@@ -94549,11 +94659,13 @@ class Handler(BaseHTTPRequestHandler):
         The hub reads a page, and an attachment's own bytes, before it takes the lock; the body that a repeat
         compares keeps the text's digest only."""
         made = {}
-        # key_kept counts only from the owner's own app, on the main Mac ("app") or a linked one ("device", which acts
-        # as the main Mac does): an AI session or a program says nothing for the owner (request_hand)
+        # key_kept counts only from the owner's own Mac app on the owner's computer ("app" with the Mac app's label):
+        # an AI session or a program says nothing for the owner (request_hand), no device may write here (device_may
+        # gives devices GET /ui/knowledge only), and the PC app reads knowledge only
         session = (self.headers.get("X-Fleet-Session") or "").strip() or None
-        hand = request_hand(self.headers.get("X-Fleet-Client", "").strip(), owner_device_at(self.client_address[0]),
-                            None, None, session)
+        client = self.headers.get("X-Fleet-Client", "").strip()
+        hand = request_hand(client, owner_device_at(self.client_address[0]), None, None, session)
+        mac_app = hand == "app" and client.startswith("founderizer-swift/")
 
         def owner_path(path):
             if not (isinstance(path, str) and re.fullmatch(r"knowledge/owner/[A-Za-z0-9._/-]+\.md", path)
@@ -94563,18 +94675,18 @@ class Handler(BaseHTTPRequestHandler):
 
         def read(data):
             fields = set(data) - {"request_id", "db", "key_kept"}
-            # The gate for older apps (the Door area's read): an app of 1.335 and later always sends key_kept, [] when
-            # nothing was kept, so an "app" request with no field is an older app, which keeps the behaviour of before
-            # until it updates (its knowledge box asks the owner, Founderizer 0.1.476); every other hand is checked.
-            # Only a linked Mac's app writes knowledge as "device" today (device_may lets no phone or PC reach this
-            # route): a device that may write knowledge later must send key_kept from its first version, or this gate
-            # reads it as an older app and checks nothing (the coordinator's and the Door area's condition)
-            checked = hand not in ("app", "device") or "key_kept" in data
+            # The gate for older apps (the Door area's read): a Mac app of 1.335 and later always sends key_kept, []
+            # when nothing was kept, so a Mac app request with no field is an older app, which keeps the behaviour of
+            # before until it updates (its knowledge box asks the owner, Founderizer 0.1.476). Every other request is
+            # checked: no other app of the owner's has ever written knowledge (device_may gives devices GET only, and
+            # the PC app reads only), so none is an older writer, and a later one is checked from its first version
+            # (the coordinator's validator, S2 of 28 November 2026)
+            checked = not mac_app or "key_kept" in data
             kept = data.get("key_kept", [])
             if not (isinstance(kept, list) and len(kept) <= KEY_KEPT_MOST and
                     all(isinstance(x, str) and re.fullmatch(r"[0-9a-f]{64}", x) for x in kept)):
                 raise ValueError("key_kept is the SHA-256 of each part that the owner kept, as lower-case hex, or absent")
-            if kept and hand not in ("app", "device"):
+            if kept and not mac_app:
                 raise ValueError("key_kept is the owner's own Keep it in the owner's app, which no other caller sends; "
                                  "an AI session asks the owner to save the text from the app")
             kept = set(kept)
@@ -100212,6 +100324,7 @@ def main():
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     key_swap_answered()         # an owner's press of a key swap item that a stop cut before it reached team.json
     team_plans_pressed()        # owner API 1.214: a plan that the owner pressed, whose steps a stop cut
+    settle_action_yes()         # D143: no yes of a name that this team lacks, after the team and its plan's steps
     key_swap_checked()          # and the asks for the owner's word, again after a turn of the manager that failed
     try:
         google_start()          # the Google file, sealed before a timer or a request reads it (UI-API.md 1.202)

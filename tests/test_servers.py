@@ -859,6 +859,28 @@ class Servers(OwnerAPI):
                          (["scout"], False, ["one_per_mac", "has_agent", "busy"]))
         self.assertEqual(mini["job"]["state"], "queued")
 
+    def test_a_new_agent_takes_no_yes_of_an_earlier_agent_of_its_name(self):
+        """D143: the owner's yes for a customer action is for the agent that they gave it to. A hand edit of team.json
+        that removed an earlier scout, and that a hub start took in, left that agent's yes rows (forget_removed_agents
+        runs only in apply_team). Bug: Add agent keeps them, so a new scout to which the manager gives the same action,
+        field for field, is active with no yes of the owner's; or they go only after the commit, so a stop between
+        the two keeps them; or the yes of an agent that runs goes too."""
+        self.joined()
+        with hub.transaction():
+            for agent in ("scout", "vps"):
+                hub.action_yes_set(agent, "order_status", "a" * 64, "owner")
+        real, left = hub.commit_kit_file, []
+
+        def commit(*args, **kwargs):
+            left.append(hub.q1("SELECT COUNT(*) FROM action_yes WHERE agent='scout'")[0])
+            return real(*args, **kwargs)
+        with patch.object(hub, "commit_kit_file", commit):
+            status, receipt = self.add_agent()
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(left, [0])
+        self.assertEqual([r["agent"] for r in hub.q("SELECT agent FROM action_yes")], ["vps"])
+        self.assertIsNone(hub.action_yes_hash("scout", "order_status"))
+
     def test_add_agent_keeps_the_owners_profile_and_waits_while_git_gives_no_answer_for_it(self):
         """The owner's words for a name stay: Add agent writes the server's default profile only where the
         configuration ref holds none. While git gives no answer for that profile, the add waits (503 profile_unread)

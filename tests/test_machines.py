@@ -585,11 +585,19 @@ class Machines(test_ui_api.OwnerAPI):
 
     # ---- team reload
     def test_team_reload_adds_a_worker_without_restart(self):
+        """D143 too: an added agent takes no yes for a customer action of an earlier agent of its name, which a hand
+        edit removed and a hub start took in (forget_removed_agents runs only in apply_team). Bug: the reload keeps
+        that yes, so the new agent with the same action, field for field, is active with no yes of the owner's; or
+        the yes of an agent that stays goes too."""
+        with hub.transaction():
+            for agent in ("vps2", "vps"):
+                hub.action_yes_set(agent, "order_status", "a" * 64, "owner")
         new = self.push_team(lambda t: (t["agents"].__setitem__("vps2", {"role": "worker", "runtime": "codex",
                                                                          "machine": "vps2", "can": ["shell", "web"]}),
                                         t["addresses"].__setitem__("vps2", "100.99.1.2")))
         code, result = self.reload(new)
         self.assertEqual((code, result["added"], result["revision"]), (200, ["vps2"], new))
+        self.assertEqual([r["agent"] for r in hub.q("SELECT agent FROM action_yes")], ["vps"])
         self.assertIn("vps2", hub.agents())
         self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), new)
         code, state = self.request()

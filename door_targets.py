@@ -52,11 +52,15 @@ OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 
 # The product's own repositories: no customer's door ever touches them (DevOps plan, "Always refused"). GitHub sends
 # the old name of a moved repository to its new one, so an old name stays here: the hub's public repository moved from
-# miguelpieras/founderizer-fleet to founderizer/founderizer on 11 November 2026.
+# miguelpieras/founderizer-fleet to founderizer/founderizer on 11 November 2026. The release gate's control and
+# verdict repositories are made in the organization founderizer-gate (M4 and M6 of the order of `main` on GitHub);
+# the plan named them under miguelpieras first, and those names stay, which refuses no repository that exists.
 VENDOR_REPOS = ("founderizer/founderizer", "founderizer/founderizer-apps", "miguelpieras/founderizer-fleet",
                 "miguelpieras/founderizer-web", "miguelpieras/agents", "miguelpieras/founderizer-control",
                 "miguelpieras/founderizer-verdicts-reviewer-1", "miguelpieras/founderizer-verdicts-reviewer-2",
-                "miguelpieras/founderizer-verdicts-security")
+                "miguelpieras/founderizer-verdicts-security", "founderizer-gate/founderizer-control",
+                "founderizer-gate/founderizer-verdicts-reviewer-1", "founderizer-gate/founderizer-verdicts-reviewer-2",
+                "founderizer-gate/founderizer-verdicts-security")
 # The words with which a refusal of a root script with no box (the form run) begins, when only the owner's word is
 # missing: Run it once, or Full access on its server. The hub knows such a refusal in the door's record by them
 # (hub.door_full_waiting), so they are one constant.

@@ -1086,9 +1086,13 @@ class TeamChanges(Remove):
         the Access card again (a customer of 21 November 2026, whose one agent was the manager); or the card and its
         yes do not show that the press gives it; or the grant lands in a second commit, or with no record that names
         the owner's press and the plan's commit, so the owner's Access page cannot say who gave it; or a second run of
-        the steps after the commit writes a grant's record again, also after the owner took the grant back."""
+        the steps after the commit writes a grant's record again, also after the owner took the grant back. D143: or
+        the yes for a customer action of an earlier agent of the name (a hand edit removed it, and a hub start took that
+        in) comes to the new agent, or a second run of the steps takes a yes that the owner gave the new agent."""
         mail = self.MAIL
         self.mailbox_plan()
+        with hub.transaction():
+            hub.action_yes_set("nova", "order_status", "a" * 64, "owner")
         card = self.card()
         self.assertEqual(json.loads(card["options"])[0], "Yes: add Nova, Customer Support 2, on box2, with Gmail, "
                                                          "Drive, an MCP server and a repository")
@@ -1110,6 +1114,9 @@ class TeamChanges(Remove):
                  ("tool:crm", "use", "owner", commit), ("repo:acme/web", "deploy", "owner", commit)]
         rows = "SELECT resource, level, by, revision FROM resource_grants WHERE agent='nova' ORDER BY id"
         self.assertEqual([tuple(r) for r in hub.q(rows)], given)
+        self.assertEqual(hub.q("SELECT * FROM action_yes WHERE agent='nova'"), [])
+        with hub.transaction():
+            hub.action_yes_set("nova", "order_status", "b" * 64, "owner")      # the owner's Give for the new nova
         made = self.told("made your plan")["text"]
         self.assertIn(f"It holds Gmail of {mail}, Google Drive of {mail}, the MCP server Acme CRM, the GitHub "
                       f"repository acme/web from its first task session", made)
@@ -1119,6 +1126,7 @@ class TeamChanges(Remove):
         hub.team_plans_pressed()            # the steps after the commit once more, as after a stop
         self.assertEqual([tuple(r) for r in hub.q(rows)],
                          given + [(f"gmail:{mail}", None, "owner", answer["revision"])])
+        self.assertEqual(hub.action_yes_hash("nova", "order_status"), "b" * 64)
         self.assertEqual(self.stands(), (hub.TEAM_MADE, None))
 
     def test_no_access_lands_when_the_press_cannot_make_the_plan(self):
@@ -1620,7 +1628,7 @@ class TeamChanges(Remove):
         # the owner-file step: a catalog that cannot be read, or a file that it lists and git does not give now,
         # passes by itself; only a file that the catalog does not list is not there
         step = {"path": "knowledge/owner/brand.md", "base_sha256": "0" * 64, "text": "# Brand\n\nGreen.\n"}
-        listed = [{"path": "knowledge/owner/brand.md", "scope": "owner"}]
+        listed = [{"path": "knowledge/owner/brand.md", "scope": "owner", "bytes": 64}]
         for catalog, blob, passing in ((hub.UnreadCatalog(), b"# Brand\n\nBlue.\n", True), (listed, None, True),
                                        ([], None, False)):
             with self.subTest(catalog=type(catalog).__name__, blob=blob), \
@@ -1647,6 +1655,39 @@ class TeamChanges(Remove):
             hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
                                 dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(), text=hidden))
         self.assertIn("holds what looks like a key", str(refused.exception))
+        # a text larger than an owner file is refused for its size before the key check reads it: that check runs
+        # under LOCK, and 16 MiB of mixed key shapes held it for 35 s (the coordinator's validator, M1 of 28 November
+        # 2026); more than twice the limit is refused before any pass over the text
+        for size in (hub.KNOWLEDGE_LIMITS["owner"][1] + 1, 2 * hub.KNOWLEDGE_LIMITS["owner"][1] + 1):
+            many = "# Brand\n\n" + (" sk-abcdefghij0123456789 xoxb-1234567890" * (size // 39 + 1))[:size]
+            with self.subTest(size=size), patch.object(hub, "knowledge_entries", lambda: listed), \
+                    patch.object(hub, "git_blob", lambda rev, path: before), \
+                    patch.object(hub, "key_parts", side_effect=AssertionError("the key check read the text")), \
+                    self.assertRaises(hub.ToolError) as refused:
+                hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                    dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(), text=many))
+            self.assertEqual(str(refused.exception),
+                             "The new text is larger than 1 MiB of Markdown, the most that an owner file holds.")
+        # the card's sweep, the press and each pass of the steps check the same change again: a pass is kept for that
+        # pair of texts only, and another text on the same base is checked again (the validator's S1)
+        calls, real = [], hub.key_parts
+        hub.TEAM_KEY_PASSED.clear()
+
+        def ctx():
+            return {"rev": "r" * 40, "team": hub.TEAM, "files": {}, "access": [], "parts": [], "facts": [], "said": [],
+                    "phrases": []}
+        good = dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest(), text="# Brand\n\nGreen and gold.\n")
+        with patch.object(hub, "knowledge_entries", lambda: [dict(listed[0], bytes=len(before))]), \
+                patch.object(hub, "git_blob", lambda rev, path: before), \
+                patch.object(hub, "knowledge_readers", lambda path, rev, strict=False: set()), \
+                patch.object(hub, "key_parts", lambda text: calls.append(text) or real(text)):
+            hub.team_owner_file(ctx(), good)
+            hub.team_owner_file(ctx(), good)
+            self.assertEqual(len(calls), 2)                     # the text and the file before, once
+            with self.assertRaises(hub.ToolError) as refused:
+                hub.team_owner_file(ctx(), dict(good, text="# Brand\n\nThe key: sk-proj-" +
+                                                "Q3vT9xLm2NpR7sKw4YbZ8cHj6FdA1eGu\n"))
+            self.assertIn("holds what looks like a key", str(refused.exception))
         # the catalog stops being readable after the plan's own read: the 503 of the room check in knowledge_replaced
         # passes by itself too, and closes no card (lanes/knowledge-list-on-a-failed-read.md)
         before = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nBlue.\n".encode()

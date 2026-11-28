@@ -3,10 +3,13 @@ action_job makes inside the caller's transaction, the vault's one question (help
 the check and the cut of the service's answer in request_done, the owner's yes row, the bind by kind, and what a
 person's removal clears. The hub runs in this process with a temporary Git kit; the tests play the vault and the
 helper through the hub's own routes. No vault, no HTTP request to a service, no real key and no AI call."""
+import contextlib
 import copy
 import hashlib
 import json
+import sqlite3
 import unittest
+from unittest.mock import patch
 
 import hub
 import customer_actions as ca
@@ -15,6 +18,7 @@ from test_call_api import CallApi
 from test_capacity import LOGIN_A, LOGIN_B
 from test_create_login import STAND_IN
 from test_customer_actions import CANCEL_ORDER, OPEN_TICKET, ORDER_STATUS
+from test_ui_api import quick
 
 SHOP = {"title": "Shop API key", "kind": "api_key", "env": "SHOP_KEY", "site": "https://shop.example.com"}
 ACTIONS = {name: dict(copy.deepcopy(a), login=LOGIN_A)
@@ -486,25 +490,50 @@ class ActionJobs(CallApi):
         for index, (sql, args) in statements.items():
             self.assertEqual(hub.q1(sql, args)[0], 1, index)
 
-    def test_a_401_is_the_keys_fault_and_a_403_a_failed_check(self):
-        """A 401 says that the service refused the key: no failed check against the customer, the session reads that
-        the team checks the key, and per_day still counts the row. A 403 says that the key works and the record is
-        not this caller's to see: a failed check, as a 404, so a customer who tries other people's records reaches
-        the stop. Bug: a 401 counts against the customer (a key that expired stops every customer after 2 reads), or a
-        403 is no failed check, so probes of other records never stop."""
+    def test_a_401_is_the_keys_fault_only_after_a_pass_and_a_403_a_failed_check(self):
+        """A 401 of a customer who had a passed read of the same action and the same record says that the service
+        refused the key: no failed check against them, the session reads that the service refused the key, and
+        per_day still counts the row. Any other 401 is a failed check in a missing record's words, because a service
+        can answer 401 for a record that the key may not see. A 403 says that the key works and the record is not this
+        caller's to see: a failed check, as a 404. Bug: a 401 counts against a customer with a pass (a key that expired
+        stops every customer after 2 reads); or a stranger's 401 reads other than a missing record, so they learn which
+        records exist and try per_day records a day and not 2; or a pass of another record counts, so a stranger who
+        makes one record with a create and reads it back learns the same; or another customer's pass, a pass of
+        another action, a pass of another agent's action of the same name, or a pass under an older hash of the action
+        (a login moved to another site with the same paths) counts as theirs; or a 403 is no failed check, so probes
+        of other records never stop."""
         rows = {}
         for status in (401, 403):
             job, _ = self.run_action("order_status", "read", dict(ORDER, order=str(status)))
+            for agent, person, action, digest in (
+                    ("seo", self.pid + 1, "order_status", job["action_hash"]),
+                    ("seo", self.pid, "cancel_order", job["action_hash"]),
+                    ("vps", self.pid, "order_status", job["action_hash"]),
+                    ("seo", self.pid, "order_status", "0" * 64)):        # no pass of Ana's with seo under this hash
+                old = hub.now() - 2 * 86400                         # two days ago: outside today's per_day
+                hub.q("INSERT INTO jobs(agent,task,kind,target,created,finished,ok,action,action_phase,action_person,"
+                      "action_pass,action_hash,path,body) VALUES(?,?,'request',?,?,?,1,?,'read',?,1,?,?,?)",
+                      (agent, self.task, f"action:{action}:read", old, old, action, person, digest, job["path"],
+                       job["body"]))
             self.served(job["id"], status=status, text=answer(status="shipped"))
             rows[status] = self.row(job["id"])
-        self.assertEqual(hub.action_answer(rows[401]), (hub.ACTION_KEY_REFUSED, 4))
+        self.assertEqual(hub.action_answer(rows[401]), (hub.ACTION_NO_RECORD, 0))
         self.assertEqual(hub.action_answer(rows[403]), (hub.ACTION_NO_RECORD, 0))
-        mine = "action_person=? AND action=? AND action_phase IN ('read','create')"
-        failed = hub.q1(f"SELECT COUNT(*) FROM jobs WHERE {mine} AND action_pass=0", (self.pid, "order_status"))[0]
-        per_day = hub.q1(f"SELECT COUNT(*) FROM jobs WHERE {mine} AND NOT (finished IS NOT NULL AND ok=0)",
-                         (self.pid, "order_status"))[0]
-        self.assertEqual((failed, per_day), (1, 2))
-        self.assertFalse(self.run_action("order_status", "read", dict(ORDER, order="401"))[1])     # no new try at once
+        first = self.passed_read()
+        job, _ = self.run_action("order_status", "read", dict(ORDER, order="402"))
+        self.served(job["id"], status=401, text=answer(status="shipped"))
+        self.assertEqual(hub.action_answer(self.row(job["id"])), (hub.ACTION_NO_RECORD, 0))      # another record
+        self.ago(first)
+        job, fresh = self.run_action("order_status", "read", ORDER)
+        self.assertTrue(fresh)
+        self.served(job["id"], status=401, text=answer(status="shipped"))
+        self.assertEqual(hub.action_answer(self.row(job["id"])), (hub.ACTION_KEY_REFUSED, 4))
+        mine = "agent='seo' AND action_person=? AND action=? AND action_phase IN ('read','create') AND created>?"
+        day = (self.pid, "order_status", hub.now() - 86400)
+        failed = hub.q1(f"SELECT COUNT(*) FROM jobs WHERE {mine} AND action_pass=0", day)[0]
+        per_day = hub.q1(f"SELECT COUNT(*) FROM jobs WHERE {mine} AND NOT (finished IS NOT NULL AND ok=0)", day)[0]
+        self.assertEqual((failed, per_day), (3, 5))
+        self.assertFalse(self.run_action("order_status", "read", ORDER)[1])     # no new try at once
 
     def test_a_fill_that_only_also_reads_is_never_kept_with_a_key(self):
         """A fill that only also reads never goes to the service, but it is kept in action_values until the person's
@@ -524,9 +553,12 @@ class ActionJobs(CallApi):
         self.assertTrue(self.run_action("order_by_email", "read", {"order": "123", "email": "ana@example.com"})[1])
 
     def test_an_agent_that_leaves_team_json_takes_the_owners_yes(self):
-        """The owner's yes is for the agent that he gave it to. Bug: a hand edit of team.json that removes the agent
+        """The owner's yes is for the agent that they gave it to. Bug: a hand edit of team.json that removes the agent
         (or the owner's delete, which applies the same team change) leaves its yes rows, so a new agent of the same name
-        with the same action is active with no yes of the owner."""
+        with the same action is active with no yes of the owner; or two hand edits that two hub starts take in, one
+        that removes the agent and one that adds it back, keep the yes, because a start applies no team change; or the
+        start's pass takes the yes of an agent that the team still has, or every yes of the fleet when team.json has
+        no map of agents, or stops the start on such a file."""
         team = copy.deepcopy(hub.TEAM)
         seo = team["agents"].pop("seo")
         hub.apply_team(copy.deepcopy(team))
@@ -534,11 +566,27 @@ class ActionJobs(CallApi):
         team["agents"]["seo"] = seo
         hub.apply_team(team)
         self.refused(hub.ACTION_GONE, "order_status", "read", ORDER)
+        self.yes("order_status")
+        for broken in ({}, None, ["seo"]):              # a file with no map of agents forgets nothing, and starts
+            with patch.dict(hub.TEAM, {"agents": broken}):
+                hub.settle_action_yes()
+            self.assertEqual(hub.q1("SELECT COUNT(*) FROM action_yes WHERE agent='seo'")[0], 1, broken)
+        hub.settle_action_yes()                                 # a start with seo in team.json
+        self.assertTrue(self.run_action("order_status", "read", ORDER)[1])
+        hub.TEAM["agents"].pop("seo")                           # a hand edit, and a start
+        hub.settle_action_yes()
+        self.assertEqual(hub.q("SELECT * FROM action_yes WHERE agent='seo'"), [])
+        hub.TEAM["agents"]["seo"] = seo                         # a hand edit back, and a start
+        hub.settle_action_yes()
+        self.refused(hub.ACTION_GONE, "order_status", "read", dict(ORDER, order="124"))
 
     def test_the_run_hashes_of_a_customers_words_go_after_ninety_days(self):
         """A customer who writes no more keeps no hash of their words for good, also before their removal (a stranger
-        is removed only by stranger_sweep). A newer call of the same words keeps them. Bug: action_runs has no age
-        limit, or a later call does not move the time, so the hashes of words that the customer still sends go."""
+        is removed only by stranger_sweep). A newer call of the same words keeps them. A pass deletes at most one
+        batch, and after a full batch the next pass comes at the next tick. Bug: action_runs has no age limit, or a
+        later call does not move the time, so the hashes of words that the customer still sends go; or a full pass
+        waits an hour as any other, so a fleet whose customers send more words in an hour than one batch never catches
+        up and the table grows for good; or a pass takes more than its batch and holds the hub's LOCK long."""
         self.addCleanup(hub.ACTION_RUNS_SWEPT.update, at=0.0)
         first = "Please call me back tomorrow."
         self.run_action("open_ticket", "create", {"text": first}, bound={"phone": PHONE})
@@ -558,6 +606,45 @@ class ActionJobs(CallApi):
         with hub.LOCK:
             self.assertEqual(hub.action_runs_sweep(hub.now()), 0)          # one pass an hour
         self.assertEqual(count(self.pid), mine)
+        hub.ACTION_RUNS_SWEPT["at"] = 0.0
+        passes = []
+        with patch.object(hub, "ACTION_RUNS_BATCH", 2), hub.LOCK:
+            for _ in range(mine + 3):                       # each call is one tick
+                passes.append(hub.action_runs_sweep(hub.now()))
+                if not passes[-1]:
+                    break
+        self.assertEqual(passes, [2] * (mine // 2) + [1] * (mine % 2) + [0])
+        self.assertEqual(count(self.pid), 0)
+        hub.q("INSERT INTO action_runs(person,hash,at) VALUES(?,?,?)", (self.pid, "e" * 32, old))
+        with hub.LOCK:
+            self.assertEqual(hub.action_runs_sweep(hub.now()), 0)          # a pass that was not full: an hour
+        self.assertEqual(count(self.pid), 1)
+
+    def test_a_database_of_before_the_column_at_takes_it_and_its_index(self):
+        """A hub whose action_runs table has no column `at` (a database that a test hub of piece 2's first commit
+        made) takes the column with a default and the index on it, and refuses no step. Bug: migrate has no entry for
+        the column, or the index stays in SCHEMA, which runs first: build_schema refuses that step, a release's schema
+        check stops on it, and each insert and each sweep fails on the missing column."""
+        path = self.tmp.name + "/before.db"
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE action_runs(person INTEGER NOT NULL, hash TEXT NOT NULL, "
+                       "PRIMARY KEY(person, hash))")
+            db.execute("INSERT INTO action_runs(person,hash) VALUES(?,?)", (self.pid, "f" * 32))
+            db.commit()
+        self.addCleanup(hub.ACTION_RUNS_SWEPT.update, at=0.0)
+        live, hub.DB = hub.DB, quick(sqlite3.connect(path, check_same_thread=False))
+        try:
+            hub.DB.row_factory = sqlite3.Row
+            self.assertEqual(hub.build_schema(), [])
+            at = [r for r in hub.q("PRAGMA table_info(action_runs)") if r["name"] == "at"]
+            self.assertEqual([(r["type"], r["notnull"], r["dflt_value"]) for r in at], [("REAL", 1, "0")])
+            self.assertTrue(hub.q1("SELECT 1 FROM sqlite_master WHERE type='index' AND name='action_run_at'"))
+            hub.ACTION_RUNS_SWEPT["at"] = 0.0
+            with hub.LOCK:
+                self.assertEqual(hub.action_runs_sweep(hub.now()), 1)      # a row of before reads as old
+        finally:
+            hub.DB.close()
+            hub.DB = live
 
     def test_the_job_texts_name_no_path_login_request_id_or_resolve_outcome(self):
         """A customer's task has no path, login, request_id, GET request or resolve_outcome, and a customer's words

@@ -1297,8 +1297,11 @@ class Refusals(DoorCase):
                                                                         "the door")
 
     def test_the_product_s_own_repositories_and_the_never_list(self):
+        # the gate's repositories by name too, so that a later edit of the list that drops them fails here
         for target in (*(f"commit:{one}" for one in door_targets.VENDOR_REPOS), "deploy:miguelpieras/founderizer-fleet",
-                       "commit:one-org/website", "deploy:Founderizer/Founderizer-Apps"):
+                       "commit:one-org/website", "deploy:Founderizer/Founderizer-Apps",
+                       "commit:founderizer-gate/founderizer-control",
+                       "deploy:Founderizer-Gate/founderizer-verdicts-security"):
             with self.subTest(target=target):
                 self.assertIn("never a target", self.decide(target, "push", content=b"{}").why)
         self.assertIn("never a target", self.decide("site-1", "uptime").why)

@@ -395,7 +395,7 @@ class Patterns(unittest.TestCase):
         self.assertFalse(ca.pattern_ok("^(a)$", "a", ca.FILL_MOST))
 
     def test_plain_words_of_the_card(self):
-        """The owner's card says each pattern in plain words; wrong words make the owner give more than he reads."""
+        """The owner's card says each pattern in plain words; wrong words make the owner give more than they read."""
         self.assertEqual(ca.pattern_words("^[0-9]{1,6}$"), "1 to 6 digits")
         self.assertEqual(ca.pattern_words("^[0-9A-Z]{3,6}$"), "3 to 6 characters, each a capital letter or digit")
         self.assertEqual(ca.pattern_words("^[a-z_]{1,19}$"), "1 to 19 characters, each a small letter or _")

@@ -1550,6 +1550,72 @@ host.
       (limit 1). The core's checker of a route clears the header with the key before the request goes on, and sends
       nothing of it back.
 
+37. **A customer action.** A customer action is the hub's way for the task of a customer (a person outside the
+    company who writes to an agent on a chat app) to use a key of its agent while no session reads the key
+    (`customer_actions.py`; `hub.py` `action_live`, `action_job`, `action_answered`). It becomes the one way only when
+    a later piece of the area Chat and files takes `call_api` and the other tools with keys out of a customer's task.
+    Until then, a customer's `ask_team` opens a task of the same agent with the agent's own tools, its logins
+    included, and the customer's words as quoted data. An action is an entry of the agent in `team.json`
+    (`customer_actions`): one fixed read of a record, a fixed write after that read, or one fixed create, with a login
+    of the agent, the values that the customer gives, and a pattern for each value that goes out and for each value
+    that comes back. What holds it:
+    - **The owner's yes.** The owner's Give press writes the hash of the action (`customer_actions.action_hash`: each
+      field, and the title, kind, site and form of its login) into a row of the hub (`action_yes_set`), and nothing
+      into `team.json`. An action that changes, by a tool or by a hand edit, or whose login gets another site, is not
+      active until the owner gives a new yes. An agent that leaves `team.json` takes its yes rows with it
+      (`forget_removed_agents`, and at a hub start `settle_action_yes`), and a new agent of the same name gets no yes
+      of an earlier one (`action_yes_forget`). An entry that a hand edit changes in place under the same name is an
+      edit of that agent: it keeps its yes only while its hash stays the same.
+    - **The hub's own matcher.** The form check (`customer_actions.action_form`) refuses each form that can send to an
+      address, bring free text back, or reach a record that its read did not prove. The hub matches each value with its
+      own matcher of a small pattern form, never with Python's `re`, and checks the length of the value first. So a
+      hostile value costs at most its length for each element of a pattern, also under the hub's lock.
+    - **The owner check of each answer.** A read passes only when the answer is one whole JSON object whose owner field
+      is the customer's own handle, and, with `also`, whose second field is the customer's value. The hub binds the
+      handle from the chat app, never from the session (`action_bind`). A write goes only after a read of the same
+      values passed under the same hash in the last 10 minutes, and one passed read opens one write. The vault's ask
+      checks that again (`action_vault_refusal`). A write's answer gets no owner check: only its read proves the
+      record, up to 10 minutes before the write. A failed check and a missing record give the session the same words.
+    - **The cuts.** Of an answer, the hub keeps only the `returns` values that match their patterns, which take no free
+      text. It drops each value that the hub's mask of keys changes, and each value that shares 12 characters with the
+      words that this customer sent in a text fill of an action in the last 90 days (`action_runs` holds salted hashes
+      of those words, never the words). It keeps nothing else of the body. A person's removal clears the values, the
+      returns and the key of each call, and the hashes. The salt (`action_salt`) is in the same database as the hashes,
+      so it protects them only from a person who reads the hashes alone: a person who reads the whole database can
+      test guesses of 12 characters of a customer's words.
+
+    These parts are later pieces: the manager's tool `customer_action` and the owner's Give press for an action (the
+    area Needs you), and `use_action` with the counts `per_day`, `fleet_day` and the stop after 2 failed checks of a
+    customer in a day (the area Chat and files). Until they are there, no action is active and no customer task runs
+    one. Where it stops:
+    - **The site.** The vault sends the request to the address of its own item, which the hub cannot see. So a request
+      goes to another site than the recorded one only if the owner replaced the item's value with a value for another
+      site. On a Linux server with the key swap on, the broker sends a key with a site only to that site (`vault.py`
+      `swap_call`).
+    - **An echo of a bind.** A service that sends a bound handle back in a `returns` value whose pattern takes it gives
+      that handle to the session as text. It is the customer's own handle, for example their phone number on WhatsApp.
+    - **Another session of the same OS user.** Each session of an agent runs as the agent's OS user (limit 27). A
+      hostile program MCP server of another session of that user can read the MCP file of a customer's task and its
+      Fleet token, and act as that task: for the customer of that task only, as the binds and the counts let it.
+    - **An answer that depends on the record.** A service that answers 5xx for some records and not for others lets a
+      customer learn which records those are, for as many records as `per_day` a day: a 5xx is no failed check, and the
+      session reads other words for it. A 401 gives other words only for a record that the customer already read with
+      a pass, under the action's present hash. For each other record, and after each change of the action or of its
+      login's site, the hub counts a 401 as a failed check, in the words of a missing record. So
+      while the service refuses the key, each customer stops after 2 reads a day of records that they did not read
+      before, and the fleet's total of failed checks fills, until the owner gives a working key.
+    - **What the static form cannot see.** A fixed number in a path part (`/chats/-100123/messages`) can be a fixed id.
+      A read of a write whose path name does not name the record (`/api/{v}/orders/latest`) can name a record that
+      moves. Bare digits under a key that is no address word (`"target": "34600123456"`) can be a phone number. A fixed
+      message text under an address key whose last word is a message word (`"phone_text": "tel 600123456"`) goes out
+      as it is, and a service that reads that key as an address sends to it. The owner's card shows each of them.
+    - **One more write after a new yes.** The key of a call holds the hash of the action. After the owner edits an
+      action and gives a new yes, the same values make a new key: a new read can open one more write on the same
+      record, and the same create can go again. Another text in a text fill, or another case or spacing of an `also`
+      value, makes a new key too, so `per_day` is the limit of such writes for each customer.
+    - **A weak second fact.** The form takes an `also` fill that accepts 100 values or more. So a person who has a
+      recycled phone number of a customer, and who knows or guesses that value, can read the earlier customer's records.
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key
