@@ -139,11 +139,13 @@ COPY_NOT_HUBS = ("The hub's copy is not a copy in the form that a hub writes (on
                  "fleet.sqlite3, each member once and under a plain name), so nothing was kept, and the hub was not "
                  "told that the copy is kept.")
 # The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own types
-# (hub.py ATTACH_TYPES and, since owner API 1.251, ATTACH_OFFICE, Word, Excel and PowerPoint; it takes no other) and the
-# other endings of the same types. Every other file is
-# application/octet-stream, which the hub refuses. One table for both programs: `--dump-tools` carries it, and the
-# program inside the Founderizer app reads it from there. Until 14 November 2026 this server asked Python's
-# `mimetypes`, whose answer hangs on the Python version and the Mac's own files.
+# (hub.py ATTACH_TYPES and, since owner API 1.251, ATTACH_OFFICE, Word, Excel and PowerPoint) and the other endings of
+# the same types. Every other file is application/octet-stream, which the hub keeps as text/plain under its own name
+# when its bytes are UTF-8 with no NUL byte (a .py, a .swift, a .yaml: owner API 1.361, hub.py attachment_type) and
+# refuses otherwise. So the hub, not this table, decides what is text, and a .py never becomes "x.py.txt": a `mime`
+# that the agent gives, text/plain too, keeps the file's own name. One table for both programs: `--dump-tools` carries
+# it, and the program inside the Founderizer app reads it from there. Until 14 November 2026 this server asked
+# Python's `mimetypes`, whose answer hangs on the Python version and the Mac's own files.
 MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "jpe": "image/jpeg", "gif": "image/gif",
                "webp": "image/webp", "pdf": "application/pdf", "zip": "application/zip", "txt": "text/plain",
                "md": "text/markdown", "markdown": "text/markdown", "csv": "text/csv", "json": "application/json",

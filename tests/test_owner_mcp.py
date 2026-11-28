@@ -3402,6 +3402,13 @@ class Admin(WithServer):
         self.assertEqual(back.read_bytes(), b"One page of notes.\n")
         self.assertEqual(got["sha256"], sent["sha256"])
         self.assertTrue(client.call("keep_attachment", attachment=sent["id"], keep=True)["kept"])
+        # a code file goes up as text under its own name (owner API 1.361), with no mime and with text/plain: before,
+        # the hub refused the first and kept the second as "check.py.txt"
+        code = source.parent / "check.py"
+        code.write_bytes(b"print('hello')\n")
+        for mime in ({}, {"mime": "text/plain"}):
+            sent = client.call("attach_file", path=str(code), **mime)
+            self.assertEqual((sent["name"], sent["mime"]), ("check.py", "text/plain"), mime)
 
     def test_the_hand_on_each_switch_the_app_has(self):
         """The small controls: Pause all, a conversation, the manager session, and a reload the hub refuses."""

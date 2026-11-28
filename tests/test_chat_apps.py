@@ -1949,11 +1949,60 @@ class AgentFiles(ChatApps):
         hub.CHAT_FILE_UPLOADS[token]["ends"] = hub.now() - 1
         self.assertEqual(self.put(token, PDF_FILE), (404, "This upload line is not valid: it was used, or it ended. "
                                                           "Call attach_file for a new one.\n"))
-        # a name of another kind of file gets no line at all
-        for name in ("report.zip", "run.sh", "notes", ".pdf", "macro.xlsm"):
-            text, error = hub.call_tool("manager", "attach_file", {"name": name}, None)
-            self.assertTrue(error, name)
-            self.assertIn("with one of these extensions: .pdf, .png, .jpg, .xlsx, .docx, .pptx, .csv or .txt", text)
+        # a name of any other extension, or of none, is a text file (owner API 1.361), kept as "<name>.txt" unless its
+        # ending is a plain text one, and only text goes up under it: a ZIP or a workbook with macros named so is
+        # refused
+        for name, data, seen, said in (
+                ("run.sh", b"echo hello\n", "run.sh.txt (the hub added .txt",
+                 "run.sh.txt (text file, 1 KB) is on the hub"),
+                ("deploy.yaml", b"on: push\n", "deploy.yaml.", "deploy.yaml (text file, 1 KB) is on the hub"),
+                ("Makefile", b"all:\n", "Makefile.", "Makefile (text file, 1 KB) is on the hub"),
+                ("report.zip", b"PK\x03\x04\xff\x00", "report.zip.txt", "Not taken: a text file must be UTF-8 text."),
+                ("macro.xlsm", b"PK\x03\x04\x00", "macro.xlsm.txt", "Not taken: a text file must hold no NUL byte.")):
+            token, text = self.line(name=name)
+            self.assertIn(f"The person sees it as {seen}", text)
+            self.assertIn("It goes as a text file", text)
+            code, answer = self.put(token, data)
+            self.assertIn(said, answer, name)
+            self.assertEqual(code, 415 if answer.startswith("Not taken") else 200, answer)
+        self.assertEqual(hub.q1("SELECT mime FROM attachments WHERE name='run.sh.txt'")["mime"], "text/plain")
+        text, error = hub.call_tool("manager", "attach_file", {"name": "  "}, None)
+        self.assertTrue(error, text)
+
+    def test_a_chat_app_s_file_is_kept_under_a_name_that_runs_nothing(self):
+        """Owner API 1.361: a file that a person or the owner sent through a chat app is kept as an agent's file is,
+        under a name that runs nothing on the owner's computer, because his apps save and open a file under its name
+        and a hub release reaches them before any app update: a text file named invoice.bat or invoice.html, and a
+        program of a type that the hub does not check, and a Word file that would fetch its template, get ".txt"; a
+        voice note, a plain Word file and a name with no ending keep theirs. The owner's route serves a sound as its
+        own type and any other type that the hub does not check as bytes."""
+        self.own()
+        template = office_file("Budget", [("word/_rels/settings.xml.rels",
+                                           '<Relationships><Relationship Id="r1" Type="http://schemas.openxmlformats.'
+                                           'org/officeDocument/2006/relationships/attachedTemplate" '
+                                           'Target="http://x.example/t.dotm" TargetMode="External"/></Relationships>')])
+        cases = (("invoice.bat", "text/plain", b"@echo off\n", "invoice.bat.txt"),
+                 # the apps cut a name at 80 and add its ending: the cut takes the stem, and the safe name comes after
+                 ("b" * 90 + ".bat", "text/plain", b"@echo off\n", "b" * 76 + ".bat.txt"),
+                 ("c" * 90 + ".md", "text/plain", b"# Notes\n", "c" * 77 + ".md"),
+                 # Word would fetch its template from another computer: kept as data, under a name Word does not open
+                 ("Budget.docx", hub.DOCX, template, "Budget.docx.txt"),
+                 ("Plain.docx", hub.DOCX, office_file("Budget"), "Plain.docx"),
+                 ("invoice.html", "application/octet-stream", b"<script>fetch('/')</script>\n", "invoice.html.txt"),
+                 ("notes", "text/plain", b"Notes\n", "notes"),
+                 ("voice.ogg", "audio/ogg", b"OggS\x00\x02" + bytes(64), "voice.ogg"),
+                 ("setup.exe", "application/x-msdownload", b"MZ\x90\x00" + bytes(64), "setup.exe.txt"))
+        ids = {}
+        for n, (name, mime, data, kept) in enumerate(cases, 1):
+            code, up = self.bridge_upload(data, f"m-name-{n}", mime=mime, name=name)
+            self.assertEqual(code, 200, (name, up))
+            ids[name] = up["id"]
+            self.assertEqual(hub.q1("SELECT name FROM attachments WHERE id=?", (up["id"],))["name"], kept)
+        # a sound goes as its own type, which no browser runs; a program of a type that the hub does not check as bytes
+        for name, served in (("voice.ogg", "audio/ogg"), ("setup.exe", "application/octet-stream")):
+            code, _, headers = self.raw("GET", f"/ui/attachments/{ids[name]}?db=test-generation", source="127.0.0.1")
+            self.assertEqual((code, headers["Content-Type"], headers["X-Content-Type-Options"]),
+                             (200, served, "nosniff"), name)
 
     def test_an_office_part_is_read_no_further_than_its_stated_size(self):
         """zipfile unpacks up to the size that a read asks and cuts the result to the part's stated size, so a part that
