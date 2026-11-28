@@ -1026,6 +1026,209 @@ class Conversations(Base):
                                             (bea["conversation"],))["person"], delete=True)[0], 200)
         self.assertEqual(len(hub.q("SELECT * FROM events WHERE kind='forget'")), 3)
 
+    def test_the_work_that_a_removed_person_asked_for_stays_goes_on_and_reports_to_the_owner(self):
+        """Piece a6 of the join's build design (a), README 5.4 of the Teams join design: "the tasks that the person
+        asked for and their results stay, and open ones report to the owner". Before it, a removal cleared the words
+        of the work that a colleague had asked for and ended the open work, so the company lost that record and the
+        owner never read what came of it. What is theirs still goes: the words of theirs that reached the work, also
+        in its session's own records, their name where the hub wrote it, and their conversation task, which is the
+        conversation itself. And the work gets no more power by the removal: its sessions stay ones that a contact
+        drives. The person here talks to two agents, and the work is in the second conversation: a name bound twice
+        in the removal's loop over the conversations made that removal fail, or kept their words there."""
+        folder = tempfile.TemporaryDirectory(prefix="fleet-kept-files-")     # a file of the owner's to the agent
+        self.addCleanup(folder.cleanup)
+        hub.CFG["attachment_dir"] = folder.name
+        self.addCleanup(hub.CFG.pop, "attachment_dir", None)
+        png, rid = b"\x89PNG\r\n\x1a\n" + bytes(range(64)), str(uuid.uuid4())
+        aid = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
+                      "VALUES(?,'plan.png','image/png',?,?,?,'test',?)",
+                      (str(uuid.uuid4()), len(png), hub.attachment_write(png, "image/png"), hub.now(), rid))
+        eid = hub.emit("studio", "say", f"[owner] The plan. [The owner attached 1 file: A-{aid} plan.png]")
+        hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
+                "VALUES(?,'message','The plan.',?,?,'test','studio')", (rid, eid, hub.now()))
+        ana = self.person("Ana Quintero", "peer", "600700901", app="discord", agents=("vps", "studio"))
+        first = self.says("600700901", "Hello.", account="discord-vps")["conversation"]
+        cid = self.says("600700901", "Please rebuild the October export.", account="discord-studio")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        titles = ("Rebuild the October export", "Count the October rows", "Check the October totals")
+        for title, details in zip(titles, ("The CSV export of October is broken.", "Each row of the October export.",
+                                           "The sums of October.")):
+            self.ok("open_work", self.context(cid), title=title, details=details)
+        work, done, totals = (hub.q1("SELECT * FROM tasks WHERE title=?", (title,)) for title in titles)
+        opened = ("test-generation", hub.tref(work["id"]), "1")
+        self.ok("deliver_result", ("test-generation", hub.tref(done["id"]), "1"), outcome="completed",
+                what_was_done="There are 120 rows.", where_output_is="the shop drive", how_checked="counted them")
+        with hub.LOCK, hub.transaction():       # a part of the open work, which a lead would give in its session
+            part = hub.admit_task("studio", {"owner": "vps", "title": "Find the October file", "details": "",
+                                             "done_when": "found", "needs": "none", "goal": None, "goal_id": None,
+                                             "parent": work["id"], "follows": None, "case_id": None})
+        later = self.says("600700901", "Use the Zafiro layout for it.", account="discord-studio")  # passed on below
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), task=hub.tref(work["id"]), messages=[f"CM-{later['id']}"])
+        self.ok("report_progress", opened, note="Half of the export is rebuilt.")
+        listed = self.ok("list_my_tasks", opened, task_id=hub.tref(work["id"]))
+        self.assertIn("Quintero", listed)
+        # ... the end of a wait that named her, from a change of her tools; and the session's own records: its start,
+        # the message that it got with her words, and the answer of its read of the task
+        hub.emit("studio", "say", f"[hub] No answer to your CM-{later['id']} comes from Ana Quintero now: their "
+                                  f"role's tools changed. Go on without it.", task=work["id"])
+        start = hub.q1("SELECT text FROM events WHERE task=? AND kind='task'", (work["id"],))["text"]
+        passed = hub.q1("SELECT text FROM events WHERE task=? AND text LIKE '[conversation C-%'", (work["id"],))["text"]
+        for seq, kind, data in ((1, "user_message", {"text": start}), (2, "user_message", {"text": passed}),
+                                (3, "tool_call_update", {"tool_call_id": "c3", "status": "completed",
+                                                         "output": listed})):
+            hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,'s',?,?,?,?,?)",
+                    (work["id"], seq, hub.now(), kind, json.dumps(data), hub.now()))
+        # ... and two as the helper cuts them at their limit (clean_record): a tool's answer at 800 characters that ends
+        # inside the hub's sentence about her, and a prompt at 4,000 that ends inside the list of people
+        said = hub.q1("SELECT details FROM tasks WHERE id=?", (work["id"],))["details"].split("\n\n", 1)[1]
+        head = f"This work comes from conversation C-{cid} with Ana Qu"
+        listed = f"PEOPLE ON YOUR LIST, whose role has tools on: Pat (P-{self.pat['id']}, peer), Ana Qu"
+        for seq, limit, record, text, fits in ((4, 800, {"type": "tool_call_update", "tool_call_id": "c4",
+                                                         "status": "completed"}, "output", head),
+                                               (5, 4000, {"type": "user_message"}, "text", listed)):
+            filler = "Earlier: " + "z" * (limit - len(fits) - len("Earlier: ") - 1) + " "
+            whole = filler + (said if seq == 4 else listed[:-2] + f"Quintero (P-{ana['id']}, peer). They are people.")
+            r = hub.clean_record(dict(record, seq=seq, ts=hub.now(), **{text: whole[:limit]}))
+            self.assertTrue(r[3][text].endswith(("with Ana…", ", Ana…")), r[3][text][-40:])
+            hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,'s',?,?,?,?,?)",
+                    (work["id"], seq, r[1], r[2], json.dumps(r[3]), hub.now()))
+        own = self.conversation_task(cid)["id"]
+        for agent in ("studio", "vps"):
+            helper_reports(agent, hub.CONVERSATION_TASKS, hub.FORGET_FEATURE)
+        hub.history_catch_up(60)
+        self.assertTrue(hub.q1("SELECT 1 FROM history WHERE task=? AND text LIKE '%Quintero%'", (work["id"],)))
+        before = {tid: self.task(tid)["state"] for tid in (work["id"], part, totals["id"])}
+        self.assertEqual(self.change(ana["id"], delete=True)[0], 200)
+        # the work and its part stay whole, open as they were, and the finished work keeps its result
+        row = self.task(work["id"])
+        self.assertEqual((row["title"], row["details"], row["why"], row["source_conversation"]),
+                         ("Rebuild the October export", "The CSV export of October is broken.", hub.REMOVED_WORDS, cid))
+        self.assertEqual({tid: self.task(tid)["state"] for tid in before}, before)
+        self.assertEqual(self.task(part)["title"], "Find the October file")
+        self.assertEqual(tuple(self.task(done["id"])[k] for k in ("state", "what")), ("completed", "There are 120 rows."))
+        self.assertIsNone(hub.kv_get(hub.REMOVAL_KEPT + str(done["id"])))     # it reported to her conversation then
+        self.assertEqual(hub.q1("SELECT text FROM notes WHERE task=?", (work["id"],))["text"],
+                         "Half of the export is rebuilt.")
+        # her conversation task is the conversation: it goes as before
+        self.assertEqual(tuple(self.task(own)[k] for k in ("title", "state")), (hub.REMOVED_TITLE, "canceled"))
+        # its sessions and its part's stay ones that a contact drives: no owner's file, no secret, no takeover
+        part_ctx = ("test-generation", hub.tref(part), "1")
+        for agent, here in (("studio", opened), ("vps", part_ctx)):
+            self.assertTrue(hub.contact_session(agent, here))
+            self.assertEqual({"request_secret", "note_secret", "request_takeover"} &
+                             {t["name"] for t in hub.tools_for(agent, here)}, set())
+        text, failed = self.tool("read_attachment", opened, attachment_id=f"A-{aid}")
+        self.assertTrue(failed, text)
+        # no word and no name of hers stays: not the hub's sentence about her, not her passed words, not in a start
+        # text (which keeps the brief), a line, a call's record or the session's own records, nor in the history
+        start = hub.q1("SELECT text FROM events WHERE task=? AND kind='task'", (work["id"],))["text"]
+        self.assertIn("The CSV export of October is broken.", start)
+        self.assertNotIn("This work comes from conversation", start)          # the hub's sentence about her
+        self.assertIn(f"{hub.REMOVED_PERSON} (P-{ana['id']}, peer)", start)
+        records = [json.loads(r["data"]) for r in hub.q("SELECT data FROM thread_events WHERE task=? ORDER BY seq",
+                                                        (work["id"],))]
+        self.assertEqual(records[1], {"text": hub.REMOVED_WORDS})          # the message with her words, whole
+        self.assertIn("The CSV export of October is broken.", records[0]["text"])
+        self.assertEqual((records[3]["output"][:9], records[3]["output"][-3:]), ("Earlier: ", "zz…"))   # to the cut
+        self.assertTrue(records[4]["text"].endswith(f"tools on: Pat (P-{self.pat['id']}, peer)…"), records[4]["text"][-60:])
+        kept = [str(t[k]) for t in hub.q("SELECT * FROM tasks") for k in ("title", "details", "done_when", "why",
+                                                                          "what", "plain")]
+        mine = (work["id"], done["id"], part, totals["id"])
+        kept += [e["text"] or "" for e in hub.q("SELECT text FROM events WHERE task IN (?,?,?,?)", mine)]
+        kept += [r["data"] for r in hub.q("SELECT data FROM thread_events WHERE task=?", (work["id"],))]
+        kept += [c["detail"] or "" for c in hub.q("SELECT detail FROM calls WHERE task IN (?,?,?,?)", mine)]
+        self.assertEqual([text[max(0, m.start() - 80):m.end() + 80] for text in kept
+                          for m in [re.search("Ana|Quintero|Zafiro", text)] if m], [])
+        hub.history_catch_up(60)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM history WHERE text LIKE '%Quintero%' OR text LIKE "
+                                "'%Zafiro%'")["n"], 0)
+        _, there = self.normal_task(title="Check the exports")
+        self.assertIn(hub.tref(work["id"]), self.ok("search_history", there, query="broken"))
+        # its session and its requester are told, with no name; the sessions of the work and of its part go on, and
+        # no helper is asked to forget them
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE task=? AND text=?", (work["id"], hub.KEPT_SESSION_SAY)))
+        told = hub.q1("SELECT text, extra FROM events WHERE agent='manager' AND text LIKE ?",
+                      (f"[hub] The person whose conversation opened {hub.tref(work['id'])} %",))
+        self.assertEqual(json.loads(told["extra"]), hub.QUIET_SAY)
+        self.assertEqual(told["text"], hub.KEPT_REQUESTER_SAY.format(task=hub.tref(work["id"])))     # by its number
+        self.ok("report_progress", opened, note="Three quarters are rebuilt.")
+        self.ok("report_progress", part_ctx, "vps", note="The October file is found.")
+        forgot = [json.loads(e["extra"]) for e in hub.q("SELECT extra FROM events WHERE kind='forget'")]
+        self.assertEqual((sorted(c[0] for f in forgot for c in f["conversations"]),
+                          [t for f in forgot for t in f["tasks"] if t in mine]), (sorted([first, cid]), []))
+        # at its end each open one reports to the owner, through the agent's own chat with them, and into no
+        # conversation: here one that its requester canceled, and one that its session delivered
+        self.assertFalse(hub.call_tool("manager", "cancel_task", {"task_id": hub.tref(totals["id"]),
+                                                                  "reason": "Not this month."}, None)[1])
+        hub.q("UPDATE tasks SET state='completed', accepted=1 WHERE id=?", (part,))
+        self.ok("deliver_result", opened, outcome="completed", what_was_done="The October export is rebuilt.",
+                where_output_is="the shop drive", how_checked="opened it")
+        for task, said in ((totals["id"], "is canceled: Canceled: Not this month."),
+                           (work["id"], "is completed: The October export is rebuilt.")):
+            told = hub.q("SELECT text FROM events WHERE agent='studio' AND kind='chat' AND "
+                         "json_extract(extra, '$.task_result')=?", (task,))
+            self.assertEqual(len(told), 1)
+            self.assertIn(said, told[0]["text"])
+            self.assertTrue(told[0]["text"].startswith(f"[hub] {hub.tref(task)}, work that a person asked for"))
+            self.assertIn("Tell the owner in a few words what came of it, with message_owner.", told[0]["text"])
+            self.assertIsNone(hub.kv_get(hub.REMOVAL_KEPT + str(task)))
+            self.assertEqual(hub.q("SELECT id FROM conversation_messages WHERE task=?", (task,)), [])
+
+    def test_a_removal_takes_the_name_only_where_the_hub_wrote_it(self):
+        """Piece a6: in the work that a removed person asked for, their name goes only from the hub's own words: the
+        sentence about their conversation and the list of people, by "(P-<id>, ". The bug: a match of the name as a
+        word turned the agent's words and the hub's codes into "a removed person" for a one-letter name ("T-123") or
+        a name that is a word ("May"), took a colleague's name that begins with it, and missed a name with a hidden
+        character, which a start shows without it. And the end of a wait changes only for a message of the removed
+        person's own conversation, and a list keeps no name that the person had in between."""
+        colleague = self.person("Ana Quintero", "peer", "600700914", app="discord")
+        other = self.says("600700914", "Hello.", account="discord-studio")["id"]       # a message of hers
+        works = {}
+        for name, handle, details in (("T", "600700911", "Fix T-123 in the export."),
+                                      ("May", "600700912", "The invoices of May."),
+                                      ("Ana", "600700913", "Ask Ana Quintero for the file."),
+                                      ("Lu‎is", "600700915", "The report of the week.")):
+            person = self.person(name, "peer", handle, app="discord")
+            cid = self.says(handle, "Please do it.", account="discord-studio")["conversation"]
+            hub.conversation_start("studio", cid)
+            self.ok("read_messages", self.context(cid))
+            self.ok("open_work", self.context(cid), title=f"The work of P-{person['id']}", details=details)
+            works[person["id"]] = (name, details, hub.q1("SELECT id FROM tasks WHERE title=?",
+                                                         (f"The work of P-{person['id']}",))["id"])
+        may, luis = (next(pid for pid, w in works.items() if w[0] == name) for name in ("May", "Lu\u200eis"))
+        mine = hub.q1("SELECT id FROM conversation_messages WHERE conversation=(SELECT conversation FROM "
+                      "conversation_messages WHERE task=? LIMIT 1) ORDER BY id LIMIT 1", (works[may][2],))["id"]
+        for cm in (mine, other):        # the end of a wait for May, and for another person of the same name
+            hub.emit("studio", "say", f"[hub] No answer to your CM-{cm} comes from May now: their role's tools "
+                                      f"changed. Go on without it.", task=works[may][2])
+        # Luis is renamed twice, and a later start of his work named him as he was in between
+        hub.q("UPDATE people SET name='Luis Bravo' WHERE id=?", (luis,))
+        hub.emit("studio", "task", f"PEOPLE ON YOUR LIST, whose role has tools on: Luis Bravo (P-{luis}, peer), Ana "
+                                   f"Quintero (P-{colleague['id']}, peer).", task=works[luis][2])
+        hub.q("UPDATE people SET name='Luis Castro' WHERE id=?", (luis,))
+        for pid, (name, details, tid) in works.items():
+            self.assertEqual(self.change(pid, delete=True)[0], 200)
+            start = hub.q1("SELECT text FROM events WHERE task=? AND kind='task'", (tid,))["text"]
+            shown = name.replace("‎", "")
+            with self.subTest(name=shown):
+                self.assertEqual(self.task(tid)["details"], details)          # the agent's own words, whole
+                self.assertIn(" ".join(details.split()), start)
+                self.assertIn(f"{hub.REMOVED_PERSON} (P-{pid}, peer)", start)
+                self.assertNotIn(f"{shown} (P-{pid}, ", start)
+                self.assertNotIn(f"with {shown} (", start)
+                self.assertIn(f"Ana Quintero (P-{colleague['id']}, peer)", start)
+                self.assertIn(f"Your task is {hub.tref(tid)}", start)
+        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND text LIKE '[hub] No answer%' "
+                                         "ORDER BY id", (works[may][2],))]
+        self.assertEqual([(f"comes from {hub.REMOVED_PERSON} now:" in line, "comes from May now:" in line)
+                          for line in said], [(True, False), (False, True)])
+        later = hub.q1("SELECT text FROM events WHERE task=? AND kind='task' ORDER BY id DESC LIMIT 1",
+                       (works[luis][2],))["text"]
+        self.assertEqual(later, f"PEOPLE ON YOUR LIST, whose role has tools on: {hub.REMOVED_PERSON} (P-{luis}, peer), "
+                                f"Ana Quintero (P-{colleague['id']}, peer).")
+
     def test_a_window_that_a_person_drives_reads_no_file_of_the_owners(self):
         """A reviewer of 18 November 2026: read_attachment worked in a conversation with tools, so a person could ask
         the agent for A-1, A-2 and so on and have the files that the owner sent it (the ids count up). A conversation
@@ -1668,6 +1871,277 @@ class Conversations(Base):
         # her next message is an ordinary one again: a conversation task of her own conversation
         self.inbound(text="And thanks.", account="discord-studio", sender=KIM, chat="dm-9")
         self.assertIsNotNone(self.conversation_task(conv["id"]))
+
+    def quotes_rig(self):
+        """Kim's conversation for P2 piece 7's replies: a task's message to her that waits for nothing (9001), and one
+        whose send the bridge could not confirm (no ID); a message to Pat in Pat's conversation (9101); the waits of
+        two tasks, refunds (9002) and call (9003); and another task's message after them that waits for nothing
+        (9005). Each platform ID is what the bridge reported for its item. It gives the conversation, the two tasks
+        and their sessions, a waiting session that has not read her later messages, says (one "Yes." of hers, with the
+        states of the two tasks after it) and sent (a message_contact with the bridge's report of its item)."""
+        kim = self.person("Kim", "manager", KIM, app="discord")
+
+        def sent(context, text, platform_ids=(), waits=False, person="Kim", lost=False, state="sent"):
+            """message_contact's message, and the bridge's report of its item: sent, unknown, or none yet (state
+            None: it is still sending); lost: unknown with no ID, then Send again, whose copy gets the report."""
+            self.ok("message_contact", context, person=person, text=text, request_id=str(uuid.uuid4()), waits=waits)
+            item = [i for i in self.out() if i["kind"] == "message" and i["text"] == text][-1]
+            if lost:
+                self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "unknown", "parts": 0, "error":
+                                                                           "lost", "platform_ids": []})[0], 200)
+                code, data = self.post(f"/ui/outbound/{item['id']}/again")
+                self.assertEqual(code, 200, data)
+                item = [i for i in self.out() if i["kind"] == "message" and i["text"] == text][-1]
+            if state is not None:
+                code, data = self.bridge(f"/bridge/out/{item['id']}", {"state": state, "parts": int(state == "sent"),
+                                                                       "error": None, "platform_ids": list(platform_ids)})
+                self.assertEqual(code, 200, data)
+        _, there = self.normal_task(title="Send the report")
+        sent(there, "Is the report ready for you?", ["9001"])
+        sent(there, "Did you get my mail?", state="unknown")
+        self.says(PAT, "Any news on my order?")         # on WhatsApp the agent writes only in a chat that Pat uses
+        self.reads(there, "Pat")
+        sent(there, "Is the report ready for you, Pat?", ["9101"], person="Pat")
+        refunds, here = self.normal_task(title="Plan the refunds")
+        self.reads(here, "Kim")
+        sent(here, "May I refund Ana's last month?", ["9002"], waits=True)
+        call, then = self.normal_task(title="Book the call")
+        self.reads(then, "Kim")
+        sent(then, "May I book Thursday at 10?", ["9003"], waits=True)
+        _, later = self.normal_task(title="Send the invoice")
+        self.reads(later, "Kim")
+        sent(later, "The invoice went out.", ["9005"])
+        conv = hub.q1("SELECT * FROM conversations WHERE person=?", (kim["id"],))
+
+        def says(reply_to, forwarded=False):
+            self.assertEqual(self.inbound(text="Yes.", account="discord-studio", sender=KIM, chat="dm-9",
+                                          forwarded=forwarded, reply_to=reply_to)[0], "stored")
+            return self.task(refunds)["state"], self.task(call)["state"]
+        return conv, (refunds, here, call, then), says, sent
+
+    def waits_for_kim(self, sent, text, **report):
+        """A new task whose message to Kim waits, with the bridge's report of its item (sent)."""
+        tid, context = self.normal_task(title=text)
+        self.reads(context, "Kim")
+        sent(context, text, waits=True, **report)
+        return tid, context
+
+    def test_a_forward_or_a_reply_to_another_message_answers_no_wait(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a forwarded "Yes" is not Kim's answer to message_contact, nor is a "Yes" under
+        a message from before the questions, under another task's message that waits for nothing, under a rule's
+        reminder, under a message of another conversation, or under one that the fleet does not have, also while a
+        message from before the questions has no confirmed ID (bugs: the task that waited took a customer's forwarded
+        words, or a yes to another question or a reminder, for Kim's answer and refunded; a reply to another task's
+        message answered the last wait before it; any unconfirmed send of the conversation's past made a reply to an
+        unknown message answer the oldest wait). The tasks keep waiting, and the sessions read each with what it was.
+        A reply to her own forward, which came after both questions, answers the later one, and a second reply to it
+        answers nothing (bugs: it answered the older one; it answered the next one); a picture with no words under the
+        forward uses up nothing."""
+        conv, (_, _, _, then), says, _ = self.quotes_rig()
+        cm = {text: hub.q1("SELECT id FROM conversation_messages WHERE conversation=? AND text=?", (conv["id"], text))
+              ["id"] for text in ("Is the report ready for you?", "The invoice went out.")}
+        t0 = hub.now()
+        item = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) VALUES("
+                       "'message','discord','discord-studio','dm-9','Your weekly report is due.','sent',?,?,?)",
+                       (t0, t0, json.dumps(["9008"])))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,outbound) VALUES(?,'agent',?,?,?)",
+              (conv["id"], "Your weekly report is due.", t0, item))       # a rule's reminder (send_rows)
+        reminder = hub.q1("SELECT MAX(id) AS id FROM conversation_messages")["id"]
+        waiting = ("input-required", "input-required")
+        self.assertEqual([says(None, forwarded=True), says("9001"), says("1000"), says("9101"), says("9005"),
+                          says("9008")], [waiting] * 6)
+        marks = ["forwarded, so not their own words", f"in reply to {hub.cm_ref(cm['Is the report ready for you?'])}",
+                 "in reply to a message that the fleet does not have",
+                 "in reply to a message that the fleet does not have",
+                 f"in reply to {hub.cm_ref(cm['The invoice went out.'])}", f"in reply to {hub.cm_ref(reminder)}"]
+        # a waiting session that writes to her again first reads them with what they were (bug: its lines gave the
+        # forward as Kim's own yes)
+        lines = self.reads(then, "Kim")
+        self.assertEqual(re.findall(r"Message CM-[0-9]+, Kim \(manager\), [^,\n]+, ([^:\n]+):\n", lines), marks)
+        mine = [r["id"] for r in hub.q("SELECT id FROM conversation_messages WHERE conversation=? AND who='person' "
+                                       "ORDER BY id", (conv["id"],))]
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM conversation_messages WHERE task=? ORDER BY id",
+                                                 (self.conversation_task(conv["id"])["id"],))], mine)
+        hub.conversation_start("studio", conv["id"])
+        read = self.ok("read_messages", self.context(conv["id"]))
+        self.assertEqual(re.findall(r" · (forwarded, so not their own words|in reply to [^\n]*)\n", read), marks)
+        forward = hub.q1("SELECT msg_id FROM conversation_messages WHERE conversation=? AND forwarded=1",
+                         (conv["id"],))["msg_id"]
+        self.assertEqual(self.inbound(text="", kind="image", account="discord-studio", sender=KIM, chat="dm-9",
+                                      forwarded=False, reply_to=forward)[0], "stored")
+        self.assertEqual(says(forward), ("input-required", "working"))
+        # the call's wait ended as one from before P1 T1 did, with no act: the second reply still answers nothing (the
+        # first reply to the forward used it up), and never the older open wait (bug: it answered the refunds' wait)
+        hub.q("DELETE FROM acts WHERE conversation=? AND cm=(SELECT id FROM conversation_messages WHERE conversation=? "
+              "AND text=?)", (conv["id"], conv["id"], "May I book Thursday at 10?"))
+        self.assertEqual(says(forward), ("input-required", "working"))
+
+    def test_a_reply_answers_the_wait_of_the_message_that_it_quotes(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a reply to a task's message answers that task's wait, also when an older wait
+        is open (bug: it answered the oldest wait), and only once (bug: a second reply to the same message answered
+        the older wait). A reply to a message after a wait that is over answers nothing, not an older wait that is
+        still open (bug: it answered that one, which was worse than none): her reply to the conversation's own answer,
+        which came after the call's wait ended. A second reply to a task's old message does not end that task's newer
+        wait (one message, one answer), and a forward that quotes a message uses up nothing. A reply to the copy that
+        Send again sent answers its wait (bug: the copy's ID was on the new item only, and the wait stayed open)."""
+        conv, (refunds, here, call, _), says, sent = self.quotes_rig()
+        # a forward that carries the quote of its own first chat uses up no answer of hers, and nor does a reply while
+        # the owner paused the conversation, which reached no task (bug: her answer after the pause answered nothing)
+        self.assertEqual(says("9003", forwarded=True), ("input-required", "input-required"))
+        body = dict(self.command(), action="pause")
+        body.pop("text", None)
+        self.assertEqual(self.request(f"/ui/conversations/{conv['id']}", body)[0], 200)
+        self.assertEqual(says("9003"), ("input-required", "input-required"))
+        self.assertEqual(self.request(f"/ui/conversations/{conv['id']}", dict(body, action="resume",
+                                                                              request_id=str(uuid.uuid4())))[0], 200)
+        self.assertEqual(says("9003"), ("input-required", "working"))
+        self.assertEqual(says("9003"), ("input-required", "working"))
+        self.assertEqual(says(None, forwarded=True), ("input-required", "working"))
+        hub.conversation_start("studio", conv["id"])
+        self.ok("read_messages", self.context(conv["id"]))
+        forward = hub.q1("SELECT id FROM conversation_messages WHERE conversation=? AND forwarded=1", (conv["id"],))
+        self.ok("reply", self.context(conv["id"]), text="Thanks, noted.", in_reply_to=hub.cm_ref(forward["id"]))
+        item = [i for i in self.out() if i["kind"] == "message" and i["text"] == "Thanks, noted."][-1]
+        self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "sent", "parts": 1, "error": None,
+                                                                   "platform_ids": ["9006"]})[0], 200)
+        self.assertEqual(says("9006"), ("input-required", "working"))
+        self.assertEqual(says("9002"), ("working", "working"))
+        sent(here, "And the month before?", ["9012"], waits=True)  # its answer gave it what came before (read)
+        self.assertEqual(says("9002"), ("input-required", "working"))
+        self.assertEqual(says("9012"), ("working", "working"))
+        for tid in (refunds, call):
+            answer = hub.q1("SELECT * FROM events WHERE kind='say' AND task=? ORDER BY id DESC LIMIT 1", (tid,))
+            self.assertIn("Kim answered your CM-", answer["text"])
+        again, _ = self.waits_for_kim(sent, "May I book Friday?", platform_ids=["9010"], lost=True)
+        says("9010")
+        self.assertEqual(self.task(again)["state"], "working")
+        # Kim does not decide: an item of the owner's in her conversation after a wait never takes her reply from it
+        # (bug: the item was the later one, and her reply to the agent's next message answered neither)
+        paper, _ = self.waits_for_kim(sent, "May I order paper?", platform_ids=["9040"])
+        t0 = hub.now()
+        need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,conversation) VALUES(?,?,?,?,?,?,?)",
+                       ("Kim asks", "Can Kim have a day off?", "", t0, "studio", "question", conv["id"]))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,need) VALUES(?,'action',?,?,?)",
+              (conv["id"], "Asked the owner: Can Kim have a day off?", t0, need))
+        out = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) VALUES("
+                      "'message','discord','discord-studio','dm-9','I asked the owner.','sent',?,?,?)",
+                      (t0, t0, json.dumps(["9041"])))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,reply_to,outbound) VALUES(?,'agent',?,?,"
+              "?,?)", (conv["id"], "I asked the owner.", t0, forward["id"], out))
+        says("9041")
+        self.assertEqual(self.task(paper)["state"], "working")
+
+    def test_a_reply_to_a_message_with_no_confirmed_id_reads_as_one_with_no_reply(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a reply that names no message of the fleet's, while a message to her since the
+        oldest open wait has an item with no confirmed ID for a part, is read as a message with no reply, as before
+        this piece: the Telegram or Discord message that Send again sent again, whose first copy she read (bug: the
+        newest item was the copy, so her reply to the first one answered nothing); a part that is still sending; one
+        that the hub's sweep made unknown (no parts, no IDs). A WhatsApp message whose unconfirmed part has its ID is
+        found by it instead, and "elsewhere" is never such a reply (bug: a reply to another chat's message answered the
+        oldest wait). A send before the oldest wait of an open task counts for nothing, also when a cancelled task's
+        wait or an item of the owner's in her conversation is older (bugs: such a reply answered the next wait); with
+        nothing open, it still reads as one with no reply, and names no message (bug: her reply to the agent's
+        unconfirmed message read as one to a message that the fleet does not have)."""
+        conv, _, says, sent = self.quotes_rig()
+        self.assertEqual([says("9002"), says("9003")][-1], ("working", "working"))
+
+        def answered(tid, reply_to):
+            says(reply_to)
+            return self.task(tid)["state"]
+        sent_again, _ = self.waits_for_kim(sent, "May I pay the supplier?", platform_ids=["9013"], lost=True)
+        self.assertEqual(answered(sent_again, "9999"), "working")
+        known, _ = self.waits_for_kim(sent, "May I pay the rent?", platform_ids=["9997"], state="unknown")
+        self.assertEqual([answered(known, "9999"), answered(known, "9997")], ["input-required", "working"])
+        sending, _ = self.waits_for_kim(sent, "May I pay the gas?", state=None)
+        self.assertEqual(answered(sending, "9999"), "working")
+        swept, _ = self.waits_for_kim(sent, "May I pay the water?", state=None)
+        hub.chat_sweep(hub.now() + hub.CHAT_SENDING + 1)
+        self.assertEqual(hub.q1("SELECT state, parts, platform_ids FROM chat_out WHERE text='May I pay the water?'")
+                         ["state"], "unknown")
+        self.assertEqual(answered(swept, "9999"), "working")
+        unsure, _ = self.waits_for_kim(sent, "May I pay the tax?", state="unknown")
+        self.assertEqual([answered(unsure, hub.REPLY_ELSEWHERE), answered(unsure, "9999")],
+                         ["input-required", "working"])
+        cancelled, _ = self.waits_for_kim(sent, "May I pay the fine?", platform_ids=["9015"])
+        hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (cancelled,))
+        t0 = hub.now()
+        need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,conversation) VALUES(?,?,?,?,?,?,?)",
+                       ("Kim asks", "Can Kim have a day off?", "", t0, "studio", "question", conv["id"]))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,need) VALUES(?,'action',?,?,?)",
+              (conv["id"], "Asked the owner: Can Kim have a day off?", t0, need))
+        _, there = self.normal_task(title="Send the notes")
+        self.reads(there, "Kim")
+        sent(there, "Here are the notes.", state="unknown")
+        last, _ = self.waits_for_kim(sent, "May I pay the bill?", platform_ids=["9014"])
+        self.assertEqual([answered(last, "9999"), answered(last, "9014")], ["input-required", "working"])
+        says("9999")
+        self.assertIsNone(hub.q1("SELECT quotes FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")
+                          ["quotes"])
+        # a month later the unconfirmed sends are too old to count, so the reply names a message that the fleet does
+        # not have (bug: every send of the conversation's past was read, under the lock)
+        hub.q("UPDATE conversation_messages SET created=created-? WHERE conversation=?", (31 * 86400, conv["id"]))
+        says("9998")
+        self.assertEqual(hub.q1("SELECT quotes FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")
+                         ["quotes"], 0)
+
+    def test_a_reply_of_a_person_who_decides_binds_to_the_later_of_a_wait_and_an_item(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a reply of a person who decides binds to one wait or one item, the one raised
+        last at or before the message that it quotes (bugs: the wait was tried first, so "Yes." under the agent's
+        message about an item answered an older wait; and an item answered a reply that the later, answered wait
+        held). The one is decided once, before either step: a reply that ends a later wait, open or one of the
+        conversation's own task from before acts (no act names it once it ended), never answers the older item too
+        (bug: the item step looked again after the wait step and found the item). Kim decides here, as a deputy does
+        (PERSON_DECIDES)."""
+        with patch.object(hub, "PERSON_DECIDES", "manager"):
+            conv, (refunds, _, call, _), says, sent = self.quotes_rig()
+
+            def item(why):
+                t0 = hub.now()
+                nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,conversation) VALUES(?,?,?,?,?,?,?)",
+                              ("Kim decides", why, "", t0, "studio", "question", conv["id"]))
+                hub.q("INSERT INTO conversation_messages(conversation,who,text,created,need) VALUES(?,'action',?,?,?)",
+                      (conv["id"], f"Asked the owner: {why}", t0, nid))
+                return nid
+
+            def agent_reply(text, platform_id):         # the conversation's own reply (it has reply_to)
+                t0 = hub.now()
+                answered = hub.q1("SELECT MAX(id) AS id FROM conversation_messages WHERE conversation=? AND "
+                                  "who='person'", (conv["id"],))["id"] or 1
+                out = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) "
+                              "VALUES('message','discord','discord-studio','dm-9',?,'sent',?,?,?)",
+                              (text, t0, t0, json.dumps([platform_id])))
+                hub.q("INSERT INTO conversation_messages(conversation,who,text,created,reply_to,outbound) VALUES(?,"
+                      "'agent',?,?,?,?)", (conv["id"], text, t0, answered, out))
+
+            def answer(nid):
+                return hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"]
+            first = item("Can Kim have a day off?")
+            agent_reply("Kim, a question for you: a day off?", "9020")
+            self.assertEqual((says("9020"), answer(first)), (("input-required", "input-required"), "Yes."))
+            second = item("Can Kim work on Saturday?")
+            later, _ = self.waits_for_kim(sent, "May I close the month?", platform_ids=["9021"])
+            says("9021")
+            self.assertEqual(self.task(later)["state"], "working")
+            agent_reply("Thanks.", "9022")
+            self.assertEqual((says("9022"), answer(second)), (("input-required", "input-required"), None))
+            # an open wait after the open item: a reply to the agent's next message answers the wait, not the item
+            third_wait, _ = self.waits_for_kim(sent, "May I pay the rent?", platform_ids=["9023"])
+            agent_reply("Noted.", "9024")
+            says("9024")
+            self.assertEqual((self.task(third_wait)["state"], answer(second)), ("working", None))
+            # the conversation's own task waits from before acts, after an open item: the reply ends that wait only
+            third = item("Can Kim take Monday off?")
+            own = self.conversation_task(conv["id"])["id"]
+            t0 = hub.now()
+            out = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) VALUES("
+                          "'message','discord','discord-studio','dm-9','Which day, Kim?','sent',?,?,?)",
+                          (t0, t0, json.dumps(["9030"])))
+            wait = hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,outbound,task,waits) "
+                           "VALUES(?,'agent','Which day, Kim?',?,?,?,?)", (conv["id"], t0, out, own, own))
+            agent_reply("So, which day?", "9031")
+            says("9031")
+            self.assertEqual((hub.q1("SELECT waits FROM conversation_messages WHERE id=?", (wait,))["waits"],
+                              answer(third)), (None, None))
 
     def test_a_calls_record_keeps_no_word_of_a_conversation_that_a_removal_deleted_meanwhile(self):
         """A removal that commits between a call and its record (call_record runs after the call's own lock) finds no

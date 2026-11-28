@@ -83,6 +83,11 @@ PYTHON_TYPES = mimetypes.MimeTypes()
 MIME_TOKEN = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")     # RFC 6838
 DISCORD_FILES = ("https://cdn.discordapp.com/", "https://media.discordapp.net/")   # Discord's CDN: a message's files
 REST_NOTE = "The rest is in Founderizer."
+# P2 piece 7 (CHAT-APPS.md 8.1): each inbound message says whether its sender forwarded it (`forwarded`) and which
+# message it replies to (`reply_to`, that message's ID in the form of this bridge's own message IDs), so that the hub
+# never reads a forward or a reply to another message as the person's own answer. A reply to a message that the chat
+# app names by no ID of this chat (Telegram's reply to a message of another chat or to a story) is this word.
+REPLY_ELSEWHERE = "elsewhere"
 # Telegram (CHAT-APPS.md 19.2). Facts read on core.telegram.org on 15 November 2026 (Bot API 10.4): every call is
 # <api>/bot<token>/<method>; sendMessage takes 1 to 4,096 characters after the entities; "typing" shows for 5 seconds;
 # at most one message a second in one chat; there is no idempotency key, so a lost answer can be a sent message.
@@ -206,9 +211,12 @@ def number(*values, default=1.0):
     return default
 
 
-def outcome(state, ids, error=None):
-    """The body of POST /bridge/out/<id>. `parts` counts the parts that went out."""
-    return {"state": state, "parts": len(ids), "platform_ids": list(ids), "error": error[:300] if error else None}
+def outcome(state, ids, error=None, maybe=None):
+    """The body of POST /bridge/out/<id>. `parts` counts the parts that went out. maybe: the ID of a part that may
+    have gone out (WhatsApp's, which the bridge chose before the send: wa_message_id), which `platform_ids` names too,
+    so that a person's reply to it and its receipt still find the item (P2 piece 7)."""
+    return {"state": state, "parts": len(ids), "platform_ids": list(ids) + ([maybe] if maybe else []),
+            "error": error[:300] if error else None}
 
 
 # ---------------------------------------------------------------- formats
@@ -1315,7 +1323,10 @@ class Discord(Account):
     def on_message(self, d):
         """A direct message from a person goes to the journal. Bots, the bot itself, servers and system messages
         do not. Its files, or a forward's (those of its first snapshot), go as `media`: each one's CDN address, name,
-        type and size, which the bridge fetches and uploads before the message (Bridge.files_up)."""
+        type and size, which the bridge fetches and uploads before the message (Bridge.files_up). A forward (its
+        reference of type 1, or its snapshots) is `forwarded`; a reply (type 19) gives the ID of the message that it
+        answers as `reply_to`. An edit (MESSAGE_UPDATE) and a reaction never come here:
+        dispatch takes only MESSAGE_CREATE, and INTENTS asks for no reaction."""
         author = d.get("author") or {}
         if d.get("guild_id") or d.get("type", 0) not in (0, 19) or author.get("bot") or author.get("system"):
             return
@@ -1326,8 +1337,14 @@ class Discord(Account):
         snapshots = d.get("message_snapshots")
         if not attachments and not words and isinstance(snapshots, list) and snapshots and \
                 isinstance(snapshots[0], dict) and isinstance(snapshots[0].get("message"), dict):
-            forwarded = snapshots[0]["message"]     # a forwarded message: its words and its files are in its snapshot
-            attachments, words = forwarded.get("attachments") or [], forwarded.get("content") or ""
+            snapshot = snapshots[0]["message"]      # a forwarded message: its words and its files are in its snapshot
+            attachments, words = snapshot.get("attachments") or [], snapshot.get("content") or ""
+        ref = d.get("message_reference") if isinstance(d.get("message_reference"), dict) else {}
+        forwarded = ref.get("type") == 1 or bool(isinstance(snapshots, list) and snapshots)
+        reply_to = None
+        if not forwarded and d.get("type") == 19:
+            quoted = str(ref.get("message_id") or "")
+            reply_to = quoted if SNOWFLAKE.match(quoted) else REPLY_ELSEWHERE
         if attachments:
             ctype = str((attachments[0] or {}).get("content_type") or "")
             kind = "image" if ctype.startswith("image/") else "audio" if ctype.startswith("audio/") else "file"
@@ -1339,8 +1356,8 @@ class Discord(Account):
                  for a in (attachments if isinstance(attachments, list) else []) if isinstance(a, dict)]
         self.bridge.inbound(with_media({"account": self.id, "id": mid, "chat": chat, "group": False, "sender": sender,
                                         "sender_alt": None, "sender_name": author.get("username"), "bot": False,
-                                        "from_me": False, "kind": kind, "text": str(words),
-                                        "ts": snowflake_time(mid)}, files))
+                                        "from_me": False, "kind": kind, "text": str(words), "forwarded": forwarded,
+                                        "reply_to": reply_to, "ts": snowflake_time(mid)}, files))
 
     def fetch_media(self, f, timeout):
         """An HTTPS GET of the file's address on Discord's CDN, which Discord signed itself: no token goes with it."""
@@ -1957,18 +1974,24 @@ class WhatsApp(Account):
         message) goes as `media`: its name (a document's own, else wa_file_name's), type and size, and `wa`, wa-link's
         own description of it (its direct path, key and hashes), which only wa-link reads, when the bridge asks it for
         the file after the hub's welcome (fetch_media). The post to the hub carries none of it. A group's message and
-        the number's own get no `media`: the hub takes no file of them, and its question cannot tell a group's sender."""
+        the number's own get no `media`: the hub takes no file of them, and its question cannot tell a group's sender.
+        `forwarded` and `reply_to` are wa-link's, from WhatsApp's context of the message: a wa-link of an older source
+        sends neither, and `forwarded` is then null, the hub's word for "not known", never false. wa-link drops edits
+        and reactions itself."""
         mid = str(event.get("id") or "")
         if not mid:
             return
         group, mine, spec = bool(event.get("group")), bool(event.get("from_me")), event.get("media")
         files = [media(spec.get("name") or wa_file_name(spec.get("kind"), spec.get("mime")), spec.get("mime"),
                        spec.get("size"), wa=spec)] if isinstance(spec, dict) and not group and not mine else []
+        forwarded, quoted = event.get("forwarded"), event.get("reply_to")
         ok = self.bridge.inbound(with_media({
             "account": self.id, "id": mid, "chat": str(event.get("chat") or ""), "group": group,
             "sender": str(event.get("sender") or ""), "sender_alt": event.get("sender_alt") or None,
             "sender_name": event.get("push_name") or None, "bot": False, "from_me": mine,
             "kind": event.get("kind") or "other", "text": str(event.get("text") or ""),
+            "forwarded": forwarded if isinstance(forwarded, bool) else None,
+            "reply_to": str(quoted) if quoted else None,
             "ts": number(event.get("ts"), default=time.time())}, files))
         if ok:      # the ack goes only after the journal write: then whatsmeow confirms the message to WhatsApp
             self.command({"op": "ack", "id": mid})
@@ -2088,11 +2111,12 @@ class WhatsApp(Account):
                                      **({"file": part["file"]} if "file" in part else {})}):
                     return outcome("failed", ids, "wa-link is not running.")
                 if not waiter[0].wait(WA_FILE_TIMEOUT if "file" in part else WA_SEND_TIMEOUT) or waiter[1] is None:
-                    return outcome("unknown", ids, f"wa-link did not confirm part {n}.")
+                    return outcome("unknown", ids, f"wa-link did not confirm part {n}.", maybe=mid)
                 if not waiter[1].get("ok"):
                     error = wa_words(waiter[1].get("error") or "WhatsApp refused the message.")
                     # wa-link: an error that starts with "unknown: " means that the message can have arrived.
-                    return outcome("unknown" if error.startswith("unknown: ") else "failed", ids, error)
+                    unknown = error.startswith("unknown: ")
+                    return outcome("unknown" if unknown else "failed", ids, error, maybe=mid if unknown else None)
                 ids.append(mid)
             finally:
                 self.waiting.pop(mid, None)
@@ -2295,7 +2319,10 @@ class Telegram(Account):
         a picture, a file or a voice note are its caption, which goes as its text, as Discord's and WhatsApp's words
         do (CHAT-APPS.md 8.1). Its file goes as `media`, of any kind (a photo, its largest size, or the file of
         TELEGRAM_FILES): its file id, name, type and size, which the bridge fetches with getFile and uploads before
-        the message (Bridge.files_up)."""
+        the message (Bridge.files_up). A message with `forward_origin` is `forwarded`; `reply_to` is the message key
+        of the message of this chat that it answers (`reply_to_message`, never a topic's first message), else
+        REPLY_ELSEWHERE for a reply to a message of another chat or to a story. An edit and a reaction never come:
+        TELEGRAM_UPDATES asks for neither, and on_update passes on only `message`."""
         chat, sender = msg.get("chat") or {}, msg.get("from") or {}
         kind, cid, mid, uid = chat.get("type"), chat.get("id"), msg.get("message_id"), sender.get("id")
         if not isinstance(cid, int):
@@ -2337,10 +2364,18 @@ class Telegram(Account):
                     default
             files = [media(item.get("file_name") or default, item.get("mime_type"), item.get("file_size"),
                            file_id=item["file_id"])]
+        quoted, reply_to = msg.get("reply_to_message"), None
+        if isinstance(quoted, dict) and isinstance(quoted.get("message_id"), int) and \
+                not quoted.get("forum_topic_created"):
+            reply_to = f"{self.bot}:{cid}:{quoted['message_id']}"
+        elif msg.get("external_reply") or msg.get("reply_to_story"):     # a quote comes only with one of the two
+            reply_to = REPLY_ELSEWHERE
         return self.bridge.inbound(with_media({"account": self.id, "id": f"{self.bot}:{cid}:{mid}", "chat": str(cid),
                                                "group": False, "sender": str(uid), "sender_alt": None,
                                                "sender_name": name, "bot": False, "from_me": False, "kind": what,
                                                "text": str(msg.get("text" if what == "text" else "caption") or ""),
+                                               "forwarded": bool(msg.get("forward_origin")),   # since Bot API 7.0
+                                               "reply_to": reply_to,
                                                "ts": number(msg.get("date"), default=time.time())}, files))
 
     def fetch_media(self, f, timeout):

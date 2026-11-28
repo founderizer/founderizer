@@ -259,7 +259,7 @@ class Bridge(unittest.TestCase):
         self.assertEqual(got, {"account": ACCOUNT, "id": f"{BOT_ID}:{OWNER_TG}:41", "chat": OWNER_TG, "group": False,
                                "sender": OWNER_TG, "sender_alt": None, "sender_name": "Alex", "bot": False,
                                "from_me": False, "kind": "text", "text": "How are sales today? tg1",
-                               "ts": got["ts"]})
+                               "forwarded": False, "reply_to": None, "ts": got["ts"]})
         self.assertTrue(self.hub.journaled[0], "the event was on disk before the hub got it")
         self.wait_for(lambda: uid + 1 in self.api.offsets, "the confirmation with the next offset")
         self.wait_for(lambda: not [n for n in os.listdir(self.journal) if n.endswith(".json")], "an empty journal")
@@ -282,7 +282,12 @@ class Bridge(unittest.TestCase):
         bot["from"]["is_bot"] = True
         self.api.inject(message=group)
         self.api.inject(message=bot)
-        self.api.inject(edited_message=private("edited", mid=7))
+        # P2 piece 7: an edit to "send it" and a reaction are no messages of a person's, and never answer anything
+        self.api.inject(edited_message=private("send it", mid=7))
+        self.api.inject(message_reaction={"chat": {"id": int(OWNER_TG), "type": "private"}, "message_id": 3,
+                                          "user": {"id": int(OWNER_TG), "is_bot": False, "first_name": "Alex"},
+                                          "date": int(time.time()), "old_reaction": [],
+                                          "new_reaction": [{"type": "emoji", "emoji": "\N{THUMBS UP SIGN}"}]})
         # a picture goes, with its caption as its words (CHAT-APPS.md 8.1: until 20 November 2026 the bridge dropped
         # them, and the agent never read what a person wrote under their screenshot)
         photo = private("", mid=8, photo=[{"file_id": "x"}], caption="This is the error that I get")
@@ -295,10 +300,31 @@ class Bridge(unittest.TestCase):
         doc = private("", mid=10, document={"file_id": "y", "file_name": "invoice.pdf"}, caption="The invoice")
         del doc["text"]
         last = self.api.inject(message=doc)
-        self.wait_for(lambda: last + 1 in self.api.offsets, "all six confirmed")
+        self.wait_for(lambda: last + 1 in self.api.offsets, "all seven confirmed")
         self.wait_for(lambda: len(self.hub.inbound) == 2, "the two messages after their files' fetches")
         self.assertEqual([(m["kind"], m["text"]) for m in self.hub.inbound],
                          [("image", "This is the error that I get"), ("file", "The invoice")])
+
+    def test_a_forward_and_a_reply_say_so(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a forwarded "send it" is `forwarded`, and a "send it" under an older message
+        names it in `reply_to` with the bot's and the chat's numbers, as the bridge names the bot's own sends, so that
+        the hub never reads either as the person's own answer. A reply to another chat's message or to a story is
+        "elsewhere"; a message in a topic, whose reply_to_message is the topic's first message, is no reply."""
+        self.connected()
+        origin = {"type": "user", "date": int(time.time()) - 60, "sender_user": {"id": 777, "is_bot": False,
+                                                                                  "first_name": "Vega"}}
+        self.api.inject(message=private("send it", mid=51, forward_origin=origin))
+        self.api.inject(message=private("send it", mid=52, reply_to_message=private("Send it to Vega?", mid=40)))
+        self.api.inject(message=private("send it", mid=53, external_reply={"origin": origin}))
+        topic = private("", mid=30, forum_topic_created={"name": "Orders", "icon_color": 7322096})
+        self.api.inject(message=private("send it", mid=54, reply_to_message=topic, is_topic_message=True))
+        self.api.inject(message=private("send it", mid=55, reply_to_story={"chat": {"id": 777, "type": "private"},
+                                                                            "id": 3}))
+        self.wait_for(lambda: len(self.hub.inbound) == 5, "five messages")
+        self.assertEqual([(m["id"].rsplit(":", 1)[1], m["forwarded"], m["reply_to"]) for m in self.hub.inbound],
+                         [("51", True, None), ("52", False, f"{BOT_ID}:{OWNER_TG}:40"),
+                          ("53", False, channels.REPLY_ELSEWHERE), ("54", False, None),
+                          ("55", False, channels.REPLY_ELSEWHERE)])
 
     def test_each_kind_of_file_goes_up_through_getfile(self):
         """The design of 20 November 2026 (version 2) and the owner's words of that day ("does it accept multiple

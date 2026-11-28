@@ -29,6 +29,7 @@ SECTIONS = [{"key": "character", "title": "Character", "text": "Calm and exact."
             {"key": "may_do", "title": "May do without asking", "text": "Read and answer tickets."},
             {"key": "must_ask", "title": "Must ask first", "text": "Refunds."}]
 BOX2_KEY = "server-key-of-box2"
+BOX3_KEY, BOX3 = "server-key-of-box3", "127.0.0.12"     # a third Linux server, at an address of its own
 
 
 class TeamChanges(Remove):
@@ -96,17 +97,18 @@ class TeamChanges(Remove):
         person = hub.ins("INSERT INTO people(name,role,added) VALUES('Bruno','peer',?)", (hub.now(),))
         hub.q("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (person, agent, hub.now()))
 
-    def box2(self, free=7 << 30, total=8 << 30):
-        """A second Linux server with no agent, whose reading shows this much memory free, of this much in all."""
-        if "box2" not in hub.server_names():
-            answer = self.code("box2", "linux")
-            status, result = self.join(answer["code"], source=NEW, key=BOX2_KEY, kind="linux", user="fleet")
+    def box2(self, free=7 << 30, total=8 << 30, name="box2", key=BOX2_KEY, source=NEW):
+        """A second Linux server with no agent, whose reading shows this much memory free, of this much in all; or
+        another such server, by its name, its key and its address."""
+        if name not in hub.server_names():
+            answer = self.code(name, "linux")
+            status, result = self.join(answer["code"], source=source, key=key, kind="linux", user="fleet")
             self.assertEqual(status, 200, result)
-        status, said = self.service("/server/box2/status", {
+        status, said = self.service(f"/server/{name}/status", {
             "revision": hub.kit_revision(fresh=True), "os": {"name": "Ubuntu 24.04.1 LTS"},
             "runtimes": {"codex": {"version": "1.0.0", "signed_in": None}}, "access": {"user": "fleet"},
             "load": {"cpu_percent": 5.0, "memory_used": total - free, "memory_total": total, "disk_used": 1,
-                     "disk_total": 2}}, key=BOX2_KEY, source=NEW)
+                     "disk_total": 2}}, key=key, source=source)
         self.assertEqual(status, 200, said)
 
     def add_plan(self):
@@ -1774,6 +1776,140 @@ class TeamChanges(Remove):
         self.assertEqual(hub.q1("SELECT replaced_by FROM needs WHERE id=?", (old,))["replaced_by"], self.card()["id"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs WHERE team_plan IS NOT NULL AND answer IS NULL")["n"], 1)
 
+    # ---- the first job (P5 version 3, piece J)
+    def first_plan(self, name="nova"):
+        """The manager's plan that adds `name` on box2, with the owner's press of its yes. The fleet's one runtime is
+        the manager's (Claude), which the hub reads as signed in."""
+        with patch.object(hub, "signed_in_now", lambda agent, runtime, reads=None: True):
+            self.plan([{"kind": "add", "server": "box2", "names": [name], "title": "Client emails",
+                        "runtime": "claude", "profile": SECTIONS}], title="Add an agent for client emails?")
+            status, answer = self.press(0)
+        self.assertEqual(status, 200, answer)
+        self.assertIn(name, self.origin_team()["agents"])
+
+    def test_the_first_plan_of_a_fleet_with_no_worker_adds_the_first_agent(self):
+        """P5 3.4: the agent of the first plan that the owner presses in a fleet with no worker is the first agent, the
+        first jobs stay in the manager's see_capacity after the press, and the first agent sends no first message of
+        its own: the manager asks the owner its question after the first result. Bugs: the hub names no first agent,
+        so no result ever ends the first job; the list ends at the press; or the new agent asks the owner what it
+        should look after while the manager leads the talk of its first job."""
+        self.fresh_fleet()
+        hub.settle_first_jobs()             # the first start of a customer's fleet: no worker
+        self.box2()
+        self.first_plan()
+        self.assertEqual(hub.first_agent(), "nova")
+        self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "nova"), "none")
+        self.assertIn("FIRST JOBS, until you, or the lead of its agent, accept a completed task of a worker or a lead "
+                      "that the owner asked for (its ask): that is the first result. The first agent is nova.",
+                      hub.t_see_capacity("manager", {}))
+
+    def test_an_agent_from_add_agent_ends_no_first_job_until_its_first_result(self):
+        """P5 3.4 (readers A and B, round 1): an agent that the owner adds in Founderizer is not the first agent and
+        ends no first job by its add, also after the hub starts again; while no plan named a first agent, the
+        manager's acceptance of its completed, asked task is the first result, and a later plan names no first agent.
+        Bugs: the owner's Add agent ends the first job, so the manager's list and the checks of the owner's files stop
+        with no result; nothing ends it in a fleet that grows by Add agent, so the manager reads the list for months
+        and a plan made then names a first agent that sends no first message and whose tasks are held; or the manager
+        is told to ask the owner the drafts question of the first agent for a developer from Add agent."""
+        self.fresh_fleet()
+        hub.settle_first_jobs()             # the first start of a customer's fleet: no worker
+        self.box2(name="box3", key=BOX3_KEY, source=BOX3)
+        status, receipt = self.add_agent("box3", "coder", "claude")
+        self.assertEqual(status, 200, receipt)
+        hub.settle_first_jobs()             # a start after the add: the mark was taken once, with no worker
+        self.assertIsNone(hub.first_agent())
+        self.assertIsNone(hub.kv_get(hub.FIRST_RESULT))
+        self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "coder"), "wait")     # it writes first, as every agent
+        self.assertIn("FIRST JOBS, until you, or the lead of its agent, accept a completed task of a worker or a lead",
+                      hub.t_see_capacity("manager", {}))
+        work = hub.ins("INSERT INTO tasks(title,owner,requester,state,attempt,created,ask) VALUES('Fix the checkout',"
+                       "'coder','manager','completed',1,?,?)", (hub.now(), str(uuid.uuid4())))
+        said, error = hub.call_tool("manager", "check_result", {"task_id": hub.tref(work), "accepted": True})
+        self.assertFalse(error, said)
+        self.assertIn("It is the fleet's first result", said)
+        self.assertEqual(hub.kv_get(hub.FIRST_RESULT), str(work))
+        self.assertNotIn("FIRST JOBS", hub.t_see_capacity("manager", {}))
+        for read in (said, hub.call_tool("manager", "see_team", {})[0], hub.manager_resume_text()):
+            self.assertNotIn("AFTER THE FIRST RESULT", read)       # no drafts question for an agent from Add agent
+        self.box2()
+        self.first_plan()                   # nova on box2, after the first result
+        self.assertIsNone(hub.first_agent())
+        self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "nova"), "wait")
+
+    def test_a_first_agent_that_never_works_keeps_no_fleet_in_its_first_job(self):
+        """P5 3.4 (the validator's M1, 28 November 2026): the accepted, completed, asked result of any worker or lead
+        ends the first job, also while a first agent is named and whatever its state. Bug: the owner presses the plan
+        for nova and never signs it in (or its install fails, or the owner pauses it), and works with coder from Add
+        agent; none of coder's accepted results counts, so each see_team, each session start and each see_capacity of
+        the manager carries the first jobs, and the manager pushes the owner to a first job, for as long as nova stays.
+        Or the next turns of the first agent ("send by itself or show first") come for coder's result."""
+        self.fresh_fleet()
+        hub.settle_first_jobs()             # the first start of a customer's fleet: no worker
+        self.box2(name="box3", key=BOX3_KEY, source=BOX3)
+        status, receipt = self.add_agent("box3", "coder", "claude")
+        self.assertEqual(status, 200, receipt)
+        self.box2()
+        self.first_plan()                   # nova: the first agent, never signed in
+        self.assertEqual(hub.first_agent(), "nova")
+        work = hub.ins("INSERT INTO tasks(title,owner,requester,state,attempt,created,ask) VALUES('Fix the checkout',"
+                       "'coder','manager','completed',1,?,?)", (hub.now(), str(uuid.uuid4())))
+        said, error = hub.call_tool("manager", "check_result", {"task_id": hub.tref(work), "accepted": True})
+        self.assertFalse(error, said)
+        self.assertIn("It is the fleet's first result", said)
+        self.assertEqual(hub.kv_get(hub.FIRST_RESULT), str(work))
+        self.assertNotIn("FIRST JOBS", hub.t_see_capacity("manager", {}))
+        for read in (said, hub.call_tool("manager", "see_team", {})[0], hub.manager_resume_text()):
+            self.assertNotIn("FIRST JOBS", read)
+            self.assertNotIn("AFTER THE FIRST RESULT", read)       # the next turns are for nova's own result only
+
+    def test_a_fleet_with_a_worker_at_its_first_start_with_j_is_past_its_first_job(self):
+        """P5 3.4: a fleet that runs today with a worker is past its first job. Bug: its next plan makes its new agent
+        the first agent, so the agent sends no first message, its tasks are held to a first piece's words, and the
+        manager's list of first jobs comes back."""
+        hub.settle_first_jobs()             # this fleet has workers: scout, vps, studio and lead
+        self.add_plan()
+        status, answer = self.press(0)
+        self.assertEqual(status, 200, answer)
+        self.assertIsNone(hub.first_agent())
+        self.assertEqual(hub.kv_get(hub.AGENT_FIRST_MESSAGE + "nova"), "wait")
+        self.assertNotIn("FIRST JOBS", hub.t_see_capacity("manager", {}))
+
+    def test_the_first_agent_s_plan_gives_it_no_access_beyond_its_first_piece(self):
+        """P5 3.4 and piece 2 (the readers' M2 and R2-S3): while the first job runs and no plan named a first agent, a
+        plan's add, whose agent becomes the first agent, gives it no Gmail, Drive or MCP server and no repository above
+        read, whatever its title. Bugs: the owner's yes on the first plan gives the agent the owner's mailbox or a
+        repository at write, so it holds them before its first task reads strangers' mails or issues and before the
+        owner answers "send by itself or show first"; the check knows the job only by its English title, so
+        "Correos de clientes" or "Email assistant" takes the whole mailbox; or the check also holds the plans of a
+        fleet past its first job."""
+        self.fresh_fleet()
+        hub.settle_first_jobs()             # the first start of a customer's fleet: no worker
+        self.box2()
+
+        def plan(title, resource, level):
+            with patch.object(hub, "signed_in_now", lambda agent, runtime, reads=None: True), self.allows(), \
+                    self.reaches("acme/web"):
+                return self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": title,
+                                   "runtime": "claude", "profile": SECTIONS,
+                                   "access": [{"resource": resource, "level": level}]}], title="Add an agent?")
+        cards = lambda: hub.q1("SELECT COUNT(*) n FROM needs WHERE team_plan IS NOT NULL")["n"]
+        for title, resource, level in (("Client emails", f"gmail:{self.MAIL}", "send"),
+                                       ("Correos de clientes", f"gmail:{self.MAIL}", "read"),     # Spanish
+                                       ("Email assistant", f"drive:{self.MAIL}", "read"),         # the owner's words
+                                       ("Bookings", "tool:calendar", "use"),
+                                       ("Developer", "repo:acme/web", "write")):
+            with self.assertRaises(hub.ToolError) as refused:
+                plan(title, resource, level)
+            self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+            self.assertIn("This plan's agent becomes the fleet's first agent, which holds no Gmail, Drive or MCP "
+                          "server and no repository above read", str(refused.exception))
+            self.assertIn(f"Take {resource} out of access", str(refused.exception))
+        self.assertEqual(cards(), 0)                    # no card of these reached the owner
+        plan("Developer", "repo:acme/web", "read")      # the first piece of Fix the bug
+        self.assertEqual(cards(), 1)
+        hub.kv_set(hub.FIRST_RESULT, hub.FIRST_BEFORE)  # a fleet past its first job: its plans are not held
+        plan("Client emails", f"gmail:{self.MAIL}", "send")
+        self.assertEqual(cards(), 2)
 
 if __name__ == "__main__":
     unittest.main()

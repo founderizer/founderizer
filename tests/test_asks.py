@@ -994,11 +994,180 @@ class FollowUps(Asks):
             self.assertTrue(any(index in plan for index in indexes), f"{sql}: {plan}")
 
 
+class FirstJob(Asks):
+    """The fleet's first job (P5 version 3, piece J; section 3.4). solo is the first agent: the agent that the first
+    plan of a fleet with no worker added (test_team_changes holds that part). Until the manager accepts a completed
+    task of it that the owner asked for, a task of it whose ask holds the owner's files takes a first piece's words."""
+
+    def setUp(self):
+        super().setUp()
+        hub.TEAM["agents"]["solo"]["can"].append("browser")
+        hub.kv_set(hub.FIRST_AGENT + "solo", str(hub.now()))
+
+    def with_file(self):
+        """The owner's message to the manager with one file: mails of other people, the material of the first job."""
+        message = self.says(text="Here are some client emails.")
+        hub.q("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) VALUES(?,?,?,?,?,?,?,?)",
+              (str(uuid.uuid4()), "mails.eml", "message/rfc822", 10, "0" * 64, hub.now(), "test", message["request_id"]))
+        return message
+
+    def piece(self, tone=""):
+        title, _, done_when, details = hub.FIRST_JOBS[0]["piece"]
+        return {"title": title, "done_when": done_when, "details": details + tone}
+
+    def deliver(self, owner, task, outcome="completed"):
+        self.ok(owner, "deliver_result", dict({"task_id": hub.tref(task["id"]), "outcome": outcome,
+                                               "what_was_done": "Wrote what the mailbox needs."},
+                                              **({"where_output_is": "This result.", "how_checked": "Read it again."}
+                                                 if outcome == "completed" else {})), task["id"])
+
+    def test_a_first_task_with_the_owner_s_files_takes_only_a_first_piece_s_words(self):
+        """P5 3.4: a task of the first agent whose ask holds the owner's files takes the title, done_when and details
+        of one first piece, with needs none, and at most 120 characters of the manager's own tone, with no web address
+        in it, in its goal (an id or a plain label) or in its step; the refusal names the part that failed and the way
+        for a job that no piece fits. Bugs: the manager copies the website's text or its address into the task that
+        holds the mails (in the details, after them, or in a goal), also with a full-width dot or a zero-width space
+        in the host name, or gives it a browser, so the agent reads other
+        people's mails beside words from a site that it may open; a refusal that says the same for each fault, which
+        the manager meets again and again; one that sends a job in the owner's own words to the nearest wrong piece;
+        or one that sends the owner's files to the agent's own chat, where no check of the hub's reads them."""
+        ref = f"M-{self.with_file()['event_id']}"
+        base = {"owner": "solo", "ask": ref, "asked": "Draft three replies", "why": "Client emails"}
+        site = "Costa Studio takes wedding photos. See https://costastudio.example/prices for all of them."
+        t0 = hub.now()
+        limits = json.dumps({"money": None, "tokens": None, "deadline": None, "not_to_do": []})     # update_goal's
+        goal = hub.ins("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) VALUES(?,?,"
+                       "'active',1,?,?,?,?)", ("Client emails of costastudio.example", "Answer client mail.", limits,
+                                               t0, t0, str(uuid.uuid4())))
+        for fields, part in (({"title": "Answer the emails", "done_when": "Done.", "details": site},
+                              "its title is the title of no first piece"),
+                             (dict(self.piece(), title="Draft replies to client emails"),
+                              "its title is the title of no first piece"),
+                             (dict(self.piece(), done_when="Done."), "its done_when is not the line"),
+                             (dict(self.piece(), details=site), "its details do not begin with the details"),
+                             (self.piece(" Warm and short. Prices: costastudio.example/prices"),
+                              "reads as a web address"),
+                             (self.piece(" Warm and short, as on www.costastudio.example"), "reads as a web address"),
+                             # NFKC and the skeleton: a full-width full stop, and a zero-width space in the host
+                             (self.piece(" Warm. Prices: costastudio" + chr(0xFF0E) + "example/prices"),
+                              "reads as a web address"),
+                             (self.piece(" Warm, as on costastudio" + chr(0x200B) + ".example"),
+                              "reads as a web address"),
+                             (self.piece(" Warm and short." * 8), "the tone after the details has 127 characters"),
+                             (dict(self.piece(), needs="browser"), "it needs browser"),
+                             (dict(self.piece(), goal=f"G-{goal}"), "its goal or its plan step holds"),
+                             (dict(self.piece(), goal="Costa Studio, costastudio.example"),
+                              "its goal or its plan step holds")):
+            said = self.refused("manager", "create_task", dict(base, **fields))
+            self.assertIn(part, said)
+            self.assertIn("give solo first a task whose ask holds no file", said)
+            self.assertNotIn("own chat", said)          # the owner's files there pass no check of the hub's
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], 0)
+        task, _ = self.create(**dict(base, **self.piece(" Warm, short sentences, with the client's first name.")))
+        self.assertEqual([a["name"] for a in hub.task_files(task)], ["mails.eml"])
+        self.create(**dict(base, **dict(self.piece(), title=hub.FIRST_JOBS[0]["piece"][1])))     # a Spanish app's
+        self.create(owner="lead", ask=ref, title="Check the replies", details=site)       # not the first agent
+        hub.kv_set(hub.FIRST_RESULT, str(task["id"]))
+        self.create(**dict(base, title="Answer the emails", details=site))                # after the first result
+
+    def test_only_the_acceptance_of_an_asked_completed_task_of_the_first_agent_ends_the_first_job(self):
+        """P5 3.4 and the readers' final note: the drafts piece is the offer, not the only way. A first task whose ask
+        is the owner's typed words with no file ("just connect my mailbox") takes the manager's own words and holds no
+        file, and the manager's acceptance of its completed result is the first result; what the manager does next
+        stays in its reads until it acts. Bugs: the check refuses the owner's own work, so the first agent never
+        starts; the agent's own delivery ends the first job, so an act of its own drops a protection early; a failed
+        task, a task with no ask, or a peer's acceptance of a part that it gave ends it, before the manager or the
+        agent's own lead saw any result; no result ends it, and the list stays for ever; the
+        steps after the result leave with the list, before the manager takes them; they stay after the manager raised
+        its next card (turn 8's Connect card has no Give) or a grant came, so each new session asks the owner the same
+        question again; or a card, a grant or a take-back from before the result ends them."""
+        ref = f"M-{self.says(text='No samples, just connect my mailbox.')['event_id']}"
+        asked, _ = self.create(title="Connect the mailbox", ask=ref, asked="Connect the mailbox")
+        self.assertEqual(hub.task_files(asked), [])
+        self.deliver("solo", asked)                     # its own delivery, which nobody accepted yet
+        failed, _ = self.create(title="Read the mailbox", ask=ref)
+        self.deliver("solo", failed, "failed")
+        plain, _ = self.create(title="Check the disk")  # no ask: no work of the owner's
+        self.deliver("solo", plain)
+        for task in (failed, plain):
+            self.assertNotIn("first result", self.ok("manager", "check_result", {"task_id": hub.tref(task["id"]),
+                                                                                  "accepted": True}))
+        # lead gives solo, its peer under the manager, a part of its own asked task, and accepts it: no first result
+        mine, _ = self.create(owner="lead", title="Check the replies", ask=ref)
+        peer, _ = self.create("lead", "solo", task=mine["id"], title="Read the replies")
+        self.assertEqual((peer["requester"], peer["ask"]), ("lead", mine["ask"]))
+        self.deliver("solo", peer)
+        self.assertNotIn("first result", self.ok("lead", "check_result", {"task_id": hub.tref(peer["id"]),
+                                                                           "accepted": True}, mine["id"]))
+        self.assertIsNone(hub.kv_get(hub.FIRST_RESULT))
+        self.assertIn("FIRST JOBS", self.ok("manager", "see_capacity", {}))
+        t0 = hub.now()
+        grant = "INSERT INTO resource_grants(ts,resource,agent,level,by) VALUES(?,?,'solo',?,'owner')"
+        card = "INSERT INTO needs(title,why,todo,raised,by) VALUES(?,'x','y',?,'manager')"      # no Give, as turn 8's
+        hub.q(card, ("Choose a plan", t0))                                  # from before the result
+        hub.q(grant, (t0, "drive:a@b.example", "read"))
+        said = self.ok("manager", "check_result", {"task_id": hub.tref(asked["id"]), "accepted": True})
+        self.assertIn("It is the fleet's first result", said)
+        after = "AFTER THE FIRST RESULT: solo holds no duty yet. Ask the owner whether it sends by itself"
+        self.assertIn(after, said)
+        self.assertEqual(hub.kv_get(hub.FIRST_RESULT), str(asked["id"]))
+        self.assertNotIn("FIRST JOBS", self.ok("manager", "see_capacity", {}))
+        # it ends at the first sign that the manager went on, after the result: any card of its own, a grant to solo
+        # that is no take-back, or a duty of solo; a second check of the task does not move the result's moment
+        def line():
+            return self.ok("manager", "see_team", {})
+        hub.q(grant, (t0, "drive:a@b.example", None))                       # a take-back
+        self.assertIn(after, line())
+        hub.q(card, ("Connect Gmail", t0))
+        self.assertNotIn("AFTER THE FIRST RESULT", line())
+        self.ok("manager", "check_result", {"task_id": hub.tref(asked["id"]), "accepted": True})
+        self.assertNotIn("AFTER THE FIRST RESULT", line())
+        hub.q("DELETE FROM needs WHERE title='Connect Gmail'")
+        self.assertIn(after, line())
+        hub.q(grant, (t0, "gmail:a@b.example", "write"))
+        self.assertNotIn("AFTER THE FIRST RESULT", line())
+        hub.q("DELETE FROM resource_grants WHERE resource='gmail:a@b.example'")
+        self.assertIn(after, line())
+        hub.q("INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,request_id) VALUES("
+              "'solo','Show each draft, send nothing.','active',1,?,?,'manager','r-1')", (t0, t0))
+        self.assertNotIn("AFTER THE FIRST RESULT", line())
+
+    def test_the_lead_of_the_first_agent_accepts_its_first_result(self):
+        """P5 3.4 (reader B, round 1): the acceptance of the first agent's task by its own requester, the lead that it
+        reports to, is the first result too, and the next turns go to the manager. Bugs: a first agent under a lead
+        never gets a first result, so the list and the hold of its tasks stay for ever; or the lead is told to ask the
+        owner, which only the manager does; or the hold of the first agent's task with the owner's files sends the lead
+        to the list of first jobs, which only the manager reads, or to the manager to give the task, which the hub
+        refuses while the lead can act, so the lead cannot follow its refusal."""
+        hub.kv_set(hub.FIRST_AGENT + "solo", None)
+        hub.kv_set(hub.FIRST_AGENT + "w", str(hub.now()))       # w reports to lead
+        files = f"M-{self.with_file()['event_id']}"
+        held, _ = self.create(owner="lead", title="Answer the client emails", ask=files, asked="Answer the emails")
+        said = self.refused("lead", "create_task", {"owner": "w", "title": "Answer the emails", "done_when": "Done.",
+                                                    "why": "It suits it."}, held["id"])
+        self.assertIn("The fleet has no first result yet, and this task for w holds the owner's files", said)
+        self.assertIn("from a list that you do not read", said)
+        # the manager may not give a task to w while its lead can act (authority): the lead asks for the words
+        self.assertIn("ask the manager with ask_my_requester for the exact words of one first piece", said)
+        self.assertNotIn("give this task", said)
+        ref = f"M-{self.says(text='No samples, just connect my mailbox.')['event_id']}"
+        mine, _ = self.create(owner="lead", title="Connect the mailbox", ask=ref, asked="Connect the mailbox")
+        part, _ = self.create("lead", "w", task=mine["id"], title="Read the mailbox")
+        self.assertEqual(part["ask"], mine["ask"])
+        self.deliver("w", part)
+        said = self.ok("lead", "check_result", {"task_id": hub.tref(part["id"]), "accepted": True}, mine["id"])
+        self.assertIn("It is the fleet's first result", said)
+        self.assertNotIn("AFTER THE FIRST RESULT", said)                # a lead asks the owner nothing
+        self.assertEqual(hub.kv_get(hub.FIRST_RESULT), str(part["id"]))
+        self.assertIn("AFTER THE FIRST RESULT: w holds no duty yet", self.ok("manager", "see_team", {}))
+
+
 # unittest runs only this file's cases, not the ones it inherits from the owner API's.
 def load_tests(_loader, _tests, _pattern):
     return unittest.TestSuite([*(Asks(name) for name in Asks.__dict__ if name.startswith("test_")),
                                *(Jobs(name) for name in Jobs.__dict__ if name.startswith("test_")),
-                               *(FollowUps(name) for name in FollowUps.__dict__ if name.startswith("test_"))])
+                               *(FollowUps(name) for name in FollowUps.__dict__ if name.startswith("test_")),
+                               *(FirstJob(name) for name in FirstJob.__dict__ if name.startswith("test_"))])
 
 
 if __name__ == "__main__":

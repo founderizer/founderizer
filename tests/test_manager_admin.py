@@ -358,9 +358,12 @@ class ManagerOps(unittest.TestCase):
         people gives the first words of each message of an unknown sender, a stranger's text that no agent reads
         today. For the owner GET /ui/knowledge gives each file of knowledge/owner/, more than the manager's profile
         lists, and the Door area keeps the page out of shape A (KnowledgeReader holds the filter for an agent's read).
-        search_history searches every chat and conversation; the manager has its own tool, with its own filters."""
+        search_history searches every chat and conversation; the manager has its own tool, with its own filters. The
+        pages machines and servers give a runtime's live Codex sign-in link and code, the servers page in a waiting
+        job's prompt (the Door area's verifier and its reader, 28 November 2026): as an alone read, the manager could
+        sign an agent in to an account of its own choosing."""
         own = ("state", "owner_chat", "conversation", "conversations", "events", "notes", "lessons", "chat_link",
-               "agent_messages", "artifacts", "knowledge", "people")
+               "agent_messages", "artifacts", "knowledge", "people", "machines", "servers")
         self.assertEqual({f"fleet_read page={page}": self.classes.get(f"fleet_read page={page}") for page in own},
                          {f"fleet_read page={page}": "owner" for page in own})
         self.assertEqual(self.classes.get("search_history"), "owner")

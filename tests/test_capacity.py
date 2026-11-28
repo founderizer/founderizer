@@ -13,6 +13,7 @@ from unittest.mock import patch
 import urllib.parse
 import uuid
 
+import fleet
 import hub
 from test_ui_api import PATIENCE, OwnerAPI
 
@@ -1049,6 +1050,62 @@ class Capacity(OwnerAPI):
         self.assertIn("YOUR OWN ALLOWANCE:", hub.manager_resume_text())
         self.week(10, 42.7)
         self.assertNotIn("YOUR OWN ALLOWANCE", hub.manager_resume_text())
+
+    # ---- the first job (P5 version 3, piece J)
+    def test_a_fleet_with_no_worker_gets_the_first_jobs_and_a_fleet_with_workers_does_not(self):
+        """P5 3.4: the manager's see_capacity gives the first jobs, each with its first piece, while the fleet has no
+        first result, also a fleet of today with no worker and no first-line mark. Bugs: a new fleet's manager has no
+        list once rules/manager.md drops its table of jobs, and proposes a job with no first piece; a first piece whose
+        title create_task refuses, so the first task can never be given; the title in English for an owner whose app
+        is in Spanish, who reads it on the Tasks page; or a fleet whose workers came before reads the list for ever.
+        The six jobs of files name only materials that exist before P5 A3 (the supervisor's condition, 28 November
+        2026): bug, a material that nothing in the fleet makes (the hub's read of Gmail, the website's prices, the
+        release's examples), so the manager offers it, then reads the site itself into the task, or accepts an empty
+        result that ends the first job. A3 changes these lines on purpose."""
+        self.assertNotIn("FIRST JOBS", self.call("manager", "see_capacity", {})[0])
+        hub.TEAM["agents"] = {"manager": dict(TEAM["agents"]["manager"])}       # the manager alone
+        self.assertIsNone(hub.kv_get("first_message"))          # no first-line mark (P5 piece H) either
+        text, error = self.call("manager", "see_capacity", {})
+        self.assertFalse(error, text)
+        self.assertIn("FIRST JOBS, until you, or the lead of its agent, accept a completed task of a worker or a lead "
+                      "that the owner asked for", text)
+        examples = "the owner's choice of examples, which the first task writes itself, marked as examples"
+        self.assertEqual([job["material"] for job in hub.FIRST_JOBS[:6]], [
+            f"the owner's emails, as files that the owner drops or attaches in the chat, or {examples}",
+            f"the owner's list of unpaid invoices, as a file that the owner drops or attaches in the chat, or {examples}",
+            f"the owner's price list or a request, as a file that the owner drops or attaches in the chat, or {examples}",
+            f"the owner's list or screenshot of the week's bookings, as a file that the owner drops or attaches in the "
+            f"chat, or {examples}",
+            f"the owner's client list, as a file that the owner drops or attaches in the chat, or {examples}",
+            f"the owner's last reviews, as a file that the owner drops or attaches in the chat, or {examples}"])
+        for job in hub.FIRST_JOBS:
+            title, title_es, done_when, details = job["piece"]
+            self.assertIn(f"Material: {job['material']}.", text)
+            if job["first"] == "none":          # a job of files: its piece works with no file, from its own examples
+                self.assertIn("marked as", done_when)
+            self.assertIn(f'First piece: title "{title}"; done_when "{done_when}"; details "{details}"', text)
+            for words in (title, title_es):
+                self.assertIsNone(hub.title_words(words), words)
+        hub.TEAM["settings"] = {"owner.app_language": "es-ES"}
+        spanish = self.call("manager", "see_capacity", {})[0]
+        self.assertIn('First piece: title "Borradores de respuesta a 3 correos de clientes"', spanish)
+        self.assertNotIn('title "Draft replies to 3 client emails"', spanish)
+
+    def test_after_a_summary_or_a_restart_the_manager_is_sent_back_to_the_first_jobs(self):
+        """P5 3.4: each manager session reads the first jobs again after a summary or a restart. A Claude session's
+        compaction hook gives it MANAGER_COMPACTED_LINE (test_claude_start runs the hook), which names see_team, and a
+        new session starts with the resume brief. Bug: the summary keeps only part of see_capacity's answer, so the
+        manager gives the first agent a task in its own words, which the hub refuses, or proposes a job with no route;
+        or the line stays after the first result and sends every later session to a list that is gone."""
+        hub.TEAM["agents"] = {"manager": dict(TEAM["agents"]["manager"])}
+        self.assertIn("see_team", fleet.MANAGER_COMPACTED_LINE)
+        line = "FIRST JOBS: see_capacity lists them, each with its first piece"
+        for said in (self.call("manager", "see_team", {})[0], hub.manager_resume_text()):
+            self.assertIn(line, said)
+        hub.kv_set(hub.FIRST_RESULT, "7")
+        for said in (self.call("manager", "see_team", {})[0], hub.manager_resume_text(),
+                     self.call("manager", "see_capacity", {})[0]):
+            self.assertNotIn("FIRST JOBS", said)
 
     def test_agents_that_share_one_account_are_named_because_they_share_one_allowance(self):
         self.reading("deva", self.limits(SHARED, 10, hub.now() + 42 * 3600, age=600))

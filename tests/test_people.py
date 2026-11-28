@@ -709,7 +709,13 @@ class Conversations(People):
 
     def test_a_deputy_answers_the_question_itself_and_it_leaves_needs_you(self):
         """The one thing the deputy can do that no other role can: the question that the agent raises in their
-        conversation is theirs, their next message answers it, and the owner is not asked."""
+        conversation is theirs, their next message answers it, and the owner is not asked. Only their own words
+        answer it (P2 piece 7, CHAT-APPS.md 8.1): a forward does not, nor does a reply to a message from before the
+        question, and the window reads which one each was (bug: a customer's "Yes, the price is fine." that the deputy
+        forwarded left Needs you as the deputy's decision); a reply answers the item raised last before the message
+        that it quotes, open or answered, only while it is open, once for each quoted message, and never under a task's
+        message or a rule's reminder (bugs: a second reply to the same message answered an older item; a reply to a
+        task's message answered the conversation's item)."""
         self.assertEqual(self.change(self.person["id"], role="deputy")[0], 200)
         self.read()
         text, error = self.tool("ask_owner", question="May I tell her the price of the big pack?")
@@ -726,6 +732,11 @@ class Conversations(People):
         # a picture with no words answers nothing: the item would leave Needs you with an empty answer
         self.assertEqual(self.wrote(text="", kind="image"), "stored")
         self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"])
+        # a forward is not their answer, and nor is a "Yes." under their own message from before the question
+        self.assertEqual(self.wrote(text="Yes, the price is fine.", forwarded=True, reply_to=None), "stored")
+        first = hub.q1("SELECT msg_id FROM conversation_messages WHERE id=1")["msg_id"]
+        self.assertEqual(self.wrote(text="Yes.", forwarded=False, reply_to=first), "stored")
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"])
         self.assertEqual(self.wrote(text="Yes, the price is fine."), "stored")
         need = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(need["answer"], "Yes, the price is fine.")
@@ -736,10 +747,92 @@ class Conversations(People):
         self.assertIn("Yes, the price is fine.", back)
         self.assertIn(f"[Fleet C-{self.cid}] Laura · deputy · WhatsApp", back)
         self.assertNotIn("the owner of this fleet", back)
+        self.assertRegex(back, r" · forwarded, so not their own words\n\"Yes, the price is fine.\"")
+        self.assertRegex(back, r" · in reply to CM-1\n\"Yes.\"")
+        # and a later window's recap says the same (bug: a new session read the forward as Laura's own yes)
+        recap = hub.conversation_prompt("studio", self.conversation(), self.person_row())
+        self.assertIn("\nLaura: (forwarded, so not their own words) Yes, the price is fine.\nLaura: (in reply to CM-1) "
+                      "Yes.\n", recap)
         self.assertEqual(self.count("needs"), 1)
         record = self.request(f"/ui/conversations/{self.cid}?db=test-generation")[1]
         answered = [m for m in record["items"] if m["who"] == "person" and m["need"]][-1]
         self.assertEqual(answered["need"]["id"], need["id"])
+        # two more items, the agent's message about the second one, then a task's message: a reply to the task's
+        # message answers no item; a reply to the agent's message answers the item raised last before it, and the
+        # first one stays open (bug: a reply answered the oldest item, whatever it quoted); a second reply to that
+        # message answers nothing
+        asked = []
+        for question in ("May I give her the 10% discount?", "May I send her the catalogue?"):
+            self.assertFalse(self.tool("ask_owner", question=question)[1])
+            asked.append(hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"])
+        last = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        self.assertFalse(self.tool("reply", text="May I send her the catalogue?", in_reply_to=f"CM-{last}")[1])
+        item = [i for i in self.out() if i["kind"] == "message"][-1]
+        self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "sent", "parts": 1, "error": None,
+                                                                   "platform_ids": ["wamid-3"]})[0], 200)
+        with hub.LOCK, hub.transaction():
+            tid = hub.admit_task("manager", {"owner": "studio", "title": "Send the invoice", "details": "",
+                                             "done_when": "done", "needs": "none", "goal": None, "goal_id": None,
+                                             "parent": None, "follows": None, "case_id": None})
+        t0 = hub.now()
+        sent = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) VALUES("
+                       "'message','whatsapp','whatsapp-studio',?,'The invoice went out.','sent',?,?,?)",
+                       (ANA, t0, t0, json.dumps(["wamid-task"])))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,task,outbound) VALUES(?,'agent',?,?,?,?)",
+              (self.cid, "The invoice went out.", t0, tid, sent))
+
+        def answers(reply_to, text="Yes."):
+            self.assertEqual(self.wrote(text=text, forwarded=False, reply_to=reply_to), "stored")
+            return [hub.q1("SELECT answer FROM needs WHERE id=?", (n,))["answer"] for n in asked]
+        self.assertEqual(answers("wamid-task"), [None, None])
+        self.assertEqual(answers("wamid-3", "Yes, send it."), [None, "Yes, send it."])
+        self.assertEqual(answers("wamid-3", "Yes, both."), [None, "Yes, send it."])
+        # the owner answers the newer of two more items himself: a reply to the agent's next message binds to that
+        # one, the last before it, and answers nothing (bug: it answered the older item, which was worse than none)
+        more = []
+        for question in ("May I offer her free shipping?", "May I add a gift?"):
+            self.assertFalse(self.tool("ask_owner", question=question)[1])
+            more.append(hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"])
+        body = dict(self.command(), answer="No gift.")
+        body.pop("text", None)
+        self.assertEqual(self.request(f"/ui/needs/{more[1]}", body)[0], 200)
+        self.read()
+        last = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        self.assertFalse(self.tool("reply", text="Free shipping, then?", in_reply_to=f"CM-{last}")[1])
+        item = [i for i in self.out() if i["kind"] == "message"][-1]
+        self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "sent", "parts": 1, "error": None,
+                                                                   "platform_ids": ["wamid-5"]})[0], 200)
+        self.assertEqual(self.wrote(text="Yes, free shipping.", forwarded=False, reply_to="wamid-5"), "stored")
+        self.assertEqual([hub.q1("SELECT answer FROM needs WHERE id=?", (n,))["answer"] for n in [asked[0], *more]],
+                         [None, None, "No gift."])
+        # a reply to a message whose send the bridge could not confirm, after the item, reads as one with no reply,
+        # as before this piece: it answers the oldest open item
+        self.read()
+        last = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        self.assertFalse(self.tool("reply", text="And the 10%?", in_reply_to=f"CM-{last}")[1])
+        item = [i for i in self.out() if i["kind"] == "message"][-1]
+        self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "unknown", "parts": 0, "error": "lost",
+                                                                   "platform_ids": []})[0], 200)
+        self.assertEqual(self.wrote(text="Yes, the 10%.", forwarded=False, reply_to="wamid-lost"), "stored")
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (asked[0],))["answer"], "Yes, the 10%.")
+        # the owner answers the last open item, and the agent asks one more: a "Yes." under a rule's reminder answers
+        # nothing (bug: it answered the item before it), and nor does a reply that names no message while the only
+        # unconfirmed send came before that item (bug: an answered item counted as open, and the reply read as one
+        # with no reply and answered the item)
+        body = dict(self.command(), answer="No free shipping.")
+        body.pop("text", None)
+        self.assertEqual(self.request(f"/ui/needs/{more[0]}", body)[0], 200)
+        self.assertFalse(self.tool("ask_owner", question="May I call her tomorrow?")[1])
+        last = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+        t0 = hub.now()
+        sent = hub.ins("INSERT INTO chat_out(kind,app,account,chat,text,state,created,updated,platform_ids) VALUES("
+                       "'message','whatsapp','whatsapp-studio',?,'Your order ships on Monday.','sent',?,?,?)",
+                       (ANA, t0, t0, json.dumps(["wamid-rule"])))
+        hub.q("INSERT INTO conversation_messages(conversation,who,text,created,outbound) VALUES(?,'agent',?,?,?)",
+              (self.cid, "Your order ships on Monday.", t0, sent))          # a rule's reminder (send_rows)
+        self.assertEqual(self.wrote(text="Yes.", forwarded=False, reply_to="wamid-rule"), "stored")
+        self.assertEqual(self.wrote(text="Yes, call her.", forwarded=False, reply_to="wamid-none"), "stored")
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (last,))["answer"])
 
     def test_a_person_who_does_not_decide_answers_nothing(self):
         """Every other role: the item waits for the owner, whatever that person writes next."""

@@ -150,6 +150,8 @@ type messageEvent struct {
 	FromMe    bool       `json:"from_me"`
 	Kind      string     `json:"kind"`
 	Text      string     `json:"text"`
+	Forwarded bool       `json:"forwarded"` // its sender forwarded it: its words are not their own (CHAT-APPS.md 8.1)
+	ReplyTo   *string    `json:"reply_to"`  // the ID of the message that it quotes, or null
 	TS        float64    `json:"ts"`
 	Media     *mediaSpec `json:"media,omitempty"` // a direct message's picture, voice note, sound, video, file or sticker
 }
@@ -1063,12 +1065,44 @@ func convertMessage(e *events.Message) (messageEvent, bool) {
 		s := info.SenderAlt.ToNonAD().String()
 		ev.SenderAlt = &s
 	}
+	ev.Forwarded, ev.ReplyTo = messageContext(e.Message)
 	// the hub takes no file of a group's message or of the number's own; and a picture, a video or a voice note that
 	// its sender let be seen only once is never kept as a file (its words still come)
 	if !ev.Group && !ev.FromMe && !viewOnce(e) {
 		ev.Media = describeMedia(e.Message)
 	}
 	return ev, true
+}
+
+// replyElsewhere is the reply_to of a message that quotes another one that WhatsApp names by no ID (the bridge's
+// REPLY_ELSEWHERE): it is still a reply to another message, never the person's own answer.
+const replyElsewhere = "elsewhere"
+
+// messageContext gives whether a message was forwarded and the ID of the message that it quotes, from the context
+// info of the part that the person sent (a text with a quote or a link is an extended text; a plain text has none).
+func messageContext(m *waE2E.Message) (bool, *string) {
+	parts := []interface{ GetContextInfo() *waE2E.ContextInfo }{
+		m.GetExtendedTextMessage(), m.GetImageMessage(), m.GetAudioMessage(), m.GetDocumentMessage(),
+		m.GetVideoMessage(), m.GetPtvMessage(), m.GetStickerMessage(), m.GetLocationMessage(),
+		m.GetLiveLocationMessage(), m.GetContactMessage(), m.GetContactsArrayMessage(), m.GetPollCreationMessage(),
+		m.GetPollCreationMessageV2(), m.GetPollCreationMessageV3(), m.GetEventMessage(),
+	}
+	for _, part := range parts {
+		info := part.GetContextInfo()
+		if info == nil {
+			continue
+		}
+		forwarded := info.GetIsForwarded() || info.GetForwardingScore() > 0
+		if id := info.GetStanzaID(); id != "" {
+			return forwarded, &id
+		}
+		if info.GetQuotedMessage() != nil {
+			id := replyElsewhere
+			return forwarded, &id
+		}
+		return forwarded, nil
+	}
+	return false, nil
 }
 
 // viewOnce tells a message that its sender let be seen only once: whatsmeow unwraps its wrapper and says so, and an

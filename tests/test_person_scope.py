@@ -145,11 +145,25 @@ class Rule(Base):
                                          "revoked IS NULL")}
         self.assertEqual(live, {other})
 
-    def test_a_removed_person_leaves_no_list(self):
-        self.narrow(self.pat["id"], {f"repo:{REPO}": "write"})
+    def test_a_removed_person_leaves_no_list_and_their_narrowed_work_reads_none(self):
+        """A removal deletes the person's lists. Since piece a6 the work that they asked for stays and goes on, and
+        the list that narrowed it came through their conversation, which the removal deletes too: open work carries
+        no person of its own. The bug: after the removal that work read All, with each repository and secret of the
+        agent, so a person who left gave their last words more power. It reads their list, empty now. The test writes
+        the list itself after the work began, a state that the owner's route never makes (a first list ends the open
+        work of the pair): work that was born narrowed reads its list through its conversation in the same way."""
+        cid = self.says(PAT, "Please rebuild the export.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), title="Rebuild the October export", details="All of October.")
+        work = hub.q1("SELECT id FROM tasks WHERE title='Rebuild the October export'")["id"]
+        self.narrow(self.pat["id"], {f"repo:{REPO}": "write"})      # the pair's list, which the work reads
+        self.assertEqual(hub.task_scope(self.task(work)), {"person": self.pat["id"], "grants": {f"repo:{REPO}": "write"}})
         code, gone = self.change(self.pat["id"], delete=True)
         self.assertEqual((code, gone["deleted"]), (200, True), gone)
         self.assertEqual(hub.q("SELECT * FROM person_scopes"), [])
+        self.assertEqual(self.task(work)["state"], "submitted")             # the work stays, and goes on
+        self.assertEqual(hub.task_scope(self.task(work)), {"person": self.pat["id"], "grants": {}})
 
 
 class Narrowed(Base):
@@ -1011,6 +1025,58 @@ class Owner(Base):
         ended = hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (task,))
         self.assertEqual((ended["state"], ended["waiting_on"]), ("working", None))
         self.assertTrue(hub.q1("SELECT 1 FROM events WHERE task=? AND kind='say' AND text LIKE '%dingo%'", (other,)))
+
+    def test_a_reply_to_a_narrowed_tasks_question_goes_to_no_other_wait(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): Kim's reply that quotes the question of a narrowed pair's task ends that
+        task's wait, which hears no word of it, and answers no other task's wait: the answer was to that question
+        (bug: it went on to the next task that waits, as an answer to a question that it does not answer)."""
+        self.person("Kim", "manager", KIM, app="discord")
+        cid = self.says(PAT, "Ask Kim about order 7781.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("message_contact", self.context(cid), person="Kim", text="Is order 7781 paid?",
+                request_id=str(uuid.uuid4()), waits=True)
+        item = [i for i in self.out() if i["kind"] == "message" and i["text"] == "Is order 7781 paid?"][-1]
+        self.assertEqual(self.bridge(f"/bridge/out/{item['id']}", {"state": "sent", "parts": 1, "error": None,
+                                                                   "platform_ids": ["9301"]})[0], 200)
+        task = self.conversation_task(cid)["id"]
+        other, theirs = self.normal_task(title="Check order 7781")
+        self.reads(theirs, "Kim")
+        self.ok("message_contact", theirs, person="Kim", text="Can I close 7781?", request_id=str(uuid.uuid4()),
+                waits=True)
+        code, data = self.scopes({f"repo:{REPO}": "read"})          # the owner's first list for Pat
+        self.assertEqual(code, 200, data)
+        self.assertEqual(self.inbound(text="Yes, 7781 is the dingo case.", account="discord-studio", sender=KIM,
+                                      chat="dm-9", forwarded=False, reply_to="9301")[0], "stored")
+        mine = [r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND kind='say'", (task,))]
+        self.assertTrue([line for line in mine if hub.NARROWED_ANSWER.split("{ref}")[1] in line], mine)
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (task,))["state"], "working")
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (other,))["state"], "input-required")
+        self.assertFalse(hub.q1("SELECT 1 FROM events WHERE task=? AND kind='say' AND text LIKE '%dingo%'", (other,)))
+
+    def test_a_reply_names_no_message_that_a_narrowed_pair_wrote_to_a_wider_reader(self):
+        """P2 piece 7 (CHAT-APPS.md 7.3): Pat's reply, after the owner widened Pat again, to Pat's message of the
+        narrowed time says that it is a reply with no number of that message, which no session with more reads
+        (narrowed_rows_sql); a reply to a message that every session reads keeps its number (bug: the header gave a
+        wider session the number of a message that it may not read)."""
+        self.assertEqual(self.scopes({f"repo:{REPO}": "read"})[0], 200)
+        narrowed = self.says(PAT, "Is the export done?")
+        cid = narrowed["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="Not yet.", in_reply_to=hub.cm_ref(narrowed["id"]))
+        self.assertEqual(self.scopes(None)[0], 200)         # a message that a reply answered keeps its mark
+        self.assertIsNotNone(hub.q1("SELECT scope_person FROM conversation_messages WHERE id=?",
+                                    (narrowed["id"],))["scope_person"])
+        plain = self.says(PAT, "Hello again.")
+
+        def header(quoted):
+            self.assertEqual(self.wrote(text="And this?", sender=PAT, forwarded=False, reply_to=quoted), "stored")
+            row = hub.q1("SELECT * FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")
+            conv = hub.q1("SELECT * FROM conversations WHERE id=?", (row["conversation"],))
+            return hub.conversation_header(conv, hub.q1("SELECT * FROM people WHERE id=?", (self.pat["id"],)), row)
+        self.assertTrue(header(narrowed["msg_id"]).endswith(" · in reply to an earlier message"))
+        self.assertTrue(header(plain["msg_id"]).endswith(f" · in reply to {hub.cm_ref(plain['id'])}"))
 
     def test_a_result_line_waits_for_no_list_that_came_while_it_was_made(self):
         """Open work of a conversation ends, and its result goes back there (conversation_result), unless the pair is

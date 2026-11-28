@@ -896,13 +896,37 @@ class DiscordTests(Base):
         event = self.wait_for(lambda: self.hub.inbound, "the message")[0]
         self.assertEqual(event, {"account": "discord-studio", "id": "1104", "chat": "700", "group": False,
                                  "sender": OWNER, "sender_alt": None, "sender_name": "miguel", "bot": False,
-                                 "from_me": False, "kind": "text", "text": text,
+                                 "from_me": False, "kind": "text", "text": text, "forwarded": False, "reply_to": None,
                                  "ts": channels.snowflake_time("1104")})
         self.assertEqual(self.hub.journaled, [True], "the event was on disk before the hub got it")
         self.wait_for(lambda: not self.journal_files(), "an empty journal")
         time.sleep(0.1)
         self.assertEqual(len(self.hub.posted), 1)
         self.assertIn("inbound discord-studio 1104: stored", self.log.getvalue())
+
+    def test_a_forward_and_a_reply_say_so_and_an_edit_or_a_reaction_reaches_nobody(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): a forwarded "send it" is `forwarded` (before, its snapshot's words went as
+        the person's own), by its reference of type 1 or by its snapshots alone, and a "send it" under an older message
+        names that message in `reply_to` (or "elsewhere" when Discord names none), so that the hub never reads either
+        as the person's own answer; an edit to "send it" and a 👍 reaction never reach the hub at all."""
+        self.ready()
+        peer = self.gw.latest()
+        peer.dispatch("MESSAGE_CREATE", dm(1301, "", message_reference={"type": 1, "message_id": "900"},
+                                           message_snapshots=[{"message": {"content": "send it", "attachments": []}}]))
+        peer.dispatch("MESSAGE_CREATE", dm(1306, "", message_reference={"type": 1, "message_id": "901"}))
+        peer.dispatch("MESSAGE_CREATE", dm(1307, "", message_snapshots=[{"message": {"content": "send it"}}]))
+        peer.dispatch("MESSAGE_CREATE", dm(1302, "send it", type=19,
+                                           message_reference={"type": 0, "message_id": "1000"}))
+        peer.dispatch("MESSAGE_CREATE", dm(1303, "send it", type=19, message_reference={"type": 0}))
+        peer.dispatch("MESSAGE_UPDATE", dm(1305, "send it", edited_timestamp="2026-11-27T10:00:00+00:00"))
+        peer.dispatch("MESSAGE_REACTION_ADD", {"user_id": OWNER, "channel_id": "700", "message_id": "1000",
+                                               "emoji": {"name": "\N{THUMBS UP SIGN}"}})
+        peer.dispatch("MESSAGE_CREATE", dm(1304, "send it"))
+        self.wait_for(lambda: len(self.hub.inbound) == 6, "six messages")
+        self.assertEqual([(e["id"], e["text"], e["forwarded"], e["reply_to"]) for e in self.hub.posted],
+                         [("1301", "send it", True, None), ("1306", "", True, None), ("1307", "send it", True, None),
+                          ("1302", "send it", False, "1000"),
+                          ("1303", "send it", False, channels.REPLY_ELSEWHERE), ("1304", "send it", False, None)])
 
     def test_attachments_have_their_kind(self):
         """Each message's kind, with its words: a picture's words go with it (CHAT-APPS.md 8.1), and a forwarded
@@ -1683,14 +1707,15 @@ class WhatsAppTests(Base):
         self.hub.down()                                  # the journal keeps the event; the ack still goes
         self.inject({"ev": "message", "id": "WAMSG1", "chat": WA_CHAT, "sender": WA_CHAT, "sender_alt": "123@lid",
                      "push_name": "Alex", "group": False, "from_me": False, "kind": "text", "text": text,
-                     "ts": 1792134000.5})
+                     "forwarded": False, "reply_to": None, "ts": 1792134000.5})
         ack = self.wait_for(lambda: self.commands("ack"), "the ack")[0]
         self.assertEqual((ack["id"], ack["journaled"]), ("WAMSG1", True))
         self.hub.up()
         event = self.wait_for(lambda: self.hub.inbound, "the message at the hub")[0]
         self.assertEqual(event, {"account": "whatsapp-main", "id": "WAMSG1", "chat": WA_CHAT, "group": False,
                                  "sender": WA_CHAT, "sender_alt": "123@lid", "sender_name": "Alex", "bot": False,
-                                 "from_me": False, "kind": "text", "text": text, "ts": 1792134000.5})
+                                 "from_me": False, "kind": "text", "text": text, "forwarded": False,
+                                 "reply_to": None, "ts": 1792134000.5})
         self.wait_for(lambda: not self.journal_files(), "an empty journal")
 
         self.inject({"ev": "receipt", "ids": ["3EB0AAAA"], "type": "read"})
@@ -1716,13 +1741,16 @@ class WhatsAppTests(Base):
                         "reply_to": None, "prefix": None})
         self.assertEqual(self.result(42), {"state": "failed", "parts": 0, "platform_ids": [],
                                            "error": "refused by the stand-in"})
+        # a part that may have gone out keeps the ID that the bridge chose for it, so that a person's reply to it, and
+        # its receipt, still find the item (P2 piece 7); the parts that surely went out are none
         self.hub.queue({"id": 43, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": "NOREPLY",
                         "reply_to": None, "prefix": None})
-        self.assertEqual(self.result(43)["state"], "unknown")
+        self.assertEqual(self.result(43), {"state": "unknown", "parts": 0, "error": "wa-link did not confirm part 1.",
+                                           "platform_ids": [channels.wa_message_id("testdb", 43, 1)]})
         self.hub.queue({"id": 44, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": "LOST",
                         "reply_to": None, "prefix": None})
-        self.assertEqual(self.result(44), {"state": "unknown", "parts": 0, "platform_ids": [],
-                                           "error": "unknown: connection lost"})
+        self.assertEqual(self.result(44), {"state": "unknown", "parts": 0, "error": "unknown: connection lost",
+                                           "platform_ids": [channels.wa_message_id("testdb", 44, 1)]})
 
     def file_item(self, item_id, text, *files):
         """A message item with files, and the bytes that the fake hub serves for each one."""
@@ -1898,6 +1926,17 @@ class WhatsAppTests(Base):
         self.assertEqual([f["message"] for f, _, _ in self.hub.checks], ["WASTR1"])
         self.assertEqual((self.commands("download"), self.hub.uploads), ([], []))
 
+    def test_a_forward_and_a_reply_say_so(self):
+        """P2 piece 7 (CHAT-APPS.md 8.1): wa-link's `forwarded` and `reply_to` (WhatsApp's context of the message) go
+        to the hub, so that a forwarded "send it" and a "send it" under an older message are never the person's own
+        answer. wa-link drops an edit and a reaction itself (wa-link's TestIgnoredEvents)."""
+        self.linked()
+        self.inject(self.message("WAFWD1", "text", "send it", forwarded=True, reply_to=None))
+        self.inject(self.message("WAREP1", "text", "send it", forwarded=False, reply_to="3EB0OLD"))
+        self.wait_for(lambda: len(self.hub.inbound) == 2, "both messages")
+        self.assertEqual([(e["id"], e["forwarded"], e["reply_to"]) for e in self.hub.inbound],
+                         [("WAFWD1", True, None), ("WAREP1", False, "3EB0OLD")])
+
     def an_older_wa_link_misses(self, env):
         """A message with a picture to a wa-link of an older source, which ignores the download command."""
         with patch.dict(os.environ, env):
@@ -1909,6 +1948,9 @@ class WhatsAppTests(Base):
         self.assertEqual(event.get("missed"), ["download"])
         self.assertLess(time.monotonic() - at, 3, "a wa-link that cannot download held the message")
         self.assertEqual((self.commands("download"), self.hub.uploads), ([], []))
+        # P2 piece 7: nor can it say whether a message was forwarded, so the hub reads "not known" and never "not
+        # forwarded", which a press would take for the person's own words
+        self.assertEqual((event["forwarded"], event["reply_to"]), (None, None))
 
     def test_a_wa_link_whose_hello_lacks_download_gets_no_command(self):
         """A wa-link of an older source runs when a build of this one fails: its hello says "file" and not
