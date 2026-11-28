@@ -3424,17 +3424,27 @@ class HealthLive(unittest.TestCase):
     def test_a_real_process_s_arguments_and_environment_are_not_in_the_answer(self):
         # A program that takes the argument and lives on: GNU sleep refused it and ended at once, so health read a
         # host with no such process, and the read of its arguments failed whenever the process had ended first.
+        # Popen returns once the exec has begun (its pipe closes on exec), and the kernel sets the new program's
+        # arguments after that, so a read at once can find none: the test waits for them (Release's finding of 28
+        # November 2026: half of the runs on the test server failed in 1 ms).
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", f"--token={self.MARK}-ARG"],
-                                 stdin=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                  env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "API_KEY": f"{self.MARK}-ENV"})
         try:
-            with open(f"/proc/{child.pid}/cmdline", "rb") as f:        # the marker is there for a program that reads it
-                self.assertIn(f"{self.MARK}-ARG".encode(), f.read())
+            held, until = b"", time.monotonic() + 10
+            while f"{self.MARK}-ARG".encode() not in held and child.poll() is None and time.monotonic() < until:
+                with open(f"/proc/{child.pid}/cmdline", "rb") as f:    # the marker is there for a program that reads it
+                    held = f.read()
+                time.sleep(0 if f"{self.MARK}-ARG".encode() in held else 0.01)
+            if child.poll() is not None:
+                self.fail(f"the program ended at once ({child.returncode}): {child.stderr.read()[-800:]!r}")
+            self.assertIn(f"{self.MARK}-ARG".encode(), held)
             out = ROOT.call({"v": 1, "op": "health", "args": []})
             self.assertIsNone(child.poll())                             # it lived while health read the host
         finally:
             child.kill()
             child.wait()
+            child.stderr.close()
         self.assertNotIn(self.MARK, out)
         self.assertIn("memory by user, the sum of its processes:", out)
         self.assertRegex(out, r"memory: \d+ MiB in all, \d+ MiB available; swap: ")

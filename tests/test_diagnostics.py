@@ -652,6 +652,10 @@ class OnTheHub(OwnerAPI):
         self.assertEqual((code, answer["faults"], answer["refusals"]), (200, [], []))
         with hub.LOCK:
             self.assertEqual([w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"], [])
+        diagnostics.pending()
+        with hub.LOCK, contextlib.redirect_stderr(io.StringIO()):
+            hub.fault_pass_time()               # a pass of the tick: no fault of its own for the table, each 5 s
+        self.assertEqual(diagnostics.pending(), [])
 
     def test_a_length_that_is_not_a_number_is_the_callers_mistake_and_no_fault(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)

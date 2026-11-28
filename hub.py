@@ -7764,6 +7764,9 @@ FAULT_WARN_HOURS = 24   # System status says "The hub hit an error" while a faul
                         # no error report can go (health_view, error_reports_go)
 FAULT_EARLY_MOST = 2    # a fault asks for an early report only while fewer early reports than this went in a DAY...
 FAULT_EARLY_GAP = 3600  # ...and none in this many seconds before (fault_flush)
+CLOCK_WRONG = 3600      # a wall clock behind the last take or stamp by more than this many seconds was ahead by error
+                        # and came back: the error reports' times move back to it (fault_pass_time); by less, it
+                        # stepped back, and the passes go on after them
 
 
 def print_fault():
@@ -7875,13 +7878,119 @@ def fault_flush(t0):
 
 def fault_pass_time():
     """Under LOCK: the t0 of a pass of fault_flush, which is also the stamp of the report of that pass (tick,
-    error_report_before_restart). Read under LOCK, it comes after each bound that a holder of LOCK wrote: the owner's
-    yes, the stamp of a report. It comes after the take before too (_error_report["flushed"]), so that the takes and
-    the stamps only go forward, also when the wall clock steps back: a count of the step dates after the take before
-    (fault_flush), and a stamp of the step after the stamp before. Then the day's report, and each wait that compares
-    a stamp with this time, comes later by the size of the step."""
-    t, before = now(), _error_report["flushed"]
+    error_report_before_restart) or the owner's yes (set_error_reports). Read under LOCK, it comes after each bound
+    that a holder of LOCK wrote: the owner's yes, the stamp of a report. It comes after the take before too, so that
+    the takes and the stamps only go forward, also when the wall clock steps back: a count of the step dates after the
+    take before (fault_flush), and a stamp of the step after the stamp before. Then the day's report, and each wait
+    that compares a stamp with this time, comes later by the size of the step.
+
+    The take before is this process's (_error_report["flushed"]), else the newest time that the records keep: the
+    last stamp and try (error_reports_sent, error_reports_tried), the owner's yes and the newest last time of a fault
+    row. So a process that starts while the clock is still behind them goes on after them too: one that took the clock
+    dated a count of that time before the stamp, and the next report left it out; and with reports off, a process that
+    stopped during a wrong jump keeps no row of the jump ahead, which a later yes would have sent (the validator's
+    R6-2, 27 November 2026). A wall clock behind them by more than CLOCK_WRONG was ahead by error and came back: then
+    each time that the error reports wrote ahead moves back to now (error_reports_clock_back), and the passes go on
+    from now. Without that, they went on from the wrong time, and each wait that compares a stamp with it waited until
+    the real clock reached it: a year for a wrong jump of a year. A clock before the code that runs was made
+    (code_time), or before the times that a report may carry (errorreports.EPOCH), is itself the wrong one (a clock
+    reset to an old time): then nothing moves, and the passes go on after the stamps until the clock is set right. A
+    move back to such a time dated the rows that no report held before the FAULT_DAYS that the hub reads and keeps, or
+    before EPOCH, which a report leaves out, and once the clock was set right they went in no report. One such case
+    stays: a clock reset behind, but after the time of the code, by more than FAULT_DAYS (code older than the reset)
+    moves back, and the rows that no report held then go in no report."""
+    t = now()
+    try:
+        try:
+            newest = read_rows("SELECT MAX(last) AS t FROM faults")[0]["t"]
+        except sqlite3.Error:   # a database that refused the table at the start (build_schema): none, as health_view
+            newest = None
+        before = max(_error_report["flushed"] or 0, kv_time("error_reports_tried") or 0,
+                     kv_time("error_reports_sent") or 0, kv_time("error_reports_on_at") or 0,
+                     newest if finite(newest) else 0) or None
+        if before is not None and before - t > CLOCK_WRONG and t > errorreports.EPOCH[0] and t > code_time():
+            error_reports_clock_back(t, before)
+            before = t
+        _error_report["flushed"] = before       # fault_flush's take before, also of a process before this one
+    except Exception:           # the times that were ahead stay: the passes go on after them, as before
+        print_fault()
+        before = _error_report["flushed"]
     return t if before is None or t > before else math.nextafter(before, math.inf)
+
+
+_code_time = {}
+
+
+def read_code_time():
+    """At the start of the process (main), outside LOCK, once: the time of the code that runs, kept for the process
+    (code_time): the committer time of the release revision that the signed manifest at the checkout's HEAD names
+    (version_at reads its version). The machine that made the release wrote it, never this hub's clock: git writes a
+    release's files at the hub's own clock when it takes the release, and the commits of the configuration ref are
+    this fleet's own (version_at), so a release taken during a wrong jump put a time from either ahead, and the clock
+    that came back moved nothing (the validator's R6-7, 27 November 2026). The manifest itself holds no time
+    (revision, version, notes, minimum, hold and the signature). The committer time is the clock of the machine that
+    ran ship.py and pushed the release: a move back waits for this time only when that clock was ahead as well, two
+    wrong clocks at once, and then until the real clock reaches it. math.inf when it cannot be read, kept too: then
+    nothing moves back. Read at the start, as diagnostics.code_id is, it is the time of the code that this process
+    runs, also after a restart onto new code that began or failed has put HEAD at the new release; and no pass of the
+    tick runs git under LOCK for it, which a slow disk could hold up to a minute at each pass."""
+    at = math.inf
+    code, out, _ = git_kit("cat-file", "blob", f"HEAD:{errorreports.MANIFEST}")
+    try:
+        said = json.loads(out) if code == 0 else None
+    except ValueError:
+        said = None
+    revision = said.get("revision") if isinstance(said, dict) else None
+    if isinstance(revision, str) and errorreports.COMMIT.fullmatch(revision):
+        code, out, _ = git_kit("log", "-1", "--format=%ct", revision)
+        try:
+            read = float(out) if code == 0 else None
+        except ValueError:
+            read = None
+        if finite(read):
+            at = read
+    _code_time["at"] = at
+    return at
+
+
+def code_time():
+    """The time of the code that runs, as main read it at the start (read_code_time): a clock before it is wrong
+    (fault_pass_time). math.inf before that read: then nothing moves back."""
+    return _code_time.get("at", math.inf)
+
+
+def error_reports_clock_back(t, ahead):
+    """Under LOCK (fault_pass_time): the wall clock was ahead by error, up to `ahead`, and came back to `t`. Each time
+    that the error reports wrote after `t` moves back to it, in the order that a report's window needs. A fault row
+    that a report held, or that came before the owner's yes (its last time not after the stamp of the last report or
+    his yes), gets `t`, which the next report leaves out, because its `since` is now `t`; one that no report held gets
+    the moment after `t`, which the next report holds. A row of the wrong time alone moves as a whole (fault_flush);
+    one that began before it keeps its first time, so that a stall keeps the length that it had. The stamp, the try,
+    the early ask and the yes get `t`; the times of the early reports and of what our side took get `t`, so they count
+    a DAY from now; a hold keeps what was left of it at `ahead`. With no move, the next report took the stamp for one
+    ahead of the clock and held again all that came since the yes, and each row of the wrong time went in every report
+    until the clock reached it. All of it is one transaction, so a hub that stops in it moves all or nothing, and the
+    next pass moves what is still ahead. The health block's own records keep their times (UI-API 1.340)."""
+    times = {key: kv_time(key) for key in ("error_reports_sent", "error_reports_tried", "error_reports_early_at",
+                                           "error_reports_on_at", "error_reports_hold", "error_reports_health_hold",
+                                           "error_reports_funnel_hold")}
+    earlies, took = kv_json("error_reports_earlies", list), kv_json("error_reports_took", list)
+    held, later = max(times["error_reports_sent"] or 0, times["error_reports_on_at"] or 0), math.nextafter(t, math.inf)
+    with area("quiet"), transaction():
+        for key, value in times.items():
+            if value is not None and value > t:
+                kv_set_rows(key, repr(t) if not key.endswith("_hold") else
+                            repr(t + value - ahead) if value > ahead else None)
+        if earlies:
+            kv_set_rows("error_reports_earlies", json.dumps([min(e, t) if finite(e) else e for e in earlies]))
+        if took:
+            kv_set_rows("error_reports_took", json.dumps([dict(r, at=min(r["at"], t)) if isinstance(r, dict) and
+                                                          finite(r.get("at")) else r for r in took]))
+        for new, low, high in ((t, t, held), (later, max(t, held), None)):
+            DB.execute("UPDATE faults SET first=CASE WHEN first>? THEN MIN(first-(last-?),?) ELSE first END, last=? "
+                       "WHERE last>?" + ("" if high is None else " AND last<=?"),
+                       (t, new, new, new, low) + (() if high is None else (high,)))
+    log("hub", f"the clock was {round(ahead - t)} s ahead and came back: the error reports go on from now")
 
 
 def thread_fault(args, default=threading.excepthook):
@@ -7948,11 +8057,19 @@ def error_reports_go():
 
 
 def set_error_reports(on):
-    """The owner's switch. Turning it on keeps the moment (error_reports_on_at): a report holds only what came after
-    it, as the Mac drops a crash that came while it was off. The counts and records of the health block start at that
-    moment too (error_reports_counts_start)."""
+    """The owner's switch, under LOCK. Turning it on keeps the moment (error_reports_on_at): a report holds only what
+    came after it, as the Mac drops a crash that came while it was off. The moment is a pass of its own, which stores
+    what was counted before it (fault_pass_time, fault_flush): so each count before it is dated before it, and each
+    one after it after it, also while the wall clock is behind the takes, when each count is dated just after the take
+    before; a yes at the wall clock's time came before both. The counts and records of the health block start at
+    that moment too (error_reports_counts_start)."""
     if on and not error_reports_on():
-        kv_set("error_reports_on_at", repr(now()))
+        t = fault_pass_time()
+        try:
+            fault_flush(t)
+        except Exception:       # as a step of the tick: the switch turns on all the same
+            print_fault()
+        kv_set("error_reports_on_at", repr(t))
         error_reports_counts_start()
     kv_set("error_reports", "1" if on else "0")
     log("owner", f"error reports are {'on' if on else 'off'}")
@@ -98971,6 +99088,7 @@ def main():
                request_wait=args.request_wait,
                stop_after=args.stop_after, offline_after=args.offline_after, tick=args.tick)
     CFG["team_path"] = os.path.abspath(args.team)
+    read_code_time()            # the lane "Error reports": the time of this code, once, as its id above (git: the kit)
     CFG["release_floor"] = floor_path(os.path.expanduser("~"))      # DevOps plan 0.1: lifecycle.may_take's floor
     CFG["central_vault"] = CENTRAL_SOCKET       # owner feature central_vault: its socket, which hubsetup.py makes
     with open(args.team, encoding="utf-8") as f:

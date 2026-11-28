@@ -10,6 +10,7 @@ The first classes need no hub. The last one runs the test hub of test_ui_api (Ow
 import contextlib
 import http.client
 import http.server
+import inspect
 import io
 import json
 import os
@@ -561,9 +562,13 @@ class OnTheHub(OwnerAPI):
         funnel = unittest.mock.patch.object(errorreports, "FUNNEL", False)
         funnel.start()
         self.addCleanup(funnel.stop)
-        # no code of a restart, no version read at HEAD and no take of fault_flush, of an earlier test
+        # no code of a restart, no version read at HEAD and no take of fault_flush, of an earlier test; and no time of
+        # the code that runs (hub.code_time), which this test's checkout, no git one, cannot give: a test that moves a
+        # clock back gives it
         hub._error_report.update(runs=None, code=None, head=None, flushed=None)
         self.addCleanup(hub._error_report.update, runs=None, code=None, head=None, flushed=None)
+        hub._code_time.clear()
+        self.addCleanup(hub._code_time.clear)
 
     def sweep(self, t0):
         with hub.LOCK:
@@ -872,6 +877,257 @@ class OnTheHub(OwnerAPI):
         stall = self.sent[sent][1]["faults"][1]
         (row,) = self.request("/ui/diagnostics?db=test-generation")[1]["stalls"]
         self.assertEqual((round(stall["last"] - stall["first"]), round(row["last"] - row["first"])), (40, 40))
+
+    def test_a_wall_clock_that_was_ahead_by_error_holds_back_no_report(self):
+        """The wall clock jumps a day ahead by error, one pass of the tick runs and sends the day's report, and the
+        clock comes back: the times that the error reports wrote ahead move back (error_reports_clock_back), so the
+        next day's report goes a day after the last report, and each fault and stall goes in exactly one report, the
+        stall with its length; one that began before the jump keeps its first time. A hub whose passes went on from
+        the wrong time held back each wait (the day's report, the faults' hour, a retry) until the clock reached it, a
+        year for a wrong jump of a year; one that took the clock as it came back sent again what the report of the
+        wrong time held, at each report until the clock reached it (the review of 27 November 2026)."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600     # the code that runs was made an hour before
+        self.switch(True)
+        self.tick()                             # the day's report
+        at[0] += 50
+        began, across = at[0] - 40, diagnostics.Watch(cpu=lambda ids: None, wall=lambda: hub.now(), out=io.StringIO())
+        across.stall("hold", "a thread", (("hub.py", 2),), 40.0)     # a stall that goes on into the jump
+        self.tick()
+        at[0] += errorreports.DAY + 1           # the jump: one pass, which sends the day's report
+        across.stall("hold", "a thread", (("hub.py", 2),), 40.0)
+        self.count(ValueError)
+        self.stall(40.0, t0=False)
+        self.tick()
+        at[0] -= errorreports.DAY - 10          # the clock comes back
+        self.count(OSError)                     # it asks for an early report
+        self.tick()
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent],
+                         [[], ["ValueError", "StallHold", "StallHold"], ["OSError"]])
+        with hub.LOCK:                          # the next day's report: a day after that report
+            due = [errorreports.due(True, hub.kv_time("error_reports_sent"), hub.kv_time("error_reports_tried"), None,
+                                    at[0] + errorreports.DAY + d, None, hub.error_report_earlies()) for d in (-1, 1)]
+        self.assertEqual(due, [None, "day"])
+        stalls = {r["frames"][0]["line"]: r for r in self.request("/ui/diagnostics?db=test-generation")[1]["stalls"]}
+        rows = hub.q("SELECT first, last FROM faults")
+        self.assertEqual((round(stalls[1]["last"] - stalls[1]["first"]), stalls[2]["first"],
+                          all(r["first"] <= r["last"] for r in rows)), (40, round(began, 3), True))
+
+    def test_a_hub_whose_clock_starts_far_behind_moves_no_time_back(self):
+        """A clock before the code that runs was made (code_time) is itself the wrong one (a clock reset to an old
+        time), not one that came back after a wrong jump ahead: the error reports' times stay, the passes go on after
+        them, and once the clock is set right each fault has gone once. A hub that moved them back a year dated the
+        rows that no report held a year back, and its end of rows after FAULT_DAYS took them once the clock was set
+        right (the review of 27 November 2026)."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        at[0] += 10
+        self.fault(canary(), KeyError)          # the faults' early report
+        self.sweep(hub.now())
+        right = at[0]
+        hub._error_report["flushed"] = None     # a new process, whose clock starts a year behind
+        at[0] -= 365 * 86400
+        self.count(ValueError)
+        self.tick()                             # its pass goes on after the stamps
+        at[0] = right + 3600                    # the clock is set right
+        with hub.LOCK:
+            hub.error_report_early("a test")
+        self.tick()
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent],
+                         [[], ["KeyError"], ["ValueError"], []])
+
+    def test_the_code_time_is_read_once_at_the_start_and_no_pass_runs_git(self):
+        """main reads the time of the code that runs once, outside LOCK (read_code_time), and keeps it for the process,
+        math.inf when git cannot give it (no manifest at HEAD, or no commit of its revision): then a clock behind the
+        stamps moves nothing back, as a clock before the code does. A pass (fault_pass_time, under LOCK) only reads
+        the kept value, also before any is kept: one that ran git held LOCK up to a minute on a slow disk, at each pass
+        while the clock was behind, and a code time of 0 let a clock that is wrong behind, but after
+        errorreports.EPOCH, move the stamps and the rows back (the reviews of 27 November 2026)."""
+        at = self.clock()
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        stamp = hub.kv_get("error_reports_sent")
+        at[0] -= 2 * 86400                      # a clock two days behind it
+        calls = []
+        with patch.object(hub, "git_kit", lambda *args, **how: calls.append(args) or (128, "", "fatal")):
+            with hub.LOCK:
+                hub.fault_pass_time()           # no time kept yet: nothing moves, and no git
+            moved, ran = hub.kv_get("error_reports_sent"), list(calls)
+            hub.read_code_time()                # main's read, which git refuses
+            with hub.LOCK:
+                hub.fault_pass_time()
+        self.assertEqual((moved, ran, hub._code_time.get("at"), hub.kv_get("error_reports_sent"), len(calls)),
+                         (stamp, [], float("inf"), stamp, 1))
+        self.assertIn("\n    read_code_time()", inspect.getsource(hub.main))     # else every hub kept math.inf
+
+    def test_a_wall_clock_that_was_a_year_ahead_sends_the_days_report_a_day_after_it_came_back(self):
+        """A wrong jump of a year: the day's report of the wrong time goes, the one report more that the jump costs,
+        which holds no fault that went before; and when the clock comes back, the times move back, so the next report
+        of kind "day" goes a day after the clock came back, not a year later, and no fault goes twice: the move sends
+        nothing again. A hub that moved nothing back by FAULT_DAYS or more stayed shut for the year, also across
+        restarts, since the stamps stay ahead (the coordinator's decision of 27 November 2026)."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600
+        self.switch(True)
+        self.tick()                             # the day's report
+        at[0] += 10
+        self.count(KeyError)
+        self.tick()                             # its early report
+        at[0] += 365 * 86400                    # the jump
+        self.count(ValueError)
+        self.tick()                             # the day's report of the wrong time
+        at[0] -= 365 * 86400 - 10               # the clock comes back
+        back = at[0]
+        self.count(OSError)
+        self.tick()                             # no report: an early report went 20 s before, by the real clock
+        with hub.LOCK:                          # the day's report: not a moment before a day after that
+            soon = errorreports.due(True, hub.kv_time("error_reports_sent"), hub.kv_time("error_reports_tried"), None,
+                                    back + errorreports.DAY - 1, None, [])
+        at[0] = back + errorreports.DAY + 1     # (no pass between: a day with none makes a warning ask early)
+        self.tick()                             # the day's report
+        kinds = [r["what"].split(":")[0] for r in hub.q("SELECT what FROM log WHERE what LIKE 'sent %error report%' "
+                                                        "ORDER BY rowid")]
+        day, early = "sent the day's error report", "sent an early error report"
+        self.assertEqual((soon, kinds, [[f["class"] for f in body["faults"]] for _, body in self.sent]),
+                         (None, [day, early, day, day], [[], ["KeyError"], ["ValueError"], ["OSError"]]))
+
+    def test_a_release_taken_during_the_jump_holds_no_report_back(self):
+        """code_time is the committer time of the release revision that the signed manifest at HEAD names, which the
+        machine that made the release wrote. A release taken during a wrong jump writes its files, and the
+        configuration ref's own commit at HEAD, at this hub's clock: a code time from either stayed ahead after the
+        clock came back, nothing moved, and each wait held until the real clock reached the jump (the validator's
+        R6-7, 27 November 2026)."""
+        at = self.clock()
+        made, taken, revision, real = at[0] - 3600, [], "ab" * 20, hub.git_kit
+
+        def git_kit(*args, **how):              # HEAD: this fleet's own commit on the release
+            if args == ("cat-file", "blob", f"HEAD:{errorreports.MANIFEST}"):
+                return 0, json.dumps({"revision": revision, "version": "2026.11.700"}), ""
+            if args in (("log", "-1", "--format=%ct", revision), ("log", "-1", "--format=%ct", "HEAD")):
+                return 0, str(int(made if args[-1] == revision else taken[0])), ""
+            return real(*args, **how)
+        patcher = patch.object(hub, "git_kit", git_kit)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.switch(True)
+        self.tick()                             # the day's report
+        at[0] += errorreports.DAY + 1           # the jump
+        self.count(ValueError)
+        self.tick()                             # the day's report of the wrong time
+        taken.append(hub.now())                 # a release taken now: its files and HEAD's commit at the wrong time
+        path = os.path.join(diagnostics.ROOT, "errorreports.py")
+        kept = os.stat(path)
+        self.addCleanup(os.utime, path, ns=(kept.st_atime_ns, kept.st_mtime_ns))
+        os.utime(path, (taken[0], taken[0]))
+        hub._error_report["flushed"] = None     # the new process on that release, which reads its code's time
+        hub.read_code_time()
+        at[0] -= errorreports.DAY - 10          # the clock comes back
+        self.tick()
+        self.assertLessEqual(hub.kv_time("error_reports_sent"), hub.now() + 1)
+
+    def test_with_reports_off_a_hub_that_stopped_during_a_jump_keeps_out_what_came_before_the_yes(self):
+        """Reports off; a fault during a wrong jump of a day; the hub stops during the jump and starts after the clock
+        came back. Its first pass reads the newest time of the fault rows too, so it moves the row of the wrong time
+        back: the card names no day ahead, and after the owner's yes only the fault after it goes. A new process that
+        read only the stamps, which reports off leaves empty, kept the row ahead, and the yes came before it (the
+        validator's R6-2, 27 November 2026; the privacy page: "Only errors that came after you turned the switch on
+        go")."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600
+        self.tick()                             # a pass, with reports off
+        at[0] += errorreports.DAY + 1           # the jump
+        self.count(KeyError)
+        self.tick()
+        hub._error_report["flushed"] = None     # the hub stops, and starts...
+        at[0] -= errorreports.DAY - 10          # ...after the clock came back
+        self.tick()
+        with hub.LOCK:
+            card = [w["detail"] for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"]
+        self.switch(True)
+        at[0] += 1
+        self.count(ValueError)
+        self.tick()                             # the day's report
+        self.assertEqual((card, [[f["class"] for f in body["faults"]] for _, body in self.sent]),
+                         ([f"Once at {hub.owner_clock(at[0] - 1, at[0] - 1)}."], [["ValueError"]]))
+
+    def test_a_yes_during_the_jump_then_a_restart_lets_a_later_fault_go(self):
+        """Reports off; the clock jumps a day ahead; the owner's yes at that time, and nothing more; the clock comes
+        back and the hub restarts: a fault after that goes in a report, once. The new process's take before reads the
+        yes (error_reports_on_at), the one time of the jump that it keeps here, and moves it back; one that did not
+        kept the yes ahead, and each report's `since` stayed at its own pass, so the fault went in no report (the
+        validator's R7-S1, 27 November 2026)."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600
+        self.tick()                             # reports off
+        at[0] += errorreports.DAY + 1           # the jump
+        self.switch(True)                       # the yes at the wrong time; no fault, no report
+        at[0] -= errorreports.DAY - 10          # the clock comes back
+        hub._error_report["flushed"] = None     # and the hub restarts
+        self.tick()
+        at[0] += 60
+        self.count(ValueError)
+        self.tick()
+        at[0] += errorreports.DAY + 1
+        self.tick()
+        self.assertEqual([c for _, body in self.sent for c in (f["class"] for f in body["faults"])], ["ValueError"])
+
+    def test_a_yes_during_the_jump_keeps_out_what_came_before_it(self):
+        """Reports off; the clock jumps a day ahead; a fault; the owner's yes during the jump; the clock comes back
+        before any report; a fault after the yes: only the fault after the yes goes. The move back keeps the order of
+        the yes as of the last stamp: a move that kept only the stamp's order sent the fault before the yes (the
+        validator's R6-4, 27 November 2026)."""
+        at = self.clock()
+        hub._code_time["at"] = at[0] - 3600
+        self.tick()                             # a pass, with reports off
+        at[0] += errorreports.DAY + 1           # the jump
+        self.count(KeyError)                    # before the yes
+        self.tick()
+        at[0] += 1
+        self.switch(True)                       # the yes, at the wrong time
+        at[0] -= errorreports.DAY - 10          # the clock comes back before any report
+        self.count(ValueError)                  # after the yes
+        self.tick()                             # the day's report
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent], [["ValueError"]])
+
+    def test_a_hub_that_starts_while_the_clock_is_behind_its_last_stamp_loses_no_fault(self):
+        """A hub that starts while the wall clock is behind the stamp of its last report (by less than CLOCK_WRONG: a
+        step back) goes on after that stamp, which its records keep (error_reports_tried), as the hub before it did:
+        a fault of that time goes in exactly one report. A hub that took the clock as it was dated the fault before
+        that stamp, and the fault went in no report (the review of 27 November 2026)."""
+        at = self.clock()
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        at[0] += 10
+        self.fault(canary(), KeyError)          # the faults' early report
+        self.sweep(hub.now())
+        hub._error_report["flushed"] = None     # a new process...
+        at[0] -= 600                            # ...while the clock is 10 minutes behind that report
+        self.count(ValueError)
+        self.tick()                             # no report: an early report went less than an hour before
+        at[0] += 3600
+        with hub.LOCK:
+            hub.error_report_early("a test")
+        self.tick()
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent],
+                         [[], ["KeyError"], ["ValueError"]])
+
+    def test_the_owners_yes_during_a_step_back_of_the_clock_keeps_out_what_came_before_it(self):
+        """The owner's yes is a pass of its own, which stores what was counted before it (set_error_reports): so a
+        fault before it goes in no report and one after it goes, also while the wall clock is behind the takes (a
+        step back), when each count of the step is dated just after the take before. A yes at the wall clock's time,
+        or at the take before, came before both, and the fault before it went (the review of 27 November 2026)."""
+        at = self.clock()
+        self.tick()                             # a pass, with reports off
+        at[0] -= 600                            # the wall clock steps back
+        self.count(KeyError)                    # before the yes
+        at[0] += 1
+        self.switch(True)
+        at[0] += 1
+        self.count(ValueError)                  # after it
+        self.tick()                             # the day's report
+        self.assertEqual([[f["class"] for f in body["faults"]] for _, body in self.sent], [["ValueError"]])
 
     def test_a_new_kind_of_fault_goes_before_a_restart_past_the_four_early_reports(self):
         """The validator's day of 25 November 2026: a fault that comes back in each code, and a release with new code
@@ -1663,7 +1919,7 @@ class HealthOnTheHub(OnTheHub):
         # restarts onto, and each one under it, as run, so that a hub about to run its newest release does not read
         # as stuck for a day.
         self.release("2026.11.720", "done", step="follow", started=t0 + 70, finished=t0 + 80, reached="e" * 40)
-        self.fault(canary())
+        self.count()                            # stored by the report's own pass, after the stamp of the one before
         with self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.720", "e" * 40: "2026.11.720"}):
             again = hub.error_report_before_restart("d" * 40, "e" * 40)
         self.assertEqual(again["version"], "2026.11.700")
